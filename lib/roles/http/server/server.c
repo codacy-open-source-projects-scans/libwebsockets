@@ -220,7 +220,11 @@ done_list:
 					FALSE, DUPLICATE_SAME_ACCESS))
 				sockfd = LWS_SOCK_INVALID;
 #else
+#if defined(LWS_PLAT_FREERTOS)
+			sockfd = a->info->vh_listen_sockfd;
+#else
 			sockfd = dup(a->info->vh_listen_sockfd);
+#endif
 #endif
 		}
 		else
@@ -375,9 +379,11 @@ done_list:
 			if (setsockopt(wsi->desc.sockfd, IPPROTO_TCP,
 				       TCP_FASTOPEN,
 				       (const char*)&optval, sizeof(optval)) < 0) {
+#if (_LWS_ENABLED_LOGS & LLL_WARN)
 				int error = LWS_ERRNO;
 				lwsl_warn("%s: TCP_NODELAY failed with error %d\n",
 						__func__, error);
+#endif
 			}
 		}
 #else
@@ -1994,6 +2000,7 @@ lws_http_action(struct lws *wsi)
 	if (m > 0)
 #endif
 	{
+lwsl_notice("%s: hit->protocol %s\n", __func__, hit->protocol);
 		/*
 		 * lws_return_http_status(wsi, HTTP_STATUS_NOT_FOUND, NULL);
 		 */
@@ -2001,7 +2008,7 @@ lws_http_action(struct lws *wsi)
 			const struct lws_protocols *pp =
 					lws_vhost_name_to_protocol(
 						wsi->a.vhost, hit->protocol);
-
+lwsl_notice("%s: pp %p\n", __func__, pp);
 			/* coverity */
 			if (!pp)
 				return 1;

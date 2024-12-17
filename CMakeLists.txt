@@ -85,6 +85,7 @@ if (ESP_PLATFORM)
        include_directories(
 		$ENV{IDF_PATH}/components/esp_hw_support/include/soc/
 		$ENV{IDF_PATH}/components/freertos/include/
+		$ENV{IDF_PATH}/components/lwip/include/
 		$ENV{IDF_PATH}/components/freertos/esp_additions/include/
 		$ENV{IDF_PATH}/components/freertos/esp_additions/include/freertos/
 		$ENV{IDF_PATH}/components/freertos/FreeRTOS-Kernel/include/
@@ -98,6 +99,22 @@ if (ESP_PLATFORM)
 		$ENV{IDF_PATH}/components/hal/${CONFIG_IDF_TARGET}/include/
 		$ENV{IDF_PATH}/components/app_update/include/
 		$ENV{IDF_PATH}/components/bootloader_support/include
+		$ENV{IDF_PATH}/components/lwip/port/include
+		$ENV{IDF_PATH}/components/lwip/port/freertos/include
+		$ENV{IDF_PATH}/components/lwip/port/esp32xx/include
+		$ENV{IDF_PATH}/components/freertos/config/include/freertos/
+		$ENV{IDF_PATH}/components/freertos/config/${CONFIG_IDF_TARGET_ARCH}/include
+		$ENV{IDF_PATH}/components/freertos/FreeRTOS-Kernel/portable/${CONFIG_IDF_TARGET_ARCH}/include
+		$ENV{IDF_PATH}/components/freertos/FreeRTOS-Kernel/portable/${CONFIG_IDF_TARGET_ARCH}/include/freertos
+		$ENV{IDF_PATH}/components/freertos/config/include
+		$ENV{IDF_PATH}/components/esp_driver_gpio/include
+		$ENV{IDF_PATH}/components/esp_driver_spi/include
+		$ENV{IDF_PATH}/components/esp_driver_ledc/include
+		$ENV{IDF_PATH}/components/esp_partition/include
+		$ENV{IDF_PATH}/components/spi_flash/include
+		$ENV{IDF_PATH}/components/esp_app_format/include
+		$ENV{IDF_PATH}/components/esp_bootloader_format/include
+		$ENV{IDF_PATH}/components/esp_system/include/
 	)
 
 	if (CONFIG_IDF_TARGET_ARCH_RISCV)
@@ -338,9 +355,11 @@ endif()
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
 	option(LWS_WITH_NETLINK "Monitor Netlink for Routing Table changes" ON)
 	option(LWS_WITH_BINDTODEVICE "Use bind to interface socket option" ON)
+	option(LWS_WITH_LIBCAP "Enable libcap" ON)
 else()
 	set(LWS_WITH_NETLINK 0)
 	set(LWS_WITH_BINDTODEVICE 0)
+	set(LWS_WITH_LIBCAP OFF)
 endif()
 option(LWS_WITH_MCUFONT_ENCODER "Build the ttf to mcufont encoder" OFF)
 
@@ -726,7 +745,11 @@ if (WIN32 OR MSVC)
 	endif()
 endif()
 
-CHECK_LIBRARY_EXISTS(cap cap_set_flag "" LWS_HAVE_LIBCAP)
+if (LWS_WITH_LIBCAP)
+   CHECK_LIBRARY_EXISTS(cap cap_set_flag "" LWS_HAVE_LIBCAP)
+else()
+   set(LWS_HAVE_LIBCAP OFF)
+endif()
 
 
 if (LWS_WITH_ZLIB AND NOT LWS_WITH_BUNDLED_ZLIB)

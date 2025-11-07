@@ -352,18 +352,14 @@ lws_wsmsg_transfer(lws_wsmsg_info_t *info)
 	 * upstream, emptying the private buflist
 	 */
 
-	if (!bl) {
-		lwsl_notice("%s: denied: no content to transfer\n", __func__);
+	if (!bl)
 		return;
-	}
 
 	while (bl && bl->next)
 		bl = bl->next;
 
-	if (bl->awaiting_eom) {
-		lwsl_notice("%s: denied: head awaiting EOM\n", __func__);
+	if (bl->awaiting_eom)
 		return;
-	}
 
 	if (!*info->head_upstream) {
 		/*
@@ -374,8 +370,6 @@ lws_wsmsg_transfer(lws_wsmsg_info_t *info)
 		*info->head_upstream = info->private_heads[info->private_source_idx];
 		info->private_heads[info->private_source_idx] = NULL;
 
-		lwsl_notice("%s: transferred: head -> head_upstream\n", __func__);
-
 		return;
 	}
 
@@ -385,10 +379,8 @@ lws_wsmsg_transfer(lws_wsmsg_info_t *info)
 	while (ubl && ubl->next)
 		ubl = ubl->next;
 
-	if (ubl->awaiting_eom) {
-		lwsl_notice("%s: denied: no content to transfer\n", __func__);
+	if (ubl->awaiting_eom)
 		return;
-	}
 
 	/*
 	 * Add the private buflist on to the end of
@@ -414,8 +406,6 @@ lws_wsmsg_append(lws_wsmsg_info_t *info)
 	    (info->ss_flags == (LWSSS_FLAG_SOM | LWSSS_FLAG_EOM)) &&
 	    (!(*info->head_upstream) || !(*info->head_upstream)->awaiting_eom)) {
 
-		lwsl_notice("%s: directly applying upstream\n", __func__);
-
 		if (lws_buflist_append_segment(info->head_upstream, info->buf, info->len) < 0)
 			return -1;
 
@@ -429,8 +419,6 @@ lws_wsmsg_append(lws_wsmsg_info_t *info)
 		/*
 		 * Otherwise, apply the message to the private buflist first
 		 */
-
-		lwsl_notice("%s: applying via private buflist\n", __func__);
 
 		if (lws_buflist_append_segment(&info->private_heads[info->private_source_idx],
 					       info->buf, info->len) < 0)

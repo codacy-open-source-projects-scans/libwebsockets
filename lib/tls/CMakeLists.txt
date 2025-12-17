@@ -56,7 +56,7 @@ if (LWS_WITH_BORINGSSL OR LWS_WITH_AWSLC)
 	set (LWS_WITH_GENHASH OFF PARENT_SCOPE)
 endif()
 
-if (LWS_WITH_SSL AND NOT LWS_WITH_WOLFSSL AND NOT LWS_WITH_MBEDTLS)
+if (LWS_WITH_SSL AND NOT LWS_WITH_WOLFSSL AND NOT LWS_WITH_MBEDTLS AND NOT LWS_WITH_SCHANNEL)
 	if ("${LWS_OPENSSL_LIBRARIES}" STREQUAL "" OR "${LWS_OPENSSL_INCLUDE_DIRS}" STREQUAL "")
 	else()
 		if (NOT LWS_PLAT_FREERTOS)
@@ -155,6 +155,21 @@ if (LWS_WITH_SSL)
 				tls/mbedtls/lws-genec.c
 				tls/mbedtls/lws-gencrypto.c)
 		endif()
+	elseif (LWS_WITH_SCHANNEL)
+		list(APPEND SOURCES
+			tls/schannel/schannel-tls.c
+			tls/schannel/schannel-ssl.c
+			tls/schannel/schannel-session.c
+			tls/schannel/schannel-x509.c)
+		list(APPEND LIB_LIST "ncrypt" "bcrypt" "crypt32" "secur32")
+		if (LWS_WITH_GENCRYPTO)
+			list(APPEND SOURCES
+				tls/schannel/lws-genhash.c
+				tls/schannel/lws-genrsa.c
+				tls/schannel/lws-genaes.c
+				tls/lws-genec-common.c
+				tls/schannel/lws-genec.c)
+		endif()
 	else()
 		list(APPEND SOURCES
 			tls/openssl/openssl-tls.c
@@ -184,7 +199,7 @@ if (LWS_WITH_SSL)
 		if (LWS_WITH_MBEDTLS)
 			list(APPEND SOURCES
 				tls/mbedtls/mbedtls-server.c)
-		else()
+		elseif(NOT LWS_WITH_SCHANNEL)
 			list(APPEND SOURCES
 				tls/openssl/openssl-server.c)
 		endif()
@@ -195,7 +210,7 @@ if (LWS_WITH_SSL)
 		if (LWS_WITH_MBEDTLS)
 			list(APPEND SOURCES
 				tls/mbedtls/mbedtls-client.c)
-		else()
+		elseif(NOT LWS_WITH_SCHANNEL)
 			list(APPEND SOURCES
 				tls/openssl/openssl-client.c)
 		endif()
@@ -259,6 +274,10 @@ if (LWS_WITH_SSL)
 	if (LWS_WITH_MBEDTLS)
 		set(chose_ssl 1)
 	endif()
+
+       if (LWS_WITH_SCHANNEL)
+               set(chose_ssl 1)
+       endif()
 
 	if (NOT chose_ssl)
 		if (OPENSSL_FOUND AND "${OPENSSL_INCLUDE_DIRS}" STREQUAL "")
@@ -325,6 +344,9 @@ if (NOT VARIA)
 	set(VARIA "")
 endif()
 
+if (LWS_WITH_SCHANNEL)
+else()
+
 CHECK_FUNCTION_EXISTS(${VARIA}SSL_CTX_set1_param LWS_HAVE_SSL_CTX_set1_param PARENT_SCOPE)
 CHECK_FUNCTION_EXISTS(${VARIA}SSL_set_info_callback LWS_HAVE_SSL_SET_INFO_CALLBACK PARENT_SCOPE)
 
@@ -361,7 +383,7 @@ CHECK_FUNCTION_EXISTS(${VARIA}SSL_CTX_set_keylog_callback LWS_HAVE_SSL_CTX_set_k
 # deprecated in openssl v3
 CHECK_FUNCTION_EXISTS(${VARIA}EC_KEY_new_by_curve_name LWS_HAVE_EC_KEY_new_by_curve_name PARENT_SCOPE)
 
-if (LWS_WITH_SSL AND NOT LWS_WITH_MBEDTLS)
+if (LWS_WITH_SSL AND NOT LWS_WITH_MBEDTLS AND NOT LWS_WITH_SCHANNEL)
 	# we don't want to confuse what's in or out of the wrapper with
 	# what's in an openssl also installed on the build host
 CHECK_C_SOURCE_COMPILES("#include <openssl/ssl.h>\nint main(void) { STACK_OF(X509) *c = NULL; SSL_CTX *ctx = NULL; return (int)SSL_CTX_get_extra_chain_certs_only(ctx, &c); }\n" LWS_HAVE_SSL_EXTRA_CHAIN_CERTS)
@@ -382,6 +404,8 @@ CHECK_FUNCTION_EXISTS(${VARIA}SSL_CTX_load_verify_file LWS_HAVE_SSL_CTX_load_ver
 CHECK_FUNCTION_EXISTS(${VARIA}SSL_CTX_load_verify_dir LWS_HAVE_SSL_CTX_load_verify_dir PARENT_SCOPE)
 endif()
 
+endif() # schannel
+
 if (LWS_WITH_MBEDTLS)
 	set(LWS_HAVE_TLS_CLIENT_METHOD 1 PARENT_SCOPE)
 	if (NOT LWS_PLAT_FREERTOS)
@@ -389,7 +413,7 @@ if (LWS_WITH_MBEDTLS)
 		set(LWS_HAVE_X509_VERIFY_PARAM_set1_host 1 PARENT_SCOPE)
 	endif()
 
-	set(CMAKE_REQUIRED_LIBRARIES ${MBEDTLS_LIBRARY} ${MBEDX509_LIBRARY} ${MBEDCRYPTO_LIBRARY})
+	set(CMAKE_REQUIRED_LIBRARIES ${MBEDTLS_LIBRARIES} ${MBEDX509_LIBRARY} ${MBEDCRYPTO_LIBRARY})
 	set(CMAKE_REQUIRED_INCLUDES ${CMAKE_REQUIRED_INCLUDES} ${MBEDTLS_INCLUDE_DIRS})
 
 	if (ESP_PLATFORM)

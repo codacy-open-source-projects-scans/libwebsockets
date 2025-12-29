@@ -76,6 +76,11 @@ enum {
 	LCSPS_ECOMMENT2,
 
 	LCSPS_CSS_STANZA,
+
+	/* script */
+
+	LHPS_SCRIPT,
+	LHPS_SCRIPT_TAG1,
 };
 
 /*
@@ -119,6 +124,111 @@ static const char * const void_elems[] = {
 static const uint8_t void_elems_lens[] = /* lengths for the table above */
 	{ 4, 4, 2, 3, 7, 5, 2, 3, 5, 6, 4, 4, 5, 6, 5, 3 };
 
+static const struct {
+	const char *name;
+	uint32_t val;
+} entities[] = {
+	{ "quot", 34 },
+	{ "amp", 38 },
+	{ "apos", 39 },
+	{ "lt", 60 },
+	{ "gt", 62 },
+	{ "nbsp", 160 },
+	{ "copy", 169 },
+	{ "reg", 174 },
+	{ "deg", 176 },
+	{ "plusmn", 177 },
+	{ "sup2", 178 },
+	{ "sup3", 179 },
+	{ "micro", 181 },
+	{ "para", 182 },
+	{ "middot", 183 },
+	{ "cedil", 184 },
+	{ "sup1", 185 },
+	{ "ordm", 186 },
+	{ "raquo", 187 },
+	{ "frac14", 188 },
+	{ "frac12", 189 },
+	{ "frac34", 190 },
+	{ "iquest", 191 },
+	{ "times", 215 },
+	{ "divide", 247 },
+	{ "mdash", 8212 },
+	{ "ndash", 8211 },
+	{ "bull", 8226 },
+	{ "hellip", 8230 },
+	{ "prime", 8242 },
+	{ "Prime", 8243 },
+	{ "oline", 8254 },
+	{ "frasl", 8260 },
+	{ "weierp", 8472 },
+	{ "image", 8465 },
+	{ "real", 8476 },
+	{ "trade", 8482 },
+	{ "alefsym", 8501 },
+	{ "larr", 8592 },
+	{ "uarr", 8593 },
+	{ "rarr", 8594 },
+	{ "darr", 8595 },
+	{ "harr", 8596 },
+	{ "crarr", 8629 },
+	{ "lArr", 8656 },
+	{ "uArr", 8657 },
+	{ "rArr", 8658 },
+	{ "dArr", 8659 },
+	{ "hArr", 8660 },
+	{ "forall", 8704 },
+	{ "part", 8706 },
+	{ "exist", 8707 },
+	{ "empty", 8709 },
+	{ "nabla", 8711 },
+	{ "isin", 8712 },
+	{ "notin", 8713 },
+	{ "ni", 8715 },
+	{ "prod", 8719 },
+	{ "sum", 8721 },
+	{ "minus", 8722 },
+	{ "lowast", 8727 },
+	{ "radic", 8730 },
+	{ "prop", 8733 },
+	{ "infin", 8734 },
+	{ "ang", 8736 },
+	{ "and", 8743 },
+	{ "or", 8744 },
+	{ "cap", 8745 },
+	{ "cup", 8746 },
+	{ "int", 8747 },
+	{ "there4", 8756 },
+	{ "sim", 8764 },
+	{ "cong", 8773 },
+	{ "asymp", 8776 },
+	{ "ne", 8800 },
+	{ "equiv", 8801 },
+	{ "le", 8804 },
+	{ "ge", 8805 },
+	{ "sub", 8834 },
+	{ "sup", 8835 },
+	{ "nsub", 8836 },
+	{ "sube", 8838 },
+	{ "supe", 8839 },
+	{ "oplus", 8853 },
+	{ "otimes", 8855 },
+	{ "perp", 8869 },
+	{ "sdot", 8901 },
+	{ "lceil", 8968 },
+	{ "rceil", 8969 },
+	{ "lfloor", 8970 },
+	{ "rfloor", 8971 },
+	{ "lang", 9001 },
+	{ "rang", 9002 },
+	{ "loz", 9674 },
+	{ "spades", 9824 },
+	{ "clubs", 9827 },
+	{ "hearts", 9829 },
+	{ "diams", 9830 },
+	{ "dash", 8212 },
+};
+
 static const char *const default_css =
 	"/* lws_lhp default css */"
 	"html, address,blockquote, dd, div,dl, dt, fieldset, form, frame, "
@@ -132,7 +242,7 @@ static const char *const default_css =
 	"div             { display: block; width: auto; }\n"
 	"body		 { display: block}\n"
 	"li              { display: list-item }\n"
-	"head            { display: none }\n"
+	"head, script, style { display: none }\n"
 	"table           { display: table;  }\n"
 	"tr              { display: table-row }\n"
 	"thead           { display: table-header-group }\n"
@@ -173,6 +283,8 @@ static const char *const default_css =
 	"u, ins          { text-decoration: underline }\n"
 	"br:before       { content: \"A\"; white-space: pre-line }\n"
 	"center          { text-align: center }\n"
+	"nav             { text-align: left }\n"
+	"span, time, label, a, b, strong, i, em, code { display: inline }\n"
 	":link, :visited { text-decoration: underline }\n"
 	":focus          { outline: thin dotted invert }\n"
 
@@ -309,6 +421,36 @@ lws_css_compute_cascaded_length(lhp_ctx_t *ctx, int ref, lhp_pstack_t *ps,
 	return 0;
 }
 
+static void
+lhp_fx_parse(lws_fx_t *fx, const char *str, size_t len)
+{
+	const char *dot = NULL;
+	int i;
+
+	for (i = 0; i < (int)len; i++)
+		if (str[i] == '.') {
+			dot = &str[i];
+			break;
+		}
+
+	if (!dot) {
+		fx->whole = atoi(str);
+		fx->frac = 0;
+		return;
+	}
+
+	fx->whole = atoi(str);
+	fx->frac = 0;
+
+	dot++;
+	len -= (size_t)(dot - str);
+	i = 10000000;
+	while (len-- && *dot) {
+		fx->frac += ((*dot++) - '0') * i;
+		i /= 10;
+	}
+}
+
 const lws_fx_t *
 lws_csp_px(const lcsp_atr_t *a, lhp_pstack_t *ps)
 {
@@ -338,6 +480,89 @@ lws_csp_px(const lcsp_atr_t *a, lhp_pstack_t *ps)
 	ref = lhp_prop_axis(a);
 
 	switch (a->unit) {
+	case LCSP_UNIT_LENGTH_REM:
+		if (!ctx->stack.head)
+			break;
+		return lws_fx_mul((lws_fx_t *)&a->r, &a->u.i,
+			&((lhp_pstack_t *)lws_container_of(ctx->stack.head, lhp_pstack_t, list))->font->em);
+
+	case LCSP_UNIT_CALC:
+		{
+			char buf[128], unit[8];
+			const char *p = (const char *)&a[1];
+			size_t len = a->value_len;
+			lws_fx_t sum = { 0, 0 }, v;
+			lcsp_atr_t atr;
+			int op = 1;
+
+			memset(&atr, 0, sizeof(atr));
+
+			/* simplistic calc parser: A + B + C... */
+
+			while (len) {
+				size_t n = 0, m = 0;
+
+				while (len && (*p == ' ' || *p == '\t' || *p == '\n')) {
+					p++;
+					len--;
+				}
+
+				if (len && (*p == '+' || *p == '-')) {
+					op = *p++ == '+';
+					len--;
+					continue;
+				}
+
+				while (len && n < sizeof(buf) - 1 &&
+				       ((*p >= '0' && *p <= '9') || *p == '.')) {
+					buf[n++] = *p++;
+					len--;
+				}
+				buf[n] = '\0';
+
+				if (!n)
+					break;
+
+				lws_fx_set(atr.u.i, 0, 0);
+				lhp_fx_parse(&atr.u.i, buf, n);
+
+				while (len && m < sizeof(unit) - 1 &&
+				       (*p >= 'a' && *p <= 'z')) {
+					unit[m++] = *p++;
+					len--;
+				}
+				unit[m] = '\0';
+
+				if (len && *p == '%') {
+					unit[0] = '%';
+					unit[1] = '\0';
+					p++;
+					len--;
+				}
+
+				atr.unit = LCSP_UNIT_LENGTH_PX;
+				if (!strcmp(unit, "em")) atr.unit = LCSP_UNIT_LENGTH_EM;
+				if (!strcmp(unit, "ex")) atr.unit = LCSP_UNIT_LENGTH_EX;
+				if (!strcmp(unit, "rem")) atr.unit = LCSP_UNIT_LENGTH_REM;
+				if (!strcmp(unit, "in")) atr.unit = LCSP_UNIT_LENGTH_IN;
+				if (!strcmp(unit, "cm")) atr.unit = LCSP_UNIT_LENGTH_CM;
+				if (!strcmp(unit, "mm")) atr.unit = LCSP_UNIT_LENGTH_MM;
+				if (!strcmp(unit, "pt")) atr.unit = LCSP_UNIT_LENGTH_PT;
+				if (!strcmp(unit, "pc")) atr.unit = LCSP_UNIT_LENGTH_PC;
+				if (!strcmp(unit, "%")) atr.unit = LCSP_UNIT_LENGTH_PERCENT;
+
+				v = *lws_csp_px(&atr, ps);
+
+				if (op)
+					lws_fx_add(&sum, &sum, &v);
+				else
+					lws_fx_sub(&sum, &sum, &v);
+			}
+
+			*(lws_fx_t *)&a->r = sum;
+			return &a->r;
+		}
+
 	case LCSP_UNIT_LENGTH_EM:
 		return lws_fx_mul((lws_fx_t *)&a->r, &a->u.i, &f->em);
 
@@ -573,6 +798,7 @@ lcsp_append_cssval_string(lhp_ctx_t *ctx)
 	atr->value_len = (size_t)ctx->npos;
 	memcpy(v, c, (size_t)ctx->npos);
 	v[ctx->npos] = '\0';
+	atr->unit = LCSP_UNIT_STRING;
 
 	//lwsl_notice("%s: %s\n", __func__, v);
 
@@ -581,8 +807,38 @@ lcsp_append_cssval_string(lhp_ctx_t *ctx)
 	return 0;
 }
 
+const char *
+lws_html_get_atr(lhp_pstack_t *ps, const char *aname, size_t aname_len);
+
 static int
-lws_css_cascade_atr_match(lhp_ctx_t *ctx, const char *tag, size_t tag_len)
+lhp_element_has_class(lhp_pstack_t *ps, const char *name, size_t name_len)
+{
+	const char *c = lws_html_get_atr(ps, "class", 5);
+	struct lws_tokenize ts;
+
+	if (!c)
+		return 0;
+
+	memset(&ts, 0, sizeof(ts));
+	ts.start = c;
+	ts.len = strlen(c);
+	ts.flags = LWS_TOKENIZE_F_MINUS_NONTERM;
+
+	do {
+		ts.e = (int8_t)lws_tokenize(&ts);
+		if (ts.e == LWS_TOKZE_TOKEN) {
+			if (ts.token_len == name_len &&
+			    !memcmp(ts.token, name, name_len))
+				return 1;
+		}
+	} while (ts.e > 0);
+
+	return 0;
+}
+
+static int
+lws_css_cascade_atr_match(lhp_ctx_t *ctx, lhp_pstack_t *ps, const char *tag,
+			  size_t tag_len)
 {
 	lws_start_foreach_dll(struct lws_dll2 *, q, ctx->css.head) {
 		lcsp_stanza_t *stz = lws_container_of(q, lcsp_stanza_t, list);
@@ -594,14 +850,17 @@ lws_css_cascade_atr_match(lhp_ctx_t *ctx, const char *tag, size_t tag_len)
 							    list);
 			const char *p = (const char *)&nm[1];
 			size_t nl = nm->name_len;
+			char is_class_selector = 0;
 
 			if (nl && *p == '.') { /* match .mycss as mycss */
 				p++;
 				nl--;
+				is_class_selector = 1;
 			}
 
 			if (nl == tag_len && !memcmp(p, tag, tag_len)) {
-
+matched:
+				{
 				lcsp_stanza_ptr_t *sp = lwsac_use_zero(
 						&ctx->cascadeac,
 						sizeof(*sp), LHP_AC_GRANULE);
@@ -612,6 +871,40 @@ lws_css_cascade_atr_match(lhp_ctx_t *ctx, const char *tag, size_t tag_len)
 				lws_dll2_add_tail(&sp->list,
 						  &ctx->active_stanzas);
 				break;
+				}
+			} else {
+				/* check for tag.class or .class.class */
+				const char *dot = memchr(p, '.', nl);
+				if (dot) {
+					size_t p1_len = (size_t)(dot - p);
+					size_t p2_len = nl - p1_len - 1;
+					const char *p2 = dot + 1;
+
+					/* p1 is tag (or class1), p2 is class (or class2) */
+					/* check if 'tag' argument matches p1 */
+					if (tag_len == p1_len && !memcmp(tag, p, p1_len)) {
+						/* we matched p1, now check if element has p2 as class */
+						if (lhp_element_has_class(ps, p2, p2_len))
+							goto matched;
+					}
+
+					/* check if 'tag' argument matches p2 */
+					if (tag_len == p2_len && !memcmp(tag, p2, p2_len)) {
+						/* we matched p2. */
+						if (is_class_selector) {
+							/* .class1.class2: check if element has p1 as class */
+							if (lhp_element_has_class(ps, p, p1_len))
+								goto matched;
+						} else {
+							/* tag.class: check if element has p1 as tag */
+							if (ps->atr.head) {
+								lhp_atr_t *ta = lws_container_of(ps->atr.head, lhp_atr_t, list);
+								if (ta->name_len == p1_len && !memcmp(&ta[1], p, p1_len))
+									goto matched;
+							}
+						}
+					}
+				}
 			}
 
 		} lws_end_foreach_dll(z);
@@ -637,6 +930,173 @@ lws_html_get_atr(lhp_pstack_t *ps, const char *aname, size_t aname_len)
 	} lws_end_foreach_dll(p);
 
 	return NULL;
+}
+
+const lcsp_atr_t *
+lhp_resolve_var_color(lhp_ctx_t *ctx, const lcsp_atr_t *a)
+{
+	const char *n;
+	size_t len;
+
+	if (a->unit != LCSP_UNIT_STRING && a->unit != LCSP_UNIT_URL)
+		return a;
+
+	/* check if it is var(--name) */
+	n = (const char *)&a[1];
+	if (strncmp(n, "var(--", 6))
+		return a;
+
+	n += 4; /* skip var( */
+	len = 0;
+	while (n[len] && n[len] != ')')
+		len++;
+
+	/* lwsl_err("RESOLVE: '%.*s'\n", (int)len, n); */
+
+	/* look it up in css_vars */
+	lws_start_foreach_dll(struct lws_dll2 *, d, ctx->css_vars.head) {
+		lhp_css_var_t *v = lws_container_of(d, lhp_css_var_t, list);
+		const char *vn = (const char *)&v[1];
+
+		if (v->name_len == len && !strncmp(vn, n, len)) {
+			/* found it */
+			if (v->def && v->def->atrs.head) {
+				lcsp_atr_t *ra = lws_container_of(v->def->atrs.head, lcsp_atr_t, list);
+				if (ra->unit == LCSP_UNIT_RGBA)
+					return ra;
+			}
+			break;
+		}
+	} lws_end_foreach_dll(d);
+
+	return a;
+}
+
+static const lcsp_atr_t *
+lhp_shorthand_TRBL(lhp_ctx_t *ctx, lcsp_props_t prop, int idx)
+{
+	const lcsp_atr_t *a;
+	int c;
+
+	a = lws_css_cascade_get_prop_atr(ctx, prop);
+	if (!a)
+		return NULL;
+
+	/*
+	 * Shorthand expansion:
+	 * 1 value: all
+	 * 2 values: top/bottom, left/right
+	 * 3 values: top, left/right, bottom
+	 * 4 values: top, right, bottom, left
+	 */
+
+	c = (int)ctx->active_atr.count;
+	if (!c)
+		return NULL;
+
+	if (c == 1) /* apply to all */
+		return a; // Head is same as tail if count 1
+
+	/* navigate to the correct index in active_atr based on count and requested idx */
+	/* requested idx: 0=TOP, 1=RIGHT, 2=BOTTOM, 3=LEFT */
+
+	int use_idx = 0;
+	switch (c) {
+	case 2:
+		if (idx == 0 || idx == 2) use_idx = 0;
+		else use_idx = 1;
+		break;
+	case 3:
+		if (idx == 0) use_idx = 0;
+		else if (idx == 1 || idx == 3) use_idx = 1;
+		else use_idx = 2;
+		break;
+	case 4:
+		use_idx = idx;
+		break;
+	default:
+		return a;
+	}
+
+	lws_start_foreach_dll(struct lws_dll2 *, d, ctx->active_atr.head) {
+		lcsp_atr_ptr_t *ap = lws_container_of(d, lcsp_atr_ptr_t, list);
+		if (!use_idx--)
+			return ap->atr;
+	} lws_end_foreach_dll(d);
+
+	return a;
+}
+
+static const lcsp_atr_t *
+lhp_shorthand_radii(lhp_ctx_t *ctx, lcsp_props_t prop, int idx)
+{
+	const lcsp_atr_t *a;
+	int c;
+
+	a = lws_css_cascade_get_prop_atr(ctx, prop);
+	if (!a)
+		return NULL;
+
+	/*
+	 * Shorthand expansion for border-radius:
+	 * 1 value: all
+	 * 2 values: top-left/bottom-right, top-right/bottom-left
+	 * 3 values: top-left, top-right/bottom-left, bottom-right
+	 * 4 values: top-left, top-right, bottom-right, bottom-left
+	 */
+
+	c = (int)ctx->active_atr.count;
+	if (!c) return NULL;
+
+	if (c == 1) /* apply to all */
+		return a; // Head is same as tail if count 1
+
+	/* navigate to the correct index in active_atr based on count and requested idx */
+	/* requested idx: 0=TL, 1=TR, 2=BL, 3=BR */
+
+	int use_idx = 0;
+	switch (c) {
+	case 2:
+		/*
+		 * [0] is TL/BR
+		 * [1] is TR/BL
+		 */
+		if (idx == 0 || idx == 3) use_idx = 0;
+		else use_idx = 1;
+		break;
+	case 3:
+		/*
+		 * [0] is TL
+		 * [1] is TR/BL
+		 * [2] is BR
+		 */
+		if (idx == 0) use_idx = 0;
+		else if (idx == 1 || idx == 2) use_idx = 1;
+		else use_idx = 2;
+		break;
+	case 4:
+		/*
+		 * [0] is TL
+		 * [1] is TR
+		 * [2] is BR
+		 * [3] is BL
+		 */
+		if (idx == 0) use_idx = 0;
+		else if (idx == 1) use_idx = 1;
+		else if (idx == 3) use_idx = 2;
+		else use_idx = 3;
+		break;
+	default:
+		return a;
+	}
+
+	lws_start_foreach_dll(struct lws_dll2 *, d, ctx->active_atr.head) {
+		lcsp_atr_ptr_t *ap = lws_container_of(d, lcsp_atr_ptr_t, list);
+		if (!use_idx--)
+			return ap->atr;
+	} lws_end_foreach_dll(d);
+
+	return a;
 }
 
 /*
@@ -679,6 +1139,7 @@ lws_css_cascade(lhp_ctx_t *ctx)
 			     !strcmp((const char *)&a[1], "class")) {
 				ts.start = ((const char *)&a[1]) + 5 + 1;
 				ts.len = a->value_len;
+				ts.flags |= LWS_TOKENIZE_F_MINUS_NONTERM;
 			}
 
 			do {
@@ -695,7 +1156,7 @@ lws_css_cascade(lhp_ctx_t *ctx)
 					 * for a tag match
 					 */
 
-					if (lws_css_cascade_atr_match(ctx,
+					if (lws_css_cascade_atr_match(ctx, ps,
 							ts.token, ts.token_len))
 						return 1;
 				}
@@ -717,12 +1178,21 @@ lws_css_cascade(lhp_ctx_t *ctx)
 		ps->css_display = lws_css_cascade_get_prop_atr(ctx, LCSP_PROP_DISPLAY);
 
 		ps->css_border_radius[0] = lws_css_cascade_get_prop_atr(ctx, LCSP_PROP_BORDER_TOP_LEFT_RADIUS);
+		if (!ps->css_border_radius[0]) ps->css_border_radius[0] = lhp_shorthand_radii(ctx, LCSP_PROP_BORDER_RADIUS, 0);
 		ps->css_border_radius[1] = lws_css_cascade_get_prop_atr(ctx, LCSP_PROP_BORDER_TOP_RIGHT_RADIUS);
+		if (!ps->css_border_radius[1]) ps->css_border_radius[1] = lhp_shorthand_radii(ctx, LCSP_PROP_BORDER_RADIUS, 1);
 		ps->css_border_radius[2] = lws_css_cascade_get_prop_atr(ctx, LCSP_PROP_BORDER_BOTTOM_LEFT_RADIUS);
+		if (!ps->css_border_radius[2]) ps->css_border_radius[2] = lhp_shorthand_radii(ctx, LCSP_PROP_BORDER_RADIUS, 2);
 		ps->css_border_radius[3] = lws_css_cascade_get_prop_atr(ctx, LCSP_PROP_BORDER_BOTTOM_RIGHT_RADIUS);
+		if (!ps->css_border_radius[3]) ps->css_border_radius[3] = lhp_shorthand_radii(ctx, LCSP_PROP_BORDER_RADIUS, 3);
 
 		ps->css_background_color = lws_css_cascade_get_prop_atr(ctx, LCSP_PROP_BACKGROUND_COLOR);
+		if (ps->css_background_color)
+			ps->css_background_color = lhp_resolve_var_color(ctx, ps->css_background_color);
+
 		ps->css_color = lws_css_cascade_get_prop_atr(ctx, LCSP_PROP_COLOR);
+		if (ps->css_color)
+			ps->css_color = lhp_resolve_var_color(ctx, ps->css_color);
 
 		ps->css_pos[CCPAS_TOP] = lws_css_cascade_get_prop_atr(ctx, LCSP_PROP_TOP);
 		ps->css_pos[CCPAS_RIGHT] = lws_css_cascade_get_prop_atr(ctx, LCSP_PROP_RIGHT);
@@ -730,14 +1200,22 @@ lws_css_cascade(lhp_ctx_t *ctx)
 		ps->css_pos[CCPAS_LEFT] = lws_css_cascade_get_prop_atr(ctx, LCSP_PROP_LEFT);
 
 		ps->css_margin[CCPAS_TOP] = lws_css_cascade_get_prop_atr(ctx, LCSP_PROP_MARGIN_TOP);
+		if (!ps->css_margin[CCPAS_TOP]) ps->css_margin[CCPAS_TOP] = lhp_shorthand_TRBL(ctx, LCSP_PROP_MARGIN, CCPAS_TOP);
 		ps->css_margin[CCPAS_RIGHT] = lws_css_cascade_get_prop_atr(ctx, LCSP_PROP_MARGIN_RIGHT);
+		if (!ps->css_margin[CCPAS_RIGHT]) ps->css_margin[CCPAS_RIGHT] = lhp_shorthand_TRBL(ctx, LCSP_PROP_MARGIN, CCPAS_RIGHT);
 		ps->css_margin[CCPAS_BOTTOM] = lws_css_cascade_get_prop_atr(ctx, LCSP_PROP_MARGIN_BOTTOM);
+		if (!ps->css_margin[CCPAS_BOTTOM]) ps->css_margin[CCPAS_BOTTOM] = lhp_shorthand_TRBL(ctx, LCSP_PROP_MARGIN, CCPAS_BOTTOM);
 		ps->css_margin[CCPAS_LEFT] = lws_css_cascade_get_prop_atr(ctx, LCSP_PROP_MARGIN_LEFT);
+		if (!ps->css_margin[CCPAS_LEFT]) ps->css_margin[CCPAS_LEFT] = lhp_shorthand_TRBL(ctx, LCSP_PROP_MARGIN, CCPAS_LEFT);
 
 		ps->css_padding[CCPAS_TOP] = lws_css_cascade_get_prop_atr(ctx, LCSP_PROP_PADDING_TOP);
+		if (!ps->css_padding[CCPAS_TOP]) ps->css_padding[CCPAS_TOP] = lhp_shorthand_TRBL(ctx, LCSP_PROP_PADDING, CCPAS_TOP);
 		ps->css_padding[CCPAS_RIGHT] = lws_css_cascade_get_prop_atr(ctx, LCSP_PROP_PADDING_RIGHT);
+		if (!ps->css_padding[CCPAS_RIGHT]) ps->css_padding[CCPAS_RIGHT] = lhp_shorthand_TRBL(ctx, LCSP_PROP_PADDING, CCPAS_RIGHT);
 		ps->css_padding[CCPAS_BOTTOM] = lws_css_cascade_get_prop_atr(ctx, LCSP_PROP_PADDING_BOTTOM);
+		if (!ps->css_padding[CCPAS_BOTTOM]) ps->css_padding[CCPAS_BOTTOM] = lhp_shorthand_TRBL(ctx, LCSP_PROP_PADDING, CCPAS_BOTTOM);
 		ps->css_padding[CCPAS_LEFT] = lws_css_cascade_get_prop_atr(ctx, LCSP_PROP_PADDING_LEFT);
+		if (!ps->css_padding[CCPAS_LEFT]) ps->css_padding[CCPAS_LEFT] = lhp_shorthand_TRBL(ctx, LCSP_PROP_PADDING, CCPAS_LEFT);
 
 	} lws_end_foreach_dll(p);
 
@@ -754,6 +1232,7 @@ lws_lhp_destruct(lhp_ctx_t *ctx)
 	lws_dll2_foreach_safe(&ctx->stack, NULL, lhp_clean_stack);
 	lws_dll2_owner_clear(&ctx->active_stanzas);
 	lws_dll2_owner_clear(&ctx->active_atr);
+	lws_dll2_owner_clear(&ctx->css_vars);
 	lwsac_free(&ctx->propatrac);
 	lwsac_free(&ctx->cascadeac);
 	lwsac_free(&ctx->cssac);
@@ -814,7 +1293,7 @@ lws_lhp_parse(lhp_ctx_t *ctx, const uint8_t **buf, size_t *len)
 			(*buf)--;
 		}
 
-		// lwsl_notice("%s: %d, '%c', %02X\n", __func__, ctx->state, c, c);
+	//	lwsl_notice("%s: %d, '%c', %02X\n", __func__, ctx->state, c, c);
 
 		switch (ctx->state) {
 
@@ -873,6 +1352,16 @@ lws_lhp_parse(lhp_ctx_t *ctx, const uint8_t **buf, size_t *len)
 				break;
 
 			case '&':
+				if (ctx->npos) {
+					if (ctx->in_body &&
+					    (ctx->npos != 1 || ctx->buf[0] != ' ')) {
+						lws_css_cascade(ctx);
+						ps->cb(ctx, LHPCB_CONTENT);
+					}
+					ctx->npos = 0;
+				}
+				ctx->saved_state = LHPS_OUTER;
+				ctx->entity_start = 0;
 				ctx->state = LHPS_AMP;
 				ctx->temp_count = 0;
 				continue;
@@ -950,8 +1439,22 @@ lws_lhp_parse(lhp_ctx_t *ctx, const uint8_t **buf, size_t *len)
 
 					ps->cb(ctx, LHPCB_ELEMENT_START);
 					ctx->npos = 0;
-					// lwsl_warn("leaving html for css\n");
 					ctx->state = LCSPS_CSS_OUTER;
+					break;
+				}
+
+				/* <script> trapdoor into skipping */
+
+				if (ctx->u.f.tag_used && c == '>' &&
+				    ctx->tag_len == 6 &&
+				    !strncasecmp(ctx->buf, "script", 6) &&
+				    !ctx->u.f.closing) {
+					/*
+					 * We don't want to parse script as
+					 * text.
+					 */
+					ctx->npos = 0;
+					ctx->state = LHPS_SCRIPT;
 					break;
 				}
 			}
@@ -1015,7 +1518,7 @@ elem_start:
 				lhp_pstack_t *psb;
 				lws_dlo_t *dlo;
 				lws_box_t box;
-				char url[128];
+				char url[LHP_URL_LEN];
 
 				memset(&i, 0, sizeof(i));
 				lws_css_cascade(ctx);
@@ -1076,8 +1579,7 @@ elem_start:
 					aa = lws_css_cascade_get_prop_atr(ctx,
 						LCSP_PROP_BACKGROUND_IMAGE);
 
-					if (ctx->npos == 4 &&
-					    !strncmp(ctx->buf, "body", 4) && aa)
+					if (aa)
 						pname = (const char *)(aa + 1);
 				}
 
@@ -1093,75 +1595,69 @@ elem_start:
 
 				if (lws_http_rel_to_url(url, sizeof(url),
 							ctx->base_url, pname))
-					goto skip_image;
+					goto check_closing;
+
+				/* decode percent-encoding in the URL */
+				{
+					char temp[LHP_URL_LEN];
+					lws_strncpy(temp, url, sizeof(temp));
+					lws_urldecode(url, temp, sizeof(url) - 1);
+				}
 
 				psb = lws_css_get_parent_block(ctx, ps);
 				//if (!psb)
 				//	lwsl_err("%s: NULL psb\n", __func__);
 
-				if (ctx->npos == 3 && !strncmp(ctx->buf, "img", 3)) {
-					lws_fx_set(box.x, 0, 0);
-					lws_fx_set(box.y, 0, 0);
+				lws_fx_set(box.x, 0, 0);
+				lws_fx_set(box.y, 0, 0);
+				lws_fx_set(box.w, 0, 0);
+				lws_fx_set(box.h, 0, 0);
 
-					if (ps->css_position->propval == LCSP_PROPVAL_ABSOLUTE) {
-					//	box.x = *lws_csp_px(ps->css_pos[CCPAS_LEFT], ps);
-					///	box.y = *lws_csp_px(ps->css_pos[CCPAS_TOP], ps);
-					//	abs = 1;
-					} else {
-						if (psb) {
-							box.x = psb->curx;
-							box.y = psb->cury;
-						}
-					}
-
-					if (psb) {
-						lws_fx_add(&box.x, &box.x,
-							lws_csp_px(psb->css_margin[CCPAS_LEFT], psb));
-						lws_fx_add(&box.y, &box.y,
-							lws_csp_px(psb->css_margin[CCPAS_TOP], psb));
-					}
-
-					box.h = ctx->ic.wh_px[LWS_LHPREF_HEIGHT]; /* placeholder */
-					lws_fx_sub(&box.w, &ctx->ic.wh_px[0], &box.x);
-
-					if (ps->css_width &&
-					    lws_fx_comp(lws_csp_px(ps->css_width, ps), &box.w) > 0)
-						box.w = *lws_csp_px(ps->css_width, ps);
+				if (psb) {
+					box.x = psb->curx;
+					box.y = psb->cury;
+					lws_fx_add(&box.x, &box.x,
+						lws_csp_px(psb->css_margin[CCPAS_LEFT], psb));
+					lws_fx_add(&box.y, &box.y,
+						lws_csp_px(psb->css_margin[CCPAS_TOP], psb));
 				}
+
+				if (ps->css_width &&
+					lws_fx_comp(lws_csp_px(ps->css_width, ps), &box.w) > 0)
+					box.w = *lws_csp_px(ps->css_width, ps);
+				if (ps->css_height &&
+					lws_fx_comp(lws_csp_px(ps->css_height, ps), &box.h) > 0)
+					box.h = *lws_csp_px(ps->css_height, ps);
 
 				memset(&u, 0, sizeof(u));
 				if (lws_dlo_ss_find(cx, url, &u)) {
 
-					i.cx = cx;
-					i.dl = drt->dl;
+					i.cx			= cx;
+					i.dl			= drt->dl;
 					if (psb)
-						i.dlo_parent = psb->dlo;
-					i.box = &box;
-					i.on_rx = ctx->ssevcb;
-					i.on_rx_sul = ctx->ssevsul;
-					i.url = url;
-					i.lhp = ctx;
-					i.u = &u;
-					i.window = ctx->window;
+						i.dlo_parent	= psb->dlo;
+					i.box			= &box;
+					i.on_rx			= ctx->ssevcb;
+					i.on_rx_sul		= ctx->ssevsul;
+					i.url			= url;
+					i.lhp			= ctx;
+					i.u			= &u;
+					i.window		= ctx->window;
 
-					lwsl_cx_warn(cx, "not already in progress: %s", url);
+					lwsl_cx_info(cx, "not already in progress: %s", url);
 					if (lws_dlo_ss_create(&i, &dlo)) {
 						/* we can't get it */
 						lwsl_cx_warn(cx, "Can't get %s", url);
-						goto issue_elem_start;
+						goto check_closing;
 					} else {
-						lwsl_cx_warn(cx, "Created SS for %s\n", url);
-						if (psb)
-							psb->dlo = dlo;
-					//	else
-						ps->dlo = dlo;
+						lwsl_cx_info(cx, "Created SS for %s\n", url);
+						if (ctx->npos == 3 && !strncmp(ctx->buf, "img", 3))
+							ps->dlo = dlo;
 					}
 				} else {
 					// lwsl_cx_warn(cx, "Found in-progress %s\n", url);
-					if (psb)
-						psb->dlo = &u.u.dlo_png->dlo;
-					//else
-					ps->dlo = &u.u.dlo_png->dlo;
+					if (ctx->npos == 3 && !strncmp(ctx->buf, "img", 3))
+						ps->dlo = &u.u.dlo_png->dlo;
 				}
 
 				if (ctx->npos == 4 && !strncmp(ctx->buf, "link", 4)) {
@@ -1184,7 +1680,7 @@ elem_start:
 							LCSP_PROP_HEIGHT), ps)->whole &&
 						lws_csp_px(lws_css_cascade_get_prop_atr(ctx,
 							LCSP_PROP_WIDTH), ps)->whole) {
-					lwsl_cx_warn(cx, "Have width and height %d x %d",
+					lwsl_cx_info(cx, "Have width and height %d x %d",
 							(int)lws_csp_px(lws_css_cascade_get_prop_atr(ctx,
 								LCSP_PROP_WIDTH), ps)->whole,
 							(int)lws_csp_px(lws_css_cascade_get_prop_atr(ctx,
@@ -1197,6 +1693,19 @@ elem_start:
 					goto issue_elem_start;
 				}
 
+				{
+					const char *p = lws_html_get_atr(ps, "width", 5);
+					if (p)
+						u.u.dlo_png->dlo.box.w.whole = atoi(p);
+					p = lws_html_get_atr(ps, "height", 6);
+					if (p)
+						u.u.dlo_png->dlo.box.h.whole = atoi(p);
+				}
+
+				if (u.u.dlo_png->dlo.box.w.whole &&
+				    u.u.dlo_png->dlo.box.h.whole)
+					goto issue_elem_start;
+
 				/*
 				 * Do we have the dimensions?  If not, bail
 				 * from here and await a retry (maybe caused by
@@ -1205,8 +1714,12 @@ elem_start:
 
 				if (!lws_dlo_image_width(&u) ||
 				    !lws_dlo_image_height(&u)) {
-					// lwsl_warn("%s: exiting with AWAIT_RETRY\n", __func__);
-					return LWS_SRET_AWAIT_RETRY;
+					ps->dlo->budget++;
+					if (ps->dlo->budget < 8) {
+						lwsl_warn("%s: exiting with AWAIT_RETRY due to no dims\n", __func__);
+						return LWS_SRET_AWAIT_RETRY;
+					} else
+						lwsl_err("%s: ignoring no dims\n", __func__);
 				}
 
 				u.u.dlo_png->dlo.box.w.whole = (int32_t)lws_dlo_image_width(&u);
@@ -1216,7 +1729,7 @@ elem_start:
 
 				if (u.u.dlo_png->dlo.box.w.whole < 0) {
 					lwsl_notice("%s: understanding image failed\n", __func__);
-					goto skip_image;
+					goto check_closing;
 				}
 
 				/*
@@ -1233,6 +1746,7 @@ issue_elem_start:
 				}
 			}
 
+check_closing:
 			if (ctx->u.f.closing || ctx->u.f.void_element){
 				if (ctx->stack.count == 1) {
 					lwsl_err("%s: element close mismatch\n", __func__);
@@ -1252,7 +1766,6 @@ issue_elem_start:
 				ps = lws_container_of(ctx->stack.tail,
 						      lhp_pstack_t, list);
 			}
-skip_image:
 			ctx->npos = 0;
 			ctx->state = LHPS_OUTER;
 			break;
@@ -1304,6 +1817,14 @@ skip_image:
 					break;
 			}
 
+			if (c == '&') {
+				ctx->saved_state = LHPS_ATTRIB_VAL;
+				ctx->entity_start = ctx->npos;
+				ctx->temp_count = 0;
+				ctx->state = LHPS_AMP;
+				break;
+			}
+
 			if ((ctx->u.f.inq || !hspace(c)) &&
 			    c != '>' && c != '\'' && c != '\"') {
 				/* collect the attrib value */
@@ -1352,11 +1873,58 @@ skip_image:
 				ctx->temp = 0;
 				break;
 			}
-			/*
-			 * These are supposed to be named chars, like &dagger;
-			 * but not supported yet.
-			 */
-			ctx->state = LHPS_OUTER;
+
+			if ((c >= 'a' && c <= 'z') ||
+			    (c >= 'A' && c <= 'Z') ||
+			    (c >= '0' && c <= '9')) {
+				if (ctx->npos < (int)sizeof(ctx->buf) - 1)
+					ctx->buf[ctx->npos++] = (char)c;
+				break;
+			}
+
+			if (c == ';') {
+				size_t n;
+
+				ctx->buf[ctx->npos] = '\0';
+				for (n = 0; n < LWS_ARRAY_SIZE(entities); n++) {
+					if (!strcmp(ctx->buf + ctx->entity_start, entities[n].name)) {
+						ctx->temp = entities[n].val;
+						ctx->npos = ctx->entity_start;
+						lhp_uni_emit(ctx);
+						ctx->state = ctx->saved_state;
+						goto done_amp;
+					}
+				}
+
+				if (ctx->npos + 2 < LHP_STRING_CHUNK) {
+					memmove(ctx->buf + ctx->entity_start + 1,
+						ctx->buf + ctx->entity_start,
+						(size_t)(ctx->npos - ctx->entity_start));
+					ctx->buf[ctx->entity_start] = '&';
+					ctx->buf[ctx->npos + 1] = ';';
+					ctx->npos += 2;
+					ctx->state = ctx->saved_state;
+				} else {
+					ctx->npos = 0;
+					ctx->state = ctx->saved_state;
+				}
+				break;
+			}
+
+			if (ctx->npos + 1 < LHP_STRING_CHUNK) {
+				memmove(ctx->buf + ctx->entity_start + 1,
+					ctx->buf + ctx->entity_start,
+					(size_t)(ctx->npos - ctx->entity_start));
+				ctx->buf[ctx->entity_start] = '&';
+				ctx->npos++;
+				(*len)++;
+				(*buf)--;
+				ctx->state = ctx->saved_state;
+			} else {
+				ctx->npos = 0;
+				ctx->state = ctx->saved_state;
+			}
+done_amp:
 			break;
 		case LHPS_AMPHASH:
 			/*
@@ -1369,41 +1937,55 @@ skip_image:
 			}
 
 			if (ctx->temp_count++ > 32 /* sanity */) {
-				ctx->state = LHPS_OUTER;
+				ctx->state = ctx->saved_state;
 				break;
 			}
 			if (c == ';') {
 				if (ctx->npos >= LHP_STRING_CHUNK - 5) {
-					if (ctx->in_body)
+					if (ctx->saved_state == LHPS_OUTER && ctx->in_body) {
 						ps->cb(ctx, LHPCB_CONTENT);
-					ctx->npos = 0;
+						ctx->npos = 0;
+					} else {
+						if (ctx->saved_state != LHPS_OUTER)
+							lwsl_err("%s: string chunk\n", __func__);
+						ps->cb(ctx, LHPCB_FAILED);
+						return LWS_SRET_FATAL;
+					}
 				}
-				ctx->state = LHPS_OUTER;
+				ctx->npos = ctx->entity_start;
 				lhp_uni_emit(ctx);
+				ctx->state = ctx->saved_state;
 				break;
 			}
 
 			if (c >= '0' && c <= '9')
 				ctx->temp = (uint32_t)(((int)ctx->temp * 10) + ((int)c - '0'));
 			else
-				ctx->state = LHPS_OUTER;
+				ctx->state = ctx->saved_state;
 
 			break;
 
 		case LHPS_AMPHASH_HEX:
 			if (c == ';') {
 				if (ctx->npos >= LHP_STRING_CHUNK - 5) {
-					if (ctx->in_body)
+					if (ctx->saved_state == LHPS_OUTER && ctx->in_body) {
 						ps->cb(ctx, LHPCB_CONTENT);
-					ctx->npos = 0;
+						ctx->npos = 0;
+					} else {
+						if (ctx->saved_state != LHPS_OUTER)
+							lwsl_err("%s: string chunk\n", __func__);
+						ps->cb(ctx, LHPCB_FAILED);
+						return LWS_SRET_FATAL;
+					}
 				}
-				ctx->state = LHPS_OUTER;
+				ctx->npos = ctx->entity_start;
 				lhp_uni_emit(ctx);
+				ctx->state = ctx->saved_state;
 				break;
 			}
 
 			if (ctx->temp_count++ > 8 /* sanity */) {
-				ctx->state = LHPS_OUTER;
+				ctx->state = ctx->saved_state;
 				break;
 			}
 
@@ -1422,7 +2004,7 @@ skip_image:
 				break;
 			}
 
-			ctx->state = LHPS_OUTER;
+			ctx->state = ctx->saved_state;
 			break;
 		case LHPS_SCOMMENT1: /* we have <! */
 			if (c == '-') {
@@ -1521,7 +2103,8 @@ skip_image:
 				ts.start = ctx->buf;
 				ts.len = (size_t)ctx->npos;
 				ts.flags = LWS_TOKENIZE_F_COMMA_SEP_LIST |
-						LWS_TOKENIZE_F_DOT_NONTERM;
+						LWS_TOKENIZE_F_DOT_NONTERM |
+						LWS_TOKENIZE_F_MINUS_NONTERM;
 
 				do {
 					ts.e = (int8_t)lws_tokenize(&ts);
@@ -1553,6 +2136,7 @@ skip_image:
 
 				ctx->buf[ctx->npos] = '\0';
 
+				ctx->npos = 0;
 				ctx->state = LCSPS_CSS_STANZA;
 				ctx->cssval_state = 0;
 				ctx->css_state = 0;
@@ -1725,6 +2309,8 @@ skip_image:
 								ctx->unit = LCSP_UNIT_LENGTH_PX;
 						}
 						if (ctx->npos == 3) {
+							if (!strcmp(ctx->buf, "rem"))
+								ctx->unit = LCSP_UNIT_LENGTH_REM;
 							if (!strcmp(ctx->buf, "deg"))
 								ctx->unit = LCSP_UNIT_ANGLE_ABS_DEG;
 							if (!strcmp(ctx->buf, "rad"))
@@ -1764,6 +2350,44 @@ issue_post:
 				/* well-known property value strings */
 
 for_term:
+
+				if (ctx->npos == 5 && !memcmp(ctx->buf, "calc(", 5)) {
+					int nested = 1;
+
+					while (*len) {
+						c = *(*buf)++;
+						(*len)--;
+
+						if (c == '(')
+							nested++;
+						if (c == ')') {
+							nested--;
+							if (!nested) {
+								lcsp_atr_t *atr = lwsac_use_zero(&ctx->cssac,
+										sizeof(*atr) +
+										(unsigned int)ctx->npos + 1 - 5,
+										LHP_AC_GRANULE);
+								if (!atr)
+									goto oom;
+
+								atr->unit = LCSP_UNIT_CALC;
+								atr->value_len = (size_t)ctx->npos - 5;
+								memcpy(&atr[1], ctx->buf + 5, atr->value_len);
+								((char *)&atr[1])[atr->value_len] = '\0';
+
+								lws_dll2_add_tail(&atr->list, &ctx->def->atrs);
+								ctx->npos = 0;
+								break;
+							}
+						}
+						if (ctx->npos >= LHP_STRING_CHUNK) {
+							lwsl_err("%s: calc string too long\n", __func__);
+							goto oom;
+						}
+						ctx->buf[ctx->npos++] = (char)c;
+					}
+					break;
+				}
 
 				switch(lws_minilex_parse(css_propconst_lextable,
 							 &ctx->cssval_state,
@@ -1826,6 +2450,55 @@ for_term:
 				if (ctx->css_state) /* space after the start
 						     * means no match */
 					ctx->css_state = (int16_t)-1;
+				break;
+			}
+
+			/*
+			 * Check if it looks like a CSS variable definition, eg
+			 * --color-bg:
+			 */
+
+			if (c == '-' && !ctx->npos && !ctx->css_state) {
+				ctx->css_state = -2; /* var name */
+				ctx->buf[ctx->npos++] = (char)c;
+				break;
+			}
+
+			if (ctx->css_state == -2) {
+				if (c != ':') {
+					if (ctx->npos < 64)
+						ctx->buf[ctx->npos++] = (char)c;
+					break;
+				}
+
+				/* it is a var definition */
+
+				ctx->def = lwsac_use_zero(&ctx->cssac,
+						  sizeof(*ctx->def),
+						  LHP_AC_GRANULE);
+				if (!ctx->def)
+					goto oom;
+				ctx->def->prop = LCSP_PROP__COUNT; /* var definition */
+				lws_dll2_add_tail(&ctx->def->list, &ctx->stz->defs);
+
+				{
+					lhp_css_var_t *v = lwsac_use_zero(&ctx->cssac,
+							sizeof(*v) + (unsigned int)ctx->npos + 1,
+							LHP_AC_GRANULE);
+					if (!v)
+						goto oom;
+
+					v->name_len = (size_t)ctx->npos;
+					v->def = ctx->def;
+					memcpy(&v[1], ctx->buf, v->name_len);
+					*((uint8_t *)&v[1] + v->name_len) = '\0';
+					lws_dll2_add_tail(&v->list, &ctx->css_vars);
+				}
+
+				ctx->u.f.arg = 1;
+				ctx->npos = 0;
+				ctx->cssval_state = 0;
+				ctx->css_state = 0;
 				break;
 			}
 
@@ -1985,6 +2658,33 @@ finish_css:
 			ctx->buf[ctx->npos++] = '-';
 			ctx->buf[ctx->npos++] = (char)c;
 			ctx->state = LCSPS_COMMENT;
+			break;
+
+		case LHPS_SCRIPT:
+			if (c == '<') {
+				ctx->state = LHPS_SCRIPT_TAG1;
+				ctx->u.f.first = 1;
+				break;
+			}
+			break;
+
+		case LHPS_SCRIPT_TAG1:
+			if (c == '/' && ctx->u.f.first) {
+				ctx->u.s = 0;
+
+				ctx->tag = NULL;
+				ctx->tag_len = 0;
+				ctx->npos = 0;
+				ctx->state = LHPS_TAG;
+				ctx->await_css_done = 0;
+				ctx->finish_css = 0;
+				ctx->u.f.closing = 1;
+				break;
+			}
+			if (hspace(c))
+				break;
+
+			ctx->state = LHPS_SCRIPT;
 			break;
 
 		}

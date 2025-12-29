@@ -646,7 +646,7 @@ secstream_h1(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 			lwsl_info("%s: Connected streamtype %s, %d\n", __func__,
 				h->policy->streamtype, status);
 		else
-			lwsl_warn("%s: Connected streamtype %s, BAD %d\n",
+			lwsl_info("%s: Connected streamtype %s, BAD %d\n",
 				__func__, h->policy->streamtype, status);
 
 		h->hanging_som = 0;
@@ -1174,6 +1174,32 @@ malformed:
 				r = lws_ss_event_helper(h, LWSSSCS_CONNECTED);
 				if (r)
 					return _lws_ss_handle_state_ret_CAN_DESTROY_HANDLE(r, wsi, &h);
+			}
+		}
+
+		/*
+		 * Check if any of the metadata defined in the policy correspond
+		 * to urlargs that we can see... if so, adopt them as the
+		 * metadata values
+		 */
+		{
+			lws_ss_metadata_t *polmd;
+
+			if (h->policy) {
+				polmd = h->policy->metadata;
+				while (polmd) {
+					char buf[1024];
+					int n = lws_get_urlarg_by_name_safe(wsi,
+							polmd->name, buf,
+							sizeof(buf));
+					if (n >= 0)
+						if (lws_ss_alloc_set_metadata(h,
+							polmd->name, buf,
+							(unsigned int)n))
+							return -1;
+
+					polmd = polmd->next;
+				}
 			}
 		}
 

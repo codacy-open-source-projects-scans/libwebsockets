@@ -104,9 +104,14 @@ lhp_tag_cmp(const char *buf, const char *name, size_t len)
 {
 	while (len--) {
 		char c1 = *buf++, c2 = *name++;
-		if (c1 >= 'A' && c1 <= 'Z') c1 += 'a' - 'A';
-		if (c2 >= 'A' && c2 <= 'Z') c2 += 'a' - 'A';
-		if (c1 != c2) return 1;
+
+		if (c1 >= 'A' && c1 <= 'Z')
+			c1 = (char)(c1 + 'a' - 'A');
+		if (c2 >= 'A' && c2 <= 'Z')
+			c2 = (char)(c2 + 'a' - 'A');
+
+		if (c1 != c2)
+			return 1;
 	}
 	return 0;
 }

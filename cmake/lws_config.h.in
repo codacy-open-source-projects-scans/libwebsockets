@@ -73,6 +73,7 @@
 #cmakedefine LWS_HAVE_mbedtls_ssl_conf_alpn_protocols
 #cmakedefine LWS_HAVE_mbedtls_ssl_get_alpn_protocol
 #cmakedefine LWS_HAVE_mbedtls_ssl_conf_sni
+#cmakedefine LWS_HAVE_mbedtls_ssl_session_save
 #cmakedefine LWS_HAVE_mbedtls_ssl_set_hs_ca_chain
 #cmakedefine LWS_HAVE_mbedtls_ssl_set_hs_own_cert
 #cmakedefine LWS_HAVE_mbedtls_ssl_set_hs_authmode
@@ -203,6 +204,7 @@
 #cmakedefine LWS_LOGS_TIMESTAMP
 #cmakedefine LWS_WITH_MBEDTLS
 #cmakedefine LWS_WITH_SCHANNEL
+#cmakedefine LWS_WITH_GNUTLS
 #cmakedefine LWS_WITH_MINIZ
 #cmakedefine LWS_WITH_NETLINK
 #cmakedefine LWS_WITH_BINDTODEVICE

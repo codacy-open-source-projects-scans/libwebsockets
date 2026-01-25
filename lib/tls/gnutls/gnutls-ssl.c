@@ -50,8 +50,10 @@ lws_ssl_capable_read(struct lws *wsi, unsigned char *buf, size_t len)
 		return n;
 	}
 
-	if (!n)
+	if (!n) {
+		__lws_ssl_remove_wsi_from_buffered_list(wsi);
 		return LWS_SSL_CAPABLE_ERROR;
+	}
 
 	if (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED)
 		return LWS_SSL_CAPABLE_MORE_SERVICE;
@@ -92,10 +94,11 @@ int
 lws_ssl_close(struct lws *wsi)
 {
 	if (wsi->tls.ssl) {
-		// gnutls_bye((gnutls_session_t)wsi->tls.ssl, GNUTLS_SHUT_WR);
 		gnutls_deinit((gnutls_session_t)wsi->tls.ssl);
 		wsi->tls.ssl = NULL;
 	}
+
+	__lws_ssl_remove_wsi_from_buffered_list(wsi);
 
 	return 0;
 }

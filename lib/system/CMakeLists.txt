@@ -46,6 +46,17 @@ if (LWS_WITH_NETWORK)
 		list(APPEND SOURCES
 			system/async-dns/async-dns.c
 			system/async-dns/async-dns-parse.c)
+
+		if (LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
+			list(APPEND SOURCES
+				system/async-dns/dnssec.c)
+		endif()
+	endif()
+
+	if (LWS_WITH_AUTHORITATIVE_DNS)
+		list(APPEND SOURCES
+			system/auth-dns/auth-dns.c
+			system/auth-dns/sign.c)
 	endif()
 
 	if (LWS_WITH_SYS_NTPCLIENT)

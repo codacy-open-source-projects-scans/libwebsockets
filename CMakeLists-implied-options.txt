@@ -139,6 +139,27 @@ if (LWS_WITH_SECURE_STREAMS_PROXY_API)
 	set(LWS_WITH_SECURE_STREAMS 1)
 endif()
 
+if (LWS_WITH_DHT)
+	set(LWS_WITH_TRANSPORT_SEQUENCER 1)
+endif()
+
+if (LWS_WITH_TRANSPORT_SEQUENCER)
+	set(LWS_WITH_LWS_DSH 1)
+endif()
+
+if (LWS_WITH_WEBRTC)
+	set(LWS_WITH_UDP 1)
+	set(LWS_WITH_DTLS 1)
+	set(LWS_WITH_ALSA 1 CACHE BOOL "Enable alsa audio example" FORCE)
+	set(LWS_WITH_OPUS 1 CACHE BOOL "Enable opus audio codec" FORCE)
+	set(LWS_WITH_PLUGINS 1 CACHE BOOL "Enable plugins" FORCE)
+	set(LWS_WITH_GENCRYPTO 1)
+	set(LWS_WITH_JOSE 1)
+	set(LWS_WITH_NETWORK 1)
+	set(LWS_WITH_CLIENT 1)
+endif()
+
+
 if (NOT LWS_WITH_NETWORK)
 	set(LWS_ROLE_MQTT 0)
 	set(LWS_ROLE_H1 0)
@@ -400,6 +421,16 @@ if (LWS_WITH_LHP)
 	set(LWS_WITH_SECURE_STREAMS 1)
 endif()
 
+if (LWS_WITH_AUTHORITATIVE_DNS)
+	set(LWS_WITH_GENCRYPTO 1)
+	set(LWS_WITH_JOSE 1)
+endif()
+
+if (LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
+	set(LWS_WITH_SYS_ASYNC_DNS 1)
+	set(LWS_WITH_GENCRYPTO 1)
+endif()
+
 # using any abstract protocol enables LWS_WITH_ABSTRACT
 
 #if (LWS_WITH_SMTP)
@@ -453,3 +484,6 @@ if (WIN32 AND NOT LWS_EXT_PTHREAD_LIBRARIES)
         set(LWS_WITH_SYS_SMD 0)
 endif()
 
+if (LWS_WITH_ASYNC_QUEUE)
+	set(LWS_ROLE_H1 1)
+endif()

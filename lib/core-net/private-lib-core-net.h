@@ -266,6 +266,8 @@ typedef struct lws_async_dns {
 	lws_dll2_owner_t	cached;
 
 	struct lws_context	*cx;
+
+	uint8_t			dnssec_mode; /* lws_async_dns_dnssec_mode_t */
 } lws_async_dns_t;
 
 #define lws_async_dns_from_server(_s) ((lws_async_dns_t *)_s->list.owner)
@@ -402,7 +404,53 @@ struct lws_context_per_thread {
 	unsigned char event_loop_pt_unused:1;
 	unsigned char destroy_self:1;
 	unsigned char is_destroyed:1;
+
+#if defined(LWS_WITH_LATENCY)
+	lws_usec_t latency_last_cb_end;
+	lws_usec_t latency_cb_start;
+	uint32_t latency_idx;
+	lws_latency_bucket_t latency_ring[LWS_LATENCY_RING_SIZE];
+#endif
 };
+
+#if defined(LWS_WITH_LATENCY)
+LWS_EXTERN LWS_VISIBLE void
+lws_latency_cb_start(struct lws_context_per_thread *pt);
+LWS_EXTERN LWS_VISIBLE void
+lws_latency_cb_end(struct lws_context_per_thread *pt, const char *pn);
+
+#define lws_latency_note(_pt, _start, _thresh, ...) do { \
+	if ((lws_now_usecs() - (_start)) > (_thresh)) { \
+		int _slen = (int)strlen((_pt)->latency_ring[(_pt)->latency_idx].req_info); \
+		if (_slen < (int)sizeof((_pt)->latency_ring[0].req_info) - 1) { \
+			if (_slen && _slen < (int)sizeof((_pt)->latency_ring[0].req_info) - 2) { \
+				(_pt)->latency_ring[(_pt)->latency_idx].req_info[_slen++] = ' '; \
+				(_pt)->latency_ring[(_pt)->latency_idx].req_info[_slen] = '\0'; \
+			} \
+			lws_snprintf((_pt)->latency_ring[(_pt)->latency_idx].req_info + _slen, \
+				(size_t)((int)sizeof((_pt)->latency_ring[0].req_info) - _slen), __VA_ARGS__); \
+		} \
+	} \
+} while(0)
+
+#define lws_latency_append_annotation(_pt, ...) do { \
+	int _slen = (int)strlen((_pt)->latency_ring[(_pt)->latency_idx].annotation); \
+	if (_slen < (int)sizeof((_pt)->latency_ring[0].annotation) - 1) { \
+		if (_slen && _slen < (int)sizeof((_pt)->latency_ring[0].annotation) - 2) { \
+			(_pt)->latency_ring[(_pt)->latency_idx].annotation[_slen++] = ' '; \
+			(_pt)->latency_ring[(_pt)->latency_idx].annotation[_slen] = '\0'; \
+		} \
+		lws_snprintf((_pt)->latency_ring[(_pt)->latency_idx].annotation + _slen, \
+			(size_t)((int)sizeof((_pt)->latency_ring[0].annotation) - _slen), __VA_ARGS__); \
+	} \
+} while(0)
+
+#else
+#define lws_latency_cb_start(_pt)
+#define lws_latency_cb_end(_pt, _pn)
+#define lws_latency_note(_pt, _start, _thresh, ...)
+#define lws_latency_append_annotation(_pt, ...)
+#endif
 
 /*
  * virtual host -related context information
@@ -521,6 +569,8 @@ struct lws_vhost {
 	unsigned int socks_proxy_port;
 #endif
 	int count_protocols;
+	int plugin_protocol_count;
+	int plugin_protocol_bind;
 	int ka_time;
 	int ka_probes;
 	int ka_interval;
@@ -556,7 +606,17 @@ struct lws_vhost {
 
 	unsigned char default_protocol_index;
 	unsigned char raw_protocol_index;
+
+#if defined(LWS_WITH_DHT)
+	lws_dll2_owner_t	dht_owner;
+#endif
+
 };
+
+#if defined(LWS_WITH_DHT)
+void
+lws_dht_destroy_all_on_vhost(struct lws_vhost *vh);
+#endif
 
 void
 __lws_vhost_destroy2(struct lws_vhost *vh);
@@ -590,6 +650,39 @@ lws_wsi_mux_apply_queue(struct lws *wsi);
 /*
  * struct lws
  */
+
+#if defined(LWS_WITH_ASYNC_QUEUE)
+enum lws_async_job_type {
+	LWS_AQ_FILE_READ,
+	LWS_AQ_SSL_ACCEPT,
+};
+
+struct lws_async_job {
+	lws_dll2_t		list;
+	struct lws		*wsi;
+	enum lws_async_job_type	type;
+	uint8_t			handled_by_main;
+
+	union {
+		struct {
+			lws_fop_fd_t		fop_fd;
+			uint8_t			*buf;
+			lws_filepos_t		len;
+			lws_filepos_t		amount;
+		} fs;
+#if defined(LWS_WITH_TLS)
+		struct {
+			void *ssl;
+			enum lws_ssl_capable_status status;
+		} ssl;
+#endif
+	} u;
+};
+
+void *
+lws_async_worker_worker(void *d);
+
+#endif
 
 /*
  * These pieces are very commonly used (via accessors) in user protocol handlers
@@ -719,6 +812,10 @@ struct lws {
 	lws_sockaddr46			sa46_peer;
 
 	/* pointers */
+
+#if defined(LWS_WITH_ASYNC_QUEUE)
+	struct lws_async_job		*async_worker_job;
+#endif
 
 	struct lws			*parent; /* points to parent, if any */
 	struct lws			*child_list; /* points to first child */

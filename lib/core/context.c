@@ -66,6 +66,7 @@ static const char * system_state_names[] = {
 	"CONTEXT_CREATED",
 	"PRE_PRIV_DROP",
 	"INITIALIZED",
+	"COLLECTING_STDIN",
 	"IFACE_COLDPLUG",
 	"DHCP",
 	"CPD_PRE_TIME",
@@ -1216,6 +1217,12 @@ lws_create_context(const struct lws_context_creation_info *info)
 	context->default_retry.secs_since_valid_ping = 40;
 	context->default_retry.secs_since_valid_hangup = 50;
 
+#if defined(LWS_WITH_ASYNC_QUEUE)
+	pthread_mutex_init(&context->async_worker_mutex, NULL);
+	pthread_cond_init(&context->async_worker_cond, NULL);
+	context->count_async_threads = info->count_async_threads ? info->count_async_threads : 1;
+#endif
+
 	if (info->retry_and_idle_policy &&
 	    info->retry_and_idle_policy->secs_since_valid_ping) {
 		context->default_retry.secs_since_valid_ping =
@@ -1401,6 +1408,9 @@ lws_create_context(const struct lws_context_creation_info *info)
 #if defined(LWS_HAVE_SYS_CAPABILITY_H) && defined(LWS_HAVE_LIBCAP)
 	memcpy(context->caps, info->caps, sizeof(context->caps));
 	context->count_caps = info->count_caps;
+#endif
+
+#if defined(LWS_WITH_SYS_ASYNC_DNS)
 #endif
 
 
@@ -1795,7 +1805,7 @@ lws_system_cpd_start_defer(struct lws_context *cx, lws_usec_t defer_us)
 			 lws_system_deferred_cb, defer_us);
 }
 
-#if (defined(LWS_WITH_SYS_STATE) && defined(LWS_WITH_SYS_SMD)) || !defined(LWS_WITH_NO_LOGS)
+#if (defined(LWS_WITH_SYS_STATE) && defined(LWS_WITH_SYS_SMD)) || (_LWS_ENABLED_LOGS & LLL_INFO)
 static const char *cname[] = { "Unknown", "OK", "Captive", "No internet" };
 #endif
 
@@ -1805,7 +1815,7 @@ lws_system_cpd_set(struct lws_context *cx, lws_cpd_result_t result)
 	if (cx->captive_portal_detect != LWS_CPD_UNKNOWN)
 		return;
 
-#if !defined(LWS_WITH_NO_LOGS)
+#if (_LWS_ENABLED_LOGS & LLL_INFO)
 	lwsl_cx_info(cx, "setting CPD result %s", cname[result]);
 #endif
 
@@ -2457,6 +2467,19 @@ next:
 
 #if defined(LWS_WITH_SYS_FAULT_INJECTION)
 		lws_fi_destroy(&context->fic);
+#endif
+
+#if defined(LWS_WITH_ASYNC_QUEUE)
+		/* Ensure no threads are running before destroying */
+		pthread_mutex_lock(&context->async_worker_mutex);
+		pthread_cond_broadcast(&context->async_worker_cond);
+		pthread_mutex_unlock(&context->async_worker_mutex);
+
+		while (context->async_worker_threads_active > 0)
+			usleep(1000);
+
+		pthread_mutex_destroy(&context->async_worker_mutex);
+		pthread_cond_destroy(&context->async_worker_cond);
 #endif
 
 		lwsl_refcount_cx(context->log_cx, -1);

@@ -194,9 +194,7 @@ callback_raw_proxy(struct lws *wsi, enum lws_callback_reasons reason,
 		if (!vhd)
 			return 0;
 		if (lws_pvo_get_str(in, "onward", &cp)) {
-			lwsl_warn("%s: vh %s: pvo 'onward' required\n", __func__,
-				 lws_get_vhost_name(lws_get_vhost(wsi)));
-
+			lwsl_vhost_warn(lws_get_vhost(wsi), "%s: pvo 'onward' required\n", __func__);
 			return 0;
 		}
 		lws_tokenize_init(&ts, cp, LWS_TOKENIZE_F_DOT_NONTERM |
@@ -570,10 +568,10 @@ LWS_VISIBLE const struct lws_protocols lws_raw_proxy_protocols[] = {
 
 LWS_VISIBLE const lws_plugin_protocol_t lws_raw_proxy = {
 	.hdr = {
-		"raw proxy",
-		"lws_protocol_plugin",
-		LWS_BUILD_HASH,
-		LWS_PLUGIN_API_MAGIC
+		.name = "raw proxy",
+		._class = "lws_protocol_plugin",
+		.lws_build_hash = LWS_BUILD_HASH,
+		.api_magic = LWS_PLUGIN_API_MAGIC
 	},
 
 	.protocols = lws_raw_proxy_protocols,

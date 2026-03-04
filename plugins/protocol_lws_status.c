@@ -103,7 +103,7 @@ callback_lws_status(struct lws *wsi, enum lws_callback_reasons reason,
 				lws_get_protocol(wsi),
 				sizeof(struct per_vhost_data__lws_status));
 		if (!vhd) {
-			lwsl_notice("%s: PROTOCOL_INIT failed\n", __func__);
+			lwsl_vhost_err(lws_get_vhost(wsi), "%s: PROTOCOL_INIT failed", __func__);
 			return 1;
 		}
 		vhd->context = lws_get_context(wsi);
@@ -255,10 +255,10 @@ LWS_VISIBLE const struct lws_protocols lws_status_protocols[] = {
 
 LWS_VISIBLE const lws_plugin_protocol_t lws_status = {
 	.hdr = {
-		"lws status",
-		"lws_protocol_plugin",
-		LWS_BUILD_HASH,
-		LWS_PLUGIN_API_MAGIC
+		.name = "lws status",
+		._class = "lws_protocol_plugin",
+		.lws_build_hash = LWS_BUILD_HASH,
+		.api_magic = LWS_PLUGIN_API_MAGIC
 	},
 
 	.protocols = lws_status_protocols,

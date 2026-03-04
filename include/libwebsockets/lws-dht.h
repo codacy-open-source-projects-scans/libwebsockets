@@ -28,6 +28,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <libwebsockets/lws-genhash.h>
 
 /*! \defgroup dht Distributed Hash Table
  * ## Distributed Hash Table (DHT) API
@@ -96,7 +97,68 @@ lws_dht_hash_destroy(lws_dht_hash_t **p);
  * \param data_len: length of event-specific data
  */
 typedef void
-lws_dht_callback_t(void *closure, int event, const lws_dht_hash_t *info_hash, const void *data, size_t data_len);
+lws_dht_callback_t(void *closure, int event, const lws_dht_hash_t *info_hash, const void *data, size_t data_len, const struct sockaddr *from, size_t fromlen);
+
+struct lws_dht_msg {
+	char verb[16];
+	char hash[LWS_GENHASH_LARGEST * 2 + 1];
+	unsigned long long offset;
+	unsigned long long len;
+	const void *payload;
+	size_t payload_len;
+};
+
+struct lws_dht_verb_dispatch_args {
+	struct lws_dht_ctx *ctx;
+	const struct lws_dht_msg *msg;
+	const struct sockaddr *from;
+	size_t fromlen;
+};
+
+struct lws_dht_verb {
+	const char *name;
+	const struct lws_protocols *protocol;
+};
+
+/**
+ * lws_dht_msg_parse() - Parse a raw DHT message
+ *
+ * \param in: raw message buffer
+ * \param len: length of raw message
+ * \param out: struct to populate with parsed data
+ *
+ * Safe parsing of DHT command messages.
+ *
+ * \return 0 on success, non-zero on error
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_dht_msg_parse(const char *in, size_t len, struct lws_dht_msg *out);
+
+/**
+ * lws_dht_msg_gen() - Generate a raw DHT message
+ *
+ * \param out: buffer to write message to
+ * \param verb: e.g. "PUT", "GET", "REPLICATE"
+ * \param hash: the hex SHA1 associated
+ * \param offset: the byte offset
+ * \param len_val: the length val
+ *
+ * Generate a complete DHT payload with a space separated verb schema.
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_dht_msg_gen(char *out, size_t len, const char *verb, const char *hash, unsigned long long offset, unsigned long long len_val);
+
+/**
+ * lws_dht_register_verbs() - Register custom verb handlers
+ *
+ * \param ctx: DHT context
+ * \param verbs: array of lws_dht_verb_t
+ * \param count: number of verbs in array
+ *
+ * \return 0 on success, non-zero on error
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_dht_register_verbs(struct lws_dht_ctx *ctx, const struct lws_dht_verb *verbs, int count);
 
 /**
  * lws_dht_blacklist_cb_t() - DHT blacklist check callback
@@ -163,6 +225,9 @@ typedef enum {
 	LWS_DHT_EVENT_SEARCH_DONE6,	/**< IPv6 search operation completed */
 	LWS_DHT_EVENT_EXTERNAL_ADDR,	/**< External IPv4 address determined */
 	LWS_DHT_EVENT_EXTERNAL_ADDR6,	/**< External IPv6 address determined */
+	LWS_DHT_EVENT_DATA,		/**< Arbitrary data payload received */
+	LWS_DHT_EVENT_WRITE_COMPLETED,	/**< Reliable write successful */
+	LWS_DHT_EVENT_WRITE_FAILED,	/**< Reliable write failed */
 } lws_dht_event_t;
 
 
@@ -189,6 +254,7 @@ typedef struct lws_dht_info {
 	void				*closure;
 	const lws_dht_hash_t		*id;
 	const char			*v;
+	const char			*name;
 	int				port;
 	uint8_t				ipv6:1;
 	uint8_t				legacy:1;
@@ -210,12 +276,33 @@ LWS_VISIBLE LWS_EXTERN struct lws_dht_ctx *
 lws_dht_create(const lws_dht_info_t *info);
 
 /**
+ * lws_dht_get_closure() - Get the user closure pointer
+ *
+ * \param ctx: DHT context
+ *
+ * \return the closure pointer
+ */
+LWS_VISIBLE LWS_EXTERN void *
+lws_dht_get_closure(struct lws_dht_ctx *ctx);
+
+/**
  * lws_dht_destroy() - Destroy a DHT context
  *
  * \param pctx: pointer to the DHT context pointer to destroy
  */
 LWS_VISIBLE LWS_EXTERN void
 lws_dht_destroy(struct lws_dht_ctx **pctx);
+
+/**
+ * lws_dht_get_by_name() - Get a specific DHT context by name
+ *
+ * \param vhost: vhost the DHT is bound to
+ * \param name: name to match against
+ *
+ * \return pointer to DHT context or NULL on failure.
+ */
+LWS_VISIBLE LWS_EXTERN struct lws_dht_ctx *
+lws_dht_get_by_name(struct lws_vhost *vhost, const char *name);
 
 /**
  * lws_dht_insert_node() - Manually insert a node into the DHT
@@ -242,6 +329,15 @@ lws_dht_insert_node(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id,
  */
 LWS_VISIBLE LWS_EXTERN int
 lws_dht_ping_node(struct lws_dht_ctx *ctx, struct sockaddr *sa, size_t salen);
+
+LWS_VISIBLE LWS_EXTERN int
+lws_dht_send_data(struct lws_dht_ctx *ctx, const struct sockaddr *dest, const void *data, size_t len);
+
+LWS_VISIBLE LWS_EXTERN int
+lws_dht_send_data_at(struct lws_dht_ctx *ctx, const struct sockaddr *dest, uint64_t offset, const void *data, size_t len);
+
+LWS_VISIBLE LWS_EXTERN struct lws_transport_sequencer *
+lws_dht_get_ts(struct lws_dht_ctx *ctx, const struct sockaddr *dest, size_t salen, int create);
 
 /**
  * lws_dht_search() - Perform an asynchronous search for a hash

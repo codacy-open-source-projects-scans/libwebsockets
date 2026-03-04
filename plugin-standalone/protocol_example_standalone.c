@@ -99,7 +99,7 @@ callback_dumb_increment(struct lws *wsi, enum lws_callback_reasons reason,
 		n = sprintf((char *)p, "%d", pss->number++);
 		m = lws_write(wsi, p, n, LWS_WRITE_TEXT);
 		if (m < n) {
-			lwsl_err("ERROR %d writing to di socket\n", n);
+			lwsl_vhost_err(vhd->vhost, "ERROR %d writing to di socket", n);
 			return -1;
 		}
 		break;
@@ -135,10 +135,10 @@ static const struct lws_protocols protocols[] = {
 
 LWS_VISIBLE const lws_plugin_protocol_t protocol_example_standalone = {
 	.hdr = {
-		"standalone",
-		"lws_protocol_plugin",
-		LWS_BUILD_HASH,
-		LWS_PLUGIN_API_MAGIC
+		.name = "standalone",
+		._class = "lws_protocol_plugin",
+		.lws_build_hash = LWS_BUILD_HASH,
+		.api_magic = LWS_PLUGIN_API_MAGIC
 	},
 
 	.protocols = protocols,

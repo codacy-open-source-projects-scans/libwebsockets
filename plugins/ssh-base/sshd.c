@@ -2066,7 +2066,7 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 				if (prot)
 					vhd->ops = (const struct lws_ssh_ops *)prot->user;
 				else
-					lwsl_err("%s: can't find protocol %s\n",
+					lwsl_vhost_err(vhd->vhost, "%s: can't find protocol %s",
 						    __func__, pvo->value);
 			}
 
@@ -2074,14 +2074,14 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 		}
 
 		if (!vhd->ops) {
-			lwsl_warn("ssh pvo \"ops\" is mandatory\n");
+			lwsl_vhost_warn(vhd->vhost, "ssh pvo \"ops\" is mandatory");
 			return 0;
 		}
 		/*
 		 * The user code ops api_version has to be current
 		 */
 		if (vhd->ops->api_version != LWS_SSH_OPS_VERSION) {
-			lwsl_err("FATAL ops is api_version v%d but code is v%d\n",
+			lwsl_vhost_err(vhd->vhost, "FATAL ops is api_version v%d but code is v%d",
 				vhd->ops->api_version, LWS_SSH_OPS_VERSION);
 			return 1;
 		}
@@ -2605,19 +2605,19 @@ bail:
 		1024, 0, NULL, 900	\
 	}
 
+#if !defined (LWS_PLUGIN_STATIC)
+
 LWS_VISIBLE const struct lws_protocols lws_ssh_base_protocols[] = {
 	LWS_PLUGIN_PROTOCOL_LWS_RAW_SSHD,
 	{ NULL, NULL, 0, 0, 0, NULL, 0 } /* terminator */
 };
 
-#if !defined (LWS_PLUGIN_STATIC)
-
 LWS_VISIBLE const lws_plugin_protocol_t lws_ssh_base = {
 	.hdr = {
-		"ssh base",
-		"lws_protocol_plugin",
-		LWS_BUILD_HASH,
-		LWS_PLUGIN_API_MAGIC
+		.name = "ssh base",
+		._class = "lws_protocol_plugin",
+		.lws_build_hash = LWS_BUILD_HASH,
+		.api_magic = LWS_PLUGIN_API_MAGIC
 	},
 
 	.protocols = lws_ssh_base_protocols,

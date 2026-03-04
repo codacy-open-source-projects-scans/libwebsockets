@@ -22,6 +22,9 @@
  * IN THE SOFTWARE.
  */
 
+#ifndef __LWS_GENHASH_H__
+#define __LWS_GENHASH_H__
+
 /*! \defgroup generichash Generic Hash
  * ## Generic Hash related functions
  *
@@ -49,6 +52,7 @@ enum lws_genhash_types {
 
 enum lws_genhmac_types {
 	LWS_GENHMAC_TYPE_UNKNOWN,
+	LWS_GENHMAC_TYPE_SHA1,
 	LWS_GENHMAC_TYPE_SHA256,
 	LWS_GENHMAC_TYPE_SHA384,
 	LWS_GENHMAC_TYPE_SHA512,
@@ -170,6 +174,35 @@ lws_genhash_update(struct lws_genhash_ctx *ctx, const void *in, size_t len);
 LWS_VISIBLE LWS_EXTERN int
 lws_genhash_destroy(struct lws_genhash_ctx *ctx, void *result);
 
+/**
+ * lws_genhash_render() - render a hash into a hex string
+ *
+ * \param type: one of LWS_GENHASH_TYPE_...
+ * \param hash: pointer to the binary hash
+ * \param out: buffer to receive the hex string
+ * \param out_len: length of the out buffer
+ *
+ * Renders the binary hash into a hex string in the out buffer. If the buffer
+ * is too small, it will truncate with an ellipsis '...' and ensure NUL
+ * termination.
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_genhash_render(enum lws_genhash_types type, const uint8_t *hash, char *out, size_t out_len);
+
+/**
+ * lws_genhash_render_prefixed() - render a hash into a hex string with type prefix
+ *
+ * \param type: one of LWS_GENHASH_TYPE_...
+ * \param hash: pointer to the binary hash
+ * \param out: buffer to receive the hex string
+ * \param out_len: length of the out buffer
+ *
+ * Renders the binary hash into a hex string in the out buffer, prepending
+ * the hash type (e.g., "SHA256:hex...").
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_genhash_render_prefixed(enum lws_genhash_types type, const uint8_t *hash, char *out, size_t out_len);
+
 /** lws_genhmac_init() - prepare your struct lws_genhmac_ctx for use
  *
  * \param ctx: your struct lws_genhmac_ctx
@@ -215,3 +248,5 @@ lws_genhmac_destroy(struct lws_genhmac_ctx *ctx, void *result);
 
 #endif
 ///@}
+
+#endif /* __LWS_GENHASH_H__ */

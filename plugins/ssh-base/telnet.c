@@ -144,7 +144,7 @@ lws_callback_raw_telnet(struct lws *wsi, enum lws_callback_reasons reason,
 		}
 
 		if (!vhd->ops) {
-			lwsl_err("telnet pvo \"ops\" is mandatory\n");
+			lwsl_vhost_err(vhd->vhost, "telnet pvo \"ops\" is mandatory");
 			return -1;
 		}
 		break;
@@ -180,14 +180,17 @@ lws_callback_raw_telnet(struct lws *wsi, enum lws_callback_reasons reason,
 		/* this stuff is coming in telnet line discipline, we
 		 * have to strip IACs and process IAC repeats */
 
-		while (len--) {
+		while (len > 0) {
+			len--;
 			if (telnet_ld(pss, *pu))
 				buf[n++] = *pu++;
 			else
 				pu++;
 
-			if (n > 100 || !len)
+			if (n > 100 || !len) {
 				pss->vhd->ops->rx(pss->priv, wsi, buf, (uint32_t)n);
+				n = 0;
+			}
 		}
 		break;
 

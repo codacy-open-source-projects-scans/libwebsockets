@@ -126,6 +126,19 @@ typedef int suseconds_t;
 #define LWS_WARN_DEPRECATED
 #define LWS_FORMAT(string_index)
 
+#if defined(LWS_HAVE_PTHREAD_H)
+#define lws_mutex_t		pthread_mutex_t
+#define lws_mutex_init(x)	pthread_mutex_init(&(x), NULL)
+#define lws_mutex_destroy(x)	pthread_mutex_destroy(&(x))
+#define lws_mutex_lock(x)	pthread_mutex_lock(&(x))
+#define lws_mutex_unlock(x)	pthread_mutex_unlock(&(x))
+
+#define lws_tid_t		pthread_t
+#define lws_thread_is(x)	pthread_equal(x, pthread_self())
+#define lws_thread_id()		pthread_self()
+
+#endif
+
 #if !defined(LWS_EXTERN) && defined(LWS_BUILDING_SHARED)
 #ifdef LWS_DLL
 #ifdef LWS_INTERNAL
@@ -160,6 +173,44 @@ typedef int suseconds_t;
 
 #else /* NOT WIN32 */
 #include <unistd.h>
+
+#if defined (LWS_PLAT_FREERTOS)
+#if defined(LWS_AMAZON_RTOS)
+#include <FreeRTOS.h>
+#include <semphr.h>
+#include <task.h>
+#else
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+#endif
+
+typedef SemaphoreHandle_t lws_mutex_t;
+#define lws_mutex_init(x)	x = xSemaphoreCreateMutex()
+#define lws_mutex_destroy(x)	vSemaphoreDelete(x)
+#define lws_mutex_lock(x)	(!xSemaphoreTake(x, portMAX_DELAY)) /*0 = OK */
+#define lws_mutex_unlock(x)	xSemaphoreGive(x)
+
+#define lws_tid_t		TaskHandle_t
+#define lws_thread_is(x)	(x == xTaskGetCurrentTaskHandle())
+#define lws_thread_id()		xTaskGetCurrentTaskHandle()
+#else
+
+#if defined(LWS_HAVE_PTHREAD_H)
+#include <pthread.h>
+#include <sys/types.h>
+
+typedef pthread_mutex_t lws_mutex_t;
+#define lws_mutex_init(x)	pthread_mutex_init(&(x), NULL)
+#define lws_mutex_destroy(x)	pthread_mutex_destroy(&(x))
+#define lws_mutex_lock(x)	pthread_mutex_lock(&(x))
+#define lws_mutex_unlock(x)	pthread_mutex_unlock(&(x))
+
+#define lws_tid_t		pthread_t
+#define lws_thread_is(x)	pthread_equal(x, pthread_self())
+#define lws_thread_id()		pthread_self()
+#endif
+#endif /* freertos */
 
 #define LWS_POSIX_LENGTH_CAST(x) (x)
 
@@ -747,6 +798,10 @@ lws_fx_string(const lws_fx_t *a, char *buf, size_t size);
 #endif
 #include <libwebsockets/lws-state.h>
 #include <libwebsockets/lws-retry.h>
+#include <libwebsockets/lws-adapt.h>
+#if defined(LWS_WITH_TRANSPORT_SEQUENCER)
+#include <libwebsockets/lws-transport-sequencer.h>
+#endif
 #if defined(LWS_WITH_NETWORK)
 #include <libwebsockets/lws-adopt.h>
 #include <libwebsockets/lws-network-helper.h>
@@ -761,6 +816,7 @@ lws_fx_string(const lws_fx_t *a, char *buf, size_t size);
 #include <libwebsockets/lws-ws-close.h>
 #include <libwebsockets/lws-ws-state.h>
 #include <libwebsockets/lws-ws-ext.h>
+#include <libwebsockets/lws-latency.h>
 #endif
 
 #include <libwebsockets/lws-protocols-plugins.h>
@@ -791,6 +847,11 @@ lws_fx_string(const lws_fx_t *a, char *buf, size_t size);
 #include <libwebsockets/lws-writeable.h>
 #endif
 #include <libwebsockets/lws-ring.h>
+#if defined(LWS_WITH_MNEMONIC)
+#include <libwebsockets/lws-mnemonic.h>
+#endif
+#include <libwebsockets/lws-gendtls.h>
+#include <libwebsockets/lws-stun.h>
 #include <libwebsockets/lws-sha1-base64.h>
 #include <libwebsockets/lws-x509.h>
 #if defined(LWS_WITH_NETWORK)
@@ -818,6 +879,7 @@ lws_fx_string(const lws_fx_t *a, char *buf, size_t size);
 #include <libwebsockets/lws-jrpc.h>
 
 #include <libwebsockets/lws-async-dns.h>
+#include <libwebsockets/lws-auth-dns.h>
 
 #if defined(LWS_WITH_TLS)
 
@@ -866,9 +928,22 @@ lws_fx_string(const lws_fx_t *a, char *buf, size_t size);
 #include <libwebsockets/lws-uc8176-spi.h>
 #include <libwebsockets/lws-ssd1675b-spi.h>
 #include <libwebsockets/lws-settings.h>
+#if defined(LWS_WITH_DLTS)
+#include <libwebsockets/lws-gendtls.h>
+#endif
 #if defined(LWS_WITH_NETWORK)
 #include <libwebsockets/lws-netdev.h>
 #include "libwebsockets/lws-dht.h"
+#if defined(LWS_WITH_TRANSCODE)
+#include <libwebsockets/lws-transcode.h>
+#endif
+#if defined(LWS_WITH_V4L2)
+#include <libwebsockets/lws-v4l2.h>
+#endif
+#if defined(LWS_WITH_ALSA)
+#include <libwebsockets/lws-alsa.h>
+#include <libwebsockets/lws-audio-features.h>
+#endif
 #endif
 
 #include <libwebsockets/lws-html.h>

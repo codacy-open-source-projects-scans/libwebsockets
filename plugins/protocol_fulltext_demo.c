@@ -80,8 +80,10 @@ callback_fts(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 		if (!vhd)
 			return 0;
 		if (lws_pvo_get_str(in, "indexpath",
-				    (const char **)&vhd->indexpath))
+				    (const char **)&vhd->indexpath)) {
+			lwsl_vhost_notice(lws_get_vhost(wsi), "%s: indexpath PVO required\n", __func__);
                        return 0;
+		}
 
 		return 0;
 
@@ -272,10 +274,10 @@ LWS_VISIBLE const struct lws_protocols fulltext_demo_protocols[] = {
 
 LWS_VISIBLE const lws_plugin_protocol_t fulltext_demo = {
 	.hdr = {
-		"fulltext demo",
-		"lws_protocol_plugin",
-		LWS_BUILD_HASH,
-		LWS_PLUGIN_API_MAGIC
+		.name = "fulltext demo",
+		._class = "lws_protocol_plugin",
+		.lws_build_hash = LWS_BUILD_HASH,
+		.api_magic = LWS_PLUGIN_API_MAGIC
 	},
 
 	.protocols = fulltext_demo_protocols,

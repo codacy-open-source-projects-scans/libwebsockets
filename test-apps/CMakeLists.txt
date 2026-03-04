@@ -192,11 +192,11 @@ if ((LWS_ROLE_H1 OR LWS_ROLE_H2))
 		endif()
 
 		add_custom_command(TARGET test-server
-						POST_BUILD 
+						POST_BUILD
 						COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:test-server>/../share/libwebsockets-test-server")
 
 		add_custom_command(TARGET test-server
-						POST_BUILD 
+						POST_BUILD
 						COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:test-server>/../share/libwebsockets-test-server/captcha-protected")
 
 		# Data files for running the test server.
@@ -215,7 +215,7 @@ if ((LWS_ROLE_H1 OR LWS_ROLE_H2))
 			"${PROJECT_SOURCE_DIR}/test-apps/captcha-protected/index.html"
 		)
 		add_custom_command(TARGET test-server
-				POST_BUILD 
+				POST_BUILD
 				COMMAND "${CMAKE_COMMAND}" -E copy "${PROJECT_SOURCE_DIR}/test-apps/captcha-protected/index.html" "$<TARGET_FILE_DIR:test-server>/../share/libwebsockets-test-server/captcha-protected/index.html" VERBATIM)
 
 		# Copy the file needed to run the server so that the test apps can
@@ -246,7 +246,7 @@ install(TARGETS ${TEST_APP_LIST}
 		RUNTIME DESTINATION ${LWS_INSTALL_EXAMPLES_DIR}
 		COMPONENT examples)
 	install(FILES "${PROJECT_SOURCE_DIR}/test-apps/captcha-protected/index.html" DESTINATION share/libwebsockets-test-server/captcha-protected COMPONENT examples)
-	
+
 	set(CPACK_COMPONENT_EXAMPLES_DISPLAY_NAME "Example files")
 
 # Programs shared files used by the test-server

@@ -36,8 +36,16 @@ list(APPEND SOURCES
 	core-net/wsi.c
 	core-net/wsi-timeout.c
 	core-net/adopt.c
+	core-net/latency.c
 	roles/pipe/ops-pipe.c
 )
+
+if (LWS_WITH_TRANSPORT_SEQUENCER)
+	list(APPEND SOURCES
+		core-net/lws-transport-sequencer.c
+	)
+endif()
+
 
 if (LWS_WITH_SYS_STATE)
 	list(APPEND SOURCES
@@ -80,6 +88,14 @@ endif()
 if (LWS_WITH_SOCKS5 AND NOT LWS_WITHOUT_CLIENT)
 	list(APPEND SOURCES
 		core-net/socks5-client.c)
+endif()
+
+if (LWS_WITH_WEBRTC)
+	list(APPEND SOURCES
+		core-net/lws-rtp.c
+		core-net/lws-srtp.c
+		core-net/lws-stun.c
+	)
 endif()
 
 exports_to_parent_scope()

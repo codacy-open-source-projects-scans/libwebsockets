@@ -44,7 +44,7 @@ document.addEventListener('DOMContentLoaded', function() {
             var elapsed = Date.now() - start;
             var progress = Math.min(100, (elapsed / duration) * 100);
             if (barFill) barFill.style.width = progress + '%';
-            
+
             if (elapsed < duration) {
                 var left = Math.ceil((duration - elapsed) / 1000);
                 if (msg) {
@@ -74,21 +74,21 @@ document.addEventListener('DOMContentLoaded', function() {
         form.addEventListener('submit', function(e) {
             // Prevent multiple submissions
             if (btn.disabled) return;
-            
+
             btn.disabled = true;
             btn.style.display = 'none';
             setStatus('pressed');
-            
+
             if (barFill) {
                 barFill.classList.add('verifying');
                 barFill.style.width = '0%';
             }
-            
+
             // Stage 2: Post-submission delay
             animateBar(post_delay, function() {
                 if (msg) msg.innerText = 'Redirecting...';
             });
-            
+
             // We let the form submit normally, the server will hold the connection
             // for post_delay_ms anyway. The JS animation is just for UI.
             return true;

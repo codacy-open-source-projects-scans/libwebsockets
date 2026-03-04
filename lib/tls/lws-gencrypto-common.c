@@ -653,6 +653,8 @@ lws_genhmac_size(enum lws_genhmac_types type)
 	switch(type) {
 	case LWS_GENHMAC_TYPE_UNKNOWN:
 		return 0;
+	case LWS_GENHMAC_TYPE_SHA1:
+		return 20;
 	case LWS_GENHMAC_TYPE_SHA256:
 		return 32;
 	case LWS_GENHMAC_TYPE_SHA384:
@@ -692,4 +694,59 @@ lws_gencrypto_destroy_elements(struct lws_gencrypto_keyelem *el, int m)
 size_t lws_gencrypto_padded_length(size_t pad_block_size, size_t len)
 {
 	return (len / pad_block_size + 1) * pad_block_size;
+}
+
+int
+lws_genhash_render(enum lws_genhash_types type, const uint8_t *hash, char *out, size_t out_len)
+{
+	size_t hs = lws_genhash_size(type);
+	size_t i;
+
+	if (!hs) {
+		if (out_len)
+			out[0] = '\0';
+		return -1;
+	}
+
+	if (out_len < (hs * 2) + 1) {
+		/* Needs truncation with ellipsis? */
+		if (out_len > 4) {
+			for (i = 0; i < (out_len - 4) / 2; i++)
+				lws_snprintf(out + (i * 2), 3, "%02x", hash[i]);
+			lws_strncpy(out + (i * 2), "...", out_len - (i * 2));
+			return 0;
+		}
+		if (out_len)
+			out[0] = '\0';
+		return -1;
+	}
+
+	for (i = 0; i < hs; i++)
+		lws_snprintf(out + (i * 2), 3, "%02x", hash[i]);
+
+	out[i * 2] = '\0';
+
+	return 0;
+}
+
+int
+lws_genhash_render_prefixed(enum lws_genhash_types type, const uint8_t *hash, char *out, size_t out_len)
+{
+	const char *t;
+	int n;
+
+	switch (type) {
+	case LWS_GENHASH_TYPE_MD5:	t = "MD5"; break;
+	case LWS_GENHASH_TYPE_SHA1:	t = "SHA1"; break;
+	case LWS_GENHASH_TYPE_SHA256:	t = "SHA256"; break;
+	case LWS_GENHASH_TYPE_SHA384:	t = "SHA384"; break;
+	case LWS_GENHASH_TYPE_SHA512:	t = "SHA512"; break;
+	default: return -1;
+	}
+
+	n = lws_snprintf(out, out_len, "%s:", t);
+	if (n < 0 || (size_t)n >= out_len)
+		return -1;
+
+	return lws_genhash_render(type, hash, out + n, out_len - (size_t)n);
 }

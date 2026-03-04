@@ -24,6 +24,15 @@
 
 #include <private-lib-core.h>
 
+static void
+lws_accept_pause_cb(lws_sorted_usec_list_t *sul)
+{
+	struct lws *wsi = lws_container_of(sul, struct lws, sul_validity);
+
+	if (lws_change_pollfd(wsi, 0, LWS_POLLIN))
+		lwsl_wsi_info(wsi, "fail");
+}
+
 static lws_handling_result_t
 rops_handle_POLLIN_listen(struct lws_context_per_thread *pt, struct lws *wsi,
 			  struct lws_pollfd *pollfd)
@@ -31,6 +40,10 @@ rops_handle_POLLIN_listen(struct lws_context_per_thread *pt, struct lws *wsi,
 	struct lws_context *context = wsi->a.context;
 	struct lws_filter_network_conn_args filt;
 	lws_sock_file_fd_type fd;
+
+#if defined(LWS_WITH_LATENCY)
+	lws_usec_t _listen_start = lws_now_usecs();
+#endif
 
 	memset(&filt, 0, sizeof(filt));
 
@@ -81,15 +94,49 @@ rops_handle_POLLIN_listen(struct lws_context_per_thread *pt, struct lws *wsi,
 		 * block the connect queue for other legit peers.
 		 */
 
+#if defined(LWS_WITH_LATENCY)
+		lws_usec_t _acc_start = lws_now_usecs();
+#endif
+
 		filt.accept_fd = accept((int)pollfd->fd,
 					(struct sockaddr *)&filt.cli_addr,
 					&filt.clilen);
+
+#if defined(LWS_WITH_LATENCY)
+		{
+			unsigned int ms = (unsigned int)((lws_now_usecs() - _acc_start) / 1000);
+			if (ms > 2)
+				lws_latency_note(pt, _acc_start, 2000, "accept:%dms", ms);
+		}
+#endif
 		if (filt.accept_fd == LWS_SOCK_INVALID) {
-			if (LWS_ERRNO == LWS_EAGAIN ||
-			    LWS_ERRNO == LWS_EWOULDBLOCK) {
+			int m = LWS_ERRNO;
+
+			if (m == LWS_EAGAIN ||
+			    m == LWS_EWOULDBLOCK) {
 				break;
 			}
-			lwsl_err("accept: errno %d\n", LWS_ERRNO);
+			lwsl_err("accept: errno %d\n", m);
+
+			if (
+#if defined(WSAEMFILE)
+			    m == WSAEMFILE ||
+#endif
+#if defined(EMFILE)
+			    m == EMFILE ||
+#endif
+#if defined(ENFILE)
+			    m == ENFILE ||
+#endif
+			    0) {
+				if (lws_change_pollfd(wsi, LWS_POLLIN, 0))
+					lwsl_wsi_info(wsi, "failed disable POLLIN");
+
+				lws_sul_schedule(context, 0, &wsi->sul_validity,
+						 lws_accept_pause_cb,
+						 100 * LWS_US_PER_MS);
+				break;
+			}
 
 			return LWS_HPI_RET_HANDLED;
 		}
@@ -143,9 +190,21 @@ rops_handle_POLLIN_listen(struct lws_context_per_thread *pt, struct lws *wsi,
 #endif
 			opts &= ~LWS_ADOPT_ALLOW_SSL;
 
+#if defined(LWS_WITH_LATENCY)
+		lws_usec_t _adopt_start = lws_now_usecs();
+#endif
+
 		fd.sockfd = filt.accept_fd;
 		cwsi = lws_adopt_descriptor_vhost(wsi->a.vhost, (lws_adoption_type)opts, fd,
 				wsi->a.vhost->listen_accept_protocol, NULL);
+
+#if defined(LWS_WITH_LATENCY)
+		{
+			unsigned int ms = (unsigned int)((lws_now_usecs() - _adopt_start) / 1000);
+			if (ms > 2)
+				lws_latency_note(pt, _adopt_start, 2000, "adopt:%dms", ms);
+		}
+#endif
 		if (!cwsi) {
 			lwsl_info("%s: vh %s: adopt failed\n", __func__,
 					wsi->a.vhost->name);
@@ -168,6 +227,14 @@ rops_handle_POLLIN_listen(struct lws_context_per_thread *pt, struct lws *wsi,
 	} while (pt->fds_count < context->fd_limit_per_thread - 1 &&
 		 wsi->position_in_fds_table != LWS_NO_FDS_POS &&
 		 lws_poll_listen_fd(&pt->fds[wsi->position_in_fds_table]) > 0);
+
+#if defined(LWS_WITH_LATENCY)
+	{
+		unsigned int ms = (unsigned int)((lws_now_usecs() - _listen_start) / 1000);
+		if (ms > 2)
+			lws_latency_note(pt, _listen_start, 2000, "listen:%dms", ms);
+	}
+#endif
 
 	return LWS_HPI_RET_HANDLED;
 }

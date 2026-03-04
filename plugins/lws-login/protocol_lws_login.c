@@ -121,7 +121,7 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 		lws_strncpy(vhd->jwt_alg, "HS256", sizeof(vhd->jwt_alg));
 
 		if (lws_pvo_get_str(in, "db-path", &vhd->db_path)) {
-			lwsl_err("%s: db-path PVO required\n", __func__);
+			lwsl_vhost_err(lws_get_vhost(wsi), "%s: db-path PVO required\n", __func__);
 			return -1;
 		}
 
@@ -139,9 +139,12 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 			if (!strncmp(vhd->asset_dir, "file://", 7))
 				vhd->asset_dir += 7;
 
-		lws_pvo_get_str(in, "jwt-issuer", &vhd->jwt_issuer);
-		lws_pvo_get_str(in, "jwt-audience", &vhd->jwt_audience);
-		lws_pvo_get_str(in, "cookie-name", &vhd->cookie_name);
+		if (lws_pvo_get_str(in, "jwt-issuer", &vhd->jwt_issuer))
+			lwsl_info("%s: default jwt-issuer\n", __func__);
+		if (lws_pvo_get_str(in, "jwt-audience", &vhd->jwt_audience))
+			lwsl_info("%s: default jwt-audience\n", __func__);
+		if (lws_pvo_get_str(in, "cookie-name", &vhd->cookie_name))
+			lwsl_info("%s: default cookie-name\n", __func__);
 		if (!lws_pvo_get_str(in, "jwt-alg", &cp))
 			lws_strncpy(vhd->jwt_alg, cp, sizeof(vhd->jwt_alg));
 		if (!lws_pvo_get_str(in, "jwt-expiry", &cp))
@@ -155,7 +158,7 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 				}
 			}
 		} else {
-			lwsl_err("%s: jwt-jwk PVO required\n", __func__);
+			lwsl_vhost_err(lws_get_vhost(wsi), "%s: jwt-jwk PVO required\n", __func__);
 			return -1;
 		}
 		break;
@@ -180,9 +183,9 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 			if (!uri[0] || !strcmp(uri, "/"))
 				uri = "index.html";
 
-			lws_snprintf(path, sizeof(path), "%s/%s", 
+			lws_snprintf(path, sizeof(path), "%s/%s",
 				     vhd->asset_dir ? vhd->asset_dir : ".", uri);
-			
+
 			ctype = lws_get_mimetype(path, NULL);
 			if (!ctype)
 				ctype = "text/html";
@@ -225,7 +228,7 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 			 * fake the VHD or if we just implement the signing here.
 			 */
 			struct lws_jwt_sign_set_cookie ck;
-			
+
 			memset(&ck, 0, sizeof(ck));
 			ck.alg = vhd->jwt_alg;
 			ck.iss = vhd->jwt_issuer;
@@ -237,7 +240,7 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 
 			if (lws_add_http_header_status(wsi, HTTP_STATUS_SEE_OTHER, (unsigned char **)&p, (unsigned char *)end))
 				return 1;
-			
+
 			/* Redirect to where we came from, or just / if unknown */
 			if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_LOCATION, (unsigned char *)"/", 1, (unsigned char **)&p, (unsigned char *)end))
 				return 1;
@@ -277,21 +280,26 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 	return 0;
 }
 
-static const struct lws_protocols protocols[] = {
-	{
-		"lws_login",
-		callback_lws_login,
-		sizeof(struct pss_login),
-		1024, 0, NULL, 0
-	},
+#define LWS_PLUGIN_PROTOCOL_LWS_LOGIN \
+	{ \
+		"lws_login", \
+		callback_lws_login, \
+		sizeof(struct pss_login), \
+		1024, 0, NULL, 0 \
+	}
+
+#if !defined (LWS_PLUGIN_STATIC)
+
+LWS_VISIBLE const struct lws_protocols protocols[] = {
+	LWS_PLUGIN_PROTOCOL_LWS_LOGIN
 };
 
 LWS_VISIBLE const lws_plugin_protocol_t lws_login = {
 	.hdr = {
-		"lws login",
-		"lws_protocol_plugin",
-		LWS_BUILD_HASH,
-		LWS_PLUGIN_API_MAGIC
+		.name = "lws login",
+		._class = "lws_protocol_plugin",
+		.lws_build_hash = LWS_BUILD_HASH,
+		.api_magic = LWS_PLUGIN_API_MAGIC
 	},
 
 	.protocols = protocols,
@@ -299,3 +307,5 @@ LWS_VISIBLE const lws_plugin_protocol_t lws_login = {
 	.extensions = NULL,
 	.count_extensions = 0,
 };
+
+#endif

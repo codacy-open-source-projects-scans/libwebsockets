@@ -63,6 +63,8 @@ enum {
 	LWS_DHT_HASH_TYPE_BLAKE3	= 0x1e, /* 32 bytes */
 };
 
+#define LWS_DHT_SHA1_HASH_LEN 20
+
 /**
  * lws_dht_hash_create() - Create a DHT hash from data
  *
@@ -108,17 +110,63 @@ struct lws_dht_msg {
 	size_t payload_len;
 };
 
+typedef enum {
+	LWS_DHT_VERB_RESULT_PROCEED = 0,
+	LWS_DHT_VERB_RESULT_DROP_OLDER = 1,    /* The incoming object is older than what we have; reject it. */
+	LWS_DHT_VERB_RESULT_REPLACE_OLDER = 2, /* The incoming object is newer; accept and replace. */
+	LWS_DHT_VERB_RESULT_PENDING_ASYNC = 3, /* Validation is asynchronous; hold off on core DHT actions. */
+	LWS_DHT_VERB_RESULT_PASS = 4,          /* Pass to the next registered plugin handler */
+	LWS_DHT_VERB_RESULT_ERROR = -1
+} lws_dht_verb_result_t;
+
+#define LWS_DHT_STAT_BUCKETS 48
+
+/**
+ * struct lws_dht_stats - tracking metrics for DHT operation volumes
+ */
+struct lws_dht_stats {
+	uint32_t tx_ping;
+	uint32_t tx_pong;
+	uint32_t tx_find_node;
+	uint32_t tx_get_peers;
+	uint32_t tx_announce_peer;
+	uint32_t tx_put;
+	uint32_t tx_get;
+
+	uint32_t rx_ping;
+	uint32_t rx_pong;
+	uint32_t rx_find_node;
+	uint32_t rx_get_peers;
+	uint32_t rx_announce_peer;
+	uint32_t rx_put;
+	uint32_t rx_get;
+
+	uint32_t rx_drops;
+	uint32_t peer_count;
+};
+
+/**
+ * lws_dht_get_stats() - Retrieve current and historical DHT metrics
+ *
+ * \param ctx: DHT context
+ * \param current: Pointer to store current un-rotated metrics, or NULL
+ * \param history: Pointer to receive the internal history array pointer
+ * \param head: Receives the index of the oldest history frame (next to be overwritten)
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_dht_get_stats(struct lws_vhost *vh, struct lws_dht_stats *current,
+		  const struct lws_dht_stats **history, int *head);
+
 struct lws_dht_verb_dispatch_args {
 	struct lws_dht_ctx *ctx;
 	const struct lws_dht_msg *msg;
 	const struct sockaddr *from;
 	size_t fromlen;
+
+	lws_dht_verb_result_t out_precedence;
 };
 
-struct lws_dht_verb {
-	const char *name;
-	const struct lws_protocols *protocol;
-};
+
 
 /**
  * lws_dht_msg_parse() - Parse a raw DHT message
@@ -152,13 +200,14 @@ lws_dht_msg_gen(char *out, size_t len, const char *verb, const char *hash, unsig
  * lws_dht_register_verbs() - Register custom verb handlers
  *
  * \param ctx: DHT context
- * \param verbs: array of lws_dht_verb_t
+ * \param verbs: array of verb string names
  * \param count: number of verbs in array
+ * \param protocol: the unified protocol handler owning these verbs
  *
  * \return 0 on success, non-zero on error
  */
 LWS_VISIBLE LWS_EXTERN int
-lws_dht_register_verbs(struct lws_dht_ctx *ctx, const struct lws_dht_verb *verbs, int count);
+lws_dht_register_verbs(struct lws_dht_ctx *ctx, const char **verbs, int count, const struct lws_protocols *protocol);
 
 /**
  * lws_dht_blacklist_cb_t() - DHT blacklist check callback
@@ -260,6 +309,7 @@ typedef struct lws_dht_info {
 	uint8_t				legacy:1;
 	uint8_t				aux;
 	const char			*iface;
+	const char			*fallback_nodes_path;
 	lws_dht_blacklist_cb_t		*blacklist_cb;
 	lws_dht_hash_cb_t		*hash_cb;
 	lws_dht_capture_announce_cb_t	*capture_announce_cb;
@@ -284,6 +334,16 @@ lws_dht_create(const lws_dht_info_t *info);
  */
 LWS_VISIBLE LWS_EXTERN void *
 lws_dht_get_closure(struct lws_dht_ctx *ctx);
+
+/**
+ * lws_dht_get_myid() - Get the local node's DHT ID hash
+ *
+ * \param ctx: DHT context
+ *
+ * \return the local node's ID hash
+ */
+LWS_VISIBLE LWS_EXTERN const lws_dht_hash_t *
+lws_dht_get_myid(struct lws_dht_ctx *ctx);
 
 /**
  * lws_dht_destroy() - Destroy a DHT context
@@ -415,6 +475,18 @@ lws_dht_get_nodes(struct lws_dht_ctx *ctx, struct sockaddr_in *sin, int *num,
  */
 LWS_VISIBLE LWS_EXTERN int
 lws_dht_get_external_addr(struct lws_dht_ctx *ctx, struct sockaddr_storage *ss, size_t *sslen);
+
+/**
+ * lws_dht_get_fallback_node() - Retrieves a default DHT node from the system installation
+ *
+ * \param cx: lws_context to seed the randomizer
+ * \param result: buffer to write the randomly chosen fallback node IP:port
+ * \param result_len: size of the output buffer
+ *
+ * \return 0 on success, or -1 if the fallback file could not be read.
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_dht_get_fallback_node(struct lws_context *cx, const char *custom_path, char *result, size_t result_len);
 
 #endif /* __LWS_DHT_H__ */
 

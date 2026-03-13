@@ -66,6 +66,7 @@ typedef struct lws * (*lws_async_dns_cb_t)(struct lws *wsi, const char *ads,
 
 struct lws_adns_q;
 struct lws_async_dns;
+struct lws_async_dns_server;
 
 /**
  * lws_async_dns_query() - perform a dns lookup using async dns
@@ -107,6 +108,22 @@ LWS_VISIBLE LWS_EXTERN void
 lws_async_dns_freeaddrinfo(const struct addrinfo **ai);
 
 /**
+ * lws_async_dns_get_rr_cache() - get a stashed DNSSEC/raw record from the cache
+ *
+ * \param context: the lws_context
+ * \param name: the DNS name
+ * \param qtype: the query type of the record to find (e.g. LWS_ADNS_RECORD_DS)
+ * \param paylen: set to the payload length if found
+ *
+ * Retrieves a pointer to the payload of a cached DNS record that doesn't 
+ * normally result in an addrinfo (like DS, DNSKEY, TXT).
+ * Returns NULL if not found or no cache entry exists.
+ */
+LWS_VISIBLE LWS_EXTERN const uint8_t *
+lws_async_dns_get_rr_cache(struct lws_context *context, const char *name,
+			   adns_query_type_t qtype, uint16_t *paylen);
+
+/**
  * lws_async_dns_server_add() - add a DNS server to the lws async DNS list
  *
  * \param cx: the lws_context
@@ -140,8 +157,12 @@ lws_adns_get_tid(struct lws_adns_q *q);
 LWS_VISIBLE LWS_EXTERN struct lws_async_dns *
 lws_adns_get_async_dns(struct lws_adns_q *q);
 
+LWS_VISIBLE LWS_EXTERN struct lws_async_dns_server *
+lws_adns_get_server(struct lws_adns_q *q);
+
 LWS_VISIBLE LWS_EXTERN void
-lws_adns_parse_udp(struct lws_async_dns *dns, const uint8_t *pkt, size_t len);
+lws_adns_parse_udp(struct lws_async_dns *dns, const uint8_t *pkt, size_t len,
+		   struct lws_async_dns_server *dsrv);
 
 /**
  * lws_plat_asyncdns_get_server() - Get system DNS server address

@@ -134,7 +134,7 @@ again1:
 		 * it has no 00 terminator afterwards
 		 */
 
-		 return consumed;
+		return consumed;
 	}
 
 
@@ -374,7 +374,7 @@ do_cb:
 				return -1;
 			}
 #endif
-			lwsl_notice("%s: recursing looking for %s\n", __func__, stack[stp].name);
+			// lwsl_notice("%s: recursing looking for %s\n", __func__, stack[stp].name);
 
 			lwsl_info("%s: recursing looking for %s\n", __func__,
 					stack[stp].name);
@@ -392,7 +392,7 @@ do_cb:
 			/* We pass these DNSSEC-related records to the callback so
 			 * it can store/evaluate them.
 			 */
-			lwsl_notice("lws_adns_iterate: Calling CB for DNSSEC RR %d (len %d)\n", rrtype, rrpaylen);
+			// lwsl_notice("lws_adns_iterate: Calling CB for DNSSEC RR %d (len %d)\n", rrtype, rrpaylen);
 			cb(stack[0].name, opaque, ttl, rrtype, rrpaylen, p);
 			break;
 
@@ -607,7 +607,8 @@ lws_async_dns_store(const char *name, void *opaque, uint32_t ttl,
  */
 
 void
-lws_adns_parse_udp(lws_async_dns_t *dns, const uint8_t *pkt, size_t len)
+lws_adns_parse_udp(lws_async_dns_t *dns, const uint8_t *pkt, size_t len,
+		   lws_async_dns_server_t *dsrv)
 {
 	const char *nm, *nmcname;
 	lws_adns_cache_t *c;
@@ -616,7 +617,7 @@ lws_adns_parse_udp(lws_async_dns_t *dns, const uint8_t *pkt, size_t len)
 	int n;
 	size_t est;
 
-	lwsl_hexdump_notice(pkt, len);
+	// lwsl_hexdump_notice(pkt, len);
 
 	/* we have to at least have the header */
 
@@ -638,6 +639,14 @@ lws_adns_parse_udp(lws_async_dns_t *dns, const uint8_t *pkt, size_t len)
 		return;
 	}
 
+#if 0
+	{
+		int rcode = lws_ser_ru16be(pkt + DHO_FLAGS) & 0x0F;
+		lwsl_notice("%s: Received DNS response for %s, RCODE=%d, ANSWERS=%d\n", 
+			__func__, ((const char *)&q[1]) + DNS_MAX, rcode, lws_ser_ru16be(pkt + DHO_NANSWERS));
+	}
+#endif
+
 	/*
 	 * we may have recursed and the packet we just got started earlier than
 	 * the current TID we are working with... if so, ignore it
@@ -647,10 +656,22 @@ lws_adns_parse_udp(lws_async_dns_t *dns, const uint8_t *pkt, size_t len)
 			(LADNS_MOST_RECENT_TID(q) & 0xfffe))
 		return;
 
-	n = 1 << (lws_ser_ru16be(pkt + DHO_TID) & 1);
+	if (q->qtype == LWS_ADNS_RECORD_A || q->qtype == LWS_ADNS_RECORD_AAAA)
+		n = 1 << (lws_ser_ru16be(pkt + DHO_TID) & 1);
+	else
+		n = 1;
+
 	if (q->responded & n) {
 		lwsl_notice("%s: dup\n", __func__);
 		return;
+	}
+
+	if (dsrv && q->broadsiding && q->issue_time) {
+		/* Record response time for the server that won the race! */
+		lws_adapt_report_val(dsrv->adapt, (uint64_t)(lws_now_usecs() - q->issue_time), lws_now_usecs());
+	} else if (q->dsrv && q->issue_time) {
+		/* Record response time for the pre-selected server */
+		lws_adapt_report_val(q->dsrv->adapt, (uint64_t)(lws_now_usecs() - q->issue_time), lws_now_usecs());
 	}
 
 	q->responded = (uint8_t)(q->responded | n);
@@ -804,7 +825,8 @@ lws_adns_parse_udp(lws_async_dns_t *dns, const uint8_t *pkt, size_t len)
 	}
 #endif
 
-	if (q->responded != q->asked)
+	if ((q->qtype == LWS_ADNS_RECORD_A || q->qtype == LWS_ADNS_RECORD_AAAA) &&
+	    q->responded != q->asked)
 		return;
 
 #if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
@@ -821,6 +843,7 @@ lws_adns_parse_udp(lws_async_dns_t *dns, const uint8_t *pkt, size_t len)
 	 * addrinfo results, if any, to all interested wsi, if any...
 	 */
 
+	lwsl_notice("%s: Calling lws_async_dns_complete for %s\n", __func__, q->firstcache ? q->firstcache->name : "NULL");
 	c->incomplete = 0;
 	lws_async_dns_complete(q, q->firstcache);
 

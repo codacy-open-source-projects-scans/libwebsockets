@@ -1558,10 +1558,8 @@ lws_shared_webrtc_callback(struct lws *wsi, enum lws_callback_reasons reason,
 			if (!vhd->vhost) vhd->vhost = lws_get_vhost(wsi);
 			if (!vhd->udp_port) vhd->udp_port = 7682;
 
-			if (!pvo) {
-				lwsl_vhost_warn(vhd->vhost, "lws-webrtc: No PVOs provided");
-				return -1;
-			}
+			if (!pvo)
+				return 0;
 
 			while (pvo) {
 				lwsl_notice("%s: Received PVO '%s' = '%s'\n", __func__, pvo->name, pvo->value ? pvo->value : "(null)");
@@ -2181,6 +2179,11 @@ LWS_VISIBLE const struct lws_protocols webrtc_protocols[] = {
 };
 
 #if !defined (LWS_WITH_PLUGINS_BUILTIN)
+/*
+ * The exported lws_plugin_protocol_t struct MUST be named EXACTLY the same as
+ * your plugin's shared object suffix (after removing 'libprotocol_').
+ * lwsws uses this exact string directly in its dlsym() lookup on startup.
+ */
 LWS_VISIBLE const lws_plugin_protocol_t lws_webrtc = {
 	.hdr = {
 		.name = "lws webrtc",

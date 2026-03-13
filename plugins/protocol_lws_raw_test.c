@@ -111,6 +111,10 @@ callback_raw_test(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 
 	switch (reason) {
 	case LWS_CALLBACK_PROTOCOL_INIT:
+		
+		if (!in)
+			return 0;
+
 		vhd = lws_protocol_vh_priv_zalloc(lws_get_vhost(wsi),
 				lws_get_protocol(wsi),
 				sizeof(struct per_vhost_data__raw_test));
@@ -287,6 +291,11 @@ LWS_VISIBLE const struct lws_protocols lws_raw_test_protocols[] = {
 	LWS_PLUGIN_PROTOCOL_RAW_TEST
 };
 
+/*
+ * The exported lws_plugin_protocol_t struct MUST be named EXACTLY the same as
+ * your plugin's shared object suffix (after removing 'libprotocol_').
+ * lwsws uses this exact string directly in its dlsym() lookup on startup.
+ */
 LWS_VISIBLE const lws_plugin_protocol_t lws_raw_test = {
 	.hdr = {
 		.name = "lws raw test",

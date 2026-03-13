@@ -88,6 +88,7 @@ struct vhd_dht_store {
 	char				pending_nonce[16];
 	uint64_t			pending_nonce_time;
 	int				test_handshake;
+	int				cli_receiver;
 };
 
 struct dht_fragment {
@@ -112,7 +113,7 @@ typedef struct lws_dht_ts {
 /* --- Helpers --- */
 
 static struct dht_fragment *
-find_fragment(struct vhd_dht_store *vhd, const char *hash)
+dht_obj_store_find_fragment(struct vhd_dht_store *vhd, const char *hash)
 {
 	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&vhd->fragments)) {
 		struct dht_fragment *frag = lws_container_of(d, struct dht_fragment, list);
@@ -124,19 +125,19 @@ find_fragment(struct vhd_dht_store *vhd, const char *hash)
 }
 
 static void
-sul_put_cb(void *v);
+dht_obj_store_sul_put_cb(void *v);
 
 static void
-sul_get_cb(void *v);
+dht_obj_store_sul_get_cb(void *v);
 
 static int
-jwk_load_or_gen(struct vhd_dht_store *vhd)
+dht_obj_store_jwk_load_or_gen(struct vhd_dht_store *vhd)
 {
 	if (!vhd->cli_jwk_path || !*vhd->cli_jwk_path)
 		vhd->cli_jwk_path = "dht.jwk";
 
 	if (!lws_jwk_load(&vhd->jwk, vhd->cli_jwk_path, NULL, NULL)) {
-		lwsl_notice("Loaded JWK from %s\n", vhd->cli_jwk_path);
+		lwsl_notice("(obj store) Loaded JWK from %s\n", vhd->cli_jwk_path);
 		return 0;
 	}
 
@@ -165,10 +166,11 @@ verb_put_handler(struct lws_dht_ctx *ctx, const struct lws_dht_msg *msg,
 	char path[256];
 	int n;
 
-	lwsl_user("%s: PUT %s offset %llu len %llu\n", __func__, msg->hash, msg->offset, msg->len);
+	lwsl_user("%s: PUT [START] %s offset %llu len %llu payload_len %zu\n", __func__, msg->hash, msg->offset, msg->len, msg->payload_len);
 
-	frag = find_fragment(vhd, msg->hash);
+	frag = dht_obj_store_find_fragment(vhd, msg->hash);
 	if (!frag) {
+		lwsl_user("%s: PUT fragment not found in queue. Initializing new transfer metadata for hash %s\n", __func__, msg->hash);
 		frag = calloc(1, sizeof(*frag));
 		if (!frag) return -1;
 		lws_strncpy(frag->safe_hash, msg->hash, sizeof(frag->safe_hash));
@@ -176,17 +178,23 @@ verb_put_handler(struct lws_dht_ctx *ctx, const struct lws_dht_msg *msg,
 		lws_dll2_add_tail(&frag->list, &vhd->fragments);
 		
 		lws_snprintf(path, sizeof(path), "%s/%s", vhd->storage_path, frag->safe_hash);
+		lwsl_user("%s: PUT targeting filepath: %s\n", __func__, path);
+
 		if (mkdir(vhd->storage_path, 0777) < 0 && errno != EEXIST) {
-			lwsl_err("%s: Failed to create storage dir %s\n", __func__,
-				 vhd->storage_path);
+			lwsl_err("%s: Failed to create storage dir %s (errno %d)\n", __func__,
+				 vhd->storage_path, errno);
+		} else {
+			lwsl_user("%s: Storage dir %s is verified\n", __func__, vhd->storage_path);
 		}
+
 		frag->fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0666);
 		if (frag->fd < 0) {
-			lwsl_err("%s: Failed to open %s\n", __func__, path);
+			lwsl_err("%s: Failed to open %s (errno %d)\n", __func__, path, errno);
 			lws_dll2_remove(&frag->list);
 			free(frag);
 			return -1;
 		}
+		lwsl_user("%s: Successfully opened filepath %s for writing\n", __func__, path);
 
 		if (lws_genhash_init(&frag->ctx, LWS_DHT_STORE_GENHASH)) {
 			close(frag->fd);
@@ -195,14 +203,20 @@ verb_put_handler(struct lws_dht_ctx *ctx, const struct lws_dht_msg *msg,
 			return -1;
 		}
 		frag->hash_init_done = 1;
+	} else {
+		lwsl_user("%s: Continuing existing transfer! Safe Hash: %s, Current Total Bytes Received: %zu\n", __func__, frag->safe_hash, frag->received_len);
 	}
 
-	if (lseek(frag->fd, (off_t)msg->offset, SEEK_SET) < 0) return -1;
-	n = (int)write(frag->fd, msg->payload, msg->payload_len);
-	if (n < 0 || (size_t)n != msg->payload_len) {
-		lwsl_err("%s: write failed\n", __func__);
+	if (lseek(frag->fd, (off_t)msg->offset, SEEK_SET) < 0) {
+		lwsl_err("%s: lseek failed for offset %llu\n", __func__, msg->offset);
 		return -1;
 	}
+	n = (int)write(frag->fd, msg->payload, msg->payload_len);
+	if (n < 0 || (size_t)n != msg->payload_len) {
+		lwsl_err("%s: write failed (wrote %d of expected %zu, errno %d)\n", __func__, n, msg->payload_len, errno);
+		return -1;
+	}
+	lwsl_user("%s: Successfully wrote %d bytes (Total Received now: %zu/%llu)\n", __func__, n, frag->received_len + msg->payload_len, msg->len);
 
 	if (lws_genhash_update(&frag->ctx, msg->payload, msg->payload_len)) return -1;
 	frag->received_len += msg->payload_len;
@@ -214,18 +228,23 @@ verb_put_handler(struct lws_dht_ctx *ctx, const struct lws_dht_msg *msg,
 		lws_genhash_destroy(&frag->ctx, hash);
 		frag->hash_init_done = 0;
 		lws_hex_from_byte_array(hash, (size_t)lws_genhash_size(LWS_DHT_STORE_GENHASH), hex, sizeof(hex));
-		lwsl_user("%s: Finished %s, hash %s\n", __func__, frag->safe_hash, hex);
+		lwsl_user("%s: PUT COMPLETION Finished: File completely written %s, Final validation hash %s\n", __func__, frag->safe_hash, hex);
 
 		close(frag->fd);
 		frag->fd = -1;
 
-		if (vhd->cb_completion)
+		if ((vhd->cli_put_file || vhd->cli_get_hash || vhd->cli_bulk || vhd->gen_manifest || vhd->cli_receiver) &&
+		    vhd->cb_completion)
 			vhd->cb_completion(vhd->cb_closure, 0);
+
+		lws_dll2_remove(&frag->list);
+		free(frag);
 	}
 
 	/* Send ACK */
 	{
 		char ack[128];
+		lwsl_user("%s: Sending ACK back to client for %s offset %llu payload_len %zu\n", __func__, msg->hash, msg->offset, msg->payload_len);
 		lws_dht_msg_gen(ack, sizeof(ack), "ACK", msg->hash, msg->offset, msg->payload_len);
 		lws_dht_send_data(ctx, from, ack, strlen(ack));
 	}
@@ -241,6 +260,7 @@ verb_get_handler(struct lws_dht_ctx *ctx, const struct lws_dht_msg *msg,
 	char path[256], *buf;
 	int fd, n;
 	size_t blen = 1024 + 1024;
+	int hlen;
 
 	lwsl_user("%s: GET %s offset %llu len %llu\n", __func__, msg->hash, msg->offset, msg->len);
 
@@ -261,8 +281,10 @@ verb_get_handler(struct lws_dht_ctx *ctx, const struct lws_dht_msg *msg,
 	n = (int)read(fd, buf + 1024, 1024);
 	if (n < 0) goto fail;
 
-	lws_dht_msg_gen(buf, 1024, "RSP", msg->hash, msg->offset, (unsigned long long)n);
-	lws_dht_send_data(ctx, from, buf, 1024 + (size_t)n);
+	hlen = lws_dht_msg_gen(buf, 1024, "RSP", msg->hash, msg->offset, (unsigned long long)n);
+	if (hlen < 0) goto fail;
+	memmove((uint8_t *)buf + hlen, (uint8_t *)buf + 1024, (size_t)n);
+	lws_dht_send_data(ctx, from, buf, (size_t)hlen + (size_t)n);
 
 	free(buf);
 	close(fd);
@@ -287,8 +309,17 @@ verb_ack_handler(struct lws_dht_ctx *ctx, const struct lws_dht_msg *msg,
 			if (vhd->cb_completion)
 				vhd->cb_completion(vhd->cb_closure, 0);
 		} else {
-			sul_put_cb(vhd);
+			dht_obj_store_sul_put_cb(vhd);
 		}
+	} else if (vhd->cli_bulk || vhd->gen_manifest) {
+		lwsl_user("BULK mock PUT complete\n");
+		if (vhd->gen_manifest) {
+			/* Write the hash to stdout so the receiver test can read it */
+			printf("%s\n", msg->hash);
+			fflush(stdout);
+		}
+		if (vhd->cb_completion)
+			vhd->cb_completion(vhd->cb_closure, 0);
 	}
 	return 0;
 }
@@ -302,7 +333,7 @@ verb_rsp_handler(struct lws_dht_ctx *ctx, const struct lws_dht_msg *msg,
 
 	lwsl_user("%s: RSP for %s offset %llu len %llu payload %zu\n", __func__, msg->hash, msg->offset, msg->len, msg->payload_len);
 
-	frag = find_fragment(vhd, msg->hash);
+	frag = dht_obj_store_find_fragment(vhd, msg->hash);
 	if (!frag) {
 		frag = calloc(1, sizeof(*frag));
 		if (!frag) return -1;
@@ -387,7 +418,7 @@ sul_stats_cb(struct lws_sorted_usec_list *sul)
 }
 
 static void
-sul_put_cb(void *v)
+dht_obj_store_sul_put_cb(void *v)
 {
 	struct vhd_dht_store *vhd = (struct vhd_dht_store *)v;
 	char hash_hex[LWS_GENHASH_LARGEST * 2 + 1], header[256], packet[1500];
@@ -419,6 +450,7 @@ sul_put_cb(void *v)
 			vhd->cb_completion(vhd->cb_closure, 1);
 		return;
 	}
+	vhd->bulk_total = (uint64_t)st.st_size;
 	n = (int)read(fd, buf + 256, 1024);
 	close(fd);
 
@@ -441,7 +473,7 @@ sul_put_cb(void *v)
 }
 
 static void
-sul_get_cb(void *v)
+dht_obj_store_sul_get_cb(void *v)
 {
 	struct vhd_dht_store *vhd = (struct vhd_dht_store *)v;
 	struct sockaddr_in sin;
@@ -456,6 +488,77 @@ sul_get_cb(void *v)
 
 	lws_dht_msg_gen(buf, sizeof(buf), "GET", vhd->cli_get_hash, 0, 1024);
 	lws_dht_send_data(vhd->dht, (struct sockaddr *)&sin, buf, strlen(buf));
+}
+
+static void
+dht_obj_store_sul_bulk_cb(void *v)
+{
+	struct vhd_dht_store *vhd = (struct vhd_dht_store *)v;
+	char hash_hex[LWS_GENHASH_LARGEST * 2 + 1], header[256], packet[1500];
+	uint8_t hash[LWS_GENHASH_LARGEST];
+	struct lws_genhash_ctx ctx;
+	struct sockaddr_in sin;
+	int hlen;
+	char buf[1024];
+
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_port = htons((uint16_t)vhd->target_port);
+	inet_pton(AF_INET, vhd->target_ip, &sin.sin_addr);
+
+	lwsl_user("Sending mock bulk data to %s:%d\n", vhd->target_ip, vhd->target_port);
+
+	memset(buf, 0x42, sizeof(buf));
+
+	if (lws_genhash_init(&ctx, LWS_DHT_STORE_GENHASH) ||
+	    lws_genhash_update(&ctx, buf, sizeof(buf)) ||
+	    lws_genhash_destroy(&ctx, hash)) {
+		lwsl_err("Hash calculation failed\n");
+		if (vhd->cb_completion)
+			vhd->cb_completion(vhd->cb_closure, 1);
+		return;
+	}
+	lws_hex_from_byte_array(hash, (size_t)lws_genhash_size(LWS_DHT_STORE_GENHASH), hash_hex, sizeof(hash_hex));
+
+	if (vhd->gen_manifest) {
+		printf("%s\n", hash_hex);
+		fflush(stdout);
+	}
+
+	hlen = lws_dht_msg_gen((char *)header, sizeof(header), "PUT",
+			hash_hex, 0, sizeof(buf));
+	if (hlen < 0) {
+		if (vhd->cb_completion)
+			vhd->cb_completion(vhd->cb_closure, 1);
+		return;
+	}
+	memcpy(packet, header, (size_t)hlen);
+	memcpy(packet + hlen, buf, sizeof(buf));
+
+	lws_dht_send_data(vhd->dht, (struct sockaddr *)&sin, packet, (size_t)hlen + sizeof(buf));
+}
+
+static void
+dht_obj_store_sul_manifest_rcv_cb(void *v)
+{
+	struct vhd_dht_store *vhd = (struct vhd_dht_store *)v;
+	char buf[128], *p;
+	
+	if (!fgets(buf, sizeof(buf), stdin)) {
+		lwsl_err("Failed to read manifest from stdin\n");
+		if (vhd->cb_completion)
+			vhd->cb_completion(vhd->cb_closure, 1);
+		return;
+	}
+
+	p = strchr(buf, '\n');
+	if (p) *p = 0;
+
+	lws_strncpy(vhd->manifest_hashes[0], buf, sizeof(vhd->manifest_hashes[0]));
+	vhd->cli_get_hash = vhd->manifest_hashes[0];
+	lwsl_user("Receiver parsed hash: %s\n", vhd->cli_get_hash);
+
+	dht_obj_store_sul_get_cb(vhd);
 }
 
 /* --- Protocol Handler --- */
@@ -489,15 +592,19 @@ callback_dht_object_store(struct lws* wsi, enum lws_callback_reasons reason,
 	}
 
 	case LWS_CALLBACK_PROTOCOL_INIT: {
-		struct lws_dht_verb store_verbs[] = {
-			{ "PUT", protocol },
-			{ "GET", protocol },
-			{ "ACK", protocol },
-			{ "RSP", protocol },
-			{ "NONC_REQ", protocol },
-			{ "NONC_RSP", protocol },
-			{ "SIGN_REQ", protocol },
+		const char *store_verbs[] = {
+			"PUT",
+			"GET",
+			"ACK",
+			"RSP",
+			"NONC_REQ",
+			"NONC_RSP",
+			"SIGN_REQ",
 		};
+		if (!in)
+			return 0;
+		if (!lws_pvo_search(in, "dht-port"))
+			return 0;
 		lwsl_user("%s: LWS_CALLBACK_PROTOCOL_INIT\n", __func__);
 		vhd = lws_protocol_vh_priv_zalloc(vhost, protocol, sizeof(struct vhd_dht_store));
 		if (!vhd) return -1;
@@ -508,8 +615,8 @@ callback_dht_object_store(struct lws* wsi, enum lws_callback_reasons reason,
 
 		/* Default settings */
 		vhd->target_ip = "127.0.0.1";
-		vhd->target_port = 5000;
-		vhd->dht_port = 5000;
+		vhd->target_port = 49100;
+		vhd->dht_port = 49100;
 		vhd->storage_path = "./dht-store";
 
 		/* Override from PVOs */
@@ -529,11 +636,15 @@ callback_dht_object_store(struct lws* wsi, enum lws_callback_reasons reason,
 		if (!lws_pvo_get_str(in, "dht-policy-allow", &p) && p && p[0]) vhd->policy_allow = p;
 		if (!lws_pvo_get_str(in, "dht-policy-deny", &p) && p && p[0]) vhd->policy_deny = p;
 		if (!lws_pvo_get_str(in, "dht-test-handshake", &p) && p && p[0]) vhd->test_handshake = 1;
+		if (!lws_pvo_get_str(in, "receiver", &p) && p && p[0]) vhd->cli_receiver = 1;
 
 		if ((pvo = lws_pvo_search(in, "completion-cb"))) vhd->cb_completion = (lws_dht_store_completion_cb_t)(void *)pvo->value;
 		if ((pvo = lws_pvo_search(in, "completion-cb-arg"))) vhd->cb_closure = (void *)pvo->value;
 
-		if (jwk_load_or_gen(vhd)) return -1;
+		if (dht_obj_store_jwk_load_or_gen(vhd)) {
+			lwsl_vhost_warn(vhd->vhost, "Failed to load or generate JWK at '%s'\n", vhd->cli_jwk_path);
+			return -1;
+		}
 
 		memset(&vdi, 0, sizeof(vdi));
 		vdi.vhost = vhost;
@@ -550,9 +661,12 @@ callback_dht_object_store(struct lws* wsi, enum lws_callback_reasons reason,
 		}
 
 		/* Register our "verbs" */
-		lws_dht_register_verbs(vhd->dht, store_verbs, LWS_ARRAY_SIZE(store_verbs));
+		lws_dht_register_verbs(vhd->dht, store_verbs, LWS_ARRAY_SIZE(store_verbs), protocol);
 
 		lws_sul_schedule(vhd->context, 0, &vhd->sul_stats, sul_stats_cb, 100 * LWS_US_PER_MS);
+
+		lwsl_vhost_notice(vhd->vhost, "Attached lws-dht-object-store to UDP port %d (JWK at %s, store at %s)\n",
+				 vhd->dht_port, vhd->cli_jwk_path, vhd->storage_path);
 
 		if (vhd->test_handshake) {
 			lwsl_user("Initiating Handshake TEST... sending NONCE_REQ\n");
@@ -567,10 +681,13 @@ callback_dht_object_store(struct lws* wsi, enum lws_callback_reasons reason,
 			lws_dht_send_data(vhd->dht, (const struct sockaddr *)&sin, buf, strlen(buf));
 		} else if (vhd->cli_put_file) {
 			lwsl_user("%s: Starting PUT task\n", __func__);
-			sul_put_cb(vhd);
-		} else if (vhd->cli_get_hash) {
-			lwsl_user("%s: Starting GET task\n", __func__);
-			sul_get_cb(vhd);
+			dht_obj_store_sul_put_cb(vhd);
+		} else if (vhd->cli_bulk || vhd->gen_manifest) {
+			lwsl_user("%s: Starting BULK task\n", __func__);
+			dht_obj_store_sul_bulk_cb(vhd);
+		} else if (vhd->cli_receiver) {
+			lwsl_user("%s: Starting RECEIVER task\n", __func__);
+			dht_obj_store_sul_manifest_rcv_cb(vhd);
 		}
 		break;
 	}
@@ -590,10 +707,12 @@ callback_dht_object_store(struct lws* wsi, enum lws_callback_reasons reason,
 				lws_dll2_remove(&frag->list);
 				free(frag);
 			} lws_end_foreach_dll_safe(d, d1);
-			if (vhd->dht)
-				lws_dht_destroy(&vhd->dht);
-			if (vhd->bulk_fd >= 0)
+			/* vhd->dht is already torn down by lws_vhost_destroy2() */
+			vhd->dht = NULL;
+			if (vhd->bulk_fd >= 0) {
 				close(vhd->bulk_fd);
+				vhd->bulk_fd = -1;
+			}
 		}
 		break;
 
@@ -609,7 +728,12 @@ LWS_VISIBLE const struct lws_protocols lws_dht_object_store_protocols[] = {
 	LWS_PROTOCOL_LIST_TERM
 };
 
-LWS_VISIBLE const lws_plugin_protocol_t protocol_lws_dht_object_store = {
+/*
+ * The exported lws_plugin_protocol_t struct MUST be named EXACTLY the same as
+ * your plugin's shared object suffix (after removing 'libprotocol_').
+ * lwsws uses this exact string directly in its dlsym() lookup on startup.
+ */
+LWS_VISIBLE const lws_plugin_protocol_t lws_dht_object_store = {
 	.hdr = {
 		.name = "lws dht object store",
 		._class = "lws_protocol_plugin",

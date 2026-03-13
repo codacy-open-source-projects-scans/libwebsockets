@@ -100,6 +100,8 @@ lws_ssl_close(struct lws *wsi)
 
 	__lws_ssl_remove_wsi_from_buffered_list(wsi);
 
+	lws_tls_restrict_return(wsi);
+
 	return 0;
 }
 
@@ -212,7 +214,42 @@ lws_tls_server_abort_connection(struct lws *wsi)
 int
 lws_tls_client_confirm_peer_cert(struct lws *wsi, char *ebuf, size_t ebuf_len)
 {
-	/* TODO: Implement peer cert verification for GnuTLS */
+	unsigned int status = 0;
+	gnutls_session_t session = (gnutls_session_t)wsi->tls.ssl;
+
+	if (gnutls_certificate_verify_peers2(session, &status) < 0) {
+		snprintf(ebuf, ebuf_len, "gnutls_certificate_verify_peers2 failed");
+		return -1;
+	}
+
+	if (status != 0) {
+		unsigned int allowed = 0;
+
+		if (wsi->tls.use_ssl & LCCSCF_ALLOW_INSECURE)
+			allowed = status;
+
+		if (wsi->tls.use_ssl & LCCSCF_ALLOW_SELFSIGNED)
+			allowed |= GNUTLS_CERT_INVALID | GNUTLS_CERT_SIGNER_NOT_FOUND | GNUTLS_CERT_SIGNER_NOT_CA;
+
+		if (wsi->tls.use_ssl & LCCSCF_ALLOW_EXPIRED)
+			allowed |= GNUTLS_CERT_EXPIRED | GNUTLS_CERT_NOT_ACTIVATED;
+
+		if ((status & ~allowed) == 0) {
+			lwsl_info("%s: allowing anyway\n", __func__);
+			return 0;
+		}
+
+		gnutls_datum_t ds;
+		gnutls_certificate_verification_status_print(status, gnutls_certificate_type_get(session), &ds, 0);
+		if (ds.data) {
+			snprintf(ebuf, ebuf_len, "Peer cert verify failed: %s", ds.data);
+			gnutls_free(ds.data);
+		} else {
+			snprintf(ebuf, ebuf_len, "Peer cert verify failed with status %d", status);
+		}
+		return -1;
+	}
+
 	return 0;
 }
 

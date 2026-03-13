@@ -177,7 +177,7 @@ option(LWS_WITH_GTK "Enable gtk example" OFF)
 option(LWS_WITH_FTS "Full Text Search support" OFF)
 option(LWS_WITH_SYS_ASYNC_DNS "Nonblocking internal IPv4 + IPv6 DNS resolver" OFF)
 option(LWS_WITH_SYS_ASYNC_DNS_DNSSEC "Include DNSSEC parsing/validation in async-dns (requires crypto)" OFF)
-option(LWS_WITH_AUTHORITATIVE_DNS "Authoritative DNS zone signer" OFF)
+option(LWS_WITH_AUTHORITATIVE_DNS "Authoritative DNS zone signer / server" OFF)
 option(LWS_WITH_SYS_NTPCLIENT "Build in tiny ntpclient good for tls date validation and run via lws_system" OFF)
 option(LWS_WITH_SYS_DHCP_CLIENT "Build in tiny DHCP client" OFF)
 option(LWS_WITH_HTTP_BASIC_AUTH "Support Basic Auth" ON)
@@ -391,7 +391,8 @@ else()
 endif()
 option(LWS_WITH_MCUFONT_ENCODER "Build the ttf to mcufont encoder" OFF)
 option(LWS_WITH_WAKE_LOGGING "Log each wake reason" OFF)
-option(LWS_WITH_DHT "Include DHT APIs" OFF)
+option(LWS_WITH_DHT "Include DHT frontend client APIs" OFF)
+option(LWS_WITH_DHT_BACKEND "Include full DHT backend node functionality" OFF)
 option(LWS_WITH_TRANSPORT_SEQUENCER "Include Transport Sequencer APIs" OFF)
 option(LWS_WITH_MNEMONIC "Include mnemonic key generation support" OFF)
 option(LWS_WITH_DTLS "Compile with support for Generic DTLS" OFF)
@@ -1317,6 +1318,8 @@ install(DIRECTORY include/libwebsockets
 	DESTINATION "${LWS_INSTALL_INCLUDE_DIR}" COMPONENT dev)
 install(FILES ${PROJECT_BINARY_DIR}/include/libwebsockets.h ${PROJECT_BINARY_DIR}/include/lws_config.h
 	DESTINATION "${LWS_INSTALL_INCLUDE_DIR}" COMPONENT dev)
+install(FILES ${PROJECT_SOURCE_DIR}/assets/libwebsockets-dht-nodes.txt
+	DESTINATION share/libwebsockets COMPONENT dev)
 
 # Generate the config file for the installation tree.
 get_filename_component(LWS_ABSOLUTE_INSTALL_CMAKE_DIR ${LWS_INSTALL_CMAKE_DIR} ABSOLUTE)

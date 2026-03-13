@@ -167,6 +167,8 @@ lws_x509_verify(struct lws_x509_cert *x509, struct lws_x509_cert *trusted,
 	return 0;
 }
 
+#if defined(LWS_WITH_JOSE)
+
 int
 lws_x509_public_to_jwk(struct lws_jwk *jwk, struct lws_x509_cert *x509,
 		       const char *curves, int rsa_min_bits)
@@ -363,6 +365,8 @@ bail:
 
 	return ret;
 }
+
+#endif
 
 int
 lws_x509_info(struct lws_x509_cert *x509, enum lws_tls_cert_info type,

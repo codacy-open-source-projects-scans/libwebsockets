@@ -582,6 +582,9 @@ callback_lws_openmetrics_prox_agg(struct lws *wsi,
 	switch (reason) {
 
 	case LWS_CALLBACK_PROTOCOL_INIT:
+
+		if (!in)
+			return 0;
 		lwsl_notice("%s: PROTOCOL_INIT on %s\n", __func__, lws_vh_tag(lws_get_vhost(wsi)));
 		/*
 		 * We get told what to do when we are bound to the vhost
@@ -625,7 +628,8 @@ callback_lws_openmetrics_prox_agg(struct lws *wsi,
 				vhd->bind_partner_vhd->bind_partner_vhd = vhd;
 			}
 		} else {
-			lwsl_vhost_warn(lws_get_vhost(wsi), "%s: proxy-side-bind-name required\n", __func__);
+			if (in)
+				lwsl_vhost_warn(lws_get_vhost(wsi), "%s: proxy-side-bind-name required\n", __func__);
 			return 0;
 		}
 
@@ -760,6 +764,9 @@ callback_lws_openmetrics_prox_server(struct lws *wsi,
 		 * We get told what to do when we are bound to the vhost
 		 */
 
+		if (!in)
+			return 0;
+
 		lwsl_notice("%s: PROTOCOL_INIT on %s\n", __func__, lws_vh_tag(lws_get_vhost(wsi)));
 
 		vhd = lws_protocol_vh_priv_zalloc(lws_get_vhost(wsi),
@@ -801,7 +808,8 @@ callback_lws_openmetrics_prox_server(struct lws *wsi,
 				vhd->bind_partner_vhd->bind_partner_vhd = vhd;
 			}
 		} else {
-			lwsl_vhost_warn(lws_get_vhost(wsi), "%s: proxy-side-bind-name required\n", __func__);
+			if (in)
+				lwsl_vhost_warn(lws_get_vhost(wsi), "%s: proxy-side-bind-name required\n", __func__);
 			return 0;
 		}
 
@@ -954,6 +962,9 @@ callback_lws_openmetrics_prox_client(struct lws *wsi,
 	switch (reason) {
 
 	case LWS_CALLBACK_PROTOCOL_INIT:
+
+		if (!in)
+			return 0;
 
 		lwsl_notice("%s: PROTOCOL_INIT on %s\n", __func__,
 					lws_vh_tag(lws_get_vhost(wsi)));
@@ -1201,6 +1212,11 @@ LWS_VISIBLE const struct lws_protocols lws_openmetrics_export_protocols[] = {
 #endif
 };
 
+/*
+ * The exported lws_plugin_protocol_t struct MUST be named EXACTLY the same as
+ * your plugin's shared object suffix (after removing 'libprotocol_').
+ * lwsws uses this exact string directly in its dlsym() lookup on startup.
+ */
 LWS_VISIBLE const lws_plugin_protocol_t lws_openmetrics_export = {
 	.hdr = {
 		.name = "lws OpenMetrics export",

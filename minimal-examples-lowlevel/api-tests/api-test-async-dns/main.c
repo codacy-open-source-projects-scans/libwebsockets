@@ -10,6 +10,19 @@
  */
 
 #include <libwebsockets.h>
+
+enum {
+	LWS_SW_D,
+	LWS_SW_L,
+	LWS_SW_HELP,
+};
+
+static const struct lws_switches switches[] = {
+	[LWS_SW_D]	= { "-d",              "Debug logs (e.g. -d 15)" },
+	[LWS_SW_L]	= { "-l",              "Enable -l feature" },
+	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
+};
+
 #include <signal.h>
 
 static int interrupted, dtest, ok, fail, _exp = 18;
@@ -241,7 +254,7 @@ next_test_cb(lws_sorted_usec_list_t *sul)
 			canned_c_msn_com[1] = (uint8_t)lws_adns_get_tid(q);
 			lws_adns_parse_udp(lws_adns_get_async_dns(q),
 					   canned_c_msn_com,
-					   sizeof(canned_c_msn_com));
+					   sizeof(canned_c_msn_com), lws_adns_get_server(q));
 		}
 
 		if (!strcmp(adt[dtest].dns_name, "assets.msn.com")) {
@@ -249,7 +262,7 @@ next_test_cb(lws_sorted_usec_list_t *sul)
 			canned_assets_msn_com[1] = (uint8_t)lws_adns_get_tid(q);
 			lws_adns_parse_udp(lws_adns_get_async_dns(q),
 					   canned_assets_msn_com,
-					   sizeof(canned_assets_msn_com));
+					   sizeof(canned_assets_msn_com), lws_adns_get_server(q));
 		}
 
 		if (!strcmp(adt[dtest].dns_name, "e28578.d.akamaiedge.net")) {
@@ -257,14 +270,14 @@ next_test_cb(lws_sorted_usec_list_t *sul)
 			canned_e28578_d_akamaiedge_net[1] = (uint8_t)lws_adns_get_tid(q);
 			lws_adns_parse_udp(lws_adns_get_async_dns(q),
 					canned_e28578_d_akamaiedge_net,
-					   sizeof(canned_e28578_d_akamaiedge_net));
+					   sizeof(canned_e28578_d_akamaiedge_net), lws_adns_get_server(q));
 		}
 		if (!strcmp(adt[dtest].dns_name, "a-0003.a-msedge.net")) {
 			canned_a_0003_a_msedge_net[0] = (uint8_t)(lws_adns_get_tid(q) >> 8);
 			canned_a_0003_a_msedge_net[1] = (uint8_t)lws_adns_get_tid(q);
 			lws_adns_parse_udp(lws_adns_get_async_dns(q),
 					canned_a_0003_a_msedge_net,
-					   sizeof(canned_a_0003_a_msedge_net));
+					   sizeof(canned_a_0003_a_msedge_net), lws_adns_get_server(q));
 		}
 		if (first &&
 		    !strcmp(adt[dtest].dns_name, "c-msn-com-europe-vip.trafficmanager.net")) {
@@ -275,14 +288,14 @@ next_test_cb(lws_sorted_usec_list_t *sul)
 					(uint8_t)lws_adns_get_tid(q);
 			lws_adns_parse_udp(lws_adns_get_async_dns(q),
 				canned_c_msn_com_europe_vip_trafficmanager_net,
-				sizeof(canned_c_msn_com_europe_vip_trafficmanager_net));
+				sizeof(canned_c_msn_com_europe_vip_trafficmanager_net), lws_adns_get_server(q));
 		}
 		if (!strcmp(adt[dtest].dns_name, "tcp-fallback.libwebsockets.org")) {
 			canned_tc_libwebsockets_org[0] = (uint8_t)(lws_adns_get_tid(q) >> 8);
 			canned_tc_libwebsockets_org[1] = (uint8_t)lws_adns_get_tid(q);
 			lws_adns_parse_udp(lws_adns_get_async_dns(q),
 					canned_tc_libwebsockets_org,
-					sizeof(canned_tc_libwebsockets_org));
+					sizeof(canned_tc_libwebsockets_org), lws_adns_get_server(q));
 		}
 	}
 }
@@ -488,10 +501,17 @@ main(int argc, const char **argv)
 	fixup(6);
 
 	/* the normal lws init */
+	(void)switches;
+
+	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
+		lws_switches_print_help(argv[0], switches, LWS_ARRAY_SIZE(switches));
+		return 0;
+	}
+
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, "-d")))
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
 		logs = atoi(p);
 
 	lws_set_log_level(logs, NULL);
@@ -526,7 +546,7 @@ main(int argc, const char **argv)
 		}
 	}
 
-	if (lws_cmdline_option(argc, argv, "-l")) {
+	if (lws_cmdline_option(argc, argv, switches[LWS_SW_L].sw)) {
 		lws_sul_schedule(context, 0, &sul_l, sul_retry_l, LWS_US_PER_SEC);
 		goto evloop;
 	}

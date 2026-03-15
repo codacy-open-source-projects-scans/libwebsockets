@@ -137,22 +137,32 @@ dht_tx_add_ip(char *buf, size_t *offset, size_t size, const struct sockaddr *sa)
 	char tmp[32];
 	int rc;
 
+	if (!sa) {
+		lwsl_dht_warn("%s: sa is NULL\n", __func__);
+		return -1;
+	}
+
 	switch (sa->sa_family) {
 	case AF_INET:
 		rc = lws_snprintf(tmp, sizeof(tmp), "2:ip6:");
 		if (dht_tx_copy__advance_offset(buf, offset, size, tmp, (size_t)rc) ||
 		    dht_tx_copy__advance_offset(buf, offset, size, &sin->sin_addr, sizeof(sin->sin_addr)) ||
-		    dht_tx_copy__advance_offset(buf, offset, size, &sin->sin_port, sizeof(sin->sin_port)))
+		    dht_tx_copy__advance_offset(buf, offset, size, &sin->sin_port, sizeof(sin->sin_port))) {
+			lwsl_dht_warn("%s: AF_INET copy failed\n", __func__);
 			break;
+		}
 		return 0;
 	case AF_INET6:
 		rc = lws_snprintf(tmp, sizeof(tmp), "2:ip18:");
 		if (dht_tx_copy__advance_offset(buf, offset, size, tmp, (size_t)rc) ||
 		    dht_tx_copy__advance_offset(buf, offset, size, &sin6->sin6_addr, sizeof(sin6->sin6_addr)) ||
-		    dht_tx_copy__advance_offset(buf, offset, size, &sin6->sin6_port, sizeof(sin6->sin6_port)))
+		    dht_tx_copy__advance_offset(buf, offset, size, &sin6->sin6_port, sizeof(sin6->sin6_port))) {
+			lwsl_dht_warn("%s: AF_INET6 copy failed\n", __func__);
 			break;
+		}
 		return 0;
 	default:
+		lwsl_dht_warn("%s: unknown sa_family %d\n", __func__, sa->sa_family);
 		break;
 	}
 
@@ -413,6 +423,125 @@ send_find_node(struct lws_dht_ctx *ctx, const struct sockaddr *sa, size_t salen,
 	rc = lws_snprintf(buf + i, sizeof(buf) - i, "1:y1:qe"); if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
 
     return dht_send(ctx, buf, i, sa, salen);
+
+fail:
+	errno = ENOSPC;
+	return -1;
+}
+
+int
+lws_dht_send_subscribe(struct lws_dht_ctx *ctx, const struct sockaddr *sa, size_t salen,
+		uint8_t *tid, size_t tid_len, const lws_dht_hash_t *infohash,
+		int want, int confirm)
+{
+	char buf[512];
+	size_t i = 0;
+	int rc;
+
+	rc = lws_snprintf(buf + i, sizeof(buf) - i, "d1:ad2:id%d:", dht_tx_id_len(ctx, ctx->myid));
+	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+
+	if (dht_put_id__advance_offset(ctx, buf, &i, sizeof(buf), ctx->myid)) goto fail;
+
+	rc = lws_snprintf(buf + i, sizeof(buf) - i, "9:info_hash%d:", dht_tx_id_len(ctx, infohash));
+	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+
+	if (dht_put_id__advance_offset(ctx, buf, &i, sizeof(buf), infohash)) goto fail;
+
+	if (want) {
+		rc = lws_snprintf(buf + i, sizeof(buf) - i, "4:wantl%s%se",
+				(want & WANT4) ? "2:n4" : "",
+				(want & WANT6) ? "2:n6" : "");
+		if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+	}
+	rc = lws_snprintf(buf + i, sizeof(buf) - i, "e1:q9:subscribe1:t%d:", (int)tid_len);
+	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+	if (dht_tx_copy__advance_offset(buf, &i, sizeof(buf), tid, tid_len)) goto fail;
+	if (dht_tx_add_v(buf, &i, sizeof(buf), ctx)) goto fail;
+	rc = lws_snprintf(buf + i, sizeof(buf) - i, "1:y1:qe");
+	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+
+	return dht_send(ctx, buf, i, sa, salen);
+
+fail:
+	errno = ENOSPC;
+
+	return -1;
+}
+
+int
+lws_dht_send_subscribe_confirm(struct lws_dht_ctx *ctx, const struct sockaddr *sa, size_t salen,
+		   uint8_t *tid, size_t tid_len, const lws_dht_hash_t *infohash,
+		   uint8_t *token, size_t token_len, const uint8_t *sha256, int confirm)
+{
+	char buf[512];
+	size_t i = 0;
+	int rc;
+
+	rc = lws_snprintf(buf + i, sizeof(buf) - i, "d1:ad2:id%d:", dht_tx_id_len(ctx, ctx->myid));
+	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+
+	if (dht_put_id__advance_offset(ctx, buf, &i, sizeof(buf), ctx->myid)) goto fail;
+	
+	rc = lws_snprintf(buf + i, sizeof(buf) - i, "9:info_hash%d:", dht_tx_id_len(ctx, infohash));
+	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+
+	if (dht_put_id__advance_offset(ctx, buf, &i, sizeof(buf), infohash)) goto fail;
+
+	rc = lws_snprintf(buf + i, sizeof(buf) - i, "6:sha25632:");
+	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+	if (dht_tx_copy__advance_offset(buf, &i, sizeof(buf), sha256, 32)) goto fail;
+
+	rc = lws_snprintf(buf + i, sizeof(buf) - i, "5:token%d:", (int)token_len);
+	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+	if (dht_tx_copy__advance_offset(buf, &i, sizeof(buf), token, token_len)) goto fail;
+	
+	rc = lws_snprintf(buf + i, sizeof(buf) - i, "e1:q17:subscribe_confirm1:t%d:", (int)tid_len);
+	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+	if (dht_tx_copy__advance_offset(buf, &i, sizeof(buf), tid, tid_len)) goto fail;
+	if (dht_tx_add_v(buf, &i, sizeof(buf), ctx)) goto fail;
+	rc = lws_snprintf(buf + i, sizeof(buf) - i, "1:y1:qe");
+	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+
+	return dht_send(ctx, buf, i, sa, salen);
+
+fail:
+	errno = ENOSPC;
+	return -1;
+}
+
+int
+send_notify(struct lws_dht_ctx *ctx, const struct sockaddr *sa, size_t salen,
+		const uint8_t *tid, size_t tid_len,
+		const lws_dht_hash_t *infohash, const uint8_t *sha256)
+{
+	char buf[512];
+	size_t i = 0;
+	int rc;
+
+	rc = lws_snprintf(buf + i, sizeof(buf) - i, "d1:ad2:id%d:", dht_tx_id_len(ctx, ctx->myid));
+	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+
+	if (dht_put_id__advance_offset(ctx, buf, &i, sizeof(buf), ctx->myid)) goto fail;
+
+	rc = lws_snprintf(buf + i, sizeof(buf) - i, "9:info_hash%d:", dht_tx_id_len(ctx, infohash));
+	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+
+	if (dht_put_id__advance_offset(ctx, buf, &i, sizeof(buf), infohash)) goto fail;
+
+	rc = lws_snprintf(buf + i, sizeof(buf) - i, "6:sha25632:");
+	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+	if (dht_tx_copy__advance_offset(buf, &i, sizeof(buf), sha256, 32)) goto fail;
+
+	rc = lws_snprintf(buf + i, sizeof(buf) - i, "e1:q6:notify1:t%d:", (int)tid_len);
+	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+	if (dht_tx_copy__advance_offset(buf, &i, sizeof(buf), tid, tid_len)) goto fail;
+	if (dht_tx_add_v(buf, &i, sizeof(buf), ctx)) goto fail;
+	
+	rc = lws_snprintf(buf + i, sizeof(buf) - i, "1:y1:qe");
+	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+
+	return dht_send(ctx, buf, i, sa, salen);
 
 fail:
 	errno = ENOSPC;

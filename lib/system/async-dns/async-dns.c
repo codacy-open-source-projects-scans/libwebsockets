@@ -98,6 +98,7 @@ lws_async_dns_drop_server(lws_async_dns_server_t *dsrv)
 
 	dsrv->dns_server_set = 0;
 	lws_set_timeout(dsrv->wsi, 1, LWS_TO_KILL_ASYNC);
+	dsrv->wsi->a.opaque_user_data = NULL;
 	dsrv->wsi = NULL;
 	dsrv->dns_server_connected = 0;
 }
@@ -457,6 +458,9 @@ callback_async_dns(struct lws *wsi, enum lws_callback_reasons reason,
 	lws_async_dns_server_t *dsrv =
 			(lws_async_dns_server_t *)wsi->a.opaque_user_data;
 
+	if (!dsrv)
+		return 0;
+
 	switch (reason) {
 
 	/* callbacks related to raw socket descriptor */
@@ -558,6 +562,8 @@ __lws_async_dns_server_add(lws_async_dns_t *dns, const lws_sockaddr46 *sa46)
 static void
 __lws_async_dns_server_destroy(lws_async_dns_server_t *dsrv)
 {
+	lws_async_dns_t *dns;
+
 	if (!dsrv)
 		return;
 
@@ -565,21 +571,28 @@ __lws_async_dns_server_destroy(lws_async_dns_server_t *dsrv)
 	if (dsrv->refcount)
 		return;
 
+	dns = (lws_async_dns_t *)dsrv->list.owner;
+
+	if (dns) {
+		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+				lws_dll2_get_head(&dns->waiting)) {
+			lws_adns_q_t *q = lws_container_of(d, lws_adns_q_t, list);
+
+			if (q->dsrv == dsrv) {
+				/* this query will never be answered, clean it up cleanly */
+				lwsl_cx_notice(dns->cx, "failing query attached to removed DNS server");
+				lws_async_dns_complete(q, NULL);
+				lws_adns_q_destroy(q);
+			}
+		} lws_end_foreach_dll_safe(d, d1);
+	}
+
 	lws_dll2_remove(&dsrv->list);
 
 	if (dsrv->adapt)
 		lws_adapt_destroy(&dsrv->adapt);
 
-	if (dsrv->dns_server_set && dsrv->wsi && !dsrv->dns_server_connected) {
-		lwsl_wsi_notice(dsrv->wsi, "late free of incomplete dns wsi");
-		__lws_lc_untag(dsrv->wsi->a.context, &dsrv->wsi->lc);
-#if defined(LWS_WITH_SYS_METRICS)
-		lws_metrics_tags_destroy(&dsrv->wsi->cal_conn.mtags_owner);
-#endif
-		lws_free_set_NULL(dsrv->wsi->udp);
-		lws_free_set_NULL(dsrv->wsi);
-	}
-
+	lws_async_dns_drop_server(dsrv);
 	lws_free(dsrv);
 }
 
@@ -661,6 +674,42 @@ lws_async_dns_create_server_wsi(struct lws_context *context)
 	return 0;
 }
 
+lws_async_dns_server_check_t
+lws_plat_asyncdns_init(struct lws_context *context, lws_async_dns_t *dns)
+{
+	lws_async_dns_server_check_t s = LADNS_CONF_SERVER_SAME;
+	lws_async_dns_server_t *dsrv;
+	lws_sockaddr46 sa46t;
+	int n = 0;
+
+	lws_start_foreach_dll(struct lws_dll2 *, d,
+				   lws_dll2_get_head(&dns->nameservers)) {
+		dsrv = lws_container_of(d, lws_async_dns_server_t, list);
+		dsrv->seen = 0;
+	} lws_end_foreach_dll(d);
+
+	while (lws_plat_asyncdns_get_server(context, n++, &sa46t) == 0) {
+		dsrv = __lws_async_dns_server_find(dns, &sa46t);
+		if (!dsrv) {
+			dsrv = __lws_async_dns_server_add(dns, &sa46t);
+			s = LADNS_CONF_SERVER_CHANGED;
+		}
+		if (dsrv)
+			dsrv->seen = 1;
+	}
+
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+				   lws_dll2_get_head(&dns->nameservers)) {
+		dsrv = lws_container_of(d, lws_async_dns_server_t, list);
+		if (!dsrv->seen) {
+			__lws_async_dns_server_remove(dns, &dsrv->sa46);
+			s = LADNS_CONF_SERVER_CHANGED;
+		}
+	} lws_end_foreach_dll_safe(d, d1);
+
+	return s;
+}
+
 int
 lws_async_dns_init(struct lws_context *context)
 {
@@ -688,6 +737,12 @@ lws_async_dns_init(struct lws_context *context)
 	lws_async_dns_create_server_wsi(context);
 
 	return 0;
+}
+
+LWS_VISIBLE int
+lws_async_dns_server_reload(struct lws_context *context)
+{
+	return lws_async_dns_init(context);
 }
 
 lws_adns_cache_t *
@@ -890,16 +945,6 @@ ns_clean(struct lws_dll2 *d, void *user)
 			clean(dwait, user);
 		}
 	} lws_end_foreach_dll_safe(dwait, dwait1);
-
-	if (dsrv->wsi && !dsrv->dns_server_connected) {
-		lwsl_wsi_notice(dsrv->wsi, "late free of incomplete dns wsi");
-		__lws_lc_untag(dsrv->wsi->a.context, &dsrv->wsi->lc);
-#if defined(LWS_WITH_SYS_METRICS)
-		lws_metrics_tags_destroy(&dsrv->wsi->cal_conn.mtags_owner);
-#endif
-		lws_free_set_NULL(dsrv->wsi->udp);
-		lws_free_set_NULL(dsrv->wsi);
-	}
 
 	__lws_async_dns_server_destroy(dsrv);
 
@@ -1136,6 +1181,19 @@ lws_async_dns_query(struct lws_context *context, int tsi, const char *name,
 	lwsl_cx_info(context, "entry %s", name);
 	lws_adns_dump(dns);
 
+#if !defined(LWS_PLAT_OPTEE) && !defined(LWS_PLAT_FREERTOS) && !defined(WIN32)
+	{
+		struct stat st;
+		if (!stat("/etc/resolv.conf", &st)) {
+			if (dns->time_resolv_check && st.st_mtime > dns->time_resolv_check) {
+				lwsl_cx_notice(context, "/etc/resolv.conf updated, reloading");
+				lws_async_dns_server_reload(context);
+			}
+			dns->time_resolv_check = st.st_mtime;
+		}
+	}
+#endif
+
 #if !defined(LWS_WITH_IPV6)
 	if (qtype == LWS_ADNS_RECORD_AAAA) {
 		lwsl_cx_err(context, "ipv6 not enabled");
@@ -1329,6 +1387,7 @@ lws_async_dns_query(struct lws_context *context, int tsi, const char *name,
 	{
 		lws_async_dns_server_t *best_dsrv = NULL;
 		uint64_t best_rtt = ~(uint64_t)0;
+		int all_failed = 1;
 
 		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
 				   lws_dll2_get_head(&dns->nameservers)) {
@@ -1337,13 +1396,22 @@ lws_async_dns_query(struct lws_context *context, int tsi, const char *name,
 			/* 10 seconds means virtually down or unknown */
 			if (!v || v > 10000000) {
 				q->broadsiding = 1;
-				break;
+			} else {
+				all_failed = 0;
 			}
-			if (v < best_rtt) {
+			if (v && v < best_rtt) {
 				best_rtt = v;
 				best_dsrv = s;
 			}
 		} lws_end_foreach_dll_safe(d, d1);
+
+		if (dns->nameservers.count && all_failed) {
+			if (lws_now_usecs() - dns->time_last_reload > 5000000) {
+				lwsl_cx_notice(context, "Async DNS fallback reload triggered");
+				lws_async_dns_server_reload(context);
+				dns->time_last_reload = lws_now_usecs();
+			}
+		}
 
 		if (q->broadsiding)
 			/* Just peg it to the first for tracking purposes, but it will be skipped visually */

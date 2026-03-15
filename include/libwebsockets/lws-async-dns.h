@@ -179,6 +179,17 @@ LWS_VISIBLE LWS_EXTERN int
 lws_plat_asyncdns_get_server(struct lws_context *context, int n,
 			     lws_sockaddr46 *sa46);
 
+/**
+ * lws_async_dns_server_reload() - reload the OS assigned DNS servers
+ *
+ * \param context: the lws_context
+ *
+ * This forces LWS to re-check the OS for assigned DNS servers.
+ * It is useful when the device has changed networks.
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_async_dns_server_reload(struct lws_context *context);
+
 
 /**
  * lws_async_dns_dnssec_set_mode() - Set the system-wide DNSSEC mode

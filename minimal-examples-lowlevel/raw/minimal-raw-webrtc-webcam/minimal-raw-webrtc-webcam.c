@@ -14,7 +14,6 @@ enum {
 	LWS_SW_IP,
 	LWS_SW_MOUNT_ORIGIN,
 	LWS_SW_VIDEO_DEVICE,
-	LWS_SW_HELP,
 };
 
 static const struct lws_switches switches[] = {
@@ -22,7 +21,6 @@ static const struct lws_switches switches[] = {
 	[LWS_SW_IP]	= { "--ip",            "Enable --ip feature" },
 	[LWS_SW_MOUNT_ORIGIN]	= { "--mount-origin",  "Enable --mount-origin feature" },
 	[LWS_SW_VIDEO_DEVICE]	= { "--video-device",  "Enable --video-device feature" },
-	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
 };
 
 #include <string.h>

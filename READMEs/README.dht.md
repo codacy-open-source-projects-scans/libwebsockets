@@ -7,7 +7,7 @@ Libwebsockets provides an implementation of a Kademlia-based Distributed Hash Ta
 The DHT functionality is physically split into client and backend blocks to allow resource-constrained devices to participate as clients without maintaining full routing tables and storage on the device.
 
 *   `LWS_WITH_DHT`: Enables the DHT frontend and client API. This provides the core functionality to manage a DHT node ID (`dht-id.c`), serialize and parse base DHT protocol messages (`dht-bencode.c`), and manage networking and queries (`dht-tx.c`, `dht.c`).
-*   `LWS_WITH_DHT_BACKEND`: Enables the full DHT backend. This includes managing buckets, maintaining the complex routing table, coordinating decentralized searches, maintaining in-memory storage, and automatically responding to incoming RPCs like `ping`, `find_node`, `get_peers`, and `announce_peer`. Enabling this automatically requires and implies `LWS_WITH_DHT`.
+*   `LWS_WITH_DHT_BACKEND`: Enables the full DHT backend. This includes managing buckets, maintaining the complex routing table, coordinating decentralized searches, maintaining in-memory storage, and automatically responding to incoming RPCs like `ping`, `find_node`, `get_peers`, and `announce_peer`. This is automatically enabled by default when `LWS_WITH_DHT` is enabled, but can be forced off with `-DLWS_WITH_DHT_BACKEND=0`.
 
 ## Configuration Options (`lws_dht_info_t`)
 
@@ -38,6 +38,9 @@ A typical DHT client needs to formulate queries and dispatch them:
 *   `lws_dht_send_find_node(...)`: Requests closest nodes to a specified target ID from an external peer.
 *   `lws_dht_send_get_peers(...)`: Queries peers holding specific metadata/values matching an `info_hash`.
 *   `lws_dht_send_announce_peer(...)`: Announces to peers that your node is currently serving a resource corresponding to an `info_hash`.
+*   `lws_dht_send_subscribe(...)`: Initiates a long-poll request to be notified when a value at a given `info_hash` is modified or deleted.
+*   `lws_dht_send_subscribe_confirm(...)`: Formulates a valid challenge-response to complete a subscription utilizing a generated security token securely fetched from the target.
+*   `lws_dht_send_ack(...)`: Dispatches an empty `DHT_REPLY` back to a sender matching a 16-byte tracking cookie, commonly used to acknowledge asynchronous notification updates.
 
 ## Handling Events and Verb Handlers
 

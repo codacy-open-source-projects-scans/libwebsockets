@@ -68,7 +68,7 @@ check_pending_notifications(struct lws_dht_ctx *ctx)
 {
 	int soon = 0;
 	struct storage *st = ctx->storage;
-	
+
 	while (st) {
 		struct subscriber *sub = st->subscribers;
 		struct subscriber **psub = &st->subscribers;
@@ -82,7 +82,7 @@ check_pending_notifications(struct lws_dht_ctx *ctx)
 						lws_free(drop);
 						continue;
 					} else {
-						send_notify(ctx, (struct sockaddr *)&sub->ss, sub->sslen, sub->tid, sub->tid_len, st->id, sub->pending_sha256);
+						lws_dht_send_notify(ctx, (struct sockaddr *)&sub->ss, sub->sslen, sub->tid, sub->tid_len, st->id, sub->pending_sha256, NULL, 0);
 						sub->last_notify = ctx->now.tv_sec;
 						sub->notify_retries++;
 					}
@@ -302,4 +302,3 @@ lws_dht_insert_node(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id,
 
 	return -1;
 }
-

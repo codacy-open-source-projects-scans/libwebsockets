@@ -4,7 +4,7 @@
 
 The `lws-openmetrics-export` plugin provides functionality for serving system and active metrics in the OpenMetrics format, compatible with Prometheus scrapers. The plugin exports several internal protocol handlers:
 1. `lws-openmetrics` - Direct HTTP listener where a scraper can natively scrape metrics out.
-2. `lws-openmetrics-prox-agg` - Metrics proxy server logic local to the scraper. 
+2. `lws-openmetrics-prox-agg` - Metrics proxy server logic local to the scraper.
 3. `lws-openmetrics-prox-server` - Metrics proxy server logic handling remotely connected instances.
 4. `lws-openmetrics-prox-client` - Client process connecting back to the remote proxy server to expose its internal metrics payload outwardly to the scraper securely.
 

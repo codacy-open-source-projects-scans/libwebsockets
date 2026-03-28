@@ -1257,6 +1257,7 @@ lws_h2_parse_frame_header(struct lws *wsi)
 		goto update_end_headers;
 
 	case LWS_H2_FRAME_TYPE_HEADERS:
+		h2n->hpack_total_hdr_len = 0;
 		lwsl_info("HEADERS: frame header: sid = %u\n",
 				(unsigned int)h2n->sid);
 		if (!h2n->sid) {
@@ -1682,7 +1683,12 @@ lws_h2_parse_end_of_frame(struct lws *wsi)
 
 			if (!simp) /* coverity */
 				return 1;
-			h2n->swsi->http.rx_content_length = (unsigned long long)atoll(simp);
+			{
+				long long cl_val = atoll(simp);
+				if (cl_val < 0)
+					return 1;
+				h2n->swsi->http.rx_content_length = (unsigned long long)cl_val;
+			}
 			h2n->swsi->http.rx_content_remain =
 					h2n->swsi->http.rx_content_length;
 			h2n->swsi->http.content_length_given = 1;
@@ -2801,6 +2807,19 @@ lws_h2_ws_handshake(struct lws *wsi)
         if (lws_extension_server_handshake(wsi, (char **)&p, 192))
                return -1;
 #endif
+
+	{
+		struct lws_process_html_args args;
+
+		args.p = (char *)p;
+		args.max_len = lws_ptr_diff(end, p);
+		if (user_callback_handle_rxflow(wsi->a.protocol->callback, wsi,
+						LWS_CALLBACK_ADD_HEADERS,
+						wsi->user_space, &args, 0))
+			return -1;
+
+		p = (uint8_t *)args.p;
+	}
 
 	if (lws_finalize_http_header(wsi, &p, end))
 		return -1;

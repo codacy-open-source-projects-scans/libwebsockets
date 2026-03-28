@@ -66,6 +66,9 @@ struct vhd_interceptor {
 struct pss_interceptor {
 	lws_sorted_usec_list_t		sul;
 	struct lws			*wsi;
+	char				*js_buf;
+	size_t				js_len;
+	size_t				js_sent;
 };
 
 static void
@@ -203,14 +206,17 @@ lws_interceptor_issue_cookie(struct lws *wsi)
 		space = (int)sizeof(uri) - n - 1;
 
 		if (args_len > 0) {
-			*p2++ = '?';
-			n = lws_hdr_copy(wsi, p2, space, WSI_TOKEN_HTTP_URI_ARGS);
-			if (n > 0) {
-				p2 += n;
-				*p2++ = '&';
-				strcpy(p2, "lws_interceptor_ok=1");
+			if (space >= 22) {
+				*p2++ = '?';
+				space--;
+				n = lws_hdr_copy(wsi, p2, space - 20, WSI_TOKEN_HTTP_URI_ARGS);
+				if (n > 0) {
+					p2 += n;
+					*p2++ = '&';
+					strcpy(p2, "lws_interceptor_ok=1");
+				}
 			}
-		} else
+		} else if (space >= 21)
 			strcpy(p2, "?lws_interceptor_ok=1");
 
 		if (lws_add_http_header_by_token(
@@ -367,16 +373,21 @@ lws_interceptor_handle_http(struct lws *wsi, void *user, const struct lws_interc
 
 
 	if (lws_get_urlarg_by_name(wsi, "lws_interceptor_ok", junk, sizeof(junk))) {
+		int space = (int)sizeof(uri) - n - 1;
 		p2 = uri + n;
 
 		while (lws_hdr_copy_fragment(wsi, argbuf, sizeof(argbuf),
 					     WSI_TOKEN_HTTP_URI_ARGS, frag++) >= 0) {
+			int al = (int)strlen(argbuf);
 			if (!strncmp(argbuf, "lws_interceptor_ok", 18))
 				continue;
+			if (space < 1 + al)
+				break;
 			*p2++ = first ? '?' : '&';
 			first = 0;
 			strcpy(p2, argbuf);
-			p2 += strlen(argbuf);
+			p2 += al;
+			space -= 1 + al;
 		}
 		*p2 = '\0';
 
@@ -440,9 +451,17 @@ lws_interceptor_handle_http(struct lws *wsi, void *user, const struct lws_interc
 					return 1;
 
 				lws_write(wsi, (unsigned char *)buf + LWS_PRE, lws_ptr_diff_size_t(p, buf + LWS_PRE), LWS_WRITE_HTTP_HEADERS);
-				lws_write(wsi, (unsigned char *)js_buf, (size_t)js_len, LWS_WRITE_HTTP_FINAL);
 
-				return lws_http_transaction_completed(wsi);
+				pss->js_buf = lws_malloc((size_t)js_len + LWS_PRE, "interceptor js");
+				if (!pss->js_buf)
+					return -1;
+				memcpy(pss->js_buf + LWS_PRE, js_buf, (size_t)js_len);
+				pss->js_len = (size_t)js_len;
+				pss->js_sent = 0;
+
+				lws_callback_on_writable(wsi);
+
+				return 0;
 			}
 
 			lws_snprintf(argbuf, sizeof(argbuf), "%s/%s",
@@ -665,10 +684,36 @@ lws_callback_interceptor(struct lws *wsi, enum lws_callback_reasons reason,
 	case LWS_CALLBACK_HTTP_INTERCEPTOR_CHECK:
 		return lws_interceptor_check(wsi, (const struct lws_protocols *)in);
 
+	case LWS_CALLBACK_HTTP_DROP_PROTOCOL:
 	case LWS_CALLBACK_CLOSED_HTTP:
-		if (pss)
+		if (pss) {
 			lws_sul_cancel(&pss->sul);
+			lws_free_set_NULL(pss->js_buf);
+		}
 		break;
+
+	case LWS_CALLBACK_HTTP_WRITEABLE:
+	{
+		int n;
+
+		if (!pss || !pss->js_buf)
+			break;
+
+		n = lws_write(wsi, (unsigned char *)pss->js_buf + LWS_PRE + pss->js_sent,
+			      pss->js_len - pss->js_sent, LWS_WRITE_HTTP_FINAL);
+		if (n < 0)
+			return -1;
+
+		pss->js_sent += (size_t)n;
+		if (pss->js_sent == pss->js_len) {
+			lws_free_set_NULL(pss->js_buf);
+			if (lws_http_transaction_completed(wsi))
+				return -1;
+		} else {
+			lws_callback_on_writable(wsi);
+		}
+		return 0;
+	}
 
 	case LWS_CALLBACK_HTTP:
 		return lws_interceptor_handle_http(wsi, pss, ops);

@@ -8,7 +8,7 @@ The WebRTC mixer plugin relies heavily on `protocol_lws_webrtc`. While `protocol
 
 ## Asset and Sound Installation
 
-The user interface for the WebRTC mixer (HTML, CSS, JS) and the associated sound effects (WAV files) are located in the `assets/` and `sounds/` subdirectories of the plugin. 
+The user interface for the WebRTC mixer (HTML, CSS, JS) and the associated sound effects (WAV files) are located in the `assets/` and `sounds/` subdirectories of the plugin.
 
 When the project is installed (e.g., via `make install`), these assets are typically installed into the global shared data directory under `libwebsockets-test-server/lws-webrtc-mixer`.
 

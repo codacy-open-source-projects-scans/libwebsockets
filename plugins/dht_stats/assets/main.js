@@ -48,7 +48,7 @@ function connect() {
             const data = JSON.parse(e.data);
             if (data && data.stats_current) {
                 const c = data.stats_current;
-                
+
                 // Update top metrics
                 let totalTx = sumObj(c.tx);
                 let totalRx = sumObj(c.rx) - (c.rx.drops || 0); // exclude drops from rx sum
@@ -70,7 +70,7 @@ function connect() {
                     tdTx.textContent = c.tx[k] || 0;
                     const tdRx = document.createElement('td');
                     tdRx.textContent = c.rx[k] || 0;
-                    
+
                     tr.appendChild(tdName);
                     tr.appendChild(tdTx);
                     tr.appendChild(tdRx);
@@ -93,7 +93,7 @@ function connect() {
                     if (drops >= lastDrops) dDrop = drops - lastDrops;
                     else dDrop = drops;
                 }
-                
+
                 lastStats = c;
 
                 // Push to chart
@@ -126,7 +126,7 @@ function drawChart() {
         if (!s) continue;
 
         let x = i * barW;
-        
+
         let txH = (s.tx / maxEvents) * canvas.height;
         let rxH = (s.rx / maxEvents) * canvas.height;
         let dropH = (s.drop / maxEvents) * canvas.height;

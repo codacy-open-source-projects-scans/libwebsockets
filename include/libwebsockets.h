@@ -903,6 +903,7 @@ lws_fx_string(const lws_fx_t *a, char *buf, size_t size);
 #include <libwebsockets/lws-jose.h>
 #include <libwebsockets/lws-jws.h>
 #include <libwebsockets/lws-jwe.h>
+#include <libwebsockets/lws-jwt-auth.h>
 
 #endif
 
@@ -950,6 +951,12 @@ lws_fx_string(const lws_fx_t *a, char *buf, size_t size);
 #endif
 
 #include <libwebsockets/lws-html.h>
+#include <libwebsockets/qrcodegen.h>
+#include <libwebsockets/lws-smtp-client.h>
+
+#if defined(LWS_WITH_DIR)
+#include <libwebsockets/lws-dir-notify.h>
+#endif
 
 #ifdef __cplusplus
 }

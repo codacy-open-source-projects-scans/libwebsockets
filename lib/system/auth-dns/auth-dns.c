@@ -70,13 +70,13 @@ strexp_cb(void *priv, const char *name, char *out, size_t *pos,
 }
 
 int
-lws_auth_dns_parse_zone_buf(const char *buf, size_t len, struct auth_dns_zone *zone)
+lws_auth_dns_parse_zone_buf(const char *buf, size_t len, struct auth_dns_zone *zone, const char *ipv4, const char *ipv6)
 {
 	const char *p = buf, *end = buf + len;
 	char last_name[256] = "";
 	int in_parens = 0;
 	int in_comment = 0;
-	
+
 	char line_accum[4096];
 	size_t lptr = 0;
 	int loop_cycles = 0;
@@ -101,7 +101,7 @@ lws_auth_dns_parse_zone_buf(const char *buf, size_t len, struct auth_dns_zone *z
 		if (p == end || (*p == '\n' && !in_parens)) {
 			in_comment = 0;
 			line_accum[lptr] = '\0';
-			
+
 			if (lptr > 0) {
 				lws_tokenize_t ts;
 				lws_tokenize_elem e;
@@ -219,6 +219,7 @@ lws_auth_dns_parse_zone_buf(const char *buf, size_t len, struct auth_dns_zone *z
 							else if (!strcmp(toks[type_idx], "NSEC3")) type = 50;
 							else if (!strcmp(toks[type_idx], "NSEC3PARAM")) type = 51;
 							else if (!strcmp(toks[type_idx], "TLSA")) type = 52;
+							else if (!strcmp(toks[type_idx], "CAA")) type = 257;
 							else type = 0; /* unknown */
 							type_idx++;
 						}
@@ -253,14 +254,23 @@ lws_auth_dns_parse_zone_buf(const char *buf, size_t len, struct auth_dns_zone *z
 							if (rd) {
 								rd += strlen(toks[type_idx - 1]);
 								while (*rd == ' ' || *rd == '\t') rd++;
+
+								/* Strip surrounding quotes if present (TXT records) */
+								size_t rdlen = strlen(rd);
+								if (rdlen >= 2 && rd[0] == '"' && rd[rdlen - 1] == '"') {
+									rd[rdlen - 1] = '\0';
+									rdlen -= 2;
+									rd++;
+								}
+
 								rr->rdata = lws_strdup(rd);
 								if (rr->rdata)
-									rr->rdata_len = strlen(rr->rdata);
+									rr->rdata_len = rdlen;
 							}
 						}
 
 						lws_dll2_add_tail(&rr->list, &rrset->rr_list);
-						if (lws_auth_dns_rdata_to_wire(zone, rr, rrset->type))
+						if (lws_auth_dns_rdata_to_wire(zone, rr, rrset->type, ipv4, ipv6))
 							lwsl_err("Failed to wire-encode rdata for %s\n", rrset->name);
 
 						lwsl_info("Parsed RR: name=%s type=%d ttl=%u rdata=%s\n", rrset->name, rrset->type, rrset->ttl, rr->rdata ? rr->rdata : "");
@@ -304,7 +314,7 @@ lws_auth_dns_free_zone(struct auth_dns_zone *z)
 int
 lws_auth_dns_sign_zone(struct lws_auth_dns_sign_info *info)
 {
-	char obuf[2048]; /* simple large enough buffer for test */
+	char obuf[8192]; /* simple large enough buffer for test */
 	int fd, n, ofd = -1, res_wr, temp_len = 0, temp_max = 0;
 	size_t uin = 0, uout = 0;
 	lws_strexp_t exp;
@@ -366,7 +376,7 @@ lws_auth_dns_sign_zone(struct lws_auth_dns_sign_info *info)
 	struct auth_dns_zone zone;
 	memset(&zone, 0, sizeof(zone));
 
-	if (lws_auth_dns_parse_zone_buf(expbuf, uout, &zone)) {
+	if (lws_auth_dns_parse_zone_buf(expbuf, uout, &zone, info->ipv4, info->ipv6)) {
 		lwsl_err("Failed to parse zone\n");
 		goto bail;
 	}
@@ -381,14 +391,16 @@ lws_auth_dns_sign_zone(struct lws_auth_dns_sign_info *info)
 		lwsl_err("Failed to open output file for signing results\n");
 		goto bail;
 	}
-	
+
 	/* Write generic setup string at top */
 	n = lws_snprintf(obuf, sizeof(obuf), "$ORIGIN %s\n$TTL %u\n\n", zone.origin, atoi(zone.default_ttl) ? atoi(zone.default_ttl) : 3600);
+	if (n > (int)sizeof(obuf) - 1)
+		n = (int)sizeof(obuf) - 1;
 	(void)write(fd, obuf, (unsigned int)n);
 
 	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&zone.rrset_list)) {
 		struct auth_dns_rrset *rs = lws_container_of(d, struct auth_dns_rrset, list);
-		
+
 		const char *ts = "UNKNOWN";
 		switch (rs->type) {
 			case 1: ts = "A"; break;
@@ -401,13 +413,16 @@ lws_auth_dns_sign_zone(struct lws_auth_dns_sign_info *info)
 			case 48: ts = "DNSKEY"; break;
 			case 50: ts = "NSEC3"; break;
 			case 51: ts = "NSEC3PARAM"; break;
+			case 257: ts = "CAA"; break;
 		}
 
 		lws_start_foreach_dll(struct lws_dll2 *, d2, lws_dll2_get_head(&rs->rr_list)) {
 			struct auth_dns_rr *rr = lws_container_of(d2, struct auth_dns_rr, list);
-			
-			n = lws_snprintf(obuf, sizeof(obuf), "%-30s\t%u\tIN\t%s\t%s\n", 
+
+			n = lws_snprintf(obuf, sizeof(obuf), "%-30s\t%u\tIN\t%s\t%s\n",
 				rs->name, rs->ttl, ts, rr->rdata ? rr->rdata : "");
+			if (n > (int)sizeof(obuf) - 1)
+				n = (int)sizeof(obuf) - 1;
 			(void)write(fd, obuf, (unsigned int)n);
 		} lws_end_foreach_dll(d2);
 	} lws_end_foreach_dll(d);
@@ -495,7 +510,7 @@ lws_auth_dns_sign_zone(struct lws_auth_dns_sign_info *info)
 	jws.map.buf[LJWS_PYLD] = (const char *)outbuf;
 	jws.map.len[LJWS_PYLD] = (uint32_t)ost.st_size;
 
-	if (lws_jws_encode_b64_element(&jws.map_b64, LJWS_PYLD, (temp + temp_max - temp_len), &temp_len, jws.map.buf[LJWS_PYLD], jws.map.len[LJWS_PYLD]) || 
+	if (lws_jws_encode_b64_element(&jws.map_b64, LJWS_PYLD, (temp + temp_max - temp_len), &temp_len, jws.map.buf[LJWS_PYLD], jws.map.len[LJWS_PYLD]) ||
 		lws_jws_encode_b64_element(&jws.map_b64, LJWS_JOSE, (temp + temp_max - temp_len), &temp_len, jws.map.buf[LJWS_JOSE], jws.map.len[LJWS_JOSE])) {
 		lwsl_err("Failed JWS b64 encode\n");
 		goto bail_jose;

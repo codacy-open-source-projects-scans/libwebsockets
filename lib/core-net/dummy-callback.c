@@ -479,6 +479,14 @@ lws_callback_http_dummy(struct lws *wsi, enum lws_callback_reasons reason,
 				return -1;
 		}
 #endif
+		if (wsi->http.deferred_transaction_completed) {
+			uint8_t zero = 0;
+			lws_write(wsi, &zero, 0, LWS_WRITE_HTTP_FINAL);
+			if (lws_http_transaction_completed(wsi))
+				return -1;
+			return 0;
+		}
+
 		break;
 
 #if defined(LWS_WITH_HTTP_PROXY)

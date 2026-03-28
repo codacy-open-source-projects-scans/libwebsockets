@@ -192,7 +192,7 @@ lws_cose_sign_alg_hash(lws_cose_sig_alg_t *alg, const uint8_t *in, size_t in_len
 	case LWSCOSE_WKAHMAC_384_384:
 	case LWSCOSE_WKAHMAC_512_512:
 		return lws_genhmac_update(&alg->u.hmacctx, in, in_len);
-		
+
 	case LWSCOSE_WKAEDDSA_ALG_EDDSA:
 	{
 		uint8_t *n;

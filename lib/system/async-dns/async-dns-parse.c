@@ -278,11 +278,11 @@ start:
 		 */
 
 		n = lws_ptr_diff(sp, stack[0].name);
-		if (stack[0].name[n - 1] == '.')
+		if (n > 0 && stack[0].name[n - 1] == '.')
 			n--;
 
 		m = stack[stp].enl;
-		if (stack[stp].name[m - 1] == '.')
+		if (m > 0 && stack[stp].name[m - 1] == '.')
 			m--;
 
 		if (n < 1 || n != m ||
@@ -334,6 +334,10 @@ do_cb:
 			break;
 
 		case LWS_ADNS_RECORD_CNAME:
+			if (rrpaylen == 0) {
+				lwsl_notice("%s: CNAME with empty RDATA, skipping\n", __func__);
+				goto skip;
+			}
 			/*
 			 * The name the CNAME refers to MAY itself be
 			 * included elsewhere in the response packet.
@@ -642,7 +646,7 @@ lws_adns_parse_udp(lws_async_dns_t *dns, const uint8_t *pkt, size_t len,
 #if 0
 	{
 		int rcode = lws_ser_ru16be(pkt + DHO_FLAGS) & 0x0F;
-		lwsl_notice("%s: Received DNS response for %s, RCODE=%d, ANSWERS=%d\n", 
+		lwsl_notice("%s: Received DNS response for %s, RCODE=%d, ANSWERS=%d\n",
 			__func__, ((const char *)&q[1]) + DNS_MAX, rcode, lws_ser_ru16be(pkt + DHO_NANSWERS));
 	}
 #endif
@@ -763,12 +767,12 @@ lws_adns_parse_udp(lws_async_dns_t *dns, const uint8_t *pkt, size_t len,
 	}
 
 	if (lws_ser_ru16be(pkt + DHO_NANSWERS)) {
-		c->results = (struct addrinfo *)&c[1];
+		c->results = adst.ctr ? (struct addrinfo *)&c[1] : NULL;
 		c->rr_results = adst.rr_first;
 
-		if (q->last) /* chain the second one on */
+		if (q->last && c->results) /* chain the second one on */
 			*q->last = c->results;
-		else /* first one had no results, set first guy's c->results */
+		else if (c->results) /* first one had no results, set first guy's c->results */
 			if (q->firstcache)
 				q->firstcache->results = c->results;
 	}

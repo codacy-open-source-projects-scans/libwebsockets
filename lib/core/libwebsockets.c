@@ -976,6 +976,8 @@ lws_tokenize(struct lws_tokenize *ts)
 		ts->state = LWS_TOKZS_LEADING_WHITESPACE;
 		ts->token_len = 0;
 		ts->reset_token = 0;
+	} else if (ts->token_len == sizeof(ts->collect) - 1) {
+		ts->token_len = 0;
 	}
 
 	while (ts->len) {
@@ -1145,8 +1147,15 @@ lws_tokenize(struct lws_tokenize *ts)
 			case LWS_TOKZS_QUOTED_STRING:
 agg:
 				ts->collect[ts->token_len++] = c;
-				if (ts->token_len == sizeof(ts->collect) - 1)
+				if (ts->token_len == sizeof(ts->collect) - 1) {
+					if (ts->flags & LWS_TOKENIZE_F_CHUNK) {
+						ts->collect[ts->token_len] = '\0';
+						return (ts->state == LWS_TOKZS_QUOTED_STRING) ?
+							LWS_TOKZE_QUOTED_STRING_CHUNK :
+							LWS_TOKZE_TOKEN_CHUNK;
+					}
 					return LWS_TOKZE_TOO_LONG;
+				}
 				ts->collect[ts->token_len] = '\0';
 				continue;
 
@@ -1184,8 +1193,15 @@ agg:
 		case LWS_TOKZS_QUOTED_STRING:
 		case LWS_TOKZS_TOKEN:
 			ts->collect[ts->token_len++] = c;
-			if (ts->token_len == sizeof(ts->collect) - 1)
+			if (ts->token_len == sizeof(ts->collect) - 1) {
+				if (ts->flags & LWS_TOKENIZE_F_CHUNK) {
+					ts->collect[ts->token_len] = '\0';
+					return (ts->state == LWS_TOKZS_QUOTED_STRING) ?
+						LWS_TOKZE_QUOTED_STRING_CHUNK :
+						LWS_TOKZE_TOKEN_CHUNK;
+				}
 				return LWS_TOKZE_TOO_LONG;
+			}
 			ts->collect[ts->token_len] = '\0';
 checknum:
 			if (!(ts->flags & LWS_TOKENIZE_F_NO_INTEGERS)) {
@@ -1632,7 +1648,8 @@ bump:
 const char *
 lws_cmdline_options_cx(const struct lws_context *cx, const char *val, const char *last)
 {
-	assert(cx->argc);
+	if (!cx->argc)
+		return NULL;
 
 	if (!cx->stdin_argc)
 		return lws_cmdline_options((int)cx->argc, cx->argv, val, last);
@@ -1644,6 +1661,18 @@ const char *
 lws_cmdline_option_cx(const struct lws_context *cx, const char *val)
 {
 	return lws_cmdline_options_cx(cx, val, NULL);
+}
+
+const char *
+lws_cmdline_option_cx_argv0(const struct lws_context *cx)
+{
+	if (!cx->argc || !cx->argv)
+		return NULL;
+
+	if (!cx->stdin_argc)
+		return cx->argv[0];
+
+	return cx->stdin_argv[0];
 }
 
 

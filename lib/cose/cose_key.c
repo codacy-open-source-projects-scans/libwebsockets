@@ -1069,7 +1069,7 @@ lws_cose_key_export(lws_cose_key_t *ck, lws_lec_pctx_t *ctx, int flags)
 
 		if (ck->gencrypto_kty == LWS_GENCRYPTO_KTY_EC || ck->gencrypto_kty == LWS_GENCRYPTO_KTY_OKP) {
 			struct lws_gencrypto_keyelem *ke;
-			
+
 			if (ck->gencrypto_kty == LWS_GENCRYPTO_KTY_OKP)
 				ke = &ck->e[LWS_GENCRYPTO_OKP_KEYEL_CRV];
 			else

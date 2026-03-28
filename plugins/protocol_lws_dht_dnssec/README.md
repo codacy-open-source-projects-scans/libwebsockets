@@ -1,6 +1,6 @@
 # lws-dht-dnssec Plugin
 
-This plugin extends the core libwebsockets Distributed Hash Table (DHT) framework to provide a secure, decentralized storage layer specifically designed for DNSSEC zone files. 
+This plugin extends the core libwebsockets Distributed Hash Table (DHT) framework to provide a secure, decentralized storage layer specifically designed for DNSSEC zone files.
 
 It works by intercepting DHT `PUT` requests, requiring client-side JSON Web Signatures (JWS) enclosing the zone files, which the plugin subsequently validates asynchronously against the authoritative Domain Name System (DNS) `DS` records.
 
@@ -29,7 +29,7 @@ To enable the underlying requirements so out-of-the-box DHT plugins and the `lws
 -DLWS_WITH_DHT_BACKEND=1
 -DLWS_WITH_JOSE=1
 -DLWS_WITH_SYS_ASYNC_DNS=1
--DLWS_WITH_GENCRYPTO=1 
+-DLWS_WITH_GENCRYPTO=1
 -DLWS_WITH_SYS_ASYNC_DNS_DNSSEC=1
 -DLWS_ROLE_RAW_FILE=1
 -DLWS_WITH_PLUGINS=1

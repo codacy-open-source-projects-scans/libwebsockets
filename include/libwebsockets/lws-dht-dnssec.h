@@ -29,6 +29,7 @@ struct lws_context;
 
 struct lws_dht_dnssec_keygen_args {
 	const char *domain;
+	const char *workdir;
 	const char *type;   /* e.g. "EC" or "RSA" */
 	const char *curve;
 	int bits;
@@ -36,12 +37,16 @@ struct lws_dht_dnssec_keygen_args {
 
 struct lws_dht_dnssec_dsfromkey_args {
 	const char *domain;
+	const char *workdir;
 	const char *hash;   /* E.g., "SHA256" */
 };
 
 struct lws_dht_dnssec_signzone_args {
 	const char *domain;
+	const char *workdir;
 	uint32_t sign_validity_duration;
+	char ipv4[64];
+	char ipv6[64];
 };
 
 struct lws_dht_dnssec_importnsd_args {
@@ -59,6 +64,7 @@ struct lws_dht_dnssec_fetch_zone_args {
 	lws_dht_dnssec_fetch_cb_t cb;
 	void *opaque;
 	int is_cancel; /* If 1, cancel an ongoing fetch for this domain/opaque pair */
+	int force_network; /* If 1, bypass local cache and query network directly */
 };
 
 struct lws_dht_dnssec_ops {
@@ -68,8 +74,25 @@ struct lws_dht_dnssec_ops {
 	int (*importnsd)(struct lws_context *context, struct lws_dht_dnssec_importnsd_args *args);
 
 	int (*add_temp_zone)(struct lws_context *context, const char *domain, const char *zone_str, int ttl_secs);
-	int (*publish_jws)(struct lws_context *context, const char *jws_filepath);
-	int (*fetch_zone)(struct lws_context *context, struct lws_dht_dnssec_fetch_zone_args *args);
+	int (*publish_jws)(struct lws_vhost *vhost, const char *jws_filepath);
+	int (*fetch_zone)(struct lws_context *cx,
+			struct lws_dht_dnssec_fetch_zone_args *args);
+
+	/*
+	 * Tell DHT plugin to actively subscribe to the network for changes
+	 * to this domain using LWS_DHT_EVENT_NOTIFY pub/sub.
+	 */
+	int (*subscribe_zone)(struct lws_vhost *vhost, const char *domain);
+
+	/*
+	 * Actively repair an outdated peer we encountered by firing a targeted
+	 * EVENT_NOTIFY packet at them containing the fresh SOA Serial.
+	 */
+	int (*notify_peer_outdated)(struct lws_vhost *vhost, const char *domain,
+				    const lws_sockaddr46 *sa46_peer, uint64_t newer_soa_serial);
+
+	void (*register_auth_cb)(struct lws_vhost *vh, void (*cb)(void *opaque, const char *domain, const char *payload_path), void *opaque);
 };
+
 
 #endif

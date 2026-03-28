@@ -60,7 +60,7 @@ static lws_sorted_usec_list_t sul_lwsws;
 static char config_dir[128], default_plugin_path = 1;
 static int opts = 0, do_reload = 1;
 static uv_loop_t loop;
-static uv_signal_t signal_outer[2];
+static uv_signal_t signal_outer[3];
 static int pids[32];
 void lwsl_emit_stderr(int level, const char *line);
 
@@ -132,7 +132,7 @@ lwsws_min(lws_sorted_usec_list_t *sul)
 }
 
 static int
-context_creation(void)
+context_creation(int argc, const char **argv)
 {
 	int cs_len = LWSWS_CONFIG_STRING_SIZE - 1;
 	struct lws_context_creation_info info;
@@ -168,6 +168,8 @@ context_creation(void)
 	foreign_loops[0] = &loop;
 	info.foreign_loops = foreign_loops;
 	info.pcontext = &context;
+	info.argc = argc;
+	info.argv = argv;
 
 	context = lws_create_context(&info);
 	if (context == NULL) {
@@ -244,6 +246,8 @@ int main(int argc, char **argv)
 #endif
 
 	strcpy(config_dir, "/etc/lwsws");
+	extern int opterr;
+	opterr = 0;
 	while (n >= 0) {
 #if defined(LWS_HAS_GETOPT_LONG) || defined(WIN32)
 		n = getopt_long(argc, argv, "hd:c:n", options, NULL);
@@ -281,6 +285,7 @@ int main(int argc, char **argv)
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGHUP, reload_handler);
 	signal(SIGINT, reload_handler);
+	signal(SIGTERM, reload_handler);
 
 	fprintf(stderr, "Root process is %u\n", (unsigned int)getpid());
 
@@ -330,8 +335,10 @@ int main(int argc, char **argv)
 	uv_signal_start(&signal_outer[0], signal_cb, SIGINT);
 	uv_signal_init(&loop, &signal_outer[1]);
 	uv_signal_start(&signal_outer[1], signal_cb, SIGHUP);
+	uv_signal_init(&loop, &signal_outer[2]);
+	uv_signal_start(&signal_outer[2], signal_cb, SIGTERM);
 
-	if (context_creation()) {
+	if (context_creation(argc, (const char **)argv)) {
 		lwsl_err("Context creation failed\n");
 		return 1;
 	}
@@ -340,7 +347,7 @@ int main(int argc, char **argv)
 
 	lwsl_err("%s: closing\n", __func__);
 
-	for (n = 0; n < 2; n++) {
+	for (n = 0; n < 3; n++) {
 		uv_signal_stop(&signal_outer[n]);
 		uv_close((uv_handle_t *)&signal_outer[n], NULL);
 	}

@@ -43,7 +43,7 @@ Development
 
 v4.5.0
 ======
- 
+
  - fixes from coverity and Nozomi Networks
  - fix for mountpoint headers being sticky for all following mounts too
  - b64 apis: fixes and new api tests

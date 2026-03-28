@@ -121,9 +121,9 @@ lws_async_dns_complete(lws_adns_q_t *q, lws_adns_cache_t *c)
 		lws_set_timeout(w, NO_PENDING_TIMEOUT, 0);
 		if (w->adns_cb(w, (const char *)&q[1], c ? c->results : NULL,
 #if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
-				0 | (q->dnssec_valid ? LWS_ADNS_DNSSEC_VALID : 0),
+				(c ? 0 : LADNS_RET_FAILED) | (q->dnssec_valid ? LWS_ADNS_DNSSEC_VALID : 0),
 #else
-				0,
+				(c ? 0 : LADNS_RET_FAILED),
 #endif
 				q->opaque) == NULL) {
 			lwsl_info("%s: failed\n", __func__);
@@ -139,9 +139,9 @@ lws_async_dns_complete(lws_adns_q_t *q, lws_adns_cache_t *c)
 		if (q->standalone_cb(NULL, (const char *)&q[1],
 				 c ? c->results : NULL,
 #if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
-				 0 | (q->dnssec_valid ? LWS_ADNS_DNSSEC_VALID : 0),
+				 (c ? 0 : LADNS_RET_FAILED) | (q->dnssec_valid ? LWS_ADNS_DNSSEC_VALID : 0),
 #else
-				 0,
+				 (c ? 0 : LADNS_RET_FAILED),
 #endif
 				 q->opaque) == NULL)
 			ret = LADNS_RET_FAILED_WSI_CLOSED;
@@ -331,7 +331,7 @@ lws_async_dns_writeable(struct lws *wsi, lws_adns_q_t *q)
 					m2 = lws_write(s->wsi, pkt + LWS_PRE - 2, (unsigned int)n + 2, 0);
 				} else
 					m2 = lws_write(s->wsi, pkt + LWS_PRE, (unsigned int)n, 0);
-					
+
 				if (s->wsi == wsi)
 					m = m2;
 			}
@@ -1234,10 +1234,14 @@ lws_async_dns_query(struct lws_context *context, int tsi, const char *name,
 	}
 
 	if (c) {
-		lwsl_cx_info(context, "%s: using cached, c->results %p",
-			  name, c->results);
-		m = c->results ? LADNS_RET_FOUND : LADNS_RET_FAILED;
+		lwsl_cx_info(context, "%s: using cached, c->results %p, c->rr_results %p",
+			  name, c->results, c->rr_results);
+		m = (c->results || c->rr_results) ? LADNS_RET_FOUND : LADNS_RET_FAILED;
 		if (c->results)
+			c->refcount++;
+		/* Note: c->rr_results relies on the same cache refcount, but to be
+		   consistent, we'll bump the refcount if rr_results exists too! */
+		else if (c->rr_results)
 			c->refcount++;
 
 #if defined(LWS_WITH_SYS_METRICS)
@@ -1382,7 +1386,7 @@ lws_async_dns_query(struct lws_context *context, int tsi, const char *name,
 	q->tsi = (uint8_t)tsi;
 	q->opaque = opaque;
 	q->dns = dns;
-	
+
 	/* Evaluate the optimal server */
 	{
 		lws_async_dns_server_t *best_dsrv = NULL;
@@ -1508,7 +1512,7 @@ lws_async_dns_create_tcp_wsi(lws_adns_q_t *q)
 	q->is_tcp = 1;
 	q->has_tcp_len = 0;
 	q->tcp_rx_pos = 0;
-	
+
 	q->wsi_tcp = lws_client_connect_via_info(&i);
 	if (!q->wsi_tcp) {
 		lwsl_cx_err(q->context, "adns tcp connect fail");
@@ -1551,4 +1555,3 @@ lws_async_dns_get_rr_cache(struct lws_context *context, const char *name,
 
 	return NULL;
 }
-

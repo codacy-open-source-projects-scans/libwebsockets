@@ -17,7 +17,7 @@ message(STATUS "ZONE: LWS_WITH_JOSE req=${requirements}")
 
 if (requirements)
 	add_executable(${SAMP} ${SRCS})
-	
+
 	if (websockets_shared)
 		target_link_libraries(${SAMP} websockets_shared ${LIBWEBSOCKETS_DEP_LIBS})
 		add_dependencies(${SAMP} websockets_shared)

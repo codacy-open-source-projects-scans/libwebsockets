@@ -29,7 +29,7 @@ struct auth_dns_rr {
 
 	char *rdata;
 	size_t rdata_len;
-	
+
 	uint8_t *wire_rdata;
 	size_t wire_rdata_len;
 };
@@ -38,7 +38,7 @@ struct auth_dns_rrset {
 	lws_dll2_t list;
 	lws_dll2_owner_t rr_list;
 
-	char *name;         
+	char *name;
 	uint32_t ttl;
 	uint16_t class_;
 	uint16_t type;
@@ -51,7 +51,7 @@ struct auth_dns_zone {
 };
 
 LWS_VISIBLE LWS_EXTERN int
-lws_auth_dns_parse_zone_buf(const char *buf, size_t len, struct auth_dns_zone *zone);
+lws_auth_dns_parse_zone_buf(const char *buf, size_t len, struct auth_dns_zone *zone, const char *ipv4, const char *ipv6);
 
 LWS_VISIBLE LWS_EXTERN void
 lws_auth_dns_free_zone(struct auth_dns_zone *z);
@@ -67,6 +67,8 @@ struct lws_auth_dns_sign_info {
 	time_t				sign_validity_start_time; /* 0 = now */
 	uint32_t			sign_validity_duration;   /* 0 = 30 days */
 	int				num_substs;
+	const char			*ipv4;              /* Dynamic IP override */
+	const char			*ipv6;
 	struct lws_context		*cx;                /* For logging/alloc */
 };
 

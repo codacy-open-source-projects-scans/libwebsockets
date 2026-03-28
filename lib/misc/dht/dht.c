@@ -180,7 +180,15 @@ dht_on_rx_data(struct lws_transport_sequencer *ts, uint64_t offset,
 	lws_dht_ts_t *dts = (lws_dht_ts_t *)lws_transport_sequencer_get_info(ts)->user_data;
 	struct lws_dht_msg msg;
 
-	lwsl_user("%s: [DEBUG] Received raw UDP packet on sequencer: offset=%llu len=%zu\n", __func__, (unsigned long long)offset, len);
+	char buf_ip[64] = "unknown";
+	if (dts->sa.ss_family == AF_INET) {
+		struct sockaddr_in *s = (struct sockaddr_in *)&dts->sa;
+		inet_ntop(AF_INET, &s->sin_addr, buf_ip, sizeof(buf_ip));
+	} else if (dts->sa.ss_family == AF_INET6) {
+		struct sockaddr_in6 *s = (struct sockaddr_in6 *)&dts->sa;
+		inet_ntop(AF_INET6, &s->sin6_addr, buf_ip, sizeof(buf_ip));
+	}
+	lwsl_user("%s: [DEBUG] Received raw UDP packet from %s on sequencer: offset=%llu len=%zu\n", __func__, buf_ip, (unsigned long long)offset, len);
 
 	int parse_ret = lws_dht_msg_parse((const char *)buf, len, &msg);
 	if (!parse_ret) {
@@ -189,22 +197,22 @@ dht_on_rx_data(struct lws_transport_sequencer *ts, uint64_t offset,
 			int n = lws_snprintf(json, sizeof(json), "{\"protocols\":[");
 			int first = 1;
 			const char *last_proto = NULL;
-			
+
 			/* Gather protocols (dumb uniqueness since they are added consecutively by register_verbs) */
 			lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&dts->ctx->verb_owner)) {
 				struct lws_dht_verb_list *vl = lws_container_of(d, struct lws_dht_verb_list, list);
-				
-				lwsl_user("CAP_REQ Generator Iteration: verb=%s, protocol=%s\n", 
-					vl->v.name ? vl->v.name : "null", 
+
+				lwsl_user("CAP_REQ Generator Iteration: verb=%s, protocol=%s\n",
+					vl->v.name ? vl->v.name : "null",
 					(vl->v.protocol && vl->v.protocol->name) ? vl->v.protocol->name : "null");
-				
+
 				if (vl->v.protocol && (!last_proto || strcmp(vl->v.protocol->name, last_proto) != 0)) {
 					n += lws_snprintf(json + n, sizeof(json) - (size_t)n, "%s\"%s\"", first ? "" : ",", vl->v.protocol->name);
 					last_proto = vl->v.protocol->name;
 					first = 0;
 				}
 			} lws_end_foreach_dll(d);
-			
+
 			/* Also return the peer's perceived public IP/port */
 			if (dts->sa.ss_family == AF_INET) {
 				struct sockaddr_in *sin = (struct sockaddr_in *)&dts->sa;
@@ -217,7 +225,7 @@ dht_on_rx_data(struct lws_transport_sequencer *ts, uint64_t offset,
 				inet_ntop(AF_INET6, &sin6->sin6_addr, ip, sizeof(ip));
 				lws_snprintf(json + n, sizeof(json) - (size_t)n, "],\"peer_ip\":\"%s\",\"peer_port\":%d}", ip, ntohs(sin6->sin6_port));
 			}
-			
+
 			n = lws_dht_msg_gen(ack, sizeof(ack), "CAP_RSP", msg.hash, 0, (unsigned long long)strlen(json));
 			if (n > 0 && (size_t)n + strlen(json) < sizeof(ack)) {
 				memcpy(ack + n, json, strlen(json));
@@ -252,22 +260,24 @@ dht_on_rx_data(struct lws_transport_sequencer *ts, uint64_t offset,
 
 				args.out_precedence = LWS_DHT_VERB_RESULT_PROCEED;
 
+				lwsl_user("DISPATCHING %s to protocol %s\n", msg.verb, vl->v.protocol->name);
+
 				n = vl->v.protocol->callback((struct lws *)&a, LWS_CALLBACK_DHT_VERB_DISPATCH,
 							lws_protocol_vh_priv_get(dts->ctx->vhost, vl->v.protocol),
 							&args, 0);
-				
+
 				if (n < 0 || args.out_precedence == LWS_DHT_VERB_RESULT_DROP_OLDER || args.out_precedence == LWS_DHT_VERB_RESULT_ERROR)
 					return -1;
 
 				if (args.out_precedence == LWS_DHT_VERB_RESULT_PASS)
-					/* 
+					/*
 					 * The plugin actively declined to handle this payload and delegated it
 					 * to the next plugin in the chain. Let's continue traversing the list!
 					 */
-					continue;
+					goto pass;
 
 				if (args.out_precedence == LWS_DHT_VERB_RESULT_PENDING_ASYNC) {
-					/* The plugin will handle validation asynchronously and ACK later. 
+					/* The plugin will handle validation asynchronously and ACK later.
 					 * We just return 0 to keep the sequencer alive but don't ACK here.
 					 * The object store plugin currently manually ACKs via its own verb handler logic anyway,
 					 * but this formally signals the core that the chunk was 'accepted' for now.
@@ -276,6 +286,9 @@ dht_on_rx_data(struct lws_transport_sequencer *ts, uint64_t offset,
 				}
 
 				return n;
+
+pass:
+				;
 			}
 		} lws_end_foreach_dll(d);
 	}
@@ -292,14 +305,15 @@ dht_on_state_change(struct lws_transport_sequencer *ts, int state, int status)
 {
 	lws_dht_ts_t *dts = (lws_dht_ts_t *)lws_transport_sequencer_get_info(ts)->user_data;
 
-	if (!dts->ctx->cb)
-		return;
+	if (dts->ctx->cb)
+		dts->ctx->cb(dts->ctx->closure,
+			     state == 0 ? LWS_DHT_EVENT_WRITE_COMPLETED :
+					  LWS_DHT_EVENT_WRITE_FAILED,
+			     NULL, (void *)(intptr_t)status, 0,
+			     (struct sockaddr *)&dts->sa, dts->salen);
 
-	dts->ctx->cb(dts->ctx->closure,
-		     state == 0 ? LWS_DHT_EVENT_WRITE_COMPLETED :
-				  LWS_DHT_EVENT_WRITE_FAILED,
-		     NULL, (void *)(intptr_t)status, 0,
-		     (struct sockaddr *)&dts->sa, dts->salen);
+	lws_dll2_remove(&dts->list);
+	lws_free(dts);
 }
 
 static const lws_transport_sequencer_ops_t dht_seq_ops = {
@@ -486,6 +500,60 @@ lws_dht_stats_periodic(lws_sorted_usec_list_t *sul)
 			 lws_dht_stats_periodic, 600 * LWS_US_PER_SEC);
 }
 
+#if defined(LWS_WITH_DHT_BACKEND)
+static void
+lws_dht_sul_ip_monitor_cb(lws_sorted_usec_list_t *sul)
+{
+	struct lws_dht_ctx *ctx = lws_container_of(sul, struct lws_dht_ctx, sul_ip_monitor);
+	struct bucket *b;
+	struct node *n;
+	int sent = 0;
+	uint8_t tid[4];
+
+	ctx->ip_monitor_seqno++;
+	tid[0] = 'i';
+	tid[1] = 'p';
+	memcpy(tid + 2, &ctx->ip_monitor_seqno, 2);
+
+	b = ctx->buckets;
+	while (b && sent < 8) {
+		n = b->nodes;
+		while (n && sent < 8) {
+			if (node_good(ctx, n)) {
+				send_ping(ctx, (struct sockaddr *)&n->ss, n->sslen, tid, 4);
+				sent++;
+			}
+			n = n->next;
+		}
+		b = b->next;
+	}
+
+	sent = 0;
+	b = ctx->buckets6;
+	while (b && sent < 8) {
+		n = b->nodes;
+		while (n && sent < 8) {
+			if (node_good(ctx, n)) {
+				send_ping(ctx, (struct sockaddr *)&n->ss, n->sslen, tid, 4);
+				sent++;
+			}
+			n = n->next;
+		}
+		b = b->next;
+	}
+
+	lws_sul_schedule(ctx->vhost->context, 0, &ctx->sul_ip_monitor,
+			 lws_dht_sul_ip_monitor_cb, 600 * LWS_US_PER_SEC);
+}
+
+LWS_VISIBLE LWS_EXTERN void
+lws_dht_test_external_ips(struct lws_dht_ctx *ctx)
+{
+	lws_sul_schedule(ctx->vhost->context, 0, &ctx->sul_ip_monitor,
+			 lws_dht_sul_ip_monitor_cb, 1);
+}
+#endif
+
 int
 lws_dht_get_stats(struct lws_vhost *vh, struct lws_dht_stats *current,
 		  const struct lws_dht_stats **history, int *head)
@@ -667,6 +735,9 @@ lws_dht_create(const lws_dht_info_t *info)
 
 	expire_buckets(ctx, ctx->buckets);
 	expire_buckets(ctx, ctx->buckets6);
+
+	lws_sul_schedule(ctx->vhost->context, 0, &ctx->sul_ip_monitor,
+			 lws_dht_sul_ip_monitor_cb, 5 * LWS_US_PER_SEC);
 #endif
 
 	lws_sul_schedule(ctx->vhost->context, 0, &ctx->sul_stats,
@@ -702,6 +773,18 @@ lws_dht_destroy(struct lws_dht_ctx **pctx)
 	if (!ctx)
 		return;
 
+	if (ctx->wsi_v4) {
+		*((struct lws_dht_ctx **)lws_wsi_user(ctx->wsi_v4)) = NULL;
+		lws_set_timeout(ctx->wsi_v4, 1, LWS_TO_KILL_ASYNC);
+		ctx->wsi_v4 = NULL;
+	}
+
+	if (ctx->wsi_v6) {
+		*((struct lws_dht_ctx **)lws_wsi_user(ctx->wsi_v6)) = NULL;
+		lws_set_timeout(ctx->wsi_v6, 1, LWS_TO_KILL_ASYNC);
+		ctx->wsi_v6 = NULL;
+	}
+
 	lws_dll2_remove(&ctx->list);
 
 	if (ctx->name)
@@ -709,6 +792,7 @@ lws_dht_destroy(struct lws_dht_ctx **pctx)
 
 	lws_sul_cancel(&ctx->sul);
 	lws_sul_cancel(&ctx->sul_stats);
+	lws_sul_cancel(&ctx->sul_ip_monitor);
 
 	lws_dht_hash_destroy(&ctx->myid);
 
@@ -951,14 +1035,14 @@ lws_dht_notify_subscribers(struct lws_dht_ctx *ctx, const lws_dht_hash_t *hash, 
 		if (ctx->now.tv_sec <= sub->expire) {
 			/* Only notify if the content actually changed from what they have */
 			if (memcmp(sub->current_sha256, sha256, 32)) {
-				send_notify(ctx, (struct sockaddr *)&sub->ss, sub->sslen, sub->tid, sub->tid_len, hash, sha256);
-				
+				lws_dht_send_notify(ctx, (struct sockaddr *)&sub->ss, sub->sslen, sub->tid, sub->tid_len, hash, sha256, NULL, 0);
+
 				/* Queue up reliable delivery retry state */
 				sub->pending_notify = 1;
 				sub->notify_retries = 0;
 				sub->last_notify = ctx->now.tv_sec;
 				memcpy(sub->pending_sha256, sha256, 32);
-				
+
 				count++;
 			}
 		}
@@ -976,14 +1060,14 @@ lws_dht_clear_pending_notify(struct lws_dht_ctx *ctx, const uint8_t *tid, size_t
 {
 #if defined(LWS_WITH_DHT_BACKEND)
 	struct storage *st = ctx->storage;
-	
+
 	if (!ctx || !tid || tid_len != 16)
 		return;
 
 	while (st) {
 		struct subscriber *sub = st->subscribers;
 		while (sub) {
-			if (sub->pending_notify && sub->tid_len == tid_len && 
+			if (sub->pending_notify && sub->tid_len == tid_len &&
 			    !memcmp(sub->tid, tid, tid_len)) {
 				/* ACK received! */
 				sub->pending_notify = 0;
@@ -1046,88 +1130,37 @@ lws_dht_destroy_all_on_vhost(struct lws_vhost *vh)
 LWS_VISIBLE LWS_EXTERN int
 lws_dht_get_fallback_node(struct lws_context *cx, const char *custom_path, char *result, size_t result_len)
 {
-	int fd;
-	char buf[256];
-	ssize_t n;
-	const char *default_paths[] = {
-		LWS_INSTALL_DATADIR"/libwebsockets/libwebsockets-dht-nodes.txt",
-		"./libwebsockets-dht-nodes.txt",
-		"../libwebsockets-dht-nodes.txt",
-		NULL
-	};
-	const char *path = NULL;
-	int total_lines = 0, target_line, current_line = 0;
-	char *p, *start;
+	lws_system_policy_t *policy;
+	const char *path = "/etc/lwsws/policy";
 	uint32_t random_val;
-	int i = 0;
+	int target_idx, current_idx = 0;
 
-	if (custom_path) {
-		fd = open(custom_path, O_RDONLY);
-		if (fd >= 0)
-			path = custom_path;
-	} else {
-		while (default_paths[i]) {
-			fd = open(default_paths[i], O_RDONLY);
-			if (fd >= 0) {
-				path = default_paths[i];
-				break;
-			}
-			i++;
-		}
-	}
+	if (custom_path)
+		path = custom_path;
 
-	if (fd < 0 || !path) {
-		lwsl_err("%s: Unable to open fallback file\n", __func__);
+	if (lws_system_parse_policy(cx, path, &policy)) {
+		lwsl_err("%s: Unable to parse policy %s\n", __func__, path);
 		return 1;
 	}
 
-	n = read(fd, buf, sizeof(buf) - 1);
-	if (n <= 0) {
-		close(fd);
-		return 1;
-	}
-	buf[n] = '\0';
-	
-	/* Count lines */
-	p = buf;
-	while (*p) {
-		if (*p == '\n') total_lines++;
-		p++;
-	}
-	if (*(p - 1) != '\n') total_lines++; /* file might lack trailing newline */
-
-	if (total_lines == 0) {
-		close(fd);
+	if (!policy->seeds.count) {
+		lwsl_err("%s: No seeds in policy\n", __func__);
+		lws_system_policy_free(policy);
 		return 1;
 	}
 
 	lws_get_random(cx, &random_val, sizeof(random_val));
-	target_line = (int)(random_val % (uint32_t)total_lines);
+	target_idx = (int)(random_val % policy->seeds.count);
 
-	/* Pick specific line */
-	p = buf;
-	start = p;
-	while (*p) {
-		if (*p == '\n' || *(p + 1) == '\0') {
-			if (current_line == target_line) {
-				size_t len;
-				if (*p == '\n')
-					*p = '\0';
-				
-				len = (size_t)(p - start);
-				if (*start && len > 0) {
-					lws_strncpy(result, start, result_len);
-					close(fd);
-					return 0;
-				}
-				break;
-			}
-			current_line++;
-			start = p + 1;
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&policy->seeds)) {
+		if (current_idx++ == target_idx) {
+			lws_system_seed_t *s = lws_container_of(d, lws_system_seed_t, list);
+			lws_strncpy(result, s->hostname, result_len);
+			lws_system_policy_free(policy);
+			return 0;
 		}
-		p++;
-	}
+	} lws_end_foreach_dll(d);
 
-	close(fd);
+	lws_system_policy_free(policy);
 	return 1;
 }

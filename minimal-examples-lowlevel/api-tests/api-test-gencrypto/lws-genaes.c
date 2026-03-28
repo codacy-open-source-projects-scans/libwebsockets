@@ -326,7 +326,7 @@ test_genaes_ctr(void)
 	size_t nc_off = 0;
 
 	int n;
-	
+
 	e.buf = (uint8_t *)ctr_key;
 	e.len = sizeof(ctr_key);
 
@@ -430,7 +430,7 @@ test_genaes_ecb(void)
 	 * a wrapper on a static binary key.
 	 */
 	int n;
-	
+
 	e.buf = (uint8_t *)ecb_key;
 	e.len = sizeof(ecb_key);
 

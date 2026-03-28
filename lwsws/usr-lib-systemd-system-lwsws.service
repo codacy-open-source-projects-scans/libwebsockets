@@ -5,7 +5,6 @@ After=syslog.target
 [Service]
 ExecStart=/usr/local/bin/lwsws
 ExecReload=/usr/bin/kill -HUP $MAINPID
-ExecStop=/usr/bin/killall lwsws
 
 [Install]
 WantedBy=multi-user.target

@@ -111,7 +111,7 @@ callback_lws_dht_stats(struct lws *wsi, enum lws_callback_reasons reason, void *
 			if (i < LWS_DHT_STAT_BUCKETS - 1)
 				n += lws_snprintf(p + n, lws_ptr_diff_size_t(end, p + n), ",\n");
 		}
-		
+
 		n += lws_snprintf(p + n, lws_ptr_diff_size_t(end, p + n), "\n  }\n}\n");
 
 		if (lws_write(wsi, pre + LWS_PRE, (size_t)n, LWS_WRITE_TEXT) < 0) {

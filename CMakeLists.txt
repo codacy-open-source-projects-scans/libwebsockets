@@ -192,22 +192,13 @@ option(LWS_WITH_UPNG "Enable stateful PNG stream decoder" ON)
 option(LWS_WITH_GZINFLATE "Enable internal minimal gzip inflator" ON)
 option(LWS_WITH_JPEG "Enable stateful JPEG stream decoder" ON)
 option(LWS_WITH_DLO "Enable Display List Objects" ON)
+option(LWS_WITH_WEBRTC "Enable WebRTC" OFF)
 option(LWS_WITH_TRANSCODE "Enable video transcoding support (requires ffmpeg)" OFF)
 option(LWS_WITH_V4L2 "Enable V4L2 support (Linux only)" OFF)
 option(LWS_WITH_LIBV4L2 "Link against libv4l2 if available" OFF)
-
-if (LWS_WITH_LIBV4L2)
-    find_library(LIBV4L2_LIBRARIES NAMES v4l2)
-    find_path(LIBV4L2_INCLUDE_DIRS NAMES libv4l2.h)
-    if (LIBV4L2_LIBRARIES AND LIBV4L2_INCLUDE_DIRS)
-        set(LWS_HAVE_LIBV4L2 1)
-        include_directories("${LIBV4L2_INCLUDE_DIRS}")
-        list(APPEND LIB_LIST_AT_END ${LIBV4L2_LIBRARIES})
-        list(APPEND LIB_LIST ${LIBV4L2_LIBRARIES})
-    else()
-        message(FATAL_ERROR "LWS_WITH_LIBV4L2 enabled but libv4l2 not found")
-    endif()
-endif()
+option(LWS_WITH_AUTH_SERVER "Include auth server plugin and its assets" OFF)
+option(LWS_WITH_EMAIL "Include async SMTP client plugin" OFF)
+option(LWS_WITH_QRCODEGEN "Include qrcodegen library natively" OFF)
 
 #
 # Secure Streams
@@ -880,6 +871,19 @@ if (LWS_WITH_V4L2)
 	endif()
 endif()
 
+if (LWS_WITH_LIBV4L2)
+    find_library(LIBV4L2_LIBRARIES NAMES v4l2)
+    find_path(LIBV4L2_INCLUDE_DIRS NAMES libv4l2.h)
+    if (LIBV4L2_LIBRARIES AND LIBV4L2_INCLUDE_DIRS)
+        set(LWS_HAVE_LIBV4L2 1)
+        include_directories("${LIBV4L2_INCLUDE_DIRS}")
+        list(APPEND LIB_LIST_AT_END ${LIBV4L2_LIBRARIES})
+        list(APPEND LIB_LIST ${LIBV4L2_LIBRARIES})
+    else()
+        message(FATAL_ERROR "LWS_WITH_LIBV4L2 enabled but libv4l2 not found")
+    endif()
+endif()
+
 
 if (LWS_WITH_ZLIB AND NOT LWS_WITH_BUNDLED_ZLIB)
 	if (LWS_WITH_MINIZ)
@@ -1322,8 +1326,10 @@ install(DIRECTORY include/libwebsockets
 	DESTINATION "${LWS_INSTALL_INCLUDE_DIR}" COMPONENT dev)
 install(FILES ${PROJECT_BINARY_DIR}/include/libwebsockets.h ${PROJECT_BINARY_DIR}/include/lws_config.h
 	DESTINATION "${LWS_INSTALL_INCLUDE_DIR}" COMPONENT dev)
-install(FILES ${PROJECT_SOURCE_DIR}/assets/libwebsockets-dht-nodes.txt
-	DESTINATION share/libwebsockets COMPONENT dev)
+install(CODE "
+	execute_process(COMMAND useradd -r -M lwsws-priv ERROR_QUIET)
+	execute_process(COMMAND useradd -r -M lwsws ERROR_QUIET)
+")
 
 # Generate the config file for the installation tree.
 get_filename_component(LWS_ABSOLUTE_INSTALL_CMAKE_DIR ${LWS_INSTALL_CMAKE_DIR} ABSOLUTE)

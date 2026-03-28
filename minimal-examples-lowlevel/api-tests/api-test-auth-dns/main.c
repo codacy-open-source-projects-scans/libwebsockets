@@ -65,7 +65,7 @@ int main(int argc, const char **argv)
 	}
 
 	lwsl_user("lws_auth_dns_sign_zone: ok\n");
-	
+
 	/* Verify the generated zone file RRSIGs directly */
 	memset(&info, 0, sizeof(info));
 	info.cx = cx;
@@ -88,13 +88,13 @@ int main(int argc, const char **argv)
 		char temp[32768];
 		int temp_len = sizeof(temp);
 		struct stat st;
-		
+
 		int fd = open(info.jws_filepath, LWS_O_RDONLY);
 		if (fd < 0 || fstat(fd, &st) < 0) {
 			lwsl_err("Failed to open JWS file\n");
 			goto bail;
 		}
-		
+
 		char *buf = malloc((size_t)st.st_size + 1);
 		if (!buf || read(fd, buf, (size_t)st.st_size) != st.st_size) {
 			if (buf) free(buf);
@@ -104,20 +104,20 @@ int main(int argc, const char **argv)
 		}
 		buf[st.st_size] = '\0';
 		close(fd);
-		
+
 		if (lws_jwk_load(&jwk, info.ksk_jwk_filepath, NULL, NULL)) {
 			free(buf);
 			lwsl_err("Failed to load JWK for verification\n");
 			goto bail;
 		}
-		
+
 		if (lws_jws_sig_confirm_compact_b64(buf, (size_t)st.st_size, &map, &jwk, cx, temp, &temp_len)) {
 			lws_jwk_destroy(&jwk);
 			free(buf);
 			lwsl_err("Failed to verify outer JWS signature\n");
 			goto bail;
 		}
-		
+
 		lwsl_user("JWS signature verified: ok\n");
 		lws_jwk_destroy(&jwk);
 		free(buf);

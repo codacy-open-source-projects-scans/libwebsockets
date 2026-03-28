@@ -7,14 +7,14 @@ This standalone utility dynamically calls into the `lws-dht-dnssec` plugin to ge
 It requires `libwebsockets` built utilizing:
 ```cmake
 -DLWS_WITH_DHT_BACKEND=1
--DLWS_WITH_GENCRYPTO=1 
+-DLWS_WITH_GENCRYPTO=1
 -DLWS_WITH_JOSE=1
 -DLWS_WITH_PLUGINS=1
 ```
 
 ## Key Generation (`keygen`)
 
-Generates cryptographically secure Key Signing Key (KSK) and Zone Signing Key (ZSK) pairs simultaneously, natively leveraging `lws_gencrypto`. 
+Generates cryptographically secure Key Signing Key (KSK) and Zone Signing Key (ZSK) pairs simultaneously, natively leveraging `lws_gencrypto`.
 
 Usage: `lws-crypto-dnssec keygen [--type <RSA|EC>] [--bits <size>] [--curve <curve>] <domain>`
 
@@ -57,6 +57,7 @@ Verifies and cryptographically signs a raw zone file, incorporating both your KS
 Usage: `lws-crypto-dnssec signzone [--duration <hours>] <domain>`
 
 - Iterates and parses `<domain>.zone` (The user-provided mock base-zone).
+- Automatically bumps the SOA serial number using the `YYYYMMDDnn` format natively.
 - Locates `<domain>.ksk.private.jwk` and `<domain>.zsk.private.jwk`.
 - Emits `<domain>.zone.signed` containing all initial `A`, `NS`, `SOA` records and appending the newly compiled `DNSKEY` and `RRSIG` combinations.
 - Outputs `<domain>.zone.signed.jws` representing the completed JSON Web Signature payload securely ingestible into the DHT network.

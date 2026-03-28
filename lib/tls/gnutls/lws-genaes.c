@@ -249,7 +249,7 @@ lws_genaes_destroy(struct lws_genaes_ctx *ctx, unsigned char *tag, size_t tlen)
 	if (ctx->ctx) {
 		if (tag && tlen && ctx->mode == LWS_GAESM_GCM && ctx->op == LWS_GAESO_ENC)
 			gnutls_cipher_tag(ctx->ctx, tag, tlen);
-		
+
 		if (ctx->op == LWS_GAESO_ENC && ctx->padding == LWS_GAESP_WITH_PADDING &&
 		    ctx->mode == LWS_GAESM_CBC && tag) {
 			uint8_t pad_val = (uint8_t)(16 - ctx->buf_len);
@@ -257,7 +257,7 @@ lws_genaes_destroy(struct lws_genaes_ctx *ctx, unsigned char *tag, size_t tlen)
 			if (gnutls_cipher_encrypt2(ctx->ctx, ctx->buf, 16, tag, 16) < 0)
 				lwsl_err("%s: final padding block encrypt failed\n", __func__);
 		}
-		
+
 		gnutls_cipher_deinit(ctx->ctx);
 	}
 	ctx->ctx = NULL;

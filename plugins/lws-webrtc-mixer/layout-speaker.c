@@ -32,7 +32,7 @@ lm_speaker_create(struct mixer_room *r)
 	struct lm_speaker_ctx *ctx = calloc(1, sizeof(*ctx));
 	if (!ctx)
 		return NULL;
-	
+
 	ctx->room = r;
 	return ctx;
 }
@@ -80,10 +80,10 @@ lm_speaker_update(struct mixer_room *r, void *vctx)
 
 	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&vhd->sessions)) {
 		struct mixer_media_session *s = lws_container_of(d, struct mixer_media_session, list);
-		
+
 		if (strcmp(s->room_name, r->name))
 			goto skip;
-		
+
 		if (!s->joined && !s->out_only)
 			goto skip;
 
@@ -197,14 +197,14 @@ skip:
 
 	int base_w = (int)r->master_w;
 	int base_h = (int)r->master_h;
-	
+
 	/* Layout strategy for 1080p:
 	 * Speaker: Most space, bottom-left aligned.
 	 * Max width for speaker if margin is taking some space: base_w - margin_w
 	 */
 	int margin_w = base_w > 1280 ? (base_w * 160) / 1920 : (base_w * 15) / 100; // ~160px on 1080p
 	int speaker_max_w = base_w - margin_w - 10; // 10px spacing
-	
+
 	/* 16:9 ratio for speaker max height */
 	int speaker_max_h = (speaker_max_w * 9) / 16;
 	if (speaker_max_h > base_h) {
@@ -266,7 +266,7 @@ lm_speaker_get_json(void *vctx)
 		struct lws_mixer_layout_region *reg = &ctx->regions[i];
 		struct mixer_media_session *s = reg->s;
 		struct participant *part = (struct participant *)s->parent_p;
-		
+
 		/* Calculate percentages */
 		int x_pct = (reg->x * 100) / (int)ctx->room->master_w;
 		int y_pct = (reg->y * 100) / (int)ctx->room->master_h;
@@ -283,7 +283,7 @@ lm_speaker_get_json(void *vctx)
 			lws_json_purify(stats_esc, part->stats, sizeof(stats_esc), NULL);
 		}
 
-		p += lws_snprintf(p, lws_ptr_diff_size_t(end, p), 
+		p += lws_snprintf(p, lws_ptr_diff_size_t(end, p),
 			"{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"text\":\"%s\\n%s\"}",
 			x_pct, y_pct, w_pct, h_pct, name_esc, stats_esc);
 	}

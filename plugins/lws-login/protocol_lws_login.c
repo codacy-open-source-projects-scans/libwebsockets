@@ -1,12 +1,13 @@
 /*
- * ws protocol handler plugin for "lws login"
+ * ws protocol handler plugin for "lws login" / auth bouncer
  *
- * Written in 2010-2025 by Andy Green <andy@warmcat.com>
+ * Written in 2010-2026 by Andy Green <andy@warmcat.com>
  *
  * This file is made available under the Creative Commons CC0 1.0
  * Universal Public Domain Dedication.
  *
- * This plugin provides SQLite3-based authentication as a mount-based interceptor.
+ * This plugin translates an LWS Mount Interceptor into a JWT-driven bouncer
+ * depending on lws_jwt_auth. Unauthenticated connections are bounced transparently.
  */
 
 #if !defined(LWS_PLUGIN_STATIC)
@@ -21,78 +22,49 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <sqlite3.h>
 
-struct lws_login_user {
-	char username[32];
-	char password[64];
-};
-
-static const lws_struct_map_t lsm_user[] = {
-	LSM_CARRAY(struct lws_login_user, username, "username"),
-	LSM_CARRAY(struct lws_login_user, password, "password"),
-};
-
-static const lws_struct_map_t lsm_schema[] = {
-	LSM_SCHEMA(struct lws_login_user, NULL, lsm_user, "users"),
+struct login_whitelist {
+	lws_dll2_t list;
+	lws_sockaddr46 sa46;
+	int net_len;
 };
 
 struct vhd_login {
 	struct lws_context *context;
 	struct lws_vhost *vhost;
-	const char *db_path;
-	const char *asset_dir;
-	sqlite3 *pdb;
+	struct lws_dll2_owner wl;
 
-	/* Captcha/JWT config inherited or explicitly set */
-	const char *jwt_issuer;
-	const char *jwt_audience;
+	/* PVO settings */
 	const char *cookie_name;
+	const char *service_name;
+	const char *auth_server_url;
+	int min_grant_level;
+
+	char db_path[256];
+	sqlite3 *db;
+	char auth_domain[128];
+	uint64_t jwt_validity_secs;
+
 	struct lws_jwk jwk;
-	char jwt_alg[32];
-	int jwt_expiry;
 };
 
 struct pss_login {
-	struct lws_spa *spa;
-	char username[32];
-	char password[64];
-	uint8_t login_attempted:1;
-};
-
-static const char * const param_names[] = {
-	"username",
-	"password",
-};
-
-enum enum_param_names {
-	EPN_USERNAME,
-	EPN_PASSWORD,
+	struct lws_jwt_auth *ja;
+	uint8_t whitelist_failed;
+	char *silent_update_jwt;
 };
 
 static int
-lws_login_verify_credentials(struct vhd_login *vhd, const char *user, const char *pass)
+lws_login_jwt_auth_cb(struct lws_jwt_auth *ja, int state, void *user)
 {
-	lws_dll2_owner_t owner;
-	struct lws_login_user *u;
-	char filter[128];
-	struct lwsac *ac = NULL;
-	int n = -1;
+	struct lws *wsi = (struct lws *)user;
 
-	lws_dll2_owner_clear(&owner);
-	lws_snprintf(filter, sizeof(filter), "username = '%s'", user);
-
-	if (lws_struct_sq3_deserialize(vhd->pdb, filter, NULL, lsm_schema, &owner, &ac, 0, 1)) {
-		lwsl_err("%s: db query failed\n", __func__);
-		return -1;
+	if (state == LWS_JWT_AUTH_STATE_EXPIRED) {
+		lwsl_notice("%s: Session expired naturally, killing wsi\n", __func__);
+		lws_set_timeout(wsi, PENDING_TIMEOUT_KILLED_BY_SSL_INFO, LWS_TO_KILL_ASYNC);
 	}
-
-	u = (struct lws_login_user *)lws_dll2_get_head(&owner);
-	if (u && !strcmp(u->password, pass))
-		n = 0;
-
-	lwsac_free(&ac);
-
-	return n;
+	return 0;
 }
 
 static int
@@ -107,7 +79,6 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 
 	switch (reason) {
 	case LWS_CALLBACK_PROTOCOL_INIT:
-
 		if (!in)
 			return 0;
 		vhd = lws_protocol_vh_priv_zalloc(lws_get_vhost(wsi),
@@ -117,43 +88,49 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 
 		vhd->context = lws_get_context(wsi);
 		vhd->vhost = lws_get_vhost(wsi);
-		vhd->jwt_expiry = 3600;
-		vhd->cookie_name = "lws_login_jwt";
-		vhd->jwt_issuer = "lws";
-		vhd->jwt_audience = "lws";
-		lws_strncpy(vhd->jwt_alg, "HS256", sizeof(vhd->jwt_alg));
 
-		if (lws_pvo_get_str(in, "db-path", &vhd->db_path)) {
-			lwsl_vhost_warn(lws_get_vhost(wsi), "%s: db-path PVO required\n", __func__);
-			return -1;
-		}
+		vhd->cookie_name = "auth_session";
+		vhd->service_name = "default-service";
+		vhd->min_grant_level = 1;
+		lws_strncpy(vhd->auth_domain, "auth.warmcat.com", sizeof(vhd->auth_domain));
+		vhd->jwt_validity_secs = 86400;
 
-		if (lws_struct_sq3_open(vhd->context, vhd->db_path, 1, &vhd->pdb)) {
-			lwsl_err("%s: failed to open db %s\n", __func__, vhd->db_path);
-			return -1;
-		}
-
-		if (lws_struct_sq3_create_table(vhd->pdb, lsm_schema)) {
-			lwsl_err("%s: failed to create table\n", __func__);
-			return -1;
-		}
-
-		if (!lws_pvo_get_str(in, "asset-dir", &vhd->asset_dir))
-			if (!strncmp(vhd->asset_dir, "file://", 7))
-				vhd->asset_dir += 7;
-
-		if (lws_pvo_get_str(in, "jwt-issuer", &vhd->jwt_issuer))
-			lwsl_info("%s: default jwt-issuer\n", __func__);
-		if (lws_pvo_get_str(in, "jwt-audience", &vhd->jwt_audience))
-			lwsl_info("%s: default jwt-audience\n", __func__);
 		if (lws_pvo_get_str(in, "cookie-name", &vhd->cookie_name))
-			lwsl_info("%s: default cookie-name\n", __func__);
-		if (!lws_pvo_get_str(in, "jwt-alg", &cp))
-			lws_strncpy(vhd->jwt_alg, cp, sizeof(vhd->jwt_alg));
-		if (!lws_pvo_get_str(in, "jwt-expiry", &cp))
-			vhd->jwt_expiry = atoi(cp);
+			lwsl_info("%s: default cookie-name %s\n", __func__, vhd->cookie_name);
 
-		if (!lws_pvo_get_str(in, "jwt-jwk", &cp)) {
+		{
+			const struct lws_protocol_vhost_options *pvo = (const struct lws_protocol_vhost_options *)in;
+			while (pvo) {
+				if (!strcmp(pvo->name, "whitelist")) {
+					struct login_whitelist *w = malloc(sizeof(*w));
+					if (!w) {
+						lwsl_err("%s: OOM\n", __func__);
+						return -1;
+					}
+					memset(w, 0, sizeof(*w));
+					if (lws_parse_cidr(pvo->value, &w->sa46, &w->net_len) < 0) {
+						lwsl_err("%s: invalid whitelist CIDR %s\n", __func__, pvo->value);
+						free(w);
+						return -1;
+					}
+					lws_dll2_add_tail(&w->list, &vhd->wl);
+				}
+				pvo = pvo->next;
+			}
+		}
+
+		if (lws_pvo_get_str(in, "service-name", &vhd->service_name))
+			lwsl_info("%s: default service-name %s\n", __func__, vhd->service_name);
+
+		if (lws_pvo_get_str(in, "auth-server-url", &vhd->auth_server_url)) {
+			lwsl_err("%s: auth-server-url PVO is REQUIRED\n", __func__);
+			return -1;
+		}
+
+		if (!lws_pvo_get_str(in, "min-grant-level", &cp))
+			vhd->min_grant_level = atoi(cp);
+
+		if (lws_pvo_get_str(in, "jwt-jwk", &cp)) {
 			if (cp[0] == '{' || lws_jwk_load(&vhd->jwk, cp, NULL, NULL)) {
 				if (lws_jwk_import(&vhd->jwk, NULL, NULL, cp, strlen(cp))) {
 					lwsl_err("%s: failed to load/import JWK\n", __func__);
@@ -161,118 +138,296 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 				}
 			}
 		} else {
-			lwsl_vhost_warn(lws_get_vhost(wsi), "%s: jwt-jwk PVO required\n", __func__);
+			lwsl_err("%s: jwt-jwk PVO required\n", __func__);
 			return -1;
 		}
+
+		if (!lws_pvo_get_str(in, "auth-domain", &cp))
+			lws_strncpy(vhd->auth_domain, cp, sizeof(vhd->auth_domain));
+
+		if (!lws_pvo_get_str(in, "jwt-validity-secs", &cp))
+			vhd->jwt_validity_secs = (uint64_t)atoll(cp);
+
+		if (!lws_pvo_get_str(in, "db-path", &cp)) {
+			lws_strncpy(vhd->db_path, cp, sizeof(vhd->db_path));
+			if (lws_struct_sq3_open(vhd->context, vhd->db_path, 1, &vhd->db)) {
+				lwsl_err("%s: db open failed\n", __func__);
+				return -1;
+			}
+			lwsl_notice("%s: Local database bound to %s\n", __func__, vhd->db_path);
+		}
+
 		break;
 
 	case LWS_CALLBACK_PROTOCOL_DESTROY:
 		if (vhd) {
-			lws_struct_sq3_close(&vhd->pdb);
+			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, vhd->wl.head) {
+				struct login_whitelist *w = lws_container_of(d, struct login_whitelist, list);
+				lws_dll2_remove(d);
+				free(w);
+			} lws_end_foreach_dll_safe(d, d1);
 			lws_jwk_destroy(&vhd->jwk);
+			if (vhd->db)
+				sqlite3_close(vhd->db);
 		}
 		break;
 
 	case LWS_CALLBACK_HTTP_INTERCEPTOR_CHECK:
-		return lws_interceptor_check(wsi, lws_get_protocol(wsi));
+	{
+		int level = -1;
+		struct lws_jwt_auth *ja;
+		int is_helper = 0;
+		char uri[256];
+
+		uri[0] = '\0';
+		if (lws_hdr_copy(wsi, uri, sizeof(uri), WSI_TOKEN_GET_URI) > 0) {
+			if (!strcmp(uri, "/.lws-login-status") || !strcmp(uri, "/lws-login.js"))
+				is_helper = 1;
+		}
+
+		if (vhd->wl.count) {
+			char ip[64];
+			lws_sockaddr46 sa46;
+			int match = 0;
+
+			lws_get_peer_simple(wsi, ip, sizeof(ip));
+			if (!lws_sa46_parse_numeric_address(ip, &sa46)) {
+				lws_start_foreach_dll(struct lws_dll2 *, d, vhd->wl.head) {
+					struct login_whitelist *w = lws_container_of(d, struct login_whitelist, list);
+					if (!lws_sa46_on_net(&sa46, &w->sa46, w->net_len)) {
+						match = 1;
+						break;
+					}
+				} lws_end_foreach_dll(d);
+			}
+
+			if (!match) {
+				lwsl_notice("%s: peer %s failed whitelist\n", __func__, ip);
+				pss->whitelist_failed = 1;
+				return 1; /* Request intercept to serve 403 */
+			}
+		}
+
+		ja = lws_jwt_auth_create(wsi, &vhd->jwk, vhd->cookie_name, lws_login_jwt_auth_cb, wsi);
+		if (ja) {
+			level = lws_jwt_auth_query_grant(ja, vhd->service_name);
+			if (level >= vhd->min_grant_level) {
+				lwsl_info("%s: authorized for %s\n", __func__, vhd->service_name);
+				pss->ja = ja;
+
+				if (vhd->db) {
+					uint32_t uid = lws_jwt_auth_get_uid(ja);
+					if (uid) {
+						char current_grants[512];
+						char *g_p = current_grants;
+						char *g_end = current_grants + sizeof(current_grants);
+						sqlite3_stmt *stmt;
+						int first = 1;
+						int mismatch = 0;
+						int count_db = 0;
+
+						g_p += lws_snprintf(g_p, lws_ptr_diff_size_t(g_end, g_p), "\"grants\":{");
+
+						if (sqlite3_prepare_v2(vhd->db, "SELECT s.name, g.grant_level FROM grants g JOIN services s ON g.service_id = s.service_id WHERE g.uid = ?", -1, &stmt, NULL) == SQLITE_OK) {
+							sqlite3_bind_int(stmt, 1, (int)uid);
+							while (sqlite3_step(stmt) == SQLITE_ROW) {
+								const char *svc_name = (const char *)sqlite3_column_text(stmt, 0);
+								int gl = sqlite3_column_int(stmt, 1);
+								if (!svc_name) continue;
+
+								count_db++;
+								int old_gl = lws_jwt_auth_query_grant(ja, svc_name);
+								if (old_gl != gl)
+									mismatch = 1;
+
+								if (!first)
+									g_p += lws_snprintf(g_p, lws_ptr_diff_size_t(g_end, g_p), ",");
+								first = 0;
+								g_p += lws_snprintf(g_p, lws_ptr_diff_size_t(g_end, g_p), "\"%s\":%d", svc_name, gl);
+							}
+							sqlite3_finalize(stmt);
+						}
+						g_p += lws_snprintf(g_p, lws_ptr_diff_size_t(g_end, g_p), "}");
+
+						if (count_db != (int)lws_jwt_auth_count_grants(ja))
+							mismatch = 1;
+
+						if (mismatch) {
+							char temp[1024];
+							char out[2048];
+							size_t out_len = sizeof(out);
+							uint64_t now = (uint64_t)time(NULL);
+							uint64_t exp = now + vhd->jwt_validity_secs;
+							const char *sub = lws_jwt_auth_get_sub(ja);
+
+							if (!lws_jwt_sign_compact(vhd->context, &vhd->jwk, "ES256",
+													  out, &out_len, temp, sizeof(temp),
+													  "{\"iss\":\"%s\",\"sub\":\"%s\",\"uid\":%u,"
+													  "\"iat\":%llu,\"exp\":%llu,%s}",
+													  vhd->auth_domain, sub ? sub : "Unknown", uid,
+													  (unsigned long long)now, (unsigned long long)exp,
+													  current_grants)) {
+								pss->silent_update_jwt = strdup(out);
+								lws_jwt_auth_destroy(&ja);
+								pss->ja = NULL;
+								lwsl_notice("%s: Dynamically replacing skewed JWT token grants natively\n", __func__);
+								return 1; /* Request to intercept so we can fire HTTP 302 */
+							}
+						}
+					}
+				}
+
+				if (is_helper)
+					return 1;
+				return 0; /* Let traffic through to the real mount */
+			}
+			lwsl_notice("%s: JWT valid but lacks required %s grant (has %d)\n", __func__, vhd->service_name, level);
+			lws_jwt_auth_destroy(&ja);
+		}
+
+		/* Unauthorized or no session, we must intercept, routing later to LWS_CALLBACK_HTTP */
+		return 1;
+	}
 
 	case LWS_CALLBACK_HTTP:
-		/* Serves the login page assets */
-		{
-			char path[512];
-			const char *uri = (const char *)in;
-			const char *ctype = "text/html";
+	{
+		char dest[512];
+		char path[256];
+		char urlenc_path[512];
 
-			if (!uri[0] || !strcmp(uri, "/"))
-				uri = "index.html";
+		if (pss && pss->whitelist_failed) {
+			const char *err = "Page Unreachable";
+			int len = (int)strlen(err);
 
-			lws_snprintf(path, sizeof(path), "%s/%s",
-				     vhd->asset_dir ? vhd->asset_dir : ".", uri);
-
-			ctype = lws_get_mimetype(path, NULL);
-			if (!ctype)
-				ctype = "text/html";
-
-			if (lws_serve_http_file(wsi, path, ctype, NULL, 0))
-				return 1;
-		}
-		return 0;
-
-	case LWS_CALLBACK_HTTP_BODY:
-		if (!pss->spa) {
-			pss->spa = lws_spa_create(wsi, param_names,
-					LWS_ARRAY_SIZE(param_names), 1024,
-					NULL, NULL);
-			if (!pss->spa)
-				return -1;
-		}
-
-		if (lws_spa_process(pss->spa, in, (int)len))
-			return -1;
-		break;
-
-	case LWS_CALLBACK_HTTP_BODY_COMPLETION:
-		lws_spa_finalize(pss->spa);
-		lws_strncpy(pss->username, lws_spa_get_string(pss->spa, EPN_USERNAME), sizeof(pss->username));
-		lws_strncpy(pss->password, lws_spa_get_string(pss->spa, EPN_PASSWORD), sizeof(pss->password));
-		pss->login_attempted = 1;
-		lws_callback_on_writable(wsi);
-		break;
-
-	case LWS_CALLBACK_HTTP_WRITEABLE:
-		if (!pss->login_attempted)
-			break;
-
-		if (!lws_login_verify_credentials(vhd, pss->username, pss->password)) {
-			/* Success! Issue cookie and redirect back */
-			/* We can't easily call lws_captcha_issue_cookie because it's vhd-specific
-			 * and expects vhd_captcha. We'll have to manually do it or
-			 * make it more generic. For now, let's assume we can use it if we
-			 * fake the VHD or if we just implement the signing here.
-			 */
-			struct lws_jwt_sign_set_cookie ck;
-
-			memset(&ck, 0, sizeof(ck));
-			ck.alg = vhd->jwt_alg;
-			ck.iss = vhd->jwt_issuer;
-			ck.aud = vhd->jwt_audience;
-			ck.jwk = &vhd->jwk;
-			lws_strncpy(ck.sub, pss->username, sizeof(ck.sub));
-			ck.cookie_name = vhd->cookie_name;
-			ck.expiry_unix_time = (unsigned long)vhd->jwt_expiry;
-
-			if (lws_add_http_header_status(wsi, HTTP_STATUS_SEE_OTHER, (unsigned char **)&p, (unsigned char *)end))
-				return 1;
-
-			/* Redirect to where we came from, or just / if unknown */
-			if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_LOCATION, (unsigned char *)"/", 1, (unsigned char **)&p, (unsigned char *)end))
-				return 1;
-
-			if (lws_jwt_sign_token_set_http_cookie(wsi, &ck, (uint8_t **)&p, (uint8_t *)end))
-				return 1;
-
-			if (lws_finalize_http_header(wsi, (unsigned char **)&p, (unsigned char *)end))
-				return 1;
-
-			lws_write(wsi, (unsigned char *)buf + LWS_PRE, lws_ptr_diff_size_t(p, buf + LWS_PRE), LWS_WRITE_HTTP_HEADERS | LWS_WRITE_H2_STREAM_END);
-			return lws_http_transaction_completed(wsi);
-		} else {
-			/* Failure - redirect back with error */
-			if (lws_add_http_header_status(wsi, HTTP_STATUS_SEE_OTHER, (unsigned char **)&p, (unsigned char *)end))
-				return 1;
-			if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_LOCATION, (unsigned char *)"/?error=Invalid+credentials", 27, (unsigned char **)&p, (unsigned char *)end))
+			if (lws_add_http_common_headers(wsi, HTTP_STATUS_FORBIDDEN, "text/plain",
+							(lws_filepos_t)len, (unsigned char **)&p, (unsigned char *)end))
 				return 1;
 			if (lws_finalize_http_header(wsi, (unsigned char **)&p, (unsigned char *)end))
 				return 1;
-			lws_write(wsi, (unsigned char *)buf + LWS_PRE, lws_ptr_diff_size_t(p, buf + LWS_PRE), LWS_WRITE_HTTP_HEADERS | LWS_WRITE_H2_STREAM_END);
+
+			lws_write(wsi, (unsigned char *)buf + LWS_PRE, lws_ptr_diff_size_t(p, buf + LWS_PRE), LWS_WRITE_HTTP_HEADERS);
+			lws_write(wsi, (unsigned char *)err, (size_t)len, LWS_WRITE_HTTP_FINAL);
 			return lws_http_transaction_completed(wsi);
 		}
-		break;
 
-	case LWS_CALLBACK_HTTP_DROP_PROTOCOL:
-		if (pss->spa) {
-			lws_spa_destroy(pss->spa);
-			pss->spa = NULL;
+		if (pss && pss->silent_update_jwt) {
+			char cookie[2048], host[128], fq_uri[512];
+
+			lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Max-Age=%llu; HttpOnly; SameSite=Lax",
+				     vhd->cookie_name, pss->silent_update_jwt, (unsigned long long)vhd->jwt_validity_secs);
+
+			path[0] = '\0';
+			host[0] = '\0';
+			lws_hdr_copy(wsi, path, sizeof(path), WSI_TOKEN_GET_URI);
+			lws_hdr_copy(wsi, host, sizeof(host), WSI_TOKEN_HOST);
+
+			lws_snprintf(fq_uri, sizeof(fq_uri), "%s://%s%s",
+				     lws_is_ssl(wsi) ? "https" : "http",
+				     host[0] ? host : "localhost", path);
+
+			if (lws_add_http_common_headers(wsi, HTTP_STATUS_FOUND, "text/html", 0, (unsigned char **)&p, (unsigned char *)end)) return 1;
+			if (lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie, (int)strlen(cookie), (unsigned char **)&p, (unsigned char *)end)) return 1;
+			if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_LOCATION, (unsigned char *)fq_uri, (int)strlen(fq_uri), (unsigned char **)&p, (unsigned char *)end)) return 1;
+			if (lws_finalize_http_header(wsi, (unsigned char **)&p, (unsigned char *)end)) return 1;
+
+			lws_write(wsi, (unsigned char *)buf + LWS_PRE, lws_ptr_diff_size_t(p, buf + LWS_PRE), LWS_WRITE_HTTP_HEADERS | LWS_WRITE_H2_STREAM_END);
+
+			free(pss->silent_update_jwt);
+			pss->silent_update_jwt = NULL;
+
+			return lws_http_transaction_completed(wsi);
+		}
+
+		path[0] = '\0';
+		lws_hdr_copy(wsi, path, sizeof(path), WSI_TOKEN_GET_URI);
+
+		if (!strcmp(path, "/lws-login.js")) {
+			const char *js =
+				"window.renderLwsLoginStatus = function(divId) {\n"
+				"    var el = document.getElementById(divId);\n"
+				"    if (!el) return;\n"
+				"    fetch('/.lws-login-status').then(function(res) { return res.json(); }).then(function(data) {\n"
+				"        if (data.logged_in) {\n"
+				"            el.innerHTML = '<span class=\"lws-login-identity\">Logged in as <b>' + data.identity + '</b></span> | <a href=\"#\" onclick=\"document.cookie=\\'' + data.cookie_name + '=; Max-Age=0; Path=/\\'; window.location.reload();\">Logout</a>';\n"
+				"        } else {\n"
+				"            el.innerHTML = '<a href=\"' + data.login_url + '\">Login / Authenticate</a>';\n"
+				"        }\n"
+				"    });\n"
+				"};\n";
+
+			if (lws_add_http_common_headers(wsi, HTTP_STATUS_OK, "application/javascript",
+							(lws_filepos_t)strlen(js), (unsigned char **)&p, (unsigned char *)end))
+				return 1;
+			if (lws_finalize_http_header(wsi, (unsigned char **)&p, (unsigned char *)end))
+				return 1;
+			lws_write(wsi, (unsigned char *)buf + LWS_PRE, lws_ptr_diff_size_t(p, buf + LWS_PRE), LWS_WRITE_HTTP_HEADERS);
+			lws_write(wsi, (unsigned char *)js, strlen(js), LWS_WRITE_HTTP_FINAL);
+			return lws_http_transaction_completed(wsi);
+		}
+
+		/* Reconstruct the fully qualified absolute URI so cross-domain redirects from auth server navigate back correctly */
+		char host[128];
+		char fq_uri[512];
+
+		host[0] = '\0';
+		lws_hdr_copy(wsi, host, sizeof(host), WSI_TOKEN_HOST);
+
+		lws_snprintf(fq_uri, sizeof(fq_uri), "%s://%s%s",
+			     lws_is_ssl(wsi) ? "https" : "http",
+			     host[0] ? host : "localhost",
+			     path);
+
+		lws_urlencode(urlenc_path, fq_uri, sizeof(urlenc_path));
+
+		lws_snprintf(dest, sizeof(dest), "%s?service_name=%s&redirect_uri=%s",
+			vhd->auth_server_url, vhd->service_name, urlenc_path);
+
+		if (!strcmp(path, "/.lws-login-status")) {
+			char pl[1024];
+			int len;
+			if (pss && pss->ja) {
+				const char *sub = lws_jwt_auth_get_sub(pss->ja);
+				len = lws_snprintf(pl, sizeof(pl), "{\"logged_in\":1,\"identity\":\"%s\",\"cookie_name\":\"%s\"}",
+					sub ? sub : "Unknown", vhd->cookie_name);
+			} else {
+				len = lws_snprintf(pl, sizeof(pl), "{\"logged_in\":0,\"login_url\":\"%s\"}", dest);
+			}
+
+			if (lws_add_http_common_headers(wsi, HTTP_STATUS_OK, "application/json",
+							(lws_filepos_t)len, (unsigned char **)&p, (unsigned char *)end))
+				return 1;
+			if (lws_finalize_http_header(wsi, (unsigned char **)&p, (unsigned char *)end))
+				return 1;
+			lws_write(wsi, (unsigned char *)buf + LWS_PRE, lws_ptr_diff_size_t(p, buf + LWS_PRE), LWS_WRITE_HTTP_HEADERS);
+			lws_write(wsi, (unsigned char *)pl, (size_t)len, LWS_WRITE_HTTP_FINAL);
+			return lws_http_transaction_completed(wsi);
+		}
+
+		lwsl_info("%s: bouncing unauth to %s\n", __func__, dest);
+
+		if (lws_add_http_header_status(wsi, HTTP_STATUS_SEE_OTHER, (unsigned char **)&p, (unsigned char *)end))
+			return 1;
+
+		if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_LOCATION,
+				(unsigned char *)dest, (int)strlen(dest), (unsigned char **)&p, (unsigned char *)end))
+			return 1;
+
+		if (lws_finalize_http_header(wsi, (unsigned char **)&p, (unsigned char *)end))
+			return 1;
+
+		lws_write(wsi, (unsigned char *)buf + LWS_PRE, lws_ptr_diff_size_t(p, buf + LWS_PRE), LWS_WRITE_HTTP_HEADERS | LWS_WRITE_H2_STREAM_END);
+
+		return lws_http_transaction_completed(wsi);
+	}
+
+	case LWS_CALLBACK_CLOSED_HTTP:
+	case LWS_CALLBACK_CLOSED:
+		if (pss && pss->ja) {
+			lws_jwt_auth_destroy(&pss->ja);
+		}
+		if (pss && pss->silent_update_jwt) {
+			free(pss->silent_update_jwt);
+			pss->silent_update_jwt = NULL;
 		}
 		break;
 
@@ -297,11 +452,6 @@ LWS_VISIBLE const struct lws_protocols protocols[] = {
 	LWS_PLUGIN_PROTOCOL_LWS_LOGIN
 };
 
-/*
- * The exported lws_plugin_protocol_t struct MUST be named EXACTLY the same as
- * your plugin's shared object suffix (after removing 'libprotocol_').
- * lwsws uses this exact string directly in its dlsym() lookup on startup.
- */
 LWS_VISIBLE const lws_plugin_protocol_t lws_login = {
 	.hdr = {
 		.name = "lws login",

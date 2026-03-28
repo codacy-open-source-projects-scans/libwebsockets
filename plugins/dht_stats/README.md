@@ -29,7 +29,7 @@ static const struct lws_http_mount mount_stats = {
 
 ## Per-Vhost Options (PVOs)
 
-The `lws-dht-stats` plugin is designed to operate seamlessly without requiring explicit Per-Vhost Options (PVOs). 
+The `lws-dht-stats` plugin is designed to operate seamlessly without requiring explicit Per-Vhost Options (PVOs).
 
 It automatically intelligently detects the underlying DHT execution context using the following resolution methodology:
 1. It queries `lws_get_vhost_by_name(..., "dht")` attempting to attach to a globally initialized `dht` designated vhost (which is the recommended LWS architecture pattern for isolating the DHT UDP backend).

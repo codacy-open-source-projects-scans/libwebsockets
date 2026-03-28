@@ -143,7 +143,7 @@ lws_dnssec_rrset_cb(const char *name, void *opaque, uint32_t ttl,
 
 	if (type != s->type_covered)
 		return 0;
-		
+
 	if (nl && name[nl - 1] == '.')
 		nl--;
 	if (sl && s->name[sl - 1] == '.')
@@ -339,6 +339,7 @@ lws_dnssec_dnskey_cb(struct lws *wsi, const char *name, const struct addrinfo *d
 							el[LWS_GENCRYPTO_RSA_KEYEL_E].buf = (uint8_t *)exp;
 							el[LWS_GENCRYPTO_RSA_KEYEL_E].len = (uint32_t)explen;
 							el[LWS_GENCRYPTO_RSA_KEYEL_N].buf = (uint8_t *)mod;
+							el[LWS_GENCRYPTO_RSA_KEYEL_N].len = (uint32_t)modlen;
 							if (lws_genrsa_create(&ctx, el, q->context, LGRSAM_PKCS1_1_5, hashtype) == 0) {
 								int res = lws_genrsa_hash_sig_verify(&ctx, vctx->hash, hashtype, vctx->sig_buf, (size_t)vctx->sig_len);
 								if (res == 0) {
@@ -367,7 +368,7 @@ lws_dnssec_dnskey_cb(struct lws *wsi, const char *name, const struct addrinfo *d
 complete:
 	q->dnssec_verify_rrsig = 0;
 	q->dnssec_valid = 1;
-	
+
 	if (is_async && q->responded == q->asked) {
 		lws_async_dns_complete(q, q->firstcache);
 		lws_adns_q_destroy(q);
@@ -472,7 +473,7 @@ lws_adns_dnssec_verify(lws_adns_q_t *q, const uint8_t *pkt, size_t len)
 			hashtype = LWS_GENHASH_TYPE_SHA256;
 			break;
 		case LWS_ADNS_DSA_RSA_SHA512:
-		       	hashtype = LWS_GENHASH_TYPE_SHA512;
+			hashtype = LWS_GENHASH_TYPE_SHA512;
 			break;
 		case LWS_ADNS_DSA_ECDSAP256SHA256:
 			hashtype = LWS_GENHASH_TYPE_SHA256;
@@ -530,8 +531,14 @@ lws_adns_dnssec_verify(lws_adns_q_t *q, const uint8_t *pkt, size_t len)
 		vctx->key_tag		= s.key_tag;
 
 		vctx->sig_len = (uint16_t)sig_len;
-		if (sig_len <= (int)sizeof(vctx->sig_buf))
+		if (sig_len <= (int)sizeof(vctx->sig_buf)) {
 			memcpy(vctx->sig_buf, s.rrsig_payload + rrsig_rdata_up_to_sig_len, (size_t)sig_len);
+		} else {
+			lwsl_err("%s: signature too large for buffer\n", __func__);
+			lws_free(vctx);
+			lws_genhash_destroy(&hash_ctx, NULL);
+			return -1;
+		}
 
 		lws_strncpy(vctx->signer_name, s.signer_name, sizeof(vctx->signer_name));
 
@@ -549,11 +556,17 @@ lws_adns_dnssec_verify(lws_adns_q_t *q, const uint8_t *pkt, size_t len)
 			return 1;
 		}
 
+		if (ret < 0) {
+			/* Query failed to initiate synchronously */
+			lws_free(vctx);
+			return -1;
+		}
+
 		/* Synchronous result from cache. The callback was already executed! */
 		if ((q->dns->dnssec_mode == LWS_ADNS_DNSSEC_REQUIRE) && !q->lacks_dnssec) {
 			return q->dnssec_valid ? 0 : -1;
 		}
-		
+
 		return 0;
 	}
 

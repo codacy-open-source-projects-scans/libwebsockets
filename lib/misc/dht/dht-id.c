@@ -230,4 +230,3 @@ common_bits(const lws_dht_hash_t *id1, const lws_dht_hash_t *id2)
 
 	return 8 * i + j;
 }
-

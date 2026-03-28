@@ -446,4 +446,3 @@ token_bucket(struct lws_dht_ctx *ctx)
 	ctx->token_bucket_tokens--;
 	return 1;
 }
-

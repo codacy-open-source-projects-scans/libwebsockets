@@ -1460,7 +1460,7 @@ handle_offer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, co
 			"a=end-of-candidates\\r\\n",
 		vhd->udp_port, pt_list[0] ? pt_list : "0", vhd->external_ip[0] ? vhd->external_ip : "127.0.0.1",
 		pss->ice_ufrag, pss->ice_pwd, vhd->fingerprint,
-		mid_video, 
+		mid_video,
 		rtpmap_lines,
 		pss->media->ssrc_video, pss->media->ssrc_video, candidates, candidates);
 

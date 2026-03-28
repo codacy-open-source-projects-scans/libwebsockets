@@ -363,7 +363,7 @@ send_announce_peer(struct lws_dht_ctx *ctx, const struct sockaddr *sa, size_t sa
 	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
 
 	if (dht_put_id__advance_offset(ctx, buf, &i, sizeof(buf), ctx->myid)) goto fail;
-	
+
 	rc = lws_snprintf(buf + i, sizeof(buf) - i, "9:info_hash%d:", dht_tx_id_len(ctx, infohash));
 	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
 
@@ -482,7 +482,7 @@ lws_dht_send_subscribe_confirm(struct lws_dht_ctx *ctx, const struct sockaddr *s
 	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
 
 	if (dht_put_id__advance_offset(ctx, buf, &i, sizeof(buf), ctx->myid)) goto fail;
-	
+
 	rc = lws_snprintf(buf + i, sizeof(buf) - i, "9:info_hash%d:", dht_tx_id_len(ctx, infohash));
 	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
 
@@ -495,7 +495,7 @@ lws_dht_send_subscribe_confirm(struct lws_dht_ctx *ctx, const struct sockaddr *s
 	rc = lws_snprintf(buf + i, sizeof(buf) - i, "5:token%d:", (int)token_len);
 	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
 	if (dht_tx_copy__advance_offset(buf, &i, sizeof(buf), token, token_len)) goto fail;
-	
+
 	rc = lws_snprintf(buf + i, sizeof(buf) - i, "e1:q17:subscribe_confirm1:t%d:", (int)tid_len);
 	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
 	if (dht_tx_copy__advance_offset(buf, &i, sizeof(buf), tid, tid_len)) goto fail;
@@ -511,15 +511,25 @@ fail:
 }
 
 int
-send_notify(struct lws_dht_ctx *ctx, const struct sockaddr *sa, size_t salen,
+lws_dht_send_notify(struct lws_dht_ctx *ctx, const struct sockaddr *sa, size_t salen,
 		const uint8_t *tid, size_t tid_len,
-		const lws_dht_hash_t *infohash, const uint8_t *sha256)
+		const lws_dht_hash_t *infohash, const uint8_t *sha256,
+		const uint8_t *payload, size_t payload_len)
 {
-	char buf[512];
+	char buf[1024]; /* Increased size to allow for payload */
 	size_t i = 0;
 	int rc;
 
-	rc = lws_snprintf(buf + i, sizeof(buf) - i, "d1:ad2:id%d:", dht_tx_id_len(ctx, ctx->myid));
+	rc = lws_snprintf(buf + i, sizeof(buf) - i, "d1:ad");
+	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+
+	if (payload && payload_len > 0) {
+		rc = lws_snprintf(buf + i, sizeof(buf) - i, "4:data%u:", (unsigned int)payload_len);
+		if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+		if (dht_tx_copy__advance_offset(buf, &i, sizeof(buf), payload, payload_len)) goto fail;
+	}
+
+	rc = lws_snprintf(buf + i, sizeof(buf) - i, "2:id%d:", dht_tx_id_len(ctx, ctx->myid));
 	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
 
 	if (dht_put_id__advance_offset(ctx, buf, &i, sizeof(buf), ctx->myid)) goto fail;
@@ -529,15 +539,17 @@ send_notify(struct lws_dht_ctx *ctx, const struct sockaddr *sa, size_t salen,
 
 	if (dht_put_id__advance_offset(ctx, buf, &i, sizeof(buf), infohash)) goto fail;
 
-	rc = lws_snprintf(buf + i, sizeof(buf) - i, "6:sha25632:");
-	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
-	if (dht_tx_copy__advance_offset(buf, &i, sizeof(buf), sha256, 32)) goto fail;
+	if (sha256) {
+		rc = lws_snprintf(buf + i, sizeof(buf) - i, "6:sha25632:");
+		if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
+		if (dht_tx_copy__advance_offset(buf, &i, sizeof(buf), sha256, 32)) goto fail;
+	}
 
 	rc = lws_snprintf(buf + i, sizeof(buf) - i, "e1:q6:notify1:t%d:", (int)tid_len);
 	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
 	if (dht_tx_copy__advance_offset(buf, &i, sizeof(buf), tid, tid_len)) goto fail;
 	if (dht_tx_add_v(buf, &i, sizeof(buf), ctx)) goto fail;
-	
+
 	rc = lws_snprintf(buf + i, sizeof(buf) - i, "1:y1:qe");
 	if (dht_tx_skip(&i, sizeof(buf), (size_t)(rc))) goto fail;
 
@@ -547,4 +559,3 @@ fail:
 	errno = ENOSPC;
 	return -1;
 }
-

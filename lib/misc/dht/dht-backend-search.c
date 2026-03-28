@@ -479,4 +479,3 @@ again:
 	ctx->search_time = ctx->now.tv_sec;
 	return 1;
 }
-

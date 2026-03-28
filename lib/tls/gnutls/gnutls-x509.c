@@ -130,7 +130,7 @@ lws_x509_parse_from_pem(struct lws_x509_cert *x509, const void *pem, size_t len)
 
 	data.data = (unsigned char *)pem;
 	data.size = (unsigned int)len;
-	
+
 	/* some backends like gnutls don't like trailing null bytes in PEM */
 	if (len > 0 && data.data[len - 1] == '\0')
 		data.size--;

@@ -162,4 +162,3 @@ expire_storage(struct lws_dht_ctx *ctx)
 	}
 	return 1;
 }
-

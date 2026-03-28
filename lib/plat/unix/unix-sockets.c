@@ -303,7 +303,7 @@ lws_plat_set_socket_options_ip(lws_sockfd_type fd, uint8_t pri, int lws_flags)
 
 #if !defined(__NuttX__)
 	/* array size differs by platform */
-	/* 
+	/*
 	 * AG: Disabled for DHT routing fixes on strict custom Linux router kernels.
 	 * UDP sendto() throws EINVAL if IP_TOS flags conflict with internal strict
 	 * routing table validation!

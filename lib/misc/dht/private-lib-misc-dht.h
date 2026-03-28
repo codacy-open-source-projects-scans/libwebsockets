@@ -231,6 +231,8 @@ struct lws_dht_ctx {
 		struct sockaddr_storage ss;
 		size_t			sslen;
 		int			count;
+		int			num_peers;
+		struct sockaddr_storage peer_ss[8];
 	} reported_ads[8];
 
 	int			num_reported_ads;
@@ -252,6 +254,8 @@ struct lws_dht_ctx {
 	struct lws_dht_stats	stats_current;
 	int			stats_history_head;
 	lws_sorted_usec_list_t	sul_stats;
+	lws_sorted_usec_list_t	sul_ip_monitor;
+	uint16_t		ip_monitor_seqno;
 
 	struct timeval		now;
 
@@ -368,7 +372,6 @@ int send_cached_ping(struct lws_dht_ctx *ctx, struct bucket *b);
 void mark_as_pinged(struct lws_dht_ctx *ctx, struct node *n, struct bucket *b);
 void flush_search_node(struct search_node *n, struct search *sr);
 int send_get_peers(struct lws_dht_ctx *ctx, const struct sockaddr *sa, size_t salen, uint8_t *tid, size_t tid_len, const lws_dht_hash_t *infohash, int want, int confirm);
-int send_notify(struct lws_dht_ctx *ctx, const struct sockaddr *sa, size_t salen, const uint8_t *tid, size_t tid_len, const lws_dht_hash_t *infohash, const uint8_t *sha256);
 int send_announce_peer(struct lws_dht_ctx *ctx, const struct sockaddr *sa, size_t salen, uint8_t *tid, size_t tid_len, const lws_dht_hash_t *infohash, unsigned short port, uint8_t *token, size_t token_len, int confirm);
 int rotate_secrets(struct lws_dht_ctx *ctx);
 void make_token(struct lws_dht_ctx *ctx, const struct sockaddr *sa, int old, uint8_t *token_return);

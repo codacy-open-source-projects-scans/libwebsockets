@@ -1663,5 +1663,3 @@ function appendChatMessage(msg) {
         }
     }
 }
-
-

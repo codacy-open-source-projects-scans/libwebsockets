@@ -70,7 +70,7 @@ policy_cb(struct lejp_ctx *ctx, char reason)
 	return 0;
 }
 
-static const char *default_policy = 
+static const char *default_policy =
 	"{\n"
 	"    \"dns_base_dir\": \"/etc/dnssec\",\n"
 	"    \"seeds\": [ \"selfdns.org\", \"uk1.selfdns.org\", \"asia1.selfdns.org\" ]\n"
@@ -95,13 +95,15 @@ lws_system_parse_policy(struct lws_context *cx, const char *filepath, lws_system
 			char dir[256];
 			lws_strncpy(dir, filepath, sizeof(dir));
 			dir[pt - filepath] = '\0';
-			mkdir(dir, 0755);
+			if (mkdir(dir, 0755) < 0)
+				lwsl_debug("%s: mkdir %s failed (may exist)\n", __func__, dir);
 		}
 #endif
 		fd = lws_open(filepath, O_CREAT | O_WRONLY | O_TRUNC, 0644);
 		if (fd >= 0) {
 			n = (int)write(fd, default_policy, strlen(default_policy));
 			close(fd);
+			fd = -1;
 			if (n == (int)strlen(default_policy))
 				fd = lws_open(filepath, O_RDONLY);
 		}

@@ -257,14 +257,16 @@ lws_auth_dns_rdata_to_wire(struct auth_dns_zone *z, struct auth_dns_rr *rr, uint
 		memset(&tm, 0, sizeof(tm));
 		if (strlen(toks[4]) == 14 && sscanf(toks[4], "%4d%2d%2d%2d%2d%2d", &tm.tm_year, &tm.tm_mon, &tm.tm_mday, &tm.tm_hour, &tm.tm_min, &tm.tm_sec) == 6) {
 			tm.tm_year -= 1900; tm.tm_mon -= 1;
-			uint32_t exp = (uint32_t)timegm(&tm);
+			uint64_t _exp64 = (uint64_t)timegm(&tm);
+			uint32_t exp = (uint32_t)_exp64;
 			w[wl++] = (uint8_t)(exp >> 24); w[wl++] = (uint8_t)(exp >> 16); w[wl++] = (uint8_t)(exp >> 8); w[wl++] = (uint8_t)(exp & 0xff);
 		} else goto fail;
 
 		memset(&tm, 0, sizeof(tm));
 		if (strlen(toks[5]) == 14 && sscanf(toks[5], "%4d%2d%2d%2d%2d%2d", &tm.tm_year, &tm.tm_mon, &tm.tm_mday, &tm.tm_hour, &tm.tm_min, &tm.tm_sec) == 6) {
 			tm.tm_year -= 1900; tm.tm_mon -= 1;
-			uint32_t inc = (uint32_t)timegm(&tm);
+			uint64_t _inc64 = (uint64_t)timegm(&tm);
+			uint32_t inc = (uint32_t)_inc64;
 			w[wl++] = (uint8_t)(inc >> 24); w[wl++] = (uint8_t)(inc >> 16); w[wl++] = (uint8_t)(inc >> 8); w[wl++] = (uint8_t)(inc & 0xff);
 		} else goto fail;
 
@@ -758,6 +760,8 @@ lws_auth_dns_sign_rrsets(struct lws_auth_dns_sign_info *info, struct auth_dns_zo
 {
 	if (info->zsk_jwk_filepath) {
 		struct lws_jwk zsk, ksk;
+		memset(&zsk, 0, sizeof(zsk));
+		memset(&ksk, 0, sizeof(ksk));
 		char *buf_zsk = NULL, *buf_ksk = NULL;
 		struct stat st_zsk, st_ksk;
 		int fd_zsk = -1, fd_ksk = -1;
@@ -767,6 +771,10 @@ lws_auth_dns_sign_rrsets(struct lws_auth_dns_sign_info *info, struct auth_dns_zo
 		(void)keytag_zsk; /* Silences unused variable warnings when loops branch differently */
 		struct lws_genec_ctx genec_zsk, genec_ksk;
 		struct lws_genrsa_ctx genrsa_zsk, genrsa_ksk;
+		memset(&genec_zsk, 0, sizeof(genec_zsk));
+		memset(&genec_ksk, 0, sizeof(genec_ksk));
+		memset(&genrsa_zsk, 0, sizeof(genrsa_zsk));
+		memset(&genrsa_ksk, 0, sizeof(genrsa_ksk));
 		int dnssec_alg = 13; /* Default ECDSAP256SHA256 */
 
 		if (info->ksk_jwk_filepath) {
@@ -990,11 +998,11 @@ lws_auth_dns_sign_rrsets(struct lws_auth_dns_sign_info *info, struct auth_dns_zo
 												time(&now);
 
 											uint32_t dur = info->sign_validity_duration ? info->sign_validity_duration : (30 * 24 * 3600);
-											uint32_t exp = (uint32_t)now + dur;
+											uint64_t exp = (uint64_t)now + dur;
 											pre[pl++] = (uint8_t)(exp >> 24); pre[pl++] = (uint8_t)(exp >> 16);
 											pre[pl++] = (uint8_t)(exp >> 8); pre[pl++] = (uint8_t)(exp & 0xff);
 
-											uint32_t inc = (uint32_t)now - 3600; /* Start valid one hour before current time to account for clock skew */
+											uint64_t inc = (uint64_t)now - 3600; /* Start valid one hour before current time to account for clock skew */
 											pre[pl++] = (uint8_t)(inc >> 24); pre[pl++] = (uint8_t)(inc >> 16);
 											pre[pl++] = (uint8_t)(inc >> 8); pre[pl++] = (uint8_t)(inc & 0xff);
 
@@ -1107,7 +1115,8 @@ next_rrset:
 					lws_free(buf_zsk);
 				}
 			}
-			close(fd_zsk);
+			if (fd_zsk >= 0)
+				close(fd_zsk);
 		} else {
 			lwsl_err("%s: Failed to open ZSK at %s\n", __func__, info->zsk_jwk_filepath);
 		}
@@ -1116,6 +1125,8 @@ next_rrset:
 			if (ksk.kty == LWS_GENCRYPTO_KTY_RSA) lws_genrsa_destroy(&genrsa_ksk);
 			lws_jwk_destroy(&ksk);
 		}
+		if (fd_ksk >= 0)
+			close(fd_ksk);
 	}
 }
 
@@ -1137,7 +1148,7 @@ lws_auth_dns_verify_zone(struct lws_auth_dns_sign_info *info)
 	fd = open(info->input_filepath, LWS_O_RDONLY);
 	if (fd < 0) return 1;
 
-	if (fstat(fd, &st) || !st.st_size) {
+	if (fstat(fd, &st) || st.st_size <= 0 || st.st_size > 1024 * 1024) {
 		close(fd);
 		return 1;
 	}
@@ -1173,6 +1184,8 @@ lws_auth_dns_verify_zone(struct lws_auth_dns_sign_info *info)
 	memset(&zsk, 0, sizeof(zsk));
 	memset(&ksk, 0, sizeof(ksk));
 	struct lws_genec_ctx genec_zsk, genec_ksk;
+	memset(&genec_zsk, 0, sizeof(genec_zsk));
+	memset(&genec_ksk, 0, sizeof(genec_ksk));
 	int has_ksk = 0;
 
 	if (0) {
@@ -1306,16 +1319,16 @@ lws_auth_dns_verify_zone(struct lws_auth_dns_sign_info *info)
 						pre[pl++] = (uint8_t)(tttl >> 8); pre[pl++] = (uint8_t)(tttl & 0xff);
 
 						/* Convert YYYYMMDDHHMMSS back to Time... */
-						uint32_t texp = 0, tinc = 0;
+						uint64_t texp = 0, tinc = 0;
 						struct tm tm_exp, tm_inc;
 						memset(&tm_exp, 0, sizeof(tm_exp)); memset(&tm_inc, 0, sizeof(tm_inc));
 						if (sscanf(exp_s, "%04d%02d%02d%02d%02d%02d", &tm_exp.tm_year, &tm_exp.tm_mon, &tm_exp.tm_mday, &tm_exp.tm_hour, &tm_exp.tm_min, &tm_exp.tm_sec) == 6) {
 							tm_exp.tm_year -= 1900; tm_exp.tm_mon -= 1;
-							texp = (uint32_t)timegm(&tm_exp);
+							texp = (uint64_t)timegm(&tm_exp);
 						}
 						if (sscanf(inc_s, "%04d%02d%02d%02d%02d%02d", &tm_inc.tm_year, &tm_inc.tm_mon, &tm_inc.tm_mday, &tm_inc.tm_hour, &tm_inc.tm_min, &tm_inc.tm_sec) == 6) {
 							tm_inc.tm_year -= 1900; tm_inc.tm_mon -= 1;
-							tinc = (uint32_t)timegm(&tm_inc);
+							tinc = (uint64_t)timegm(&tm_inc);
 						}
 
 						pre[pl++] = (uint8_t)(texp >> 24); pre[pl++] = (uint8_t)(texp >> 16);
@@ -1344,6 +1357,7 @@ lws_auth_dns_verify_zone(struct lws_auth_dns_sign_info *info)
 							struct auth_dns_rr *crr = lws_container_of(d4, struct auth_dns_rr, list);
 							uint8_t rpre[512]; size_t rpl = 0;
 							al = sizeof(rpre) - rpl; name_to_wire(cov_rs->name, zone.origin, rpre + rpl, &al); rpl += al;
+							if (rpl + 10 > sizeof(rpre)) break;
 							rpre[rpl++] = (uint8_t)(cov_rs->type >> 8); rpre[rpl++] = (uint8_t)(cov_rs->type & 0xff);
 							rpre[rpl++] = (uint8_t)(cov_rs->class_ >> 8); rpre[rpl++] = (uint8_t)(cov_rs->class_ & 0xff);
 							rpre[rpl++] = (uint8_t)(tttl >> 24); rpre[rpl++] = (uint8_t)(tttl >> 16);

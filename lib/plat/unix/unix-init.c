@@ -82,7 +82,8 @@ lws_sul_plat_unix(lws_sorted_usec_list_t *sul)
 }
 #endif
 
-#if defined(LWS_WITH_PLUGINS)
+#if (defined(LWS_WITH_PLUGINS) && !defined(LWS_WITH_PLUGINS_BUILTIN)) || \
+    (defined(LWS_BUILTIN_PLUGIN_NAMES) && defined(LWS_WITH_PLUGINS))
 static int
 protocol_plugin_cb(struct lws_plugin *pin, void *each_user)
 {
@@ -208,7 +209,7 @@ lws_plat_init(struct lws_context *context,
 		}
 
 		if (n < (int)LWS_ARRAY_SIZE(pp) - 1)
-			pp[n++] = LWS_INSTALL_DATADIR"/libwebsockets-test-server/plugins";
+			pp[n++] = LWS_PLUGIN_DIR;
 
 		pp[n] = NULL;
 

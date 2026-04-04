@@ -199,6 +199,7 @@ option(LWS_WITH_LIBV4L2 "Link against libv4l2 if available" OFF)
 option(LWS_WITH_AUTH_SERVER "Include auth server plugin and its assets" OFF)
 option(LWS_WITH_EMAIL "Include async SMTP client plugin" OFF)
 option(LWS_WITH_QRCODEGEN "Include qrcodegen library natively" OFF)
+option(LWS_WITH_MEDIA_RK_MPI "Compile with Rockchip MPI hardware pipelines" OFF)
 
 #
 # Secure Streams
@@ -269,6 +270,7 @@ option(LWS_WITH_DRIVERS "With generic drivers for gpio, i2c, display etc" OFF)
 #
 option(LWS_WITH_STATIC "Build the static version of the library" ON)
 option(LWS_WITH_SHARED "Build the shared version of the library" ON)
+set(websockets_shared ${LWS_WITH_SHARED})
 option(LWS_LINK_TESTAPPS_DYNAMIC "Link the test apps to the shared version of the library. Default is to link statically" OFF)
 option(LWS_STATIC_PIC "Build the static version of the library with position-independent code" OFF)
 option(LWS_SUPPRESS_DEPRECATED_API_WARNINGS "Turn off complaints about, eg, openssl 3 deprecated api usage" ON)
@@ -596,6 +598,7 @@ set(LWS_INSTALL_LIB_DIR       ${CMAKE_INSTALL_LIBDIR} CACHE PATH "Installation d
 set(LWS_INSTALL_BIN_DIR       ${CMAKE_INSTALL_BINDIR} CACHE PATH "Installation directory for executables")
 set(LWS_INSTALL_INCLUDE_DIR   ${CMAKE_INSTALL_INCLUDEDIR} CACHE PATH "Installation directory for header files")
 set(LWS_INSTALL_EXAMPLES_DIR  ${CMAKE_INSTALL_BINDIR} CACHE PATH "Installation directory for example files")
+set(LWS_INSTALL_PLUGIN_DIR    "${CMAKE_INSTALL_PREFIX}/share/libwebsockets-test-server/plugins" CACHE PATH "Installation directory for plugins")
 
 # if you gave LWS_WITH_MINIZ, point to MINIZ here if not found
 # automatically
@@ -1342,9 +1345,18 @@ file(RELATIVE_PATH
 if (DEFINED REL_INCLUDE_DIR)
     set(LWS__INCLUDE_DIRS "\${LWS_CMAKE_DIR}/${REL_INCLUDE_DIR}")
 endif()
-if (DEFINED OPENSSL_INCLUDE_DIRS)
-	set(LWS__INCLUDE_DIRS "${LWS__INCLUDE_DIRS};${OPENSSL_INCLUDE_DIRS}")
-endif()
+
+set(STRIPPED_LIB_LIST_AT_END "")
+foreach(lib_path IN LISTS LIB_LIST_AT_END)
+    if(IS_ABSOLUTE "${lib_path}" AND NOT "${lib_path}" MATCHES "^-")
+        get_filename_component(lib_name "${lib_path}" NAME_WE)
+        string(REGEX REPLACE "^lib" "" lib_name "${lib_name}")
+        list(APPEND STRIPPED_LIB_LIST_AT_END "-l${lib_name}")
+    else()
+        list(APPEND STRIPPED_LIB_LIST_AT_END "${lib_path}")
+    endif()
+endforeach()
+set(LIB_LIST_AT_END ${STRIPPED_LIB_LIST_AT_END})
 
 configure_file(${PROJECT_SOURCE_DIR}/cmake/libwebsockets-config.cmake.in
                 ${PROJECT_BINARY_DIR}${CMAKE_FILES_DIRECTORY}/libwebsockets-config.cmake
@@ -1364,6 +1376,27 @@ install(FILES
 if (LWS_WITH_EXPORT_LWSTARGETS)
     install(EXPORT LibwebsocketsTargets
             DESTINATION "${LWS_INSTALL_CMAKE_DIR}" COMPONENT dev)
+
+    # CMake inherently bakes absolute SYSROOT paths into exported target configurations
+    # when INTERFACE_LINK_LIBRARIES are resolved. We scrub them here natively so downstream
+    # cross-compilation environments (like Yocto) don't flag them as buildpath QA errors.
+    install(CODE "
+        if(DEFINED ENV{DESTDIR})
+            set(DESTDIR \"\$ENV{DESTDIR}/\")
+        else()
+            set(DESTDIR \"\")
+        endif()
+
+        set(SYSROOT_PATH \"${CMAKE_SYSROOT}\")
+        if (NOT SYSROOT_PATH STREQUAL \"\")
+            file(GLOB TARGET_CMAKES \"\${DESTDIR}\${CMAKE_INSTALL_PREFIX}/${LWS_INSTALL_CMAKE_DIR}/*.cmake\")
+            foreach(TARGET_CMAKE \${TARGET_CMAKES})
+                file(READ \"\${TARGET_CMAKE}\" TARGET_CMAKE_CONTENT)
+                string(REPLACE \"\${SYSROOT_PATH}\" \"\" TARGET_CMAKE_CONTENT \"\${TARGET_CMAKE_CONTENT}\")
+                file(WRITE \"\${TARGET_CMAKE}\" \"\${TARGET_CMAKE_CONTENT}\")
+            endforeach()
+        endif()
+    " COMPONENT dev)
 endif()
 
 # build subdir is not part of sources

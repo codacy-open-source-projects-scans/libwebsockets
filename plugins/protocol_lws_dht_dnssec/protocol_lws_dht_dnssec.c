@@ -2044,6 +2044,11 @@ cb_dht(void *closure, int event, const lws_dht_hash_t *info_hash,
 	case LWS_DHT_EVENT_NOTIFY: {
 		struct vhd_dht_dnssec *vhd = (struct vhd_dht_dnssec *)closure;
 
+		if (!from || fromlen < sizeof(struct sockaddr_in)) {
+			lwsl_notice("%s: Rejecting NOTIFY with missing/invalid source address\n", __func__);
+			break;
+		}
+
 		uint64_t newer_soa = 0;
 		if (data_len >= 8) {
 			const uint8_t *p = (const uint8_t *)data;
@@ -2266,7 +2271,7 @@ cb_dht(void *closure, int event, const lws_dht_hash_t *info_hash,
 			args.cb = NULL; /* Local callback */
 			args.opaque = NULL;
 
-			if (from && fromlen >= sizeof(struct sockaddr_in)) {
+			{
 				struct notify_strike_tracking *trk = malloc(sizeof(*trk));
 				if (trk) {
 					memset(trk, 0, sizeof(*trk));
@@ -3636,7 +3641,10 @@ static int bump_soa_serial(const char *filepath) {
 
 	if (strlen(new_serial) == serial_len) {
 		memcpy(serial_start, new_serial, serial_len);
-		lseek(fd, 0, SEEK_SET);
+		if (lseek(fd, 0, SEEK_SET) < 0) {
+			lwsl_err("lseek failed to reset file pointer\n");
+			free(buf); close(fd); return -1;
+		}
 		if (write(fd, buf, (size_t)st.st_size) != st.st_size) {
 			lwsl_err("Failed to write updated SOA\n");
 			free(buf); close(fd); return -1;
@@ -3651,7 +3659,10 @@ static int bump_soa_serial(const char *filepath) {
 		memcpy(new_buf + prefix_len, new_serial, strlen(new_serial));
 		memcpy(new_buf + prefix_len + strlen(new_serial), serial_end, (size_t)st.st_size - prefix_len - serial_len);
 
-		lseek(fd, 0, SEEK_SET);
+		if (lseek(fd, 0, SEEK_SET) < 0) {
+			lwsl_err("lseek failed to reset file pointer\n");
+			free(new_buf); free(buf); close(fd); return -1;
+		}
 		if (ftruncate(fd, (off_t)new_size) < 0) {
 			lwsl_err("ftruncate failed\n");
 		}
@@ -3720,14 +3731,15 @@ do_signzone(struct lws_context *context, struct lws_dht_dnssec_signzone_args *ar
 
 	/* Create temporary merged zonefile if there are active ACME records */
 	struct vhd_dht_dnssec *v = get_dnssec_vhd(context, lws_get_vhost_by_name(context, "default"));
-	char withacme_path[256];
+	char withacme_path[256] = "";
 	int fd_in, fd_out;
 	ssize_t n;
 	char buf[4096];
 
 	char acmefile_path[256];
 	lws_snprintf(acmefile_path, sizeof(acmefile_path), "%s.acme", zone_in);
-	int has_acmefile = (access(acmefile_path, F_OK) == 0);
+	int fd_acme = open(acmefile_path, O_RDONLY);
+	int has_acmefile = (fd_acme >= 0);
 
 	struct lws_dht_dnssec_domain *dom = NULL;
 
@@ -3774,16 +3786,12 @@ do_signzone(struct lws_context *context, struct lws_dht_dnssec_signzone_args *ar
 
 				/* Append .acme file if present */
 				if (has_acmefile) {
-					int fd_acme = open(acmefile_path, O_RDONLY);
-					if (fd_acme >= 0) {
-						write(fd_out, "\n", 1);
-						while ((n = read(fd_acme, buf, sizeof(buf))) > 0) {
-							if (write(fd_out, buf, (size_t)n) != n)
-								break;
-						}
-						write(fd_out, "\n", 1);
-						close(fd_acme);
+					write(fd_out, "\n", 1);
+					while ((n = read(fd_acme, buf, sizeof(buf))) > 0) {
+						if (write(fd_out, buf, (size_t)n) != n)
+							break;
 					}
+					write(fd_out, "\n", 1);
 				}
 
 				close(fd_out);
@@ -3796,6 +3804,9 @@ do_signzone(struct lws_context *context, struct lws_dht_dnssec_signzone_args *ar
 			lwsl_err("Failed to open %s for reading\n", zone_in);
 		}
 	}
+
+	if (fd_acme >= 0)
+		close(fd_acme);
 
 	if (lws_auth_dns_sign_zone(&info)) {
 		lwsl_err("lws_auth_dns_sign_zone failed\n");
@@ -3966,6 +3977,9 @@ dht_dnssec_sul_fetch_req_timeout(struct lws_sorted_usec_list *sul)
 	struct lws_dht_dnssec_fetch_req *req = lws_container_of(sul, struct lws_dht_dnssec_fetch_req, sul_timeout);
 	struct vhd_dht_dnssec *vhd = req->vhd;
 
+	if (!vhd)
+		return;
+
 	if (req->retries >= 3) {
 		lwsl_err("%s: Fetch req for %s fully timed out after 3 retries\n", __func__, req->domain);
 		if (req->cb) req->cb(req->opaque, req->domain, 0);
@@ -4121,7 +4135,7 @@ do_fetch_zone(struct lws_context *context, struct lws_dht_dnssec_fetch_zone_args
 	}
 
 	/* 2. Fallback to bootstrap target_ip if configured (for clients/unbootstrapped nodes) */
-	if (v->target_ip && v->target_ip[0] && v->target_port > 0) {
+	if (v->dht && v->target_ip && v->target_ip[0] && v->target_port > 0) {
 		struct sockaddr_in sin;
 		memset(&sin, 0, sizeof(sin));
 		sin.sin_family = AF_INET;

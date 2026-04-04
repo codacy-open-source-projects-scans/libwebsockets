@@ -58,13 +58,22 @@ char crl_path[1024] = "";
  * plugins, in this case by statically including them at build-time.
  */
 
+#if defined(LWS_WITH_PLUGINS)
+static const char * const plugin_dirs[] = {
+	LWS_PLUGIN_DIR "/",
+	NULL
+};
+#else
+#if !defined (LWS_PLUGIN_STATIC)
 #define LWS_PLUGIN_STATIC
-#if defined(LWS_ROLE_WS)
-#include "../plugins/protocol_lws_mirror.c"
-#include "../plugins/protocol_lws_status.c"
-#include "../plugins/protocol_dumb_increment.c"
 #endif
-#include "../plugins/protocol_post_demo.c"
+#if defined(LWS_ROLE_WS)
+#include "../plugins/protocol_lws_mirror/protocol_lws_mirror.c"
+#include "../plugins/protocol_lws_status/protocol_lws_status.c"
+#include "../plugins/protocol_dumb_increment/protocol_dumb_increment.c"
+#endif
+#include "../plugins/protocol_post_demo/protocol_post_demo.c"
+#endif
 
 #if defined(LWS_WITH_EXTERNAL_POLL)
 static struct lws_pollfd *
@@ -188,12 +197,14 @@ static struct lws_protocols protocols[] = {
 	/* first protocol must always be HTTP handler */
 
 	{ "http-only", lws_callback_http, 0, 0, 0, NULL, 0 },
+#if !defined(LWS_WITH_PLUGINS)
 #if defined(LWS_ROLE_WS)
 	LWS_PLUGIN_PROTOCOL_DUMB_INCREMENT,
 	LWS_PLUGIN_PROTOCOL_MIRROR,
 	LWS_PLUGIN_PROTOCOL_LWS_STATUS,
 #endif
 	LWS_PLUGIN_PROTOCOL_POST_DEMO,
+#endif
 	LWS_PROTOCOL_LIST_TERM
 };
 
@@ -530,6 +541,9 @@ int main(int argc, char **argv)
 
 	info.iface = iface;
 	info.protocols = protocols;
+#if defined(LWS_WITH_PLUGINS)
+	info.plugin_dirs = plugin_dirs;
+#endif
 
 #if defined(LWS_WITH_TLS)
 	info.ssl_cert_filepath = NULL;
@@ -566,6 +580,7 @@ int main(int argc, char **argv)
 #endif
 	info.timeout_secs = 5;
 #if defined(LWS_WITH_TLS)
+#if !defined(LWS_WITH_MBEDTLS) && !defined(LWS_WITH_GNUTLS) && !defined(USE_WOLFSSL)
 	info.ssl_cipher_list = "ECDHE-ECDSA-AES256-GCM-SHA384:"
 			       "ECDHE-RSA-AES256-GCM-SHA384:"
 			       "DHE-RSA-AES256-GCM-SHA384:"
@@ -584,6 +599,7 @@ int main(int argc, char **argv)
 	 * TLSv1.2 Kx=DH ciphers though (if the're on the ssl_cipher_list).
 	 */
 	info.options |= LWS_SERVER_OPTION_OPENSSL_AUTO_DH_PARAMETERS;
+#endif
 #endif
 	info.mounts = &mount;
 #if defined(LWS_WITH_PEER_LIMITS)

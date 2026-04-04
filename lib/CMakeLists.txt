@@ -255,7 +255,9 @@ if (LWS_WITH_STATIC)
 	)
 	target_include_directories(websockets PRIVATE ${LWS_LIB_BUILD_INC_PATHS} ${LWS_LIB_BUILD_INC_PATHS_TEMP} ${CMAKE_CURRENT_SOURCE_DIR}/../core)
 	target_compile_definitions(websockets PRIVATE LWS_BUILDING_STATIC)
-	target_include_directories(websockets PUBLIC ${LWS_PUBLIC_INCLUDES})
+	foreach(inc ${LWS_PUBLIC_INCLUDES})
+		target_include_directories(websockets PUBLIC "$<BUILD_INTERFACE:${inc}>")
+	endforeach()
 	set(LWS_PUBLIC_INCLUDES ${LWS_PUBLIC_INCLUDES} PARENT_SCOPE)
 
 	if (WIN32)
@@ -283,7 +285,9 @@ if (LWS_WITH_SHARED)
 	)
 	target_include_directories(websockets_shared PRIVATE ${LWS_LIB_BUILD_INC_PATHS} ${LWS_LIB_BUILD_INC_PATHS_TEMP} ${CMAKE_CURRENT_SOURCE_DIR}/../core)
 	target_compile_definitions(websockets_shared PRIVATE LWS_BUILDING_SHARED)
-	target_include_directories(websockets_shared PUBLIC ${LWS_PUBLIC_INCLUDES})
+	foreach(inc ${LWS_PUBLIC_INCLUDES})
+		target_include_directories(websockets_shared PUBLIC "$<BUILD_INTERFACE:${inc}>")
+	endforeach()
 	set(LWS_PUBLIC_INCLUDES ${LWS_PUBLIC_INCLUDES} PARENT_SCOPE)
 
 	# We want the shared lib to be named "libwebsockets"
@@ -344,9 +348,21 @@ endif()
 
 
 # Setup the linking for all libs.
+list(APPEND LIB_LIST ${LIB_LIST_AT_END})
+set(STRIPPED_LIB_LIST "")
+foreach(lib_path IN LISTS LIB_LIST)
+	if(IS_ABSOLUTE "${lib_path}" AND NOT "${lib_path}" MATCHES "^-")
+		get_filename_component(lib_name "${lib_path}" NAME_WE)
+		string(REGEX REPLACE "^lib" "" lib_name "${lib_name}")
+		list(APPEND STRIPPED_LIB_LIST "$<BUILD_INTERFACE:${lib_path}>$<INSTALL_INTERFACE:-l${lib_name}>")
+	else()
+		list(APPEND STRIPPED_LIB_LIST "${lib_path}")
+	endif()
+endforeach()
+
 foreach (lib ${LWS_LIBRARIES})
 	#	target_link_libraries(${lib} PRIVATE ${LIB_LIST})
-	target_link_libraries(${lib} ${LIB_LIST})
+	target_link_libraries(${lib} ${STRIPPED_LIB_LIST})
 
 endforeach()
 

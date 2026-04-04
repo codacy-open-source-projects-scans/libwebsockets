@@ -960,7 +960,7 @@ lws_http_serve(struct lws *wsi, char *uri, const char *origin,
 		const struct lws_protocols *pp = lws_vhost_name_to_protocol(
 						       wsi->a.vhost, m->protocol);
 
-		if (lws_bind_protocol(wsi, pp, __func__))
+		if (!pp || lws_bind_protocol(wsi, pp, __func__))
 			return -1;
 		args.p = (char *)p;
 		args.max_len = lws_ptr_diff(end, p);
@@ -2048,7 +2048,7 @@ lws_http_action(struct lws *wsi)
 		n = (unsigned int)lws_cgi_via_info(&cgiinfo);
 		if (n) {
 			lwsl_err("%s: cgi failed\n", __func__);
-			return -1;
+			goto bail_nuke_ah;
 		}
 
 		goto deal_body;

@@ -1173,32 +1173,6 @@ lws_parse_mac(const char *ads, uint8_t *result_6_bytes)
 }
 
 int
-lws_parse_cidr(const char *cidr, lws_sockaddr46 *sa46, int *len)
-{
-	char buf[64], *p;
-	int n;
-
-	lws_strncpy(buf, cidr, sizeof(buf));
-	p = strchr(buf, '/');
-
-	if (!p) {
-		*len = -1; /* no mask */
-	} else {
-		*p++ = '\0';
-		*len = atoi(p);
-	}
-
-	n = lws_sa46_parse_numeric_address(buf, sa46);
-	if (n)
-		return n;
-
-	if (*len == -1)
-		*len = sa46->sa4.sin_family == AF_INET6 ? 128 : 32;
-
-	return 0;
-}
-
-int
 lws_is_lan_address(const char *ads)
 {
 	lws_sockaddr46 sa46;
@@ -1242,6 +1216,32 @@ lws_is_lan_address(const char *ads)
 			return 1;
 #endif
 	}
+
+	return 0;
+}
+
+int
+lws_parse_cidr(const char *cidr, lws_sockaddr46 *sa46, int *len)
+{
+	char buf[64], *p;
+	int n;
+
+	lws_strncpy(buf, cidr, sizeof(buf));
+	p = strchr(buf, '/');
+
+	if (!p) {
+		*len = -1; /* no mask */
+	} else {
+		*p++ = '\0';
+		*len = atoi(p);
+	}
+
+	n = lws_sa46_parse_numeric_address(buf, sa46);
+	if (n)
+		return n;
+
+	if (*len == -1)
+		*len = sa46->sa4.sin_family == AF_INET6 ? 128 : 32;
 
 	return 0;
 }

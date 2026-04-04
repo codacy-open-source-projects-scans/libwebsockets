@@ -108,7 +108,7 @@ rops_handle_POLLIN_pipe(struct lws_context_per_thread *pt, struct lws *wsi,
 				lwsi_set_state(job->wsi, LRS_ISSUING_FILE);
 				lws_callback_on_writable(job->wsi);
 			}
-#if defined(LWS_WITH_TLS)
+#if defined(LWS_WITH_TLS) && defined(LWS_WITH_SERVER)
 			else if (job->type == LWS_AQ_SSL_ACCEPT) {
 				job->wsi->async_worker_job = NULL;
 
@@ -164,8 +164,14 @@ rops_handle_POLLIN_pipe(struct lws_context_per_thread *pt, struct lws *wsi,
 						 vh_being_destroyed_list);
 
 			lws_vhost_lock(v); /* -------------- vh { */
+			v->count_bound_wsi++;
 			__lws_vhost_destroy_pt_wsi_dieback_start(v);
+			v->count_bound_wsi--;
+			int do_destroy2 = !v->count_bound_wsi && v->being_destroyed;
 			lws_vhost_unlock(v); /* } vh -------------- */
+
+			if (do_destroy2)
+				__lws_vhost_destroy2(v);
 
 		} lws_end_foreach_dll_safe(d, d1);
 	}

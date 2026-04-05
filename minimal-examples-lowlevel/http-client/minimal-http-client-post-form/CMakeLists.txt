@@ -103,4 +103,3 @@ endif()
 		target_link_libraries(${SAMP} websockets ${LIBWEBSOCKETS_DEP_LIBS})
 	endif()
 endif()
-

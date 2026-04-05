@@ -80,4 +80,3 @@ endif()
 		target_link_libraries(${SAMP} websockets ${PTHREAD_LIB} ${LIBWEBSOCKETS_DEP_LIBS})
 	endif()
 endif()
-

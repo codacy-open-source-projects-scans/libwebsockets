@@ -949,7 +949,7 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 		uint16_t ancount = (uint16_t)((p[6] << 8) | p[7]);
 		uint16_t nscount = (uint16_t)((p[8] << 8) | p[9]);
 		uint16_t arcount = (uint16_t)((p[10] << 8) | p[11]);
-		
+
 		if (arcount > 32) { lwsl_notice("arcount too large (%d)\n", arcount); goto done; }
 
 		lwsl_info("DNS id %04x flags %04x qdcount %d arcount %d (from %s)\n", id, flags, qdcount, arcount, peer_ip);

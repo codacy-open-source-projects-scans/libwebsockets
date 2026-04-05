@@ -104,7 +104,7 @@ process_byte(struct parse_state *s, uint8_t b)
 	int v1, v2;
 
 	s->raw_byte_pos++;
-	
+
 	/* basic line/col accounting on the raw input stream */
 	if (b == '\n') {
 		s->line++;

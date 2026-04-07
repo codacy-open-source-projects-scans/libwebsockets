@@ -64,6 +64,52 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    function renderAuthStatus(data, isDenied) {
+        let grantsHtml = Object.keys(data.grants || {}).length
+            ? '<table class="auth-grants-table">' +
+              '<tr><th>Service</th><th class="level-col">Level</th></tr>' +
+              Object.keys(data.grants).map(k => `<tr><td>${k}</td><td class="level-col">L${data.grants[k]}</td></tr>`).join('') +
+              '</table>'
+            : '<div class="auth-grants-empty">No Active Grants</div>';
+
+        let logsHtml = (!isDenied && data.logs && data.logs.length)
+            ? '<p class="auth-session-title auth-log-title">Valid JWK Peers</p>' +
+              '<table class="auth-log-table">' +
+              '<tr><th>Date / Time</th><th class="ip-col">IP Address</th></tr>' +
+              data.logs.map(lg => `<tr><td class="time-col">${new Date(lg.time * 1000).toLocaleString()}</td><td class="ip-col">${lg.ip}</td></tr>`).join('') +
+              '</table>'
+            : '';
+
+        let headerHtml = `<div class="auth-status-row success-row">
+            <span class="auth-status-icon">✅</span>
+            <span class="auth-status-text">Logged in as ${data.email || 'Unknown User'}</span>
+        </div>`;
+
+        if (isDenied) {
+            headerHtml += `<div class="auth-status-row error-row auth-status-spacer">
+                <span class="auth-status-icon">❌</span>
+                <span class="auth-status-text">Doesn't grant '${serviceName || 'required service'}'</span>
+            </div>`;
+        } else {
+            headerHtml += `<div class="auth-status-spacer"></div>`;
+        }
+
+        loginForm.innerHTML = `<div class="auth-session-box">
+            ${headerHtml}
+            ${grantsHtml}
+            ${logsHtml}
+            <button type="button" id="btn-destroy-session" class="btn primary-btn">${isDenied ? 'Logout / Switch User' : 'Logout'}</button>
+        </div>`;
+
+        document.getElementById('btn-destroy-session').addEventListener('click', async function() {
+            const btn = this;
+            btn.innerText = "Logging out...";
+            btn.disabled = true;
+            await fetch('/api/status?destroy=1', { cache: 'no-store' });
+            window.location.reload();
+        });
+    }
+
     // Check backend status automatically
     async function checkServerStatus() {
         try {
@@ -72,33 +118,30 @@ document.addEventListener('DOMContentLoaded', () => {
             if (response.ok) {
                 const data = await response.json();
                 if (data.csrf_token) window.csrf_token = data.csrf_token;
+                
+                const strikeOverlay = document.getElementById('strike-overlay');
+                const strikeCount = document.getElementById('strike-count');
+                if (strikeOverlay && strikeCount) {
+                    if (data.strikes > 0) {
+                        strikeCount.innerText = data.strikes + "/5";
+                        strikeOverlay.classList.remove('hidden');
+                        setTimeout(() => strikeOverlay.classList.add('show-strike'), 20);
+                    } else {
+                        strikeOverlay.classList.remove('show-strike');
+                        setTimeout(() => strikeOverlay.classList.add('hidden'), 1000);
+                    }
+                }
 
                 if (data.logged_in) {
                     regToggleBox.classList.add('hidden');
 
                     if (data.lacks_grant) {
-                        let grantsHtml = Object.keys(data.grants || {}).length
-                            ? '<table class="auth-grants-table">' +
-                              '<tr><th>Service</th><th class="level-col">Level</th></tr>' +
-                              Object.keys(data.grants).map(k => `<tr><td>${k}</td><td class="level-col">L${data.grants[k]}</td></tr>`).join('') +
-                              '</table>'
-                            : '<div class="auth-grants-empty">No Active Grants</div>';
-
-                        loginForm.innerHTML = `<div class="auth-session-box">
-                            <p class="auth-session-title">Access Denied</p>
-                            <p class="auth-session-email">Your account (${data.email || 'Unknown User'}) lacks the required '${serviceName}' clearance.</p>
-                            ${grantsHtml}
-                            <button type="button" id="btn-destroy-session" class="btn primary-btn">Logout / Switch User</button>
-                        </div>`;
-                        document.getElementById('btn-destroy-session').addEventListener('click', async function() {
-                            const btn = this;
-                            btn.innerText = "Logging out...";
-                            btn.disabled = true;
-                            await fetch('/api/status?destroy=1', { cache: 'no-store' });
-                            window.location.reload();
-                        });
+                        renderAuthStatus(data, true);
                         subtitle.innerText = "Insufficient Privileges";
-                        showNotif('error', 'You lack the required grant to access this service.');
+                        /* The user requested getting rid of this error box entirely and standardizing.
+                           Since showNotif generates this other error box, let's remove it if the user doesn't want redundancy,
+                           or keep it if it's the notification. "I'd like to get rid of the first error box... and change it to this kind of simplified and standardized flow" */
+                        // showNotif('error', 'You lack the required grant to access this service.');
                         return;
                     }
 
@@ -141,7 +184,10 @@ document.addEventListener('DOMContentLoaded', () => {
                             } else {
                                 const errData = await res.json();
                                 loginForm.innerHTML = `<div class="auth-session-box">
-                                    <p class="auth-session-title">Security Violation</p>
+                                    <div class="auth-status-row error-row auth-status-spacer">
+                                        <span class="auth-status-icon">❌</span>
+                                        <span class="auth-status-text">Security Violation</span>
+                                    </div>
                                     <p class="auth-session-email">${errData.error || 'Untrusted Redirect URI'}</p>
                                     <p style="font-size: 0.8rem; color: #94a3b8; text-align: center; margin-top: 10px;">The specified redirection target is not whitelisted by the network administrator.</p>
                                 </div>`;
@@ -156,26 +202,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         }
                         return;
                     } else {
-                        let grantsHtml = Object.keys(data.grants || {}).length
-                            ? '<table class="auth-grants-table">' +
-                              '<tr><th>Service</th><th class="level-col">Level</th></tr>' +
-                              Object.keys(data.grants).map(k => `<tr><td>${k}</td><td class="level-col">L${data.grants[k]}</td></tr>`).join('') +
-                              '</table>'
-                            : '<div class="auth-grants-empty">No Active Grants</div>';
-
-                        loginForm.innerHTML = `<div class="auth-session-box">
-                            <p class="auth-session-title">Logged-in as</p>
-                            <p class="auth-session-email">${data.email || 'Unknown User'}</p>
-                            ${grantsHtml}
-                            <button type="button" id="btn-destroy-session" class="btn primary-btn">Logout</button>
-                        </div>`;
-                        document.getElementById('btn-destroy-session').addEventListener('click', async function() {
-                            const btn = this;
-                            btn.innerText = "Logging out...";
-                            btn.disabled = true;
-                            await fetch('/api/status?destroy=1', { cache: 'no-store' });
-                            window.location.reload();
-                        });
+                        renderAuthStatus(data, false);
                         subtitle.innerText = "Active Session";
                         return;
                     }
@@ -264,6 +291,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         if (data && data.error) errMsg = data.error;
                     } catch (e) {}
                     showNotif('error', errMsg);
+                    checkServerStatus();
                 }
             } else if (response.status === 403) {
                 let errMsg = 'Insufficient Privileges.';
@@ -275,6 +303,10 @@ document.addEventListener('DOMContentLoaded', () => {
             } else if (response.ok) {
                 const data = await response.json();
                 showNotif('success', 'Clearance accepted. Welcome.');
+                const stkOverlay = document.getElementById('strike-overlay');
+                if (stkOverlay) {
+                    stkOverlay.classList.remove('show-strike');
+                }
                 if (data.redirect) {
                     setTimeout(() => window.location.href = data.redirect, 1000);
                 } else if (redirectUri) {

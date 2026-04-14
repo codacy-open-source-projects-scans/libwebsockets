@@ -548,7 +548,7 @@ lws_jwe_render_compact(struct lws_jwe *jwe, char *out, size_t out_len)
 	out += n;
 	*out++ = '\0';
 	out_len -= (unsigned int)n;
-
+	/* coverity[integer_overflow] */
 	return (int)(orig - out_len);
 }
 

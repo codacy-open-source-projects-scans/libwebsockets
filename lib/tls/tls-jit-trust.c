@@ -35,8 +35,10 @@ lws_tls_kid_copy(union lws_tls_cert_info_results *ci, lws_tls_kid_t *kid)
 
 	if ((size_t)ci->ns.len > sizeof(kid->kid))
 		kid->kid_len = sizeof(kid->kid);
-	else
+	else {
+		/* coverity[cast_overflow] */
 		kid->kid_len = (uint8_t)ci->ns.len;
+	}
 
 	memcpy(kid->kid, ci->ns.name, kid->kid_len);
 }

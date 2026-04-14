@@ -1254,6 +1254,7 @@ lws_create_context(const struct lws_context_creation_info *info)
 		context->pt[n].fake_wsi = (struct lws *)u;
 		u += sizeof(struct lws);
 
+		/* coverity[store_writes_const_field] */
 		memset((void *)context->pt[n].fake_wsi, 0, sizeof(struct lws));
 #endif
 
@@ -1433,6 +1434,9 @@ lws_create_context(const struct lws_context_creation_info *info)
 #if defined(LWS_WITH_SYS_DHCP_CLIENT)
 		extern const struct lws_protocols lws_system_protocol_dhcpc4;
 #endif
+#if defined(LWS_WITH_SYS_WHOIS)
+		extern const struct lws_protocols lws_system_protocol_whois;
+#endif
 #if !defined(LWS_PLAT_FREERTOS) && !defined(LWS_PLAT_BAREMETAL) && !defined(LWS_PLAT_ANDROID) && defined(LWS_WITH_NETWORK)
 		extern const struct lws_protocols lws_system_protocol_stdin;
 #endif
@@ -1452,6 +1456,9 @@ lws_create_context(const struct lws_context_creation_info *info)
 #endif
 #if !defined(LWS_PLAT_FREERTOS) && !defined(LWS_PLAT_BAREMETAL) && !defined(LWS_PLAT_ANDROID) && defined(LWS_WITH_NETWORK)
 		pp[n++] = &lws_system_protocol_stdin;
+#endif
+#if defined(LWS_WITH_SYS_WHOIS)
+		pp[n++] = &lws_system_protocol_whois;
 #endif
 #if defined(LWS_WITH_DIR)
 		pp[n++] = &protocol_lws_dir_notify;
@@ -1929,6 +1936,7 @@ lws_pt_destroy(struct lws_context_per_thread *pt)
 	) {
 		struct lws wsi;
 
+		/* coverity[store_writes_const_field] */
 		memset((void *)&wsi, 0, sizeof(wsi));
 		wsi.a.context = pt->context;
 		wsi.tsi = (char)pt->tid;
@@ -2260,13 +2268,12 @@ next:
 			for (nu = 0; nu < context->pl_hash_elements; nu++)	{
 				if (!context->pl_hash_table[nu])
 					continue;
-				lws_start_foreach_llp(struct lws_peer **, peer,
-						      context->pl_hash_table[nu]) {
+				struct lws_peer **peer = &context->pl_hash_table[nu];
+				while (*peer) {
 					struct lws_peer *df = *peer;
 					*peer = df->next;
 					lws_free(df);
-					continue;
-				} lws_end_foreach_llp(peer, next);
+				}
 			}
 		lws_free(context->pl_hash_table);
 #endif

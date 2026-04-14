@@ -81,6 +81,7 @@ lws_ss_deserialize_tx_payload(struct lws_dsh *dsh, struct lws *wsi,
 
 	*flags = (int)lws_ser_ru32be(&p[3]);
 
+	/* coverity[tainted_scalar] */
 	lws_dsh_free((void **)&p);
 
 	return 0;

@@ -514,6 +514,7 @@ i2:
 				if (ctx->ipos + 1u >= LWS_ARRAY_SIZE(ctx->i))
 					goto reject_overflow;
 
+				/* coverity[integer_overflow] */
 				ctx->i[ctx->ipos++] = 0;
 
 				if (pst->cb(ctx, LECPCB_ARRAY_START))

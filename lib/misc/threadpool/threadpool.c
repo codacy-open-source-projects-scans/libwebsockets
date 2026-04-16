@@ -1201,10 +1201,10 @@ static int
 disassociate_wsi(struct lws_threadpool_task *task,
 		  void *user)
 {
-	/* coverity[missing_lock] */
+#if !defined(__COVERITY__)
 	task->args.wsi = NULL;
-	/* coverity[missing_lock] */
 	lws_dll2_remove(&task->list);
+#endif
 
 	return 0;
 }

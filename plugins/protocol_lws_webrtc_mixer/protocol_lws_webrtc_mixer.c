@@ -556,7 +556,12 @@ callback_mixer(struct lws *wsi, enum lws_callback_reasons reason,
 					mixer_media_session_ref(p->session); /* +1 for Worker */
 
 					lws_mutex_lock(vhd->mutex_rx);
-					lws_ring_insert(vhd->ring_rx, &msg, 1);
+					if (lws_ring_insert(vhd->ring_rx, &msg, 1) != 1) {
+						lwsl_err("%s: Failed to insert ADD_SESSION\n", __func__);
+						mixer_media_session_unref(p->session);
+						if (msg.payload)
+							free(msg.payload);
+					}
 					lws_mutex_unlock(vhd->mutex_rx);
 				}
 
@@ -872,7 +877,12 @@ callback_mixer(struct lws *wsi, enum lws_callback_reasons reason,
 								mixer_media_session_ref(p->session);
 
 								lws_mutex_lock(p->room->vhd->mutex_rx);
-								lws_ring_insert(p->room->vhd->ring_rx, &msg, 1);
+								if (lws_ring_insert(p->room->vhd->ring_rx, &msg, 1) != 1) {
+									lwsl_err("%s: Failed to insert ADD_SESSION\n", __func__);
+									mixer_media_session_unref(p->session);
+									if (msg.payload)
+										free(msg.payload);
+								}
 								lws_mutex_unlock(p->room->vhd->mutex_rx);
 							} else {
 								lwsl_err("%s: Failed to recreate session for '%s'\n", __func__, p->name);
@@ -907,42 +917,44 @@ callback_mixer(struct lws *wsi, enum lws_callback_reasons reason,
 							}
 						}
 
-						/* Send Chat History */
-						lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&p->room->chat_history)) {
-							struct chat_message *cm = lws_container_of(d, struct chat_message, list);
-							char json_buf[LWS_PRE + 2048];
-							char esc_sender[384], esc_text[1024];
+						if (p->room) {
+							/* Send Chat History */
+							lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&p->room->chat_history)) {
+								struct chat_message *cm = lws_container_of(d, struct chat_message, list);
+								char json_buf[LWS_PRE + 2048];
+								char esc_sender[384], esc_text[1024];
 
-							lws_json_purify(esc_sender, cm->sender, sizeof(esc_sender), NULL);
-							lws_json_purify(esc_text, cm->text, sizeof(esc_text), NULL);
+								lws_json_purify(esc_sender, cm->sender, sizeof(esc_sender), NULL);
+								lws_json_purify(esc_text, cm->text, sizeof(esc_text), NULL);
 
-							lws_snprintf(json_buf, sizeof(json_buf),
-									"{\"type\":\"chat\",\"sender\":\"%s\",\"text\":\"%s\"}",
-									esc_sender, esc_text);
-							if (p->pss)
-								we_ops->send_text(p->pss, json_buf, strlen(json_buf));
-						} lws_end_foreach_dll(d);
+								lws_snprintf(json_buf, sizeof(json_buf),
+										"{\"type\":\"chat\",\"sender\":\"%s\",\"text\":\"%s\"}",
+										esc_sender, esc_text);
+								if (p->pss)
+									we_ops->send_text(p->pss, json_buf, strlen(json_buf));
+							} lws_end_foreach_dll(d);
 
-						/* Send Cached Capabilities from other participants */
-						lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&p->room->participants)) {
-							struct participant *other = lws_container_of(d, struct participant, list);
-							if (other != p && other->capabilities) {
-								size_t msg_len = strlen(other->capabilities) + 128 + (strlen(other->name) * 6);
-								char *msg = malloc(msg_len);
-								if (msg) {
-									char esc_name[384];
-									lws_json_purify(esc_name, other->name, sizeof(esc_name), NULL);
+							/* Send Cached Capabilities from other participants */
+							lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&p->room->participants)) {
+								struct participant *other = lws_container_of(d, struct participant, list);
+								if (other != p && other->capabilities) {
+									size_t msg_len = strlen(other->capabilities) + 128 + (strlen(other->name) * 6);
+									char *msg = malloc(msg_len);
+									if (msg) {
+										char esc_name[384];
+										lws_json_purify(esc_name, other->name, sizeof(esc_name), NULL);
 
-									int n = lws_snprintf(msg, msg_len,
-											"{\"type\":\"remote_capabilities\",\"target\":\"%s\",\"payload\":%s}",
-											esc_name, other->capabilities);
-									if (p->pss)
-										we_ops->send_text(p->pss, msg, (size_t)n);
-									free(msg);
-									lwsl_notice("%s: Sent cached caps for '%s' to new joiner '%s'\n", __func__, other->name, p->name);
+										int n = lws_snprintf(msg, msg_len,
+												"{\"type\":\"remote_capabilities\",\"target\":\"%s\",\"payload\":%s}",
+												esc_name, other->capabilities);
+										if (p->pss)
+											we_ops->send_text(p->pss, msg, (size_t)n);
+										free(msg);
+										lwsl_notice("%s: Sent cached caps for '%s' to new joiner '%s'\n", __func__, other->name, p->name);
+									}
 								}
-							}
-						} lws_end_foreach_dll(d);
+							} lws_end_foreach_dll(d);
+						}
 					} else if ((al >= 7 && !strncmp(v, "\"leave\"", 7)) ||
 							(al >= 5 && !strncmp(v, "leave", 5))) {
 						/* Handle explicit leave without closing WS */
@@ -1014,12 +1026,13 @@ callback_mixer(struct lws *wsi, enum lws_callback_reasons reason,
 						/* Actually, simply forwarding it might be ambiguous if multiple people send it.
 						   Better to wrap it. */
 
-						char *wrapped = malloc(len + 256);
+						char esc_name[384];
+						lws_json_purify(esc_name, p->name, sizeof(esc_name), NULL);
+						size_t alloc_len = len + sizeof(esc_name) + 128;
+						char *wrapped = malloc(alloc_len);
 						if (wrapped) {
-							char esc_name[384];
-							lws_json_purify(esc_name, p->name, sizeof(esc_name), NULL);
 
-							int tlen = lws_snprintf(wrapped, len + 256 + sizeof(esc_name),
+							int tlen = lws_snprintf(wrapped, alloc_len,
 									"{\"type\":\"remote_capabilities\",\"target\":\"%s\",\"payload\":%.*s}",
 									esc_name, (int)len, (const char *)in);
 

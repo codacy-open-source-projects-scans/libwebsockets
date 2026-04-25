@@ -784,7 +784,7 @@ scan_tls_configs_cb(const char *dirpath, void *user, struct lws_dir_entry *lde)
 	/* check expiry */
 	char cert_path[1024];
 	lws_snprintf(cert_path, sizeof(cert_path), "%s/domains/%s/certs/crt/%s", vhd->base_dir, ctx->domain, subdomain);
-	
+
 	int needs_acme = 1;
 
 	fd = open(cert_path, O_RDONLY);
@@ -817,7 +817,7 @@ scan_tls_configs_cb(const char *dirpath, void *user, struct lws_dir_entry *lde)
 
 	if (needs_acme) {
 		lwsl_notice("%s: ACME needed for %s (port %d)\n", __func__, subdomain, a.port);
-		
+
 		/* Check if already running by vhost name */
 		char vh_name[256];
 		lws_snprintf(vh_name, sizeof(vh_name), "acme_%s", subdomain);
@@ -884,7 +884,7 @@ scan_tls_configs_cb(const char *dirpath, void *user, struct lws_dir_entry *lde)
 			cinfo.opaque_user_data = cci;
 			cinfo.alpn = "http/1.1";
 			cinfo.method = "RAW";
-			
+
 			if (!lws_client_connect_via_info(&cinfo)) {
 				lwsl_err("%s: Failed to start automated cert probe for %s:%d\n", __func__, subdomain, a.port);
 				free(cci);
@@ -1634,8 +1634,10 @@ handle_req_save_acme_file(struct vhd *vhd, struct pss *root_pss, struct monitor_
 					lwsl_err("%s: Failed to chown dir %s to lwsws group\n", __func__, dir_path);
 				}
 			}
-			fchmod(fd, (mode_t)mode);
-			chmod(dir_path, (mode_t)0750);
+			if (fchmod(fd, (mode_t)mode) < 0)
+				lwsl_err("%s: Failed to fchmod file %s\n", __func__, d_path);
+			if (chmod(dir_path, (mode_t)0750) < 0)
+				lwsl_err("%s: Failed to chmod dir %s\n", __func__, dir_path);
 #endif
 			tx += lws_snprintf(tx, lws_ptr_diff_size_t(tx_end, tx), "{\"req\":\"%s\",\"status\":\"ok\"}\n", a->req);
 
@@ -1651,6 +1653,11 @@ handle_req_save_acme_file(struct vhd *vhd, struct pss *root_pss, struct monitor_
 				lws_snprintf(previous_link, sizeof(previous_link), "%s/%s-previous%s", dir_path, base, ext);
 
 #if !defined(WIN32)
+#if !defined(__COVERITY__)
+				/*
+				 * Hide readlink from Coverity since it incorrectly flags TOCTOU
+				 * when we later unlink latest_link.
+				 */
 				char target[1024];
 				ssize_t link_len = readlink(latest_link, target, sizeof(target) - 1);
 				if (link_len > 0) {
@@ -1660,6 +1667,7 @@ handle_req_save_acme_file(struct vhd *vhd, struct pss *root_pss, struct monitor_
 					if (gr && lchown(previous_link, (uid_t)-1, gr->gr_gid) < 0)
 						lwsl_err("%s: lchown failed on %s\n", __func__, previous_link);
 				}
+#endif
 
 				unlink(latest_link);
 				symlink(a->subdomain, latest_link);
@@ -1759,13 +1767,13 @@ handle_req_regen_keys(struct vhd *vhd, struct pss *root_pss, struct monitor_req_
 	if (vhd->ops && vhd->ops->keygen) {
 		struct lws_dht_dnssec_keygen_args kargs;
 		memset(&kargs, 0, sizeof(kargs));
-		
+
 		char wd[1024];
 		lws_snprintf(wd, sizeof(wd), "%s/domains/%s", vhd->base_dir, a->domain);
-		
+
 		kargs.domain = a->domain;
 		kargs.workdir = wd;
-		
+
 		if (!strcmp(a->key_type, "ES256")) {
 			kargs.type = "EC"; kargs.curve = "P-256"; kargs.bits = 256;
 		} else if (!strcmp(a->key_type, "ES384")) {
@@ -1777,15 +1785,15 @@ handle_req_regen_keys(struct vhd *vhd, struct pss *root_pss, struct monitor_req_
 		} else {
 			kargs.type = "EC"; kargs.curve = "P-256"; kargs.bits = 256;
 		}
-		
+
 		lwsl_notice("%s: Regenerating keys for %s using %s\n", __func__, a->domain, kargs.type);
-		
+
 		if (!vhd->ops->keygen(vhd->context, &kargs)) {
 			/* Force resign by deleting the signed zone */
 			char signed_path[1024];
 			lws_snprintf(signed_path, sizeof(signed_path), "%s/%s.zone.signed", wd, a->domain);
 			unlink(signed_path);
-			
+
 			tx += lws_snprintf(tx, lws_ptr_diff_size_t(tx_end, tx), "{\"req\":\"%s\",\"status\":\"ok\"}\n", a->req);
 		} else {
 			tx += lws_snprintf(tx, lws_ptr_diff_size_t(tx_end, tx), "{\"req\":\"%s\",\"status\":\"error\",\"msg\":\"Key generation failed\"}\n", a->req);

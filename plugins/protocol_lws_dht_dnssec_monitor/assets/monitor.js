@@ -607,17 +607,17 @@ function renderWhoisHeader() {
                     let alg = parts[1];
                     let digestType = parts[2];
                     let digest = parts.slice(3).join('');
-                    
+
                     let algName = alg;
                     if (alg === '8') algName = '8 (RSA/SHA256)';
                     else if (alg === '13') algName = '13 (ECDSA Curve P-256 with SHA-256)';
                     else if (alg === '14') algName = '14 (ECDSA Curve P-384 with SHA-384)';
-                    
+
                     let dTypeName = digestType;
                     if (digestType === '1') dTypeName = '1 (SHA-1)';
                     else if (digestType === '2') dTypeName = '2 (SHA-256)';
                     else if (digestType === '4') dTypeName = '4 (SHA-384)';
-                    
+
                     dsText = `DS KeyID: ${keyId},  Alg: ${algName}, Digest Type: ${dTypeName}, Digest: ${digest}`;
                 } else {
                     dsText = ds;

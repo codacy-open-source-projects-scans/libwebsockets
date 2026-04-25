@@ -46,19 +46,19 @@ sanitize_ft(char *ft)
 	char *p, *eq = strchr(ft, '=');
 	if (!eq) return;
 	eq++;
-	
+
 	/* remove trailing \r, \n, spaces, or quotes */
 	p = eq + strlen(eq) - 1;
 	while (p >= eq && (*p == '\r' || *p == '\n' || *p == ' ' || *p == '"' || *p == '\'')) {
 		*p = '\0';
 		p--;
 	}
-	
+
 	/* remove leading quotes or spaces after = */
 	p = eq;
 	while (*p == ' ' || *p == '"' || *p == '\'')
 		p++;
-	
+
 	if (p != eq)
 		memmove(eq, p, strlen(p) + 1);
 }
@@ -367,49 +367,16 @@ int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
 	struct lws_context *context;
-	const char *my_argv[64];
-	int my_argc = 0, m, n = 0;
-	char stdin_buf[1024];
-	char *p, *s;
-	(void)switches;
-
-	my_argv[0] = argv[0];
-	my_argc++;
-
-	/* Pre-pend stdin piped arguments to ensure auth tokens hit the payload FIRST */
-	n = (int)read(0, stdin_buf, sizeof(stdin_buf) - 1);
-	if (n > 0) {
-		stdin_buf[n] = '\0';
-		p = s = stdin_buf;
-		while (p < stdin_buf + n) {
-			if (*p == '\n' || *p == ' ' || *p == '\0') {
-				*p = '\0';
-				if (p != s) {
-					if (my_argc < (int)LWS_ARRAY_SIZE(my_argv) - 1)
-						my_argv[my_argc++] = s;
-				}
-				s = p + 1;
-			}
-			p++;
-		}
-		if (p != s && my_argc < (int)LWS_ARRAY_SIZE(my_argv) - 1)
-			my_argv[my_argc++] = s;
-	}
-
-	for (m = 1; m < argc; m++) {
-		if (my_argc < (int)LWS_ARRAY_SIZE(my_argv) - 1)
-			my_argv[my_argc++] = argv[m];
-	}
-
-	if ((my_argc == 1) || lws_cmdline_option(my_argc, my_argv, switches[LWS_SW_HELP].sw)) {
-		lws_switches_print_help(my_argv[0], switches, LWS_ARRAY_SIZE(switches));
+	int n = 0;
+	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
+		lws_switches_print_help(argv[0], switches, LWS_ARRAY_SIZE(switches));
 		return 0;
 	}
 
 	signal(SIGINT, sigint_handler);
 
 	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
-	lws_cmdline_option_handle_builtin(my_argc, my_argv, &info);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	lwsl_user("LWS minimal http client form - POST [-d<verbosity>] [-l] [--h1] https://libwebsockets.org/testserver/formtest\n");
 
 	info.options			= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT |
@@ -429,7 +396,7 @@ int main(int argc, const char **argv)
 	 * OpenSSL uses the system trust store.  mbedTLS has to be told which
 	 * CA to trust explicitly.
 	 */
-	if (!lws_cmdline_option(my_argc, my_argv, switches[LWS_SW_L].sw))
+	if (!lws_cmdline_option(argc, argv, switches[LWS_SW_L].sw))
 		info.client_ssl_ca_filepath = "./libwebsockets.org.cer";
 #endif
 
@@ -441,6 +408,11 @@ int main(int argc, const char **argv)
 
 
 
+	if (lws_system_adopt_stdin(context, LWS_SAS_FLAG__APPEND_COMMANDLINE)) {
+		lwsl_err("%s: failed to adopt stdin\n", __func__);
+		goto bail;
+	}
+
 	/*
 	 * Init continues in app_system_state_nf() above after we reach system
 	 * state OPERATIONAL
@@ -449,6 +421,7 @@ int main(int argc, const char **argv)
 	while (n >= 0 && completed != 1 && !interrupted)
 		n = lws_service(context, 0);
 
+bail:
 	lws_context_destroy(context);
 	lwsl_user("Completed: %s\n", bad ? "failed" : "OK");
 

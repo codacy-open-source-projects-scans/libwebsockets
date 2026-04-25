@@ -429,6 +429,7 @@ append_av1_obu(struct mixer_media_session *s, const uint8_t *data, size_t len)
 	} while (tmp != 0);
 
 	size_t needed = s->video_len + hdr_len + leb_len + payload_len + 4;
+	if (needed > 16 * 1024 * 1024) return;
 	if (s->video_alloc < needed) {
 		s->video_alloc = needed + 4096;
 		s->video_buf = realloc(s->video_buf, s->video_alloc);
@@ -474,6 +475,10 @@ process_session_media(struct mixer_media_session *s)
 		}
 
 		msg_ptr = (struct mixer_msg *)lws_ring_get_element(s->ring_input, &s->ring_tail);
+		if (!msg_ptr) {
+			lws_mutex_unlock(s->mutex);
+			break;
+		}
 		msg_copy = *msg_ptr;
 		lws_ring_consume(s->ring_input, &s->ring_tail, NULL, 1);
 		lws_ring_update_oldest_tail(s->ring_input, s->ring_tail);
@@ -495,7 +500,9 @@ process_session_media(struct mixer_media_session *s)
 							if (dbg_jitter++ % 50 == 0)
 								lwsl_warn("%s: Dropped %zu PCM samples (Jitter full)\n", __func__, drop);
 						}
-						lws_ring_insert(s->ring_pcm, s->pcm_in, (size_t)ret);
+						if (lws_ring_insert(s->ring_pcm, s->pcm_in, (size_t)ret) != (size_t)ret) {
+							lwsl_err("%s: Failed to insert PCM samples into ring\n", __func__);
+						}
 #if 0
 						static int dbg_dec = 0;
 						if (dbg_dec++ % 50 == 0)
@@ -541,7 +548,11 @@ process_session_media(struct mixer_media_session *s)
 				size_t in_len = msg->len;
 				int ready_to_decode = 1;
 
-				if (msg->codec == LWS_CODEC_H264 && in_len > 0) {
+				/* satisfy coverity */
+				if (in_len > 16 * 1024 * 1024)
+					in_len = 0;
+
+				if (msg->codec == LWS_CODEC_H264 && in_data && in_len > 0) {
 					ready_to_decode = 0;
 					uint8_t header = in_data[0];
 					uint8_t type = header & 0x1F;
@@ -550,15 +561,19 @@ process_session_media(struct mixer_media_session *s)
 					if (type >= 1 && type <= 23) {
 						/* Single NAL Unit */
 						size_t needed = s->video_len + in_len + 4;
-						if (s->video_alloc < needed) {
-							s->video_buf = realloc(s->video_buf, needed + 1024);
-							s->video_alloc = needed + 1024;
-						}
-						if (s->video_buf) {
-							memcpy(s->video_buf + s->video_len, annexb_start, 4);
-							s->video_len += 4;
-							memcpy(s->video_buf + s->video_len, in_data, in_len);
-							s->video_len += in_len;
+						if (needed > 16 * 1024 * 1024) {
+							s->video_len = 0;
+						} else {
+							if (s->video_alloc < needed) {
+								s->video_buf = realloc(s->video_buf, needed + 1024);
+								s->video_alloc = needed + 1024;
+							}
+							if (s->video_buf) {
+								memcpy(s->video_buf + s->video_len, annexb_start, 4);
+								s->video_len += 4;
+								memcpy(s->video_buf + s->video_len, in_data, in_len);
+								s->video_len += in_len;
+							}
 						}
 					} else if (type == 24) {
 						/* STAP-A: Single-Time Aggregation Packet */
@@ -566,12 +581,16 @@ process_session_media(struct mixer_media_session *s)
 						while (off + 2 <= in_len) {
 							uint16_t nal_size = (uint16_t)((in_data[off] << 8) | in_data[off+1]);
 							off += 2;
-							if (nal_size == 0) {
-								lwsl_err("%s: H264 Parse Error: 0-length NAL in STAP-A detected, breaking loop\n", __func__);
+							if (nal_size == 0 || nal_size > 65000) {
+								lwsl_err("%s: H264 Parse Error: invalid NAL size %u in STAP-A detected, breaking loop\n", __func__, nal_size);
 								break;
 							}
 							if (off + nal_size > in_len) break;
 							size_t needed = s->video_len + nal_size + 4;
+							if (needed > 16 * 1024 * 1024) {
+								s->video_len = 0;
+								break;
+							}
 							if (s->video_alloc < needed) {
 								s->video_buf = realloc(s->video_buf, needed + 1024);
 								s->video_alloc = needed + 1024;
@@ -600,37 +619,47 @@ process_session_media(struct mixer_media_session *s)
 								/* Start of fragment */
 								s->fu_a_active = 1;
 								size_t needed = s->video_len + payload_len + 5;
-								if (s->video_alloc < needed) {
-									s->video_buf = realloc(s->video_buf, needed + 4096);
-									s->video_alloc = needed + 4096;
-								}
-								if (s->video_buf) {
-									memcpy(s->video_buf + s->video_len, annexb_start, 4);
-									s->video_len += 4;
-									/* Reconstruct NAL header */
-									s->video_buf[s->video_len] = (header & 0xE0) | nal_type;
-									s->video_len += 1;
-									memcpy(s->video_buf + s->video_len, payload, payload_len);
-									s->video_len += payload_len;
+								if (needed > 16 * 1024 * 1024) {
+									s->video_len = 0;
+									s->fu_a_active = 0;
+								} else {
+									if (s->video_alloc < needed) {
+										s->video_buf = realloc(s->video_buf, needed + 4096);
+										s->video_alloc = needed + 4096;
+									}
+									if (s->video_buf) {
+										memcpy(s->video_buf + s->video_len, annexb_start, 4);
+										s->video_len += 4;
+										/* Reconstruct NAL header */
+										s->video_buf[s->video_len] = (header & 0xE0) | nal_type;
+										s->video_len += 1;
+										memcpy(s->video_buf + s->video_len, payload, payload_len);
+										s->video_len += payload_len;
 
-									// static int dbg_fua1 = 0;
-									// if (dbg_fua1++ % 500 == 0)
-									// 	lwsl_notice("FU-A: Start fragment, NAL type %u, len %zu\n", nal_type, payload_len);
+										// static int dbg_fua1 = 0;
+										// if (dbg_fua1++ % 500 == 0)
+										// 	lwsl_notice("FU-A: Start fragment, NAL type %u, len %zu\n", nal_type, payload_len);
+									}
 								}
 							} else if (s->video_buf && s->video_len > 0 && s->fu_a_active) {
 								/* Middle or end of fragment */
 								size_t needed = s->video_len + payload_len;
-								if (s->video_alloc < needed) {
-									s->video_buf = realloc(s->video_buf, needed + 4096);
-									s->video_alloc = needed + 4096;
-								}
-								if (s->video_buf) {
-									memcpy(s->video_buf + s->video_len, payload, payload_len);
-									s->video_len += payload_len;
+								if (needed > 16 * 1024 * 1024) {
+									s->video_len = 0;
+									s->fu_a_active = 0;
+								} else {
+									if (s->video_alloc < needed) {
+										s->video_buf = realloc(s->video_buf, needed + 4096);
+										s->video_alloc = needed + 4096;
+									}
+									if (s->video_buf) {
+										memcpy(s->video_buf + s->video_len, payload, payload_len);
+										s->video_len += payload_len;
 
-									// static int dbg_fua2 = 0;
-									// if (dbg_fua2++ % 2000 == 0)
-									// 	lwsl_notice("FU-A: Cont fragment, len %zu\n", payload_len);
+										// static int dbg_fua2 = 0;
+										// if (dbg_fua2++ % 2000 == 0)
+										// 	lwsl_notice("FU-A: Cont fragment, len %zu\n", payload_len);
+									}
 								}
 								/* We don't decode on 'E', we decode on 'marker' */
 							}
@@ -647,7 +676,7 @@ process_session_media(struct mixer_media_session *s)
 					//	if (dbg_marker++ % 50 == 0)
 					//		lwsl_notice("H264 Marker Received! Feeding Frame to decoder (len %zu)\n", in_len);
 					}
-				} else if (msg->codec == LWS_CODEC_AV1 && in_len > 1) {
+				} else if (msg->codec == LWS_CODEC_AV1 && in_data && in_len > 1) {
 					ready_to_decode = 0; /* VERY IMPORTANT! Do not decode until marker=1 */
 					/*
 					   static int dbg_hex = 0;
@@ -730,18 +759,22 @@ process_session_media(struct mixer_media_session *s)
 						if (is_first_elem && Z == 1) {
 							/* Continuation fragment from a PREVIOUS packet */
 							if (!drop_fragment && s->obu_buf) {
-								if (s->obu_len + obu_size > s->obu_alloc) {
-									s->obu_alloc = s->obu_len + obu_size + 4096;
-									s->obu_buf = realloc(s->obu_buf, s->obu_alloc);
-								}
-								if (s->obu_buf) {
-									memcpy(s->obu_buf + s->obu_len, in_data + off, obu_size);
-									s->obu_len += obu_size;
+								if (s->obu_len + obu_size > 16 * 1024 * 1024) {
+									s->obu_len = 0;
+								} else {
+									if (s->obu_len + obu_size > s->obu_alloc) {
+										s->obu_alloc = s->obu_len + obu_size + 4096;
+										s->obu_buf = realloc(s->obu_buf, s->obu_alloc);
+									}
+									if (s->obu_buf) {
+										memcpy(s->obu_buf + s->obu_len, in_data + off, obu_size);
+										s->obu_len += obu_size;
 
-									/* Complete if not continuing into NEXT packet */
-									if (!(is_last_elem_in_packet && Y == 1)) {
-										append_av1_obu(s, s->obu_buf, s->obu_len);
-										s->obu_len = 0;
+										/* Complete if not continuing into NEXT packet */
+										if (!(is_last_elem_in_packet && Y == 1)) {
+											append_av1_obu(s, s->obu_buf, s->obu_len);
+											s->obu_len = 0;
+										}
 									}
 								}
 							}
@@ -751,13 +784,17 @@ process_session_media(struct mixer_media_session *s)
 								/* Begins here, continues into NEXT packet */
 								if (dbg_aggr < 50) lwsl_notice("  -> Frag START: idx=%d, size=%zu\n", elem_idx, obu_size);
 								s->obu_len = 0;
-								if (obu_size > s->obu_alloc) {
-									s->obu_alloc = obu_size + 4096;
-									s->obu_buf = realloc(s->obu_buf, s->obu_alloc);
-								}
-								if (s->obu_buf && obu_size > 0) {
-									memcpy(s->obu_buf, in_data + off, obu_size);
-									s->obu_len = obu_size;
+								if (obu_size > 16 * 1024 * 1024) {
+									/* Too large */
+								} else {
+									if (obu_size > s->obu_alloc) {
+										s->obu_alloc = obu_size + 4096;
+										s->obu_buf = realloc(s->obu_buf, s->obu_alloc);
+									}
+									if (s->obu_buf && obu_size > 0) {
+										memcpy(s->obu_buf, in_data + off, obu_size);
+										s->obu_len = obu_size;
+									}
 								}
 							} else {
 								/* Complete within this packet */
@@ -844,7 +881,10 @@ process_session_media(struct mixer_media_session *s)
 
 		}
 
-		if (msg->payload) free(msg->payload);
+		if (msg->payload) {
+			free(msg->payload);
+			msg->payload = NULL;
+		}
 	}
 }
 
@@ -981,7 +1021,10 @@ skip_encode:
 			lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&vhd->sessions)) {
 				struct mixer_media_session *s = lws_container_of(d, struct mixer_media_session, list);
 				if (strcmp(s->room_name, r->name)) goto next_tx_h264;
-				if (s->can_rx_h264) {
+				lws_mutex_lock(s->mutex);
+				int can_rx_h264 = s->can_rx_h264;
+				lws_mutex_unlock(s->mutex);
+				if (can_rx_h264) {
 					if (s->media && we_ops && we_ops->send_video) {
 						static int dbg_tx = 0;
 						if (dbg_tx++ % 50 == 0)
@@ -1009,7 +1052,10 @@ next_tx_h264:;
 			lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&vhd->sessions)) {
 				struct mixer_media_session *s = lws_container_of(d, struct mixer_media_session, list);
 				if (strcmp(s->room_name, r->name)) goto next_tx_av1;
-				if (s->can_rx_av1) {
+				lws_mutex_lock(s->mutex);
+				int can_rx_av1 = s->can_rx_av1;
+				lws_mutex_unlock(s->mutex);
+				if (can_rx_av1) {
 					if (s->media && we_ops && we_ops->send_video) {
 						we_ops->send_video(s->media, f->buf, f->len, LWS_CODEC_AV1, rtp_ts);
 					}
@@ -1082,6 +1128,8 @@ media_worker_thread(void *d)
         lws_mutex_lock(vhd->mutex_rx);
         while (lws_ring_get_count_waiting_elements(vhd->ring_rx, &vhd->ring_rx_tail) > 0) {
              msg = (struct mixer_msg *)lws_ring_get_element(vhd->ring_rx, &vhd->ring_rx_tail);
+             if (!msg)
+                 break;
              process_control_message(vhd, msg);
              lws_ring_consume(vhd->ring_rx, &vhd->ring_rx_tail, NULL, 1);
              lws_ring_update_oldest_tail(vhd->ring_rx, vhd->ring_rx_tail);
@@ -1614,7 +1662,10 @@ deinit_participant_media(struct participant *p)
             msg.session = p->session;
 
             lws_mutex_lock(p->room->vhd->mutex_rx);
-            lws_ring_insert(p->room->vhd->ring_rx, &msg, 1);
+            if (lws_ring_insert(p->room->vhd->ring_rx, &msg, 1) != 1) {
+                lwsl_err("%s: Failed to insert REMOVE_SESSION\n", __func__);
+                mixer_media_session_unref(p->session);
+            }
             lws_mutex_unlock(p->room->vhd->mutex_rx);
         } else {
             /* Fallback if somehow room is missing */

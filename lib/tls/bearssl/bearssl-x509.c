@@ -524,6 +524,35 @@ wrap_end_cert(const br_x509_class **ctx)
 	br_x509_minimal_vtable.end_cert(ctx);
 }
 
+static unsigned
+wrap_end_chain(const br_x509_class **ctx)
+{
+	lws_tls_conn *conn = lws_container_of((br_x509_minimal_context *)ctx, lws_tls_conn, x509_ctx);
+	unsigned err = br_x509_minimal_vtable.end_chain(ctx);
+
+	if (err == BR_ERR_X509_NOT_TRUSTED && (conn->tls_use_ssl & (LCCSCF_ALLOW_SELFSIGNED | LCCSCF_ALLOW_INSECURE))) {
+		lwsl_notice("%s: bypassing validation err %u due to ALLOW_SELFSIGNED/INSECURE\n", __func__, err);
+		return 0;
+	}
+
+	return err;
+}
+
+static const br_x509_pkey *
+wrap_get_pkey(const br_x509_class *const *ctx, unsigned *usages)
+{
+	lws_tls_conn *conn = lws_container_of((br_x509_minimal_context *)ctx, lws_tls_conn, x509_ctx);
+	const br_x509_pkey *pkey = br_x509_minimal_vtable.get_pkey(ctx, usages);
+
+	if (!pkey && (conn->tls_use_ssl & (LCCSCF_ALLOW_SELFSIGNED | LCCSCF_ALLOW_INSECURE))) {
+		if (usages)
+			*usages = conn->x509_ctx.key_usages;
+		return &conn->x509_ctx.pkey;
+	}
+
+	return pkey;
+}
+
 void lws_bearssl_x509_wrap_conn(lws_tls_conn *conn)
 {
 	memcpy(&conn->x509_vtable, &br_x509_minimal_vtable, sizeof(br_x509_class));
@@ -531,6 +560,8 @@ void lws_bearssl_x509_wrap_conn(lws_tls_conn *conn)
 	conn->x509_vtable.start_cert = wrap_start_cert;
 	conn->x509_vtable.append = wrap_append;
 	conn->x509_vtable.end_cert = wrap_end_cert;
+	conn->x509_vtable.end_chain = wrap_end_chain;
+	conn->x509_vtable.get_pkey = wrap_get_pkey;
 	conn->x509_ctx.vtable = &conn->x509_vtable;
 }
 

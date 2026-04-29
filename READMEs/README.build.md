@@ -358,7 +358,7 @@ size and memory usage as well as speed) suggest you use.
 
 NOTE: one major difference with mbedTLS and BearSSL is they do not natively load the OS trust
 store by default in the same way OpenSSL does.
- 
+
 For mbedTLS, you must provide the CA cert to lws for it to be able
 to validate it, ie, use `-A` with the test client.
 

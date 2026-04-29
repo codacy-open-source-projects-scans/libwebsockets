@@ -113,13 +113,21 @@ lws_tls_server_accept(struct lws *wsi)
 		return LWS_SSL_CAPABLE_ERROR;
 	}
 
-	if (st & BR_SSL_SENDAPP) {
-		lwsl_info("%s: server accept OK\n", __func__);
-		return LWS_SSL_CAPABLE_DONE;
-	}
-
 	if (st & BR_SSL_SENDREC)
 		return LWS_SSL_CAPABLE_MORE_SERVICE_WRITE;
+
+	if (st & (BR_SSL_SENDAPP | BR_SSL_RECVAPP)) {
+		lwsl_info("%s: server accept OK\n", __func__);
+
+		if (lws_ssl_pending(wsi)) {
+			struct lws_context_per_thread *pt = &wsi->a.context->pt[(int)wsi->tsi];
+			if (lws_dll2_is_detached(&wsi->tls.dll_pending_tls))
+				lws_dll2_add_head(&wsi->tls.dll_pending_tls,
+						  &pt->tls.dll_pending_tls_owner);
+		}
+
+		return LWS_SSL_CAPABLE_DONE;
+	}
 
 	return LWS_SSL_CAPABLE_MORE_SERVICE_READ;
 }

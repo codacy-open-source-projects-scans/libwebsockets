@@ -134,7 +134,7 @@ lws_b64_decode_stateful(struct lws_b64state *s, const char *in, size_t *in_len,
 					v = 0;
 					continue;
 				}
-				
+
 				s->c = v;
 
 				/* Sanity check this is part of the charset */

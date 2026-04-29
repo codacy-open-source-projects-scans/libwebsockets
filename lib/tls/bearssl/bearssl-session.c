@@ -332,13 +332,22 @@ lws_tls_session_dump_load(struct lws_vhost *vh, const char *host, uint16_t port,
 	lws_tls_session_tag_discrete(vh->name, host, port, d.tag, sizeof(d.tag));
 	nl = strlen(d.tag);
 
-	d.blob = &sp;
-	d.blob_len = sizeof(sp);
+	d.blob = NULL;
+	d.blob_len = 0;
 	d.opaque = opq;
 
 	n = cb_load(vh->context, &d);
 	if (n)
 		return 0;
+
+	if (d.blob_len != sizeof(sp)) {
+		lwsl_err("%s: session dump length mismatch\n", __func__);
+		free(d.blob);
+		return 0;
+	}
+
+	memcpy(&sp, d.blob, sizeof(sp));
+	free(d.blob);
 
 	lws_context_lock(vh->context, __func__); /* -------------- cx { */
 	lws_vhost_lock(vh); /* -------------- vh { */

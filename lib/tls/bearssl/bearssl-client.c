@@ -43,7 +43,10 @@ lws_tls_client_connect(struct lws *wsi, char *errbuf, size_t elen)
 
 		/* Basic init */
 		br_ssl_client_init_full(&conn->u.client, &conn->x509_ctx, tas, num_tas);
-		/* lws_bearssl_x509_wrap_conn(conn); */
+
+		conn->tls_use_ssl = wsi->tls.use_ssl;
+		lws_bearssl_x509_wrap_conn(conn);
+
 #if defined(LWS_WITH_TLS_JIT_TRUST)
 		conn->wsi = wsi;
 #endif
@@ -102,16 +105,24 @@ lws_tls_client_connect(struct lws *wsi, char *errbuf, size_t elen)
 		return LWS_SSL_CAPABLE_ERROR;
 	}
 
-	if (st & BR_SSL_SENDAPP) {
+	if (st & BR_SSL_SENDREC)
+		return LWS_SSL_CAPABLE_MORE_SERVICE_WRITE;
+
+	if (st & (BR_SSL_SENDAPP | BR_SSL_RECVAPP)) {
 		lwsl_info("%s: client connect OK\n", __func__);
+
+		if (lws_ssl_pending(wsi)) {
+			struct lws_context_per_thread *pt = &wsi->a.context->pt[(int)wsi->tsi];
+			if (lws_dll2_is_detached(&wsi->tls.dll_pending_tls))
+				lws_dll2_add_head(&wsi->tls.dll_pending_tls,
+						  &pt->tls.dll_pending_tls_owner);
+		}
+
 #if defined(LWS_WITH_TLS_SESSIONS)
 		lws_tls_session_new_bearssl(wsi);
 #endif
 		return LWS_SSL_CAPABLE_DONE;
 	}
-
-	if (st & BR_SSL_SENDREC)
-		return LWS_SSL_CAPABLE_MORE_SERVICE_WRITE;
 
 	return LWS_SSL_CAPABLE_MORE_SERVICE_READ;
 }

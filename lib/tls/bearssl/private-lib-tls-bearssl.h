@@ -71,6 +71,7 @@ struct lws_tls_conn {
 	char *client_hostname;
 	size_t pending_app_data_len;
 	struct lws_tls_ctx *ctx;
+	unsigned int tls_use_ssl;
 };
 
 typedef struct lws_tls_conn lws_tls_conn;

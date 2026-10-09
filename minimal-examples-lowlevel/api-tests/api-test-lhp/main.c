@@ -35,6 +35,8 @@ static const char * const cb_reasons[] = {
 };
 
 static const char * const html_tests[] = {
+	/* POC test */
+	"<style>span.note{color:#123;}</style><span class>x</span>",
 	/* test 1 */
 	"hello",
 	/* test 2 */
@@ -105,8 +107,32 @@ static const char * const html_tests[] = {
 	 "</div>"
         "hello</body></html>",
 
-        "<style> a { width: 0em }</style><a><body>"
+        "<style> a { width: 0em }</style><a><body>",
+
+	/* standalone parse with no lws_context and an <img> with an absolute
+	 * url: must leave the element empty rather than deref the (absent)
+	 * context or assert on the (empty) base url */
+
+	"<html><head></head><body><img src=\"file://x\"></body></html>",
+
+	/* named entities from the HTML 4.01 Latin-1, symbol and special
+	 * sets in body text, mixed with numeric ones */
+
+	("<html><body>Dr Alp&ouml;ge &euro;5 &ldquo;x&rdquo; &Omega;&amp;&#233;"
+	 "&nbsp;&iexcl;&yuml;&bogus;</body></html>")
 };
+
+/* the last test's body text, once the entities are expanded to utf-8 */
+
+#define ENTITY_TEST_IDX (LWS_ARRAY_SIZE(html_tests) - 1)
+static const char * const entity_expect =
+	"Dr Alp\xc3\xb6ge \xe2\x82\xac" "5 \xe2\x80\x9cx\xe2\x80\x9d "
+	"\xce\xa9&\xc3\xa9\xc2\xa0\xc2\xa1\xc3\xbf&bogus;";
+
+/* the content arrives in pieces, one per entity: collect it */
+
+static char content_acc[128];
+static size_t content_len;
 
 static unsigned int m, step;
 
@@ -141,10 +167,17 @@ dump_css_atr(lws_dll2_t *d, void *user)
 static lws_stateful_ret_t
 test_cb(lhp_ctx_t *ctx, char reason)
 {
-	lhp_pstack_t *ps = lws_container_of(ctx->stack.tail, lhp_pstack_t, list);
+	lhp_pstack_t *ps = lws_container_of(lws_dll2_get_tail(&ctx->stack), lhp_pstack_t, list);
 	const lcsp_atr_t *a;
 
-	printf("{ %s, %u, \"%.*s\", %u, { ", cb_reasons[(unsigned int)reason], ctx->npos, ctx->npos, ctx->buf, ps->atr.count);
+	printf("{ %s, %u, \"%.*s\", %u, { ", cb_reasons[(unsigned int)reason], ctx->npos, ctx->npos, ctx->buf, lws_dll2_count(
+		&ps->atr));
+
+	if (m == ENTITY_TEST_IDX && reason == LHPCB_CONTENT &&
+	    content_len + (size_t)ctx->npos < sizeof(content_acc)) {
+		memcpy(content_acc + content_len, ctx->buf, (size_t)ctx->npos);
+		content_len += (size_t)ctx->npos;
+	}
 
 	if (reason == LHPCB_ELEMENT_START || reason == LHPCB_ELEMENT_END) {
 		lws_dll2_foreach_safe(&ps->atr, NULL, dump_atr);
@@ -262,6 +295,71 @@ test_cb(lhp_ctx_t *ctx, char reason)
 	return 0;
 }
 
+/*
+ * lws_http_rel_to_url(): every branch, and every branch refusing a result
+ * that does not fit (a truncated url would name some other resource)
+ */
+
+static const struct {
+	const char	*base, *rel, *expect;	/* expect NULL: must fail */
+	size_t		len;
+} rel_tests[] = {
+	{ "https://x.com/y/z.html", "a.html", "https://x.com/y/a.html", 64 },
+	{ "https://x.com/y/z.html", "/c.html", "https://x.com/c.html", 64 },
+	{ "https://x.com/y/z.html", "https://y.com/a.html",
+					"https://y.com/a.html", 64 },
+	{ "https://x.com/y/z.html", "//y.com/a.html",
+					"https://y.com/a.html", 64 },
+	{ "file:///d/e/f.html", "g.css", "file:///d/e/g.css", 64 },
+	{ "file:///d/e/f.html", "/g.css", "file:///d/e/g.css", 64 },
+
+	/* exactly fits, including the NUL */
+	{ "https://x.com/y/z.html", "a.html", "https://x.com/y/a.html", 23 },
+	{ "https://x.com/y/z.html", "/c.html", "https://x.com/c.html", 21 },
+	{ "https://x.com/y/z.html", "//y.com/a.html",
+					"https://y.com/a.html", 21 },
+	{ "file:///d/e/f.html", "g.css", "file:///d/e/g.css", 18 },
+	{ "https://x.com/y/z.html", "https://y.com/a.html",
+					"https://y.com/a.html", 21 },
+
+	/* one short */
+	{ "https://x.com/y/z.html", "a.html", NULL, 22 },
+	{ "https://x.com/y/z.html", "/c.html", NULL, 20 },
+	{ "https://x.com/y/z.html", "https://y.com/a.html", NULL, 20 },
+	{ "https://x.com/y/z.html", "//y.com/a.html", NULL, 20 },
+	{ "file:///d/e/f.html", "g.css", NULL, 17 },
+	{ "x", "a.html", NULL, 2 },
+};
+
+static int
+test_rel_to_url(void)
+{
+	char dest[64];
+	size_t n;
+
+	for (n = 0; n < LWS_ARRAY_SIZE(rel_tests); n++) {
+		int r = lws_http_rel_to_url(dest, rel_tests[n].len,
+					    rel_tests[n].base, rel_tests[n].rel);
+
+		if (!rel_tests[n].expect) {
+			if (!r)
+				goto fail;
+			continue;
+		}
+		if (r || strcmp(dest, rel_tests[n].expect))
+			goto fail;
+		continue;
+fail:
+		lwsl_err("%s: case %d: %s + %s (len %d): r %d, %s\n", __func__,
+			 (int)n, rel_tests[n].base, rel_tests[n].rel,
+			 (int)rel_tests[n].len, r, r ? "-" : dest);
+
+		return 1;
+	}
+
+	return 0;
+}
+
 static const lws_surface_info_t ic = {
 	.wh_px = { { 600,0 },       { 448,0 } },
 	.wh_mm = { { 114,5000000 }, {  82,5000000 } },
@@ -272,14 +370,13 @@ static lws_displaylist_t displaylist;
 int
 main(int argc, const char **argv)
 {
-	int e = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	int e = 0;
 	lws_stateful_ret_t n;
 	lws_dl_rend_t drt;
 	lhp_ctx_t ctx;
-	const char *p;
 	(void)switches;
 
-	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
+	if (lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
 		lws_switches_print_help(argv[0], switches, LWS_ARRAY_SIZE(switches));
 		return 0;
 	}
@@ -288,10 +385,7 @@ main(int argc, const char **argv)
 
 	memset(&ctx, 0, sizeof(ctx));
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS API selftest: lhp HTML5 parser\n");
 
 	for (m = 0; m < (int)LWS_ARRAY_SIZE(html_tests); m++) {
@@ -327,6 +421,17 @@ main(int argc, const char **argv)
 
 	if (e)
 		goto bail;
+
+	if (test_rel_to_url())
+		goto bail;
+
+	if (content_len != strlen(entity_expect) ||
+	    memcmp(content_acc, entity_expect, content_len)) {
+		lwsl_err("%s: entity expansion mismatch\n", __func__);
+		lwsl_hexdump_err(content_acc, content_len);
+		lwsl_hexdump_err(entity_expect, strlen(entity_expect));
+		goto bail;
+	}
 
 	lwsl_user("Completed: PASS\n");
 

@@ -21,7 +21,7 @@ sul_start_get(lws_sorted_usec_list_t *sul)
 {
 	get_t *g = lws_container_of(sul, get_t, sul5);
 
-	lws_ss_request_tx(lws_ss_from_user(g));
+	(void)lws_ss_request_tx(lws_ss_from_user(g)); /* best effort */
 	lws_sul_schedule(lws_ss_cx_from_user(g), 0, sul, sul_start_get,
 			 5 * LWS_US_PER_SEC);
 }
@@ -29,10 +29,12 @@ sul_start_get(lws_sorted_usec_list_t *sul)
 static lws_ss_state_return_t
 get_rx(void *userobj, const uint8_t *in, size_t len, int flags)
 {
+#if (_LWS_ENABLED_LOGS & LLL_NOTICE)
 	get_t *g = (get_t *)userobj;
 
 	lwsl_ss_notice(lws_ss_from_user(g), "RX %u, flags 0x%x",
 		       (unsigned int)len, (unsigned int)flags);
+#endif
 
 	if (len) {
 		lwsl_hexdump_notice(in, 16);

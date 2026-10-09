@@ -52,7 +52,7 @@ static struct lws_protocols protocols[] = {
 };
 
 static struct lws_context *context;
-static int interrupted, started;
+static int started;
 static pthread_t pthread_service[COUNT_THREADS];
 
 static const struct lws_http_mount mount = {
@@ -89,8 +89,7 @@ static const struct lws_protocol_vhost_options pvo = {
 void *thread_service(void *threadid)
 {
 	while (lws_service_tsi(context, 1000,
-			       (int)(lws_intptr_t)threadid) >= 0 &&
-	       !interrupted)
+			       (int)(lws_intptr_t)threadid) >= 0)
 		;
 
 	pthread_exit(NULL);
@@ -140,15 +139,13 @@ static lws_state_notify_link_t *na[] = { &notifier, NULL };
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
-	lws_cancel_service(context);
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
-	int logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	
 	struct lws_context_creation_info info;
-	const char *p;
 	int n = 0;
 	(void)switches;
 
@@ -160,13 +157,13 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal ws server + threads + smp | visit http://localhost:7681\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	/* a server: size the fds tables to the process limit */
+	info.fd_limit_per_thread = 0;
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.port = 7681;
 	info.mounts = &mount;
 	info.protocols = protocols;
@@ -182,7 +179,7 @@ int main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

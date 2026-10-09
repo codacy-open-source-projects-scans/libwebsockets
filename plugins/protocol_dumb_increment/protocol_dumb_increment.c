@@ -55,6 +55,8 @@ callback_dumb_increment(struct lws *wsi, enum lws_callback_reasons reason,
 
 	switch (reason) {
 	case LWS_CALLBACK_PROTOCOL_INIT:
+		if (lws_cmdline_option_cx(lws_get_context(wsi), "--lws-stub"))
+			return 0;
 		vhd = lws_protocol_vh_priv_zalloc(lws_get_vhost(wsi),
 			lws_get_protocol(wsi),
 			sizeof(struct vhd__dumb_increment));
@@ -87,7 +89,7 @@ callback_dumb_increment(struct lws *wsi, enum lws_callback_reasons reason,
 			break;
 		if (strncmp((const char *)in, "reset\n", 6) == 0)
 			pss->number = 0;
-		if (strncmp((const char *)in, "closeme\n", 8) == 0) {
+		if (len >= 8 && strncmp((const char *)in, "closeme\n", 8) == 0) {
 			lwsl_notice("dumb_inc: closing as requested\n");
 			lws_close_reason(wsi, LWS_CLOSE_STATUS_GOINGAWAY,
 					 (unsigned char *)"seeya", 5);

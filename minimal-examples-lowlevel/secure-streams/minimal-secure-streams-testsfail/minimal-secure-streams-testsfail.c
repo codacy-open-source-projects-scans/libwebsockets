@@ -10,6 +10,13 @@
  * This demonstrates various kinds of successful and failed connection
  * situations in order to confirm the correct states are coming.
  *
+ * Everything is local: the http fixtures are lws-minimal-http-server-httpbin
+ * and -tls, and name resolution goes through lws async dns to a local
+ * lws-api-test-dns-server that is authoritative for sstf.test only (see the
+ * zone next to this file).  So it needs a build with LWS_WITH_SYS_ASYNC_DNS
+ * and the LWS_ASYNCDNS_RESOLV_CONF / LWS_ASYNCDNS_PORT env pointing at the
+ * mock, which the ctest sets up.
+ *
  * You can control how much bulk data is requested from the peer using
  * --amount xxx, the default without that is 12345 bytes.
  */
@@ -17,6 +24,7 @@
 #include <libwebsockets.h>
 
 enum {
+	LWS_SW_C,
 	LWS_SW_AMOUNT,
 	LWS_SW_A,
 	LWS_SW_I,
@@ -25,6 +33,7 @@ enum {
 };
 
 static const struct lws_switches switches[] = {
+	[LWS_SW_C]	= { "-c",              "Policy filepath" },
 	[LWS_SW_AMOUNT]	= { "--amount",        "Amount of something" },
 	[LWS_SW_A]	= { "-a",              "Enable -a feature" },
 	[LWS_SW_I]	= { "-i",              "Interface to bind to" },
@@ -35,7 +44,7 @@ static const struct lws_switches switches[] = {
 #include <string.h>
 #include <signal.h>
 
-static int interrupted, tests, tests_pass, tests_fail, doing_a_retry;
+static int tests, tests_pass, tests_fail, doing_a_retry;
 static lws_sorted_usec_list_t sul_next_test;
 static lws_state_notify_link_t nl;
 struct lws_context *context;
@@ -81,7 +90,7 @@ static const char * const default_ss_policy =
 		 * We fetch the real policy from there using SS and switch to
 		 * using that.
 		 */
-		"{\"isrg_root_x1\": \""
+				"{\"isrg_root_x1\": \""
 	"MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw"
 	"TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh"
 	"cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4"
@@ -109,8 +118,22 @@ static const char * const default_ss_policy =
 	"jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc"
 	"oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq"
 	"4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA"
-	"mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d"
-	"emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc="
+	"mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57de"
+	"myPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc="
+	  "\"},\n"
+		"{\"isrg_root_x2\": \""
+	"MIICGzCCAaGgAwIBAgIQQdKd0XLq7qeAwSxs6S+HUjAKBggqhkjOPQQDAzBPMQsw"
+	"CQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJuZXQgU2VjdXJpdHkgUmVzZWFyY2gg"
+	"R3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBYMjAeFw0yMDA5MDQwMDAwMDBaFw00"
+	"MDA5MTcxNjAwMDBaME8xCzAJBgNVBAYTAlVTMSkwJwYDVQQKEyBJbnRlcm5ldCBT"
+	"ZWN1cml0eSBSZXNlYXJjaCBHcm91cDEVMBMGA1UEAxMMSVNSRyBSb290IFgyMHYw"
+	"EAYHKoZIzj0CAQYFK4EEACIDYgAEzZvVn4CDCuwJSvMWSj5cz3es3mcFDR0HttwW"
+	"+1qLFNvicWDEukWVEYmO6gbf9yoWHKS5xcUy4APgHoIYOIvXRdgKam7mAHf7AlF9"
+	"ItgKbppbd9/w+kHsOdx1ymgHDB/qo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0T"
+	"AQH/BAUwAwEB/zAdBgNVHQ4EFgQUfEKWrt5LSDv6kviejM9ti6lyN5UwCgYIKoZI"
+	"zj0EAwMDaAAwZQIwe3lORlCEwkSHRhtFcP9Ymd70/aTSVaYgLXTWNLxBo1BfASdW"
+	"tL4ndQavEi51mI38AjEAi/V3bNTIZargCyzuFJ0nN6T5U6VR5CmD1/iQMVtCnwr1"
+	"/q4AaOeMSQ+2b1tbFfLn"
 	  "\"},{"
 	"\"digicert_global_root_g2\": \"MIIDjjCCAnagAwIBAgIQAzrx5qcRqaC7K"
 	"GSxHQn65TANBgkqhkiG9w0BAQsFADBhMQswCQYDVQQGEwJVUzEVMBMGA1UEChMMR"
@@ -186,7 +209,8 @@ static const char * const default_ss_policy =
 		"{"
 			"\"name\": \"le_via_isrg\","
 			"\"stack\": ["
-				"\"isrg_root_x1\""
+				"\"isrg_root_x1\","
+				"\"isrg_root_x2\""
 			"]"
 		"}"
 	  "],"
@@ -215,8 +239,8 @@ static const char * const default_ss_policy =
 		 */
 
 		    "\"t_h1\": {"
-			"\"endpoint\": \"libwebsockets.org\","
-			"\"port\": 8080,"
+			"\"endpoint\": \"127.0.0.1\","
+			"\"port\": 7681,"
 			"\"protocol\": \"h1\","
 			"\"http_method\": \"GET\","
 			"\"http_url\": \"/status/200\","
@@ -256,8 +280,8 @@ static const char * const default_ss_policy =
 		 */
 
 		    "\"d_h1\": {"
-			"\"endpoint\": \"libwebsockets.org\","
-			"\"port\": 8080,"
+			"\"endpoint\": \"127.0.0.1\","
+			"\"port\": 7681,"
 			"\"protocol\": \"h1\","
 			"\"http_method\": \"GET\","
 			"\"http_url\": \"/delay/10\","
@@ -338,11 +362,11 @@ static const char * const default_ss_policy =
 		 */
 
 		    "\"bulk_h1\": {"
-			"\"endpoint\": \"libwebsockets.org\","
-			"\"port\": 8080,"
+			"\"endpoint\": \"127.0.0.1\","
+			"\"port\": 7681,"
 			"\"protocol\": \"h1\","
 			"\"http_method\": \"GET\","
-			"\"http_url\": \"bytes/${amount}\","
+			"\"http_url\": \"/bytes/${amount}\","
 			"\"metadata\": [{"
 					"\"amount\": \"\""
 				"}],"
@@ -444,6 +468,17 @@ static const char * const default_ss_policy =
  * .must_see, we can count a state like UNREACHABLE as a pass.
  */
 
+#define MIN_BACKOFF_US (2500 * LWS_US_PER_MS)
+
+/*
+ * Ask to connect in CREATING, but then return LWSSSSRET_DISCONNECT_ME from
+ * it.  The stream must come back and connect again by itself, still using the
+ * metadata we set in CREATING.  When proxied, the disconnect drops the link to
+ * the proxy, and the stream must not see CREATING again, and the proxy side
+ * stream must still get our metadata.
+ */
+#define TSF_DISCONNECT_IN_CREATING	(1 << 0)
+
 struct tests_seq {
 	const char		*name;
 	const char		*streamtype;
@@ -451,10 +486,28 @@ struct tests_seq {
 	lws_ss_constate_t	must_see;
 	unsigned int		mask_unexpected;
 	size_t			eom_pass;
+	/*
+	 * For tests that must end in ALL_RETRIES_FAILED, the minimum time the
+	 * policy's backoff table must have made the stream spend retrying
+	 * before giving up.  The policy table is [200, 400, 800, 1600]ms with
+	 * conceal 4, so a correctly escalating backoff takes >= 3000ms; if
+	 * the retries all use the first entry it is done in ~800ms.
+	 */
+	uint64_t		min_us;
+	/*
+	 * For tests that must end in UNREACHABLE, the value the state
+	 * callback's ack argument must carry with it: 0 means the name was
+	 * authoritatively refused (NXDOMAIN), 1 means the resolver itself
+	 * could not be used.  -1 means don't check it.
+	 */
+	int8_t			unreach_ack;
+	uint8_t			flags; /* TSF_ */
 } tests_seq[] = {
 
 	/*
-	 * We just get a 200 from httpbin.org as a sanity check first
+	 * Get a 200 from the local httpbin as a sanity check first.  The plain h1
+	 * streams resolve hbin.sstf.test via the mock DNS; the tls ones use the
+	 * local test cert's own name, since that is what it is issued for.
 	 */
 
 	{
@@ -462,27 +515,26 @@ struct tests_seq {
 		"t_h1", 15 * LWS_US_PER_SEC, LWSSSCS_QOS_ACK_REMOTE,
 		(1 << LWSSSCS_TIMEOUT) | (1 << LWSSSCS_QOS_NACK_REMOTE) |
 					 (1 << LWSSSCS_ALL_RETRIES_FAILED),
-		0
+		0, 0, -1, 0
 	},
 	{
 		"h1:443 just get 200",
 		"t_h1_tls", 15 * LWS_US_PER_SEC, LWSSSCS_QOS_ACK_REMOTE,
 		(1 << LWSSSCS_TIMEOUT) | (1 << LWSSSCS_QOS_NACK_REMOTE) |
 					 (1 << LWSSSCS_ALL_RETRIES_FAILED),
-		0
+		0, 0, -1, 0
 	},
 	{
 		"h2:443 just get 200",
 		"t_h2_tls", 15 * LWS_US_PER_SEC, LWSSSCS_QOS_ACK_REMOTE,
 		(1 << LWSSSCS_TIMEOUT) | (1 << LWSSSCS_QOS_NACK_REMOTE) |
 					 (1 << LWSSSCS_ALL_RETRIES_FAILED),
-		0
+		0, 0, -1, 0
 	},
 
 	/*
-	 * We arranged that the server will delay 10s before sending the
-	 * response, but set our ss timeout for 5s.  So we expect to see
-	 * our timeout and not an ACK / 200.
+	 * The server delays its response 10s but the stream timeout is 3s, so
+	 * we expect to see our timeout and not an ACK / 200.
 	 */
 
 	{
@@ -490,124 +542,179 @@ struct tests_seq {
 		"d_h1", 3 * LWS_US_PER_SEC, LWSSSCS_TIMEOUT,
 		(1 << LWSSSCS_QOS_ACK_REMOTE) | (1 << LWSSSCS_QOS_NACK_REMOTE) |
 					 (1 << LWSSSCS_ALL_RETRIES_FAILED),
-		0
+		0, 0, -1, 0
 	},
 	{
 		"h1:443 timeout after connection",
 		"d_h1_tls", 3 * LWS_US_PER_SEC, LWSSSCS_TIMEOUT,
 		(1 << LWSSSCS_QOS_ACK_REMOTE) | (1 << LWSSSCS_QOS_NACK_REMOTE) |
 					 (1 << LWSSSCS_ALL_RETRIES_FAILED),
-		0
+		0, 0, -1, 0
 	},
 	{
 		"h2:443 timeout after connection",
 		"d_h2_tls", 3 * LWS_US_PER_SEC, LWSSSCS_TIMEOUT,
 		(1 << LWSSSCS_QOS_ACK_REMOTE) | (1 << LWSSSCS_QOS_NACK_REMOTE),
-		0
+		0, 0, -1, 0
 	},
 
 	/*
-	 * We are talking to a nonexistant dns address "bogus.nope".  We expect
-	 * in each case to hear that is unreachable, before any ss timeout.
+	 * nxd.sstf.test is inside the mock's zone but has no records, so the
+	 * mock answers NXDOMAIN.  We expect UNREACHABLE promptly, before any
+	 * stream timeout, with the ack arg 0: it was the name that failed.
 	 */
 
 	{
 		"h1:80 NXDOMAIN",
-		"nxd_h1", 35 * LWS_US_PER_SEC, LWSSSCS_UNREACHABLE,
+		"nxd_h1", 15 * LWS_US_PER_SEC, LWSSSCS_UNREACHABLE,
 		(1 << LWSSSCS_QOS_ACK_REMOTE) | (1 << LWSSSCS_QOS_NACK_REMOTE) |
 		(1 << LWSSSCS_TIMEOUT) | (1 << LWSSSCS_ALL_RETRIES_FAILED),
-		0
+		0, 0, 0, 0
 	},
 	{
 		"h1:443 NXDOMAIN",
-		"nxd_h1_tls", 35 * LWS_US_PER_SEC, LWSSSCS_UNREACHABLE,
+		"nxd_h1_tls", 15 * LWS_US_PER_SEC, LWSSSCS_UNREACHABLE,
 		(1 << LWSSSCS_QOS_ACK_REMOTE) | (1 << LWSSSCS_QOS_NACK_REMOTE) |
 		(1 << LWSSSCS_TIMEOUT) | (1 << LWSSSCS_ALL_RETRIES_FAILED),
-		0
+		0, 0, 0, 0
 	},
 	{
 		"h2:443 NXDOMAIN",
-		"nxd_h2_tls", 35 * LWS_US_PER_SEC, LWSSSCS_UNREACHABLE,
+		"nxd_h2_tls", 15 * LWS_US_PER_SEC, LWSSSCS_UNREACHABLE,
 		(1 << LWSSSCS_QOS_ACK_REMOTE) | (1 << LWSSSCS_QOS_NACK_REMOTE) |
 		(1 << LWSSSCS_TIMEOUT) | (1 << LWSSSCS_ALL_RETRIES_FAILED),
-		0
+		0, 0, 0, 0
 	},
 
 	/*
-	 * We are talking to a nonexistant dns address "bogus.nope".  We expect
-	 * that if we stick around longer, retries will also end up all failing.
-	 * We might see the timeout depending on blocking getaddrinfo
-	 * behaviour.
+	 * bogus.nope is outside the mock's zone, so it answers REFUSED.  That is
+	 * the resolver declining, not a statement about the name: lws must not
+	 * cache it as NXDOMAIN, must spend its dns retry budget (5 x 1s), and
+	 * then report UNREACHABLE with the ack arg 1: the resolver failed.
+	 */
+
+	{
+		"h1:80 resolver REFUSED",
+		"refused_h1", 20 * LWS_US_PER_SEC, LWSSSCS_UNREACHABLE,
+		(1 << LWSSSCS_QOS_ACK_REMOTE) | (1 << LWSSSCS_QOS_NACK_REMOTE) |
+		(1 << LWSSSCS_TIMEOUT) | (1 << LWSSSCS_ALL_RETRIES_FAILED),
+		0, 0, 1, 0
+	},
+
+	/*
+	 * Stick around on NXDOMAIN and the policy retries must also all fail,
+	 * taking at least as long as the escalating backoff table says.
 	 */
 
 	{
 		"h1:80 NXDOMAIN exhaust retries",
-		"nxd_h1", 35 * LWS_US_PER_SEC, LWSSSCS_ALL_RETRIES_FAILED,
+		"nxd_h1", 15 * LWS_US_PER_SEC, LWSSSCS_ALL_RETRIES_FAILED,
 		(1 << LWSSSCS_QOS_ACK_REMOTE) | (1 << LWSSSCS_QOS_NACK_REMOTE),
-		0
+		0, MIN_BACKOFF_US, -1, 0
 	},
 	{
 		"h1:443 NXDOMAIN exhaust retries",
-		"nxd_h1_tls", 35 * LWS_US_PER_SEC, LWSSSCS_ALL_RETRIES_FAILED,
+		"nxd_h1_tls", 15 * LWS_US_PER_SEC, LWSSSCS_ALL_RETRIES_FAILED,
 		(1 << LWSSSCS_QOS_ACK_REMOTE) | (1 << LWSSSCS_QOS_NACK_REMOTE),
-		0
+		0, MIN_BACKOFF_US, -1, 0
 	},
 	{
 		"h2:443 NXDOMAIN exhaust retries",
-		"nxd_h2_tls", 25 * LWS_US_PER_SEC, LWSSSCS_ALL_RETRIES_FAILED,
+		"nxd_h2_tls", 15 * LWS_US_PER_SEC, LWSSSCS_ALL_RETRIES_FAILED,
 		(1 << LWSSSCS_QOS_ACK_REMOTE) | (1 << LWSSSCS_QOS_NACK_REMOTE),
-		0
+		0, MIN_BACKOFF_US, -1, 0
 	},
 
 	/*
-	 * Let's request some bulk data from httpbin.org
+	 * The same for a raw stream.  The NXDOMAIN is cached by now, so every
+	 * attempt fails inside the connect call itself, and when the retries
+	 * run out we destroy the stream from ALL_RETRIES_FAILED while still
+	 * inside it.
+	 */
+
+	{
+		"raw:80 NXDOMAIN exhaust retries",
+		"nxd_raw", 15 * LWS_US_PER_SEC, LWSSSCS_ALL_RETRIES_FAILED,
+		(1 << LWSSSCS_QOS_ACK_REMOTE) | (1 << LWSSSCS_QOS_NACK_REMOTE) |
+		(1 << LWSSSCS_CONNECTED),
+		0, MIN_BACKOFF_US, -1, 0
+	},
+
+	/*
+	 * The endpoint is all ${ep} metadata, which is never set, so there is
+	 * nothing to connect to.  Each attempt must still go the legal way,
+	 * CONNECTING then UNREACHABLE, and the policy retries run out as
+	 * they do for a name that doesn't exist.
+	 */
+
+	{
+		"h1 empty endpoint exhaust retries",
+		"empty_ep_h1", 15 * LWS_US_PER_SEC, LWSSSCS_ALL_RETRIES_FAILED,
+		(1 << LWSSSCS_QOS_ACK_REMOTE) | (1 << LWSSSCS_QOS_NACK_REMOTE) |
+		(1 << LWSSSCS_CONNECTED),
+		0, MIN_BACKOFF_US, -1, 0
+	},
+
+	/*
+	 * Request some bulk data, the amount is patched in from --amount.
 	 */
 
 	{
 		"h1:80 read bulk",
 		"bulk_h1", 5 * LWS_US_PER_SEC, LWSSSCS_QOS_ACK_REMOTE,
 		(1 << LWSSSCS_TIMEOUT) | (1 << LWSSSCS_QOS_NACK_REMOTE) |
-		(1 << LWSSSCS_ALL_RETRIES_FAILED),
-		12345
+					 (1 << LWSSSCS_ALL_RETRIES_FAILED),
+		12345, 0, -1, 0
 	},
 	{
 		"h1:443 read bulk",
 		"bulk_h1_tls", 5 * LWS_US_PER_SEC, LWSSSCS_QOS_ACK_REMOTE,
 		(1 << LWSSSCS_TIMEOUT) | (1 << LWSSSCS_QOS_NACK_REMOTE) |
-		(1 << LWSSSCS_ALL_RETRIES_FAILED),
-		12345
+					 (1 << LWSSSCS_ALL_RETRIES_FAILED),
+		12345, 0, -1, 0
 	},
 	{
 		"h2:443 read bulk",
 		"bulk_h2_tls", 5 * LWS_US_PER_SEC, LWSSSCS_QOS_ACK_REMOTE,
 		(1 << LWSSSCS_TIMEOUT) | (1 << LWSSSCS_QOS_NACK_REMOTE) |
-		(1 << LWSSSCS_ALL_RETRIES_FAILED),
-		12345
+					 (1 << LWSSSCS_ALL_RETRIES_FAILED),
+		12345, 0, -1, 0
 	},
 
 	/*
-	 * Let's fail at the tls negotiation various ways
+	 * Disconnect the stream ourselves right after asking it to connect,
+	 * when proxied that also drops the link to the proxy.  It must still
+	 * complete the bulk transfer, which is sized by the metadata we only
+	 * set in CREATING.
+	 */
+
+	{
+		"h1:80 read bulk after disconnect in CREATING",
+		"bulk_h1", 15 * LWS_US_PER_SEC, LWSSSCS_QOS_ACK_REMOTE,
+		(1 << LWSSSCS_TIMEOUT) | (1 << LWSSSCS_QOS_NACK_REMOTE) |
+					 (1 << LWSSSCS_ALL_RETRIES_FAILED),
+		12345, 0, -1, TSF_DISCONNECT_IN_CREATING
+	},
+
+	/*
+	 * Fail at the tls negotiation various ways: connect to the tls httpbin
+	 * by its mock DNS name, so its cert (issued for localhost) fails the
+	 * hostname check although the CA is trusted; and to a server whose cert
+	 * is self-signed by a CA that is not in the trust store.
 	 */
 
 	{
 		"h1:badcert_hostname",
-		"badcert_hostname", 35 * LWS_US_PER_SEC, LWSSSCS_ALL_RETRIES_FAILED,
+		"badcert_hostname", 15 * LWS_US_PER_SEC, LWSSSCS_ALL_RETRIES_FAILED,
 		(1 << LWSSSCS_QOS_NACK_REMOTE),
-		0
-	},
-	{
-		"h1:badcert_expired",
-		"badcert_expired", 35 * LWS_US_PER_SEC, LWSSSCS_ALL_RETRIES_FAILED,
-		(1 << LWSSSCS_QOS_NACK_REMOTE),
-		0
+		0, MIN_BACKOFF_US, -1, 0
 	},
 	{
 		"h1:badcert_selfsigned",
-		"badcert_selfsigned", 35 * LWS_US_PER_SEC, LWSSSCS_ALL_RETRIES_FAILED,
+		"badcert_selfsigned", 15 * LWS_US_PER_SEC, LWSSSCS_ALL_RETRIES_FAILED,
 		(1 << LWSSSCS_QOS_NACK_REMOTE),
-		0
+		0, MIN_BACKOFF_US, -1, 0
 	},
-
 };
 
 typedef struct myss {
@@ -617,6 +724,8 @@ typedef struct myss {
 	size_t				rx_seen;
 	lws_usec_t			start_us;
 	char				result_reported;
+	char				seen_creating;
+	char				seen_connecting;
 } myss_t;
 
 
@@ -660,6 +769,28 @@ myss_state(void *userobj, void *sh, lws_ss_constate_t state,
 	lwsl_info("%s: %s: %s, ord 0x%x\n", __func__, lws_ss_tag(m->ss),
 		  lws_ss_state_name(state), (unsigned int)ack);
 
+	if (state == LWSSSCS_CREATING) {
+		/*
+		 * A stream sees CREATING once in its life, even if it is
+		 * proxied and the link to the proxy is lost, since user code
+		 * may do one-time setup here
+		 */
+		if (m->seen_creating) {
+			lwsl_warn("%s: ======= FAILING ON SECOND CREATING\n",
+				  __func__);
+			m->result_reported = 1;
+			tests_fail++;
+			lws_sul_schedule(context, 0, &sul_next_test,
+					 tests_start_next, 1);
+			h = NULL;
+			return LWSSSSRET_DESTROY_ME;
+		}
+		m->seen_creating = 1;
+	}
+
+	if (state == LWSSSCS_CONNECTING && m->seen_connecting < 2)
+		m->seen_connecting++;
+
 	if (curr_test->mask_unexpected & (1u << state)) {
 
 		/*
@@ -669,7 +800,6 @@ myss_state(void *userobj, void *sh, lws_ss_constate_t state,
 		lwsl_warn("%s: ======= FAILING ON UNEXPECTED STATE %s\n",
 				__func__, lws_ss_state_name(state));
 
-fail:
 		m->result_reported = 1;
 		tests_fail++;
 		/* we'll start the next test next time around the event loop */
@@ -679,14 +809,63 @@ fail:
 		return LWSSSSRET_DESTROY_ME;
 	}
 
-
 	if (state == curr_test->must_see) {
+
+#if !defined(LWS_SS_USE_SSPC)
+		/*
+		 * The connection we asked for in CREATING must really have
+		 * been disconnected, and another one made.  (When proxied, the
+		 * connection request does not get as far as the proxy before
+		 * we drop the link to it.)
+		 */
+		if ((curr_test->flags & TSF_DISCONNECT_IN_CREATING) &&
+		    m->seen_connecting < 2) {
+			lwsl_notice("%s: failing, first connection was not "
+				    "disconnected\n", __func__);
+			m->result_reported = 1;
+			tests_fail++;
+			lws_sul_schedule(context, 0, &sul_next_test,
+					 tests_start_next, 1);
+			h = NULL;
+			return LWSSSSRET_DESTROY_ME;
+		}
+#endif
 
 		if (curr_test->eom_pass != m->rx_seen) {
 			lwsl_notice("%s: failing on rx %d, expected %d\n",
 				    __func__, (int)m->rx_seen,
 				    (int)curr_test->eom_pass);
-			goto fail;
+			m->result_reported = 1;
+			tests_fail++;
+			lws_sul_schedule(context, 0, &sul_next_test, tests_start_next, 1);
+			h = NULL;
+			return LWSSSSRET_DESTROY_ME;
+		}
+
+		if (state == LWSSSCS_UNREACHABLE && curr_test->unreach_ack >= 0 &&
+		    (int)ack != (int)curr_test->unreach_ack) {
+			lwsl_notice("%s: failing on UNREACHABLE ack %d, "
+				    "expected %d\n", __func__, (int)ack,
+				    (int)curr_test->unreach_ack);
+			m->result_reported = 1;
+			tests_fail++;
+			lws_sul_schedule(context, 0, &sul_next_test, tests_start_next, 1);
+			h = NULL;
+			return LWSSSSRET_DESTROY_ME;
+		}
+
+		if (curr_test->min_us &&
+		    (uint64_t)(lws_now_usecs() - m->start_us) < curr_test->min_us) {
+			lwsl_notice("%s: failing on %s after only %dms, "
+				    "backoff table not honoured\n", __func__,
+				    lws_ss_state_name(state),
+				    (int)((lws_now_usecs() - m->start_us) /
+							LWS_US_PER_MS));
+			m->result_reported = 1;
+			tests_fail++;
+			lws_sul_schedule(context, 0, &sul_next_test, tests_start_next, 1);
+			h = NULL;
+			return LWSSSSRET_DESTROY_ME;
 		}
 
 		lwsl_warn("%s: ++++++++ saw expected state %s\n",
@@ -713,8 +892,7 @@ fail:
 			unsigned int remaining;
 
 			if (used > (lws_usec_t)curr_test->timeout_us) {
-				if (curr_test->must_see == LWSSSCS_TIMEOUT ||
-				    (curr_test->must_see == LWSSSCS_ALL_RETRIES_FAILED)) {
+				if (curr_test->must_see == LWSSSCS_TIMEOUT) {
 					lwsl_notice("%s: ++++++++ saw expected state %s (manual)\n", __func__, lws_ss_state_name(curr_test->must_see));
 					tests_pass++;
 				} else {
@@ -746,8 +924,7 @@ fail:
 			unsigned int remaining;
 
 			if (used > (lws_usec_t)curr_test->timeout_us) {
-				if (curr_test->must_see == LWSSSCS_TIMEOUT ||
-				    (curr_test->must_see == LWSSSCS_ALL_RETRIES_FAILED)) {
+				if (curr_test->must_see == LWSSSCS_TIMEOUT) {
 					lwsl_notice("%s: ++++++++ saw expected state %s (manual)\n", __func__, lws_ss_state_name(curr_test->must_see));
 					tests_pass++;
 				} else {
@@ -767,14 +944,30 @@ fail:
 			lws_ss_start_timeout(m->ss, remaining);
 		}
 
-		if (curr_test->eom_pass) {
-			sl = (size_t)lws_snprintf(buf, sizeof(buf), "%u",
+		if (state == LWSSSCS_CREATING) {
+			lws_ss_state_return_t r;
+
+			if (curr_test->eom_pass) {
+				/*
+				 * Set it once, it must be used for every
+				 * connection attempt after.  buf is going out
+				 * of scope, so the stream must have a copy.
+				 */
+				sl = (size_t)lws_snprintf(buf, sizeof(buf), "%u",
 					(unsigned int)curr_test->eom_pass);
-			if (lws_ss_set_metadata(m->ss, "amount", buf, sl))
-				return LWSSSSRET_DISCONNECT_ME;
+				if (lws_ss_alloc_set_metadata(m->ss, "amount",
+							      buf, sl))
+					return LWSSSSRET_DESTROY_ME;
+			}
+
+			r = lws_ss_client_connect(m->ss);
+			if (r || !(curr_test->flags & TSF_DISCONNECT_IN_CREATING))
+				return r;
+
+			lwsl_notice("%s: disconnecting in CREATING\n", __func__);
+
+			return LWSSSSRET_DISCONNECT_ME;
 		}
-		if (state == LWSSSCS_CREATING)
-			return lws_ss_client_connect(m->ss);
 		break;
 
 	case LWSSSCS_DESTROYING:
@@ -816,7 +1009,9 @@ tests_start_next(lws_sorted_usec_list_t *sul)
 
 	if ((unsigned int)tests >= LWS_ARRAY_SIZE(tests_seq)) {
 		lwsl_notice("Completed all tests\n");
-		interrupted = 1;
+		lws_default_loop_exit(context);
+		/* don't sit in poll() until some unrelated sul fires */
+		lws_cancel_service(context);
 		return;
 	}
 
@@ -839,7 +1034,7 @@ tests_start_next(lws_sorted_usec_list_t *sul)
 		lwsl_err("%s: failed to create secure stream\n",
 			 __func__);
 		tests_fail++;
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		return;
 	}
 }
@@ -890,7 +1085,7 @@ static const lws_system_ops_t system_ops = {
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int
@@ -898,6 +1093,7 @@ main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
 	const char *pp;
+	int n;
 	(void)switches;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
@@ -908,23 +1104,27 @@ main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	memset(&info, 0, sizeof info);
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	lws_context_info_defaults(&info, NULL);lws_cmdline_option_handle_builtin(argc, argv, &info);
 
 	if ((pp = lws_cmdline_option(argc, argv, switches[LWS_SW_AMOUNT].sw)))
 		amount = (size_t)atoi(pp);
 
 	/* set the expected payload for the bulk-related tests to amount */
 
-	tests_seq[12].eom_pass = tests_seq[13].eom_pass =
-					tests_seq[14].eom_pass = amount;
+	for (n = 0; n < (int)LWS_ARRAY_SIZE(tests_seq); n++)
+		if (!strncmp(tests_seq[n].streamtype, "bulk_", 5))
+			tests_seq[n].eom_pass = amount;
 #if !defined(LWS_SS_USE_SSPC)
-	// puts(default_ss_policy);
+	if ((pp = lws_cmdline_option(argc, argv, switches[LWS_SW_C].sw))) {
+		info.pss_policies_json = pp;
+	} else {
+		info.pss_policies_json = default_ss_policy;
+	}
 #endif
 
 	lwsl_user("LWS secure streams error path tests [-d<verb>]\n");
 
-	info.fd_limit_per_thread = 1 + 16 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 16;
 	info.port = CONTEXT_PORT_NO_LISTEN;
 	info.connect_timeout_secs = 15;
 	info.timeout_secs = 10;
@@ -936,7 +1136,14 @@ main(int argc, const char **argv)
 		/* connect to ssproxy via UDS by default, else via
 		 * tcp connection to this port */
 		if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_P].sw)))
-			info.ss_proxy_port = (uint16_t)atoi(p);
+			{
+				int __pt = atoi(p);
+				if (__pt < 0 || __pt > 65535) {
+					lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+					return 1;
+				}
+				info.ss_proxy_port = (uint16_t)__pt;
+			}
 
 		/* UDS "proxy.ss.lws" in abstract namespace, else this socket
 		 * path; when -p given this can specify the network interface
@@ -949,7 +1156,6 @@ main(int argc, const char **argv)
 			info.ss_proxy_address = p;
 	}
 #else
-	info.pss_policies_json = default_ss_policy;
 	info.options = LWS_SERVER_OPTION_EXPLICIT_VHOSTS |
 		       LWS_SERVER_OPTION_H2_JUST_FIX_WINDOW_UPDATE_OVERFLOW |
 		       LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
@@ -978,7 +1184,7 @@ main(int argc, const char **argv)
 
 	/* the event loop */
 
-	do { } while(lws_service(context, 0) >= 0 && !interrupted);
+	do { } while(lws_service(context, 0) >= 0);
 
 	lws_context_destroy(context);
 

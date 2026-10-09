@@ -25,19 +25,27 @@
 #include <libwebsockets.h>
 
 enum {
+	LWS_SW_C,
 	LWS_SW_I,
 	LWS_SW_P,
+	LWS_SW_PERMS,
 	LWS_SW_HELP,
 };
 
 static const struct lws_switches switches[] = {
+	[LWS_SW_C]	= { "-c",              "Policy filepath" },
 	[LWS_SW_I]	= { "-i",              "Interface to bind to" },
 	[LWS_SW_P]	= { "-p",              "Port number to listen or connect on" },
+	[LWS_SW_PERMS]	= { "--perms",		"user:group, or * for anyone, that may "
+						"connect to the proxy UDS (default: "
+						"our own user and group)" },
 	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
 };
 
 #include <string.h>
 #include <signal.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #if defined(__APPLE__) || defined(__linux__)
 #include <execinfo.h>
@@ -46,7 +54,7 @@ static const struct lws_switches switches[] = {
 
 #define TEST_CLIENT_ID "SN12345678"
 
-static int interrupted, bad = 1, port = 0 /* unix domain socket */;
+static int bad = 1, port = 0 /* unix domain socket */;
 static const char *ibind = NULL; /* default to unix domain skt "proxy.ss.lws" */
 static lws_state_notify_link_t nl;
 static struct lws_context *context;
@@ -84,7 +92,7 @@ static const char * const default_ss_policy =
 		 * We fetch the real policy from there using SS and switch to
 		 * using that.
 		 */
-		"{\"isrg_root_x1\": \""
+				"{\"isrg_root_x1\": \""
 	"MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw"
 	"TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh"
 	"cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4"
@@ -112,15 +120,30 @@ static const char * const default_ss_policy =
 	"jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc"
 	"oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq"
 	"4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA"
-	"mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d"
-	"emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc="
+	"mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57de"
+	"myPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc="
+	  "\"},\n"
+		"{\"isrg_root_x2\": \""
+	"MIICGzCCAaGgAwIBAgIQQdKd0XLq7qeAwSxs6S+HUjAKBggqhkjOPQQDAzBPMQsw"
+	"CQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJuZXQgU2VjdXJpdHkgUmVzZWFyY2gg"
+	"R3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBYMjAeFw0yMDA5MDQwMDAwMDBaFw00"
+	"MDA5MTcxNjAwMDBaME8xCzAJBgNVBAYTAlVTMSkwJwYDVQQKEyBJbnRlcm5ldCBT"
+	"ZWN1cml0eSBSZXNlYXJjaCBHcm91cDEVMBMGA1UEAxMMSVNSRyBSb290IFgyMHYw"
+	"EAYHKoZIzj0CAQYFK4EEACIDYgAEzZvVn4CDCuwJSvMWSj5cz3es3mcFDR0HttwW"
+	"+1qLFNvicWDEukWVEYmO6gbf9yoWHKS5xcUy4APgHoIYOIvXRdgKam7mAHf7AlF9"
+	"ItgKbppbd9/w+kHsOdx1ymgHDB/qo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0T"
+	"AQH/BAUwAwEB/zAdBgNVHQ4EFgQUfEKWrt5LSDv6kviejM9ti6lyN5UwCgYIKoZI"
+	"zj0EAwMDaAAwZQIwe3lORlCEwkSHRhtFcP9Ymd70/aTSVaYgLXTWNLxBo1BfASdW"
+	"tL4ndQavEi51mI38AjEAi/V3bNTIZargCyzuFJ0nN6T5U6VR5CmD1/iQMVtCnwr1"
+	"/q4AaOeMSQ+2b1tbFfLn"
 		"\"}"
 	  "],"
 	  "\"trust_stores\": [" /* named cert chains */
 		"{"
 			"\"name\": \"le_via_isrg\","
 			"\"stack\": ["
-				"\"isrg_root_x1\""
+				"\"isrg_root_x1\","
+				"\"isrg_root_x2\""
 			"]"
 		"}"
 	  "],"
@@ -366,6 +389,8 @@ app_system_state_nf(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 	 * past them when we haven't solved them yet, and make the system
 	 * state wait while we trigger the dependent action.
 	 */
+	lwsl_user("%s: current %d, target %d\n", __func__, current, target);
+
 	switch (target) {
 	case LWS_SYSTATE_REGISTERED:
 		size = lws_system_blob_get_size(ab);
@@ -461,7 +486,7 @@ static void
 sigint_handler(int sig)
 {
 	lwsl_notice("%s\n", __func__);
-	interrupted = 1;
+	lws_default_loop_exit(context);
 	lws_cancel_service(context);
 }
 
@@ -469,6 +494,7 @@ int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
 	const char *p;
+	char *file_buf = NULL;
 	int n = 0;
 	(void)switches;
 
@@ -478,25 +504,49 @@ int main(int argc, const char **argv)
 	}
 
 
-	memset(&info, 0, sizeof info);
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	lws_context_info_defaults(&info, NULL);lws_cmdline_option_handle_builtin(argc, argv, &info);
 
 	signal(SIGINT, sigint_handler);
 
 	/* connect to ssproxy via UDS by default, else via tcp with this port */
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_P].sw)))
-		port = atoi(p);
+		{
+			int __pt = atoi(p);
+			if (__pt < 0 || __pt > 65535) {
+				lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+				return 1;
+			}
+			port = __pt;
+		}
 
 	/* UDS "proxy.ss.lws" in abstract namespace, else this socket path;
 	 * when -p given this can specify the network interface to bind to */
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_I].sw)))
 		ibind = p;
 
+	/* who may use the proxy over its UDS, see .ss_proxy_perms */
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_PERMS].sw)))
+		info.ss_proxy_perms = p;
+
 	lwsl_user("LWS secure streams Proxy [-d<verb>]\n");
 
-	info.fd_limit_per_thread = 1 + 26 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 26;
 	info.port = CONTEXT_PORT_NO_LISTEN;
-	info.pss_policies_json = default_ss_policy;
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_C].sw))) {
+		int fd = open(p, O_RDONLY);
+		if (fd >= 0) {
+			size_t s = (size_t)lseek(fd, 0, SEEK_END);
+			file_buf = malloc(s + 1);
+			lseek(fd, 0, SEEK_SET);
+			read(fd, file_buf, s);
+			file_buf[s] = '\0';
+			close(fd);
+			info.pss_policies_json = file_buf;
+		}
+	} else {
+		info.pss_policies_json = default_ss_policy;
+	}
+	
 	info.options = LWS_SERVER_OPTION_EXPLICIT_VHOSTS |
 		       LWS_SERVER_OPTION_H2_JUST_FIX_WINDOW_UPDATE_OVERFLOW |
 		       LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
@@ -524,7 +574,7 @@ int main(int argc, const char **argv)
 
 	do {
 		n = lws_service(context, 0);
-	} while (n >= 0 && !interrupted);
+	} while (n >= 0);
 
 	bad = 0;
 

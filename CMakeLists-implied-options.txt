@@ -1,7 +1,7 @@
 #
 # libwebsockets - small server side websockets and web server implementation
 #
-# Copyright (C) 2010 - 2025 Andy Green <andy@warmcat.com>
+# Copyright (C) 2010 - 2026 Andy Green <andy@warmcat.com>
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to
@@ -34,7 +34,15 @@ endif()
 # Workaround for ESP-IDF
 # Detect ESP_PLATFORM environment flag, if exist, set LWS_WITH_ESP32.
 # Otherwise the user may not be able to run configuration ESP-IDF in the first time.
-if (ESP_PLATFORM)
+#
+# espressif-port patch: skip the ESP32 / FreeRTOS path when building
+# for the IDF Linux target. ESP_PLATFORM is set on every IDF build
+# (including --preview set-target linux), but the Linux target is a
+# POSIX/glibc environment and the FreeRTOS plat shims pull in IDF's
+# newlib platform_include — which uses `__assert_func` (newlib-only)
+# and `<sys/features.h>` (newlib path), neither of which exists on
+# glibc. Fall through to the upstream `plat/unix` path instead.
+if (ESP_PLATFORM AND NOT (DEFINED IDF_TARGET AND IDF_TARGET STREQUAL "linux"))
 	message(STATUS "ESP-IDF enabled")
 	set(LWS_WITH_ESP32 ON)
 	set(LWS_WITH_ZLIB OFF)
@@ -49,6 +57,11 @@ endif()
 
 if (LWS_PLAT_OPTEE)
 	set(LWS_WITH_UDP 0)
+endif()
+
+# h3 is based on quic
+if (LWS_WITH_HTTP3)
+	set(LWS_ROLE_QUIC 1)
 endif()
 
 if (LWS_PLAT_FREERTOS OR (${CMAKE_SYSTEM_NAME} MATCHES "QNX"))
@@ -75,6 +88,9 @@ if (LWS_FOR_GITOHASHI)
 	set(LWS_WITH_FSMOUNT 1)
 	set(LWS_WITH_STRUCT_JSON 1)
 	set(LWS_WITH_STRUCT_SQLITE3 1)
+	set(LWS_WITH_HL 1)
+	set(LWS_WITH_HL_LANG_C 1)
+	set(LWS_WITH_HL_LANG_DIFF 1)
 endif()
 
 if(LWS_WITH_DISTRO_RECOMMENDED)
@@ -131,6 +147,7 @@ if (LWS_WITH_SELFDNS)
 	set(LWS_WITH_SYS_ASYNC_DNS_DNSSEC 1)
 	set(LWS_WITH_AUTH_SERVER 1)
 	set(LWS_WITH_SYS_WHOIS 1)
+	set(LWS_WITH_PLUGINS 1)
 endif()
 
 if (LWS_WITH_AUTH_SERVER)
@@ -172,22 +189,40 @@ endif()
 
 if (LWS_WITH_WEBRTC_MIXER)
 	set(LWS_WITH_WEBRTC 1)
-	set(LWS_WITH_ALSA 1 CACHE BOOL "Enable alsa audio example" FORCE)
-	set(LWS_WITH_OPUS 1 CACHE BOOL "Enable opus audio codec" FORCE)
-	set(LWS_WITH_GSTREAMER 1 CACHE BOOL "Enable gstreamer" FORCE)
+	if (NOT DEFINED LWS_WITH_ALSA)
+		set(LWS_WITH_ALSA 1 CACHE BOOL "Enable alsa audio example" FORCE)
+	endif()
+	if (NOT DEFINED LWS_WITH_OPUS)
+		set(LWS_WITH_OPUS 1 CACHE BOOL "Enable opus audio codec" FORCE)
+	endif()
+	if (NOT DEFINED LWS_WITH_GSTREAMER)
+		set(LWS_WITH_GSTREAMER 1 CACHE BOOL "Enable gstreamer" FORCE)
+	endif()
 endif()
 
 if (LWS_WITH_WEBRTC)
 	set(LWS_WITH_UDP 1)
 	set(LWS_WITH_DTLS 1)
 	set(LWS_WITH_PLUGINS 1 CACHE BOOL "Enable plugins" FORCE)
-	set(LWS_WITH_V4L2 1)
-	set(LWS_WITH_LIBV4L2 1)
-	set(LWS_WITH_DRM 1)
+	if (NOT DEFINED LWS_WITH_V4L2)
+		set(LWS_WITH_V4L2 1)
+	endif()
+	if (NOT DEFINED LWS_WITH_LIBV4L2)
+		set(LWS_WITH_LIBV4L2 1)
+	endif()
+	if (NOT DEFINED LWS_WITH_DRM)
+		set(LWS_WITH_DRM 1)
+	endif()
 	set(LWS_WITH_GENCRYPTO 1)
 	set(LWS_WITH_JOSE 1)
 	set(LWS_WITH_NETWORK 1)
 	set(LWS_WITH_CLIENT 1)
+	if (NOT DEFINED LWS_WITH_ALSA)
+		set(LWS_WITH_ALSA 1)
+	endif()
+	if (NOT DEFINED LWS_WITH_OPUS)
+		set(LWS_WITH_OPUS 1)
+	endif()
 endif()
 
 
@@ -216,9 +251,15 @@ if (NOT LWS_WITH_NETWORK)
 	set(LWS_WITH_THREADPOOL 0)
 	set(LWS_WITH_SYS_SMD 0)
 	set(LWS_WITH_LHP 0)
+	set(LWS_WITH_SPAWN 0)
+	set(LWS_WITH_STUB 0)
 endif()
 
 if (LWS_WITH_CGI)
+	set(LWS_WITH_SPAWN 1)
+endif()
+
+if (LWS_WITH_STUB)
 	set(LWS_WITH_SPAWN 1)
 endif()
 
@@ -257,6 +298,10 @@ endif()
 
 if (LWS_WITH_HTTP2)
 	set(LWS_ROLE_H2 1)
+endif()
+if (LWS_WITH_HTTP3)
+	set(LWS_ROLE_H3 1)
+	set(LWS_ROLE_WT 1)
 endif()
 if (LWS_WITH_CGI)
 	set(LWS_ROLE_CGI 1)
@@ -331,6 +376,11 @@ if (LWS_PLAT_FREERTOS)
  set(LWS_HAVE_REALLOC 1)
  set(LWS_HAVE_GETIFADDRS 1)
  set(LWS_WITH_CUSTOM_HEADERS 0)
+ set(LWS_WITH_STUB 0)
+ # FreeRTOS can't fork/exec; STUB defaults ON and implies SPAWN above before
+ # this point disables it, leaving SPAWN (and its siginfo_t typedef) on. Force
+ # it off here - there's no spawn support on FreeRTOS anyway.
+ set(LWS_WITH_SPAWN 0)
 endif()
 
 if (LWS_WITHOUT_TESTAPPS)
@@ -405,6 +455,9 @@ if (LWS_WITHOUT_DAEMONIZE OR WIN32)
 	set(LWS_NO_DAEMONIZE 1)
 endif()
 
+if (LWS_IPV4)
+    set(LWS_WITH_IPV4 1)
+endif()
 if (LWS_IPV6)
 	set(LWS_WITH_IPV6 1)
 endif()
@@ -426,6 +479,11 @@ if (LWS_WITHOUT_CLIENT)
 	set(LWS_WITH_SECURE_STREAMS 0)
 	set(LWS_WITH_SECURE_STREAMS_PROXY_API 0)
 	set(LWS_WITH_LHP 0)
+	# the smtp client connects to its relay
+	set(LWS_WITH_EMAIL 0)
+endif()
+if (NOT LWS_WITH_NETWORK)
+	set(LWS_WITH_EMAIL 0)
 endif()
 set(LWS_WITH_SERVER 1)
 if (LWS_WITHOUT_SERVER)
@@ -442,6 +500,23 @@ if (LWS_WITH_UPNG)
 	set(LWS_WITH_GZINFLATE 1)
 endif()
 
+# lwsac is used unconditionally by the context, lejp, secure streams and the
+# server config parser, so it cannot actually be turned off
+set(LWS_WITH_LWSAC 1)
+
+# the display list needs the vfs (filesystem fops, font files), and lhp
+# renders into it
+if (NOT LWS_WITH_FILE_OPS)
+	set(LWS_WITH_DLO 0)
+	set(LWS_WITH_LHP 0)
+endif()
+# the language drivers are meaningless without the highlighter core
+
+if (NOT LWS_WITH_HL)
+	set(LWS_WITH_HL_LANG_C 0)
+	set(LWS_WITH_HL_LANG_DIFF 0)
+endif()
+
 if (LWS_WITH_OTA)
 	set(LWS_WITH_JOSE 1)
 	set(LWS_WITH_GENCRYPTO 1)
@@ -451,6 +526,19 @@ endif()
 if (LWS_WITH_LHP)
 	set(LWS_WITH_CLIENT 1)
 	set(LWS_WITH_SECURE_STREAMS 1)
+
+	# lhp's document asset cache comes along where the file-backed blob
+	# cache level can build
+	if (UNIX AND LWS_WITH_DIR AND LWS_WITH_NETWORK)
+		set(LWS_WITH_CACHE_BLOB 1)
+	endif()
+endif()
+
+# the file-backed blob cache level is built on the diskcache dir machinery
+# and posix apis, and the lws-cache-ttl core only builds with network
+
+if (LWS_WITH_CACHE_BLOB AND NOT (UNIX AND LWS_WITH_DIR AND LWS_WITH_NETWORK))
+	set(LWS_WITH_CACHE_BLOB 0)
 endif()
 
 if (LWS_WITH_AUTHORITATIVE_DNS)
@@ -467,12 +555,6 @@ if (LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
 	set(LWS_WITH_SYS_ASYNC_DNS 1)
 	set(LWS_WITH_GENCRYPTO 1)
 endif()
-
-# using any abstract protocol enables LWS_WITH_ABSTRACT
-
-#if (LWS_WITH_SMTP)
-#	set(LWS_WITH_ABSTRACT 1)
-#endif()
 
 if (NOT LWS_WITH_EVLIB_PLUGINS AND (LWS_WITH_LIBEV AND LWS_WITH_LIBEVENT))
 	message(FATAL_ERROR "Sorry libev and libevent conflict with each others' namespace, you can only have one or the other")

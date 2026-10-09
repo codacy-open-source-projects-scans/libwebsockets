@@ -28,19 +28,34 @@ static const uint8_t expected_spki[] = {
 
 int main(int argc, const char **argv)
 {
-	int logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	
 	struct lws_x509_cert *x509 = NULL;
 	char big[1024];
 	union lws_tls_cert_info_results *res = (union lws_tls_cert_info_results *)big;
 	int ret = 0;
 	size_t big_len = sizeof(big) - sizeof(*res) + sizeof(res->ns.name);
 
-	lws_set_log_level(logs, NULL);
+	struct lws_context_creation_info info;
+	struct lws_context *context;
+
 	lwsl_user("LWS x509 API test\n");
+
+	lws_context_info_defaults(&info, NULL);
+#if defined(LWS_WITH_NETWORK)
+	info.port = CONTEXT_PORT_NO_LISTEN;
+#endif
+	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+
+	context = lws_create_context(&info);
+	if (!context) {
+		lwsl_err("lws init failed\n");
+		return 1;
+	}
 
 	if (lws_x509_create(&x509)) {
 		lwsl_err("lws_x509_create failed\n");
-		return 1;
+		ret = 1;
+		goto bail_ctx;
 	}
 
 	if (lws_x509_parse_from_pem(x509, test_cert, strlen(test_cert) + 1)) {
@@ -62,15 +77,47 @@ int main(int argc, const char **argv)
 		goto bail;
 	}
 
-	if (memcmp(res->ns.name, expected_spki, (size_t)res->ns.len)) {
+	size_t name_offset = (size_t)((uint8_t *)&res->ns.name - (uint8_t *)res);
+	if (memcmp(big + name_offset, expected_spki, (size_t)res->ns.len)) {
 		lwsl_err("SPKI content mismatch\n");
 		ret = 1;
 		goto bail;
 	}
 
+#if defined(LWS_WITH_CLIENT)
+	{
+		char multi_cert[4096];
+		struct lws_vhost *vh;
+		struct lws_context_creation_info vinfo;
+
+		lws_snprintf(multi_cert, sizeof(multi_cert), "%s%s", test_cert, test_cert);
+
+		memset(&vinfo, 0, sizeof(vinfo));
+		/*
+		 * We only want to exercise client_ssl_ca_mem with two concatenated
+		 * certs.  Leaving port at 0 would make lws listen on an ephemeral
+		 * port, which races other tests running in parallel under ctest.
+		 */
+		vinfo.port = CONTEXT_PORT_NO_LISTEN;
+		vinfo.vhost_name = "test_multi_ca_mem";
+		vinfo.client_ssl_ca_mem = multi_cert;
+		vinfo.client_ssl_ca_mem_len = (unsigned int)strlen(multi_cert);
+
+		vh = lws_create_vhost(context, &vinfo);
+		if (!vh) {
+			lwsl_err("lws_create_vhost failed for multi-cert ca_mem\n");
+			ret = 1;
+			goto bail;
+		}
+		lwsl_user("Multi-cert ca_mem vhost creation success\n");
+	}
+#endif
+
 	lwsl_user("Success\n");
 
 bail:
 	lws_x509_destroy(&x509);
+bail_ctx:
+	lws_context_destroy(context);
 	return ret;
 }

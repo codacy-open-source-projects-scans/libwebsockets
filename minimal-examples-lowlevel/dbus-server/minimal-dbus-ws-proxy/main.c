@@ -34,7 +34,7 @@ static const struct lws_switches switches[] = {
 #define LWS_PLUGIN_STATIC
 #include "protocol_lws_minimal_dbus_ws_proxy.c"
 
-static int interrupted;
+static struct lws_context *context;
 static struct lws_protocols protocols[] = {
 	LWS_PLUGIN_PROTOCOL_MINIMAL_DBUS_WSPROXY,
 	LWS_PROTOCOL_LIST_TERM
@@ -62,21 +62,13 @@ static const struct lws_protocol_vhost_options pvo = {
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
-	static struct lws_context *context;
 	struct lws_context_creation_info info;
-	const char *p;
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE
-			/* for LLL_ verbosity above NOTICE to be built into lws,
-			 * lws must have been configured and built with
-			 * -DCMAKE_BUILD_TYPE=DEBUG instead of =RELEASE */
-			/* | LLL_INFO */ /* | LLL_PARSER */ /* | LLL_HEADER */
-			/* | LLL_EXT */ /* | LLL_CLIENT */ /* | LLL_LATENCY */
-			/* | LLL_DEBUG */ /* | LLL_THREAD */;
+	int n = 0;
 	(void)switches;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
@@ -87,13 +79,11 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS DBUS ws client proxy\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT |
 		LWS_SERVER_OPTION_HTTP_HEADERS_SECURITY_BEST_PRACTICES_ENFORCE;
 	info.port = CONTEXT_PORT_NO_LISTEN;
@@ -108,7 +98,7 @@ int main(int argc, const char **argv)
 
 	/* lws event loop (default poll one) */
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

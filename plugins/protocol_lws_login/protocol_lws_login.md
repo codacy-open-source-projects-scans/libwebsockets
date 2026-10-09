@@ -8,15 +8,43 @@ Instead of maintaining its own database, it acts as a lightweight, proactive **b
 
 Furthermore, `lws-login` natively maintains an `lws_sorted_usec_list` (SUL) expiration timer tracking the exact token `exp` boundary. Even if a WebSocket successfully upgrades over the protected mount, the connection will be gracefully terminated the exact moment the active authorization token naturally expires!
 
+## Gated methods
+
+The interceptor decision is taken for **every** request to a protected mount,
+whatever its method and whatever the http role serving it (h1, h2 or h3), before
+the protected mount's protocol is bound and before any of its code runs.
+
+An unauthenticated `POST` (or `PUT`, `PATCH`, `DELETE` ...) is therefore blocked
+exactly as an unauthenticated `GET` of the same url is: it bounces with a
+`303 See Other` to the auth server's login form, carrying the same
+`redirect_uri` back to the url that was asked for, so the user lands back there
+after logging in.  An authenticated request of any method passes straight
+through to the mount.  A request whose JWT is authentic but whose grants have
+gone stale is answered with a re-minted cookie and a self-redirect to the same
+url, again for whichever method it used.
+
+A blocked request whose body was still arriving has that body discarded before
+the connection is reused (h1) or its stream reset (h2 / h3), so nothing desyncs.
+
+## WebSocket Upgrades
+
+When a mount is protected by an `interceptor-path` (such as `lws-login`), **both standard HTTP requests and `wss://` WebSocket upgrade requests are subjected to the exact same cryptographic JWT validation.**
+
+If an unauthorized client (such as a headless script like `-camshow` or a browser without a valid session cookie) attempts to negotiate a WebSocket connection against a protected mount, the connection is proactively intercepted and immediately rejected with an `HTTP 401 Unauthorized` status during the HTTP phase of the handshake, cleanly dropping the socket.
+
+However, for headless IoT clients that strictly cannot redirect to a login page, we provide the `unauth-protocols` bypass to allow them into a pre-authentication "waiting room". See [Headless Device Authorization](#headless-device-authorization) below.
+
+
 ## Per-Vhost Options (PVOs)
 
 This plugin handles several PVO options to control the redirection routing and the properties of the required JWT session cookie:
 
 | PVO Name | Description |
 |---|---|
-| `auth-server-url` | **Required.** The base URI of the central auth server portal to redirect unauthenticated users to (e.g. `https://auth.warmcat.com/login`). |
+| `auth-server-url` | **Required.** The base URI of the central auth server portal to redirect unauthenticated users to (e.g. `https://auth.warmcat.com/login`). May deliberately be a *local* BFF entry instead, such as the oauth2-client plugin's `/oauth/login`, so the Login button goes through the PKCE delegate flow on this vhost rather than the auth server's own form -- in that case you must also set `auth-api-url`. |
+| `auth-api-url` | The absolute base URL of the auth server's own API surface, used for the silent-renewal side channel (`/api/sso_exchange`), logout (`/api/logout`), the SSO origin check, and the widget's auth-server links (refgirl image, Admin Console). Defaults to `auth-server-url`, which is correct when the login entry lives on the auth server itself. **Required to be set explicitly** when `auth-server-url` is a relative/local BFF URL like `/oauth/login`: a relative URL can never reach the auth server's APIs, and without this PVO every renewal is refused up front with `auth-api-url ... is not an absolute http(s) URL` and the BFF answers `401` -- no exchange is attempted, nothing appears in the auth server's logs. |
 | `jwt-jwk` | **Required.** Either a JSON Web Key string or the path to a file containing a JSON Web Key, used to establish signing criteria for verifying the token signature. Must match the public key the central server uses to sign tokens. |
-| `cookie-name` | Custom name emitted for tracking the browser cookie containing the session token. Defaults to `"auth_session"`. |
+| `cookie-name` | Custom name emitted for tracking the browser cookie containing the session token. Defaults to `"auth_session"`. Limited to 1..63 characters: the protocol refuses to initialize with a longer name, since the composed `Set-Cookie` buffers are sized for that cap (a cookie that could not be composed whole would otherwise have to be silently truncated or fail the response). |
 | `service-name` | The explicitly required grant category strictly checked against the JWT privileges array. Defaults to `"default-service"`. *Note: Any authenticated user holding a wildcard (`*`) assignment in their JWT grants array will automatically bypass this constraint, acting as an administrator for any requested service.* **This option responds to BOTH a PVO definition (applying globally to the vhost) and can be dynamically overridden by a Per-Mount Option (PMO) definition of the same name.** |
 | `min-grant-level` | The strict integer threshold allowing passage for the given service name within the token. Defaults to `1`. |
 | `cookie-domain` | The optional specific domain name the auth cookie should be scoped to stringently (e.g. `warmcat.com`). If unspecified, defaults to omitting the domain from the cookie. |
@@ -25,6 +53,8 @@ This plugin handles several PVO options to control the redirection routing and t
 | `db-path` | Absolute filepath to the shared sqlite3 permissions database (used to instantly verify and rewrite valid cookies suffering from revoked grants). Defaults to `/var/db/lws-auth.sqlite3`. |
 | `whitelist` | Optional array of CIDR netblock strings (e.g. `10.0.0.0/8`, `192.168.1.0/24`). If any are provided, the connecting peer must match at least one explicitly or they will uniformly receive a `403 Forbidden` bypass, regardless of login state. |
 | `unauth-allow` | If set to `1`, unauthenticated connections are **not** actively bounced via a 302 redirect. Traffic is instead permitted through to the underlying application mount unhindered. This enables scenarios where an underlying mount might conditionally render public views while relying securely on `/.lws-login-status` responses to dictate authenticated view logic without hard-failing unauthenticated guests. |
+| `unauth-protocols` | Optional comma-separated list of `Sec-WebSocket-Protocol` names (e.g., `lws-oauth-preauth`) that are permitted to bypass the JWT requirement during the upgrade phase. This allows unauthenticated headless devices to negotiate specific protocols to complete RFC 8628 Device Flow pairing. The exemption is decided on the subprotocol the upgrade will **bind**, not on the offer list as a whole: lws binds the first name the client offered that the vhost has a protocol for, in the client's order (RFC 6455 4.2.2), and it is that name which must be a **whole-token** member of this list. So a configured `lws-oauth-preauth` does not wave through `auth` or `preauth`, and it does not wave through an offer of `some-app-protocol, lws-oauth-preauth` either, since that upgrade would bind `some-app-protocol`; `lws-oauth-preauth, some-app-protocol` is admitted and binds the waiting room. On a mount proxied to an origin server the origin does the binding, so there *every* name the client offered must be in the list. |
+| `trust-forwarded-proto` | Defaults to `1`. Whether an `X-Forwarded-Proto: https` request header from a TLS-terminating reverse proxy in front of us may set the scheme of the `redirect_uri` we hand to the auth server (and of the cold-load self-redirect). It can only ever *upgrade* to `https`: a real TLS link is always reported as `https` whatever the header says, so a client cannot downgrade its own login round trip to cleartext. Set to `0` on a vhost that browsers reach directly, so the client-settable header is ignored entirely. |
 
 **Where does the JWK come from?**
 The central `auth-server` plugin automatically generates an Elliptic Curve (EC P-256) keypair upon its first startup and saves it to its configured `jwk_path` (e.g., `/var/db/lws-auth.jwk`). To configure the `jwt-jwk` PVO for this bouncer mount, you simply take the contents of that generated file.
@@ -35,11 +65,25 @@ Because the JWT validator only strictly requires the public key components to ve
 
 *(Note: While passing the full keypair including the private key into the bouncer works, it is best practice to strip the private component `d` from the JSON if the bouncer is operating on an entirely different physical server).*
 
+## Headless Device Authorization (RFC 8628)
+
+When building embedded devices without a screen or UI (such as IP cameras or IoT sensors), they inherently lack the ability to follow HTTP 302 redirects to a login page or process interactive OAuth flows.
+
+To securely onboard these devices to a protected mount without opening security holes, you can utilize the `lws-oauth-preauth` protocol in conjunction with the `unauth-protocols` PVO bypass.
+
+1. **The Bypass**: By defining `"unauth-protocols": "lws-oauth-preauth"` in your `lws-login` configuration, the interceptor will allow incoming WebSocket connections that are going to be bound to the `lws-oauth-preauth` subprotocol, even if they lack a valid JWT.  Only that upgrade is exempt: an offer that would bind any other protocol on the vhost (whether or not `lws-oauth-preauth` is also somewhere in its offer list) is subjected to the JWT check like any other request, so the other protocols sharing the gated vhost stay behind the bouncer.
+2. **The Waiting Room**: The `lws-oauth-preauth` plugin provides a secure "waiting room". Unauthenticated devices can connect and broadcast their unique hardware serial numbers and pairing codes.
+3. **Admin Verification**: Authenticated administrators (who connect with a valid JWT) can join this same protocol to observe pending devices. Crucially, admins can issue specific commands (like `{"cmd": "identify"}`) that the server securely routes to the target device to trigger physical "pairing indications" (e.g., blinking an LED). This ensures the admin visually verifies the physical hardware before explicitly granting it authorization via the Auth Server, effectively preventing remote phishing attacks.
+
+The admin side of this flow runs in the authenticated page: the canned `lws-login.js` widget renders each pending device's self-reported `name` / `user_code` — strings that arrived over the **unauthenticated** device connection — into the page's DOM. The widget's render boundary therefore HTML-escapes every dynamic string it composes into markup via `window.lwsLoginEsc()` (and `encodeURIComponent()`s the `device_code` query value), so device-provided data can inject text into the approval list but never markup or script. The fence is asserted against the actually-served `lws-login.js` by the `widget-js-fence` scenario of `api-test-lws-login-bff`; if you extend the widget, keep the rule that no dynamic string reaches an `innerHTML` composition unescaped.
+
 ## Cross-Domain SSO Architecture
 
 If `cookie-domain` sharing fails because the target application operates on an entirely distinct apex domain (e.g., `auth.warmcat.com` logging into `libwebsockets.org`), the system natively utilizes high-performance auto-submitting POSTs.
 When the auth portal completes authorization and identifies a foreign target domain, it dynamically preserves the original target's path sequence and constructs a transient `<form method="POST" action="https://[foreign-domain]/[target/path]/.lws-login-sso">` containing the encrypted JWT securely inside the POST body. This explicitly scopes the interception back to the specific internal mount processing the request rather than discarding internal hierarchies.
 `lws-login` intercepts all localized `/.lws-login-sso` boundaries dynamically, digests the incoming POST securely, verifies the tokens using `lws_spa`, provisions a newly scoped localized top-level cookie, and redirects cleanly back to the ultimate target securely.
+
+The SSO boundary is closed against login CSRF: a submitted token is only honored when the request carries positive proof it originated at the configured auth server — an `Origin` header (or, for user agents that do not send one on form POSTs, a `Referer`) whose scheme, host and port match `auth-api-url` (which defaults to `auth-server-url`). A token arriving with neither header matchable — for example a cross-site form POST from a sandboxed iframe combined with a no-referrer policy, which suppresses both — is rejected with `403` and nothing is planted. The legitimate flow (the auth server's auto-submitting form POST) always carries one of the two headers identifying the auth server. This requires the auth server's login document not to be under `Referrer-Policy: no-referrer`: browsers then send `Origin: null` and no `Referer` on the cross-origin POST, and the token is rejected exactly like the CSRF case (logged as `blocking SSO token: Origin: null and no Referer`). The auth server's `index.html` pins `<meta name="referrer" content="strict-origin-when-cross-origin">` so a site-wide `no-referrer` response header does not break SSO.
 
 If a visiting client lacks the required `cookie-name`, or their validated token does not meet the `<service-name>:<min-grant-level>` threshold (and they do not hold a `*` administrative wildcard), the plugin calculates the `redirect_uri` based on the exact path they were attempting to reach.
 
@@ -47,6 +91,36 @@ It intercepts the connection and issues a standard `HTTP 302 Found` bouncing the
 `%auth-server-url%?service_name=%service-name%&redirect_uri=%url_encoded_path%`
 
 The central Auth Server portal will parse these parameters. If the user is unauthenticated, they will be prompted to log in. However, if the user successfully authenticates but strictly lacks the necessary `%service-name%` privilege assignment, the central Auth Server will cleanly deny them with an `Access Denied` status to prevent endless redirect looping between the two nodes!
+
+## Injected Backend Headers
+
+When a request is allowed through to the backend app mounted behind the bouncer, `lws-login` stamps the cooked, trusted authentication result onto the request as `x-lws-login-*` headers (any client-supplied copy of these names is removed from the request on every path through the bouncer, stamped or not, so a browser cannot elevate itself). The backend reads these with no JWT or grant logic of its own. They are only trustworthy when the request actually transited the bouncer's proxy path; a backend reachable directly must not rely on them.
+
+Two details of the anti-spoof are worth knowing, since both are worked around
+here rather than in the library: the ah stores a custom header's name
+*including* its `:`, so `lws_http_zap_header()` must be given the colon or it
+matches nothing at all; and it unlinks only the first record it finds, so a
+header the client sent twice needs the call repeated until the header is gone.
+`lws_login_zap_header()` does both.
+
+| Header | Value | Meaning |
+|---|---|---|
+| `x-lws-login-state` | stringified `enum lws_login_state` (see `lws-http.h`) | **Authoritative summary role.** Prefer this. |
+| `x-lws-login-grant-level` | integer | Raw grant level the bouncer used to decide the role for this mount (e.g. `2`). Finer detail than the state. |
+| `x-lws-login-sub` | string | Verified subject identity (empty when anonymous). |
+| `x-lws-login-admin` | `0` or `1` | Back-compat: `1` exactly when `state == LWS_LOGIN_STATE_GLOBAL_ADMIN`. |
+
+The `lws_login_state` values are ordered by privilege:
+
+| Value | Name | Meaning |
+|---|---|---|
+| `0` | `LWS_LOGIN_STATE_ANON` | No valid JWT (only observable on mounts with `unauth-allow=1`). |
+| `1` | `LWS_LOGIN_STATE_NO_GRANT` | Valid JWT, but no grant (and no `*`) for this service. |
+| `2` | `LWS_LOGIN_STATE_USER` | Holds this service's grant at level `>= 1` but `< 2`, no `*`. |
+| `3` | `LWS_LOGIN_STATE_APP_ADMIN` | Holds this service's grant at level `>= 2`, no `*`: **admin of this app only**, not a system-wide admin. |
+| `4` | `LWS_LOGIN_STATE_GLOBAL_ADMIN` | Holds the `*` wildcard grant (the TOFU "god" account): admin of the whole system. Any `*` level `>= 1` qualifies. |
+
+Because the values are ordered, a backend can write `state >= LWS_LOGIN_STATE_APP_ADMIN` for "any kind of admin" and `state == LWS_LOGIN_STATE_GLOBAL_ADMIN` for "system-wide only". **Do not conflate `APP_ADMIN` with `GLOBAL_ADMIN`**: an app admin can administer only the app behind this mount, whereas a global admin can administer every user and account on the system (including from the central auth-server Admin Console at `/api/admin`, which itself gates on the literal `*` grant).
 
 ## Example JSON Configuration (`lwsws`)
 
@@ -74,10 +148,23 @@ You can enable this bouncing natively via a standard JSON layout without compili
         "min-grant-level": "2",
         "unauth-allow": "0"
       }
+    },
+    {
+      "lws_login_client": {
+        "status": "ok"
+      }
     }]
   }]
 }
 ```
+
+**The `lws_login_client` entry is required on the same vhost as `lws-login`.**  The
+silent-renewal side channel is an ordinary lws client connection bound to the
+interceptor's own vhost, and its callbacks are routed by protocol name.  Without
+it, lws binds the side channel to the vhost's first protocol and misroutes every
+client callback, so the renewal never works and the exchange bookkeeping can
+dereference a freed wsi; the plugin detects this at runtime and refuses to start
+the exchange with an obvious error in the log instead.
 
 Notice that the `pmo` *(Per-Mount Option)* strictly binds the `dashboard-service` name to the `/dashboard` mount, cleanly overriding any default global values the protocol was initialized with.
 
@@ -89,6 +176,10 @@ To leverage this, ensure your HTML includes the dynamically generated helper scr
 ```html
 <script src="lws-login.js"></script>
 ```
+
+### Status widget styling
+
+The same `lws-login.js` also renders the login status widget into a div of your choosing (via `window.renderLwsLoginStatus("element-id")`), pulling in the canned `lws-login.css`. The widget deliberately asserts its own complete, **static** colour scheme — including a solid background on the status box and the preauth dropdown — because it renders inside arbitrary host pages: any property it leaves to inherit comes from the page, and a translucent widget background combined with the widget's asserted text colour is unreadable when the page's own colours disagree. The scheme is a single static choice (a light status box) rather than following the browser's `prefers-color-scheme`, since many pages ignore that preference and a preference-following widget showed up as a dark box on their white background. A page that wants the widget to match its own theme can override these rules in its own stylesheet. The `widget-css-fence` scenario of `api-test-lws-login-bff` asserts the served stylesheet keeps it that way.
 
 Then, you can hook the `window.lwsLoginSilentRefresh` helper directly into your WebSocket `onclose` retry handler:
 
@@ -108,3 +199,116 @@ ws.onclose = async function() {
 ```
 
 This functions by initiating an invisible HTTP `POST` to the localized `/.lws-login-refresh` endpoint. The `lws-login` C-plugin intercepts this, securely acts as a Backend-For-Frontend (BFF) proxy using Libwebsockets' asynchronous non-blocking client API, fetches the new token directly from the Auth Server, and sets your browser's new `auth_session` cookie. Because all of this occurs entirely over backend TLS interfaces, your frontend Javascript never directly touches or exposes the Cross-Site Request Forgery (CSRF) tokens or OAuth codes!
+
+The same renewal side channel is also used for **cold-load silent renewal**: when a browser holding a valid `auth_refresh_session` cookie requests a protected page whose JWT has lapsed, the bouncer renews server-side and answers with a `302` back to the exact URL that was asked for — **query string included** — so app deep links (eg `sai`'s `?project=…&task=…`) survive re-login intact instead of landing the user on a shortened, unusable URL.
+
+### CSRF sidecar self-heal
+
+The renewal double-submit on the auth server compares the `csrf_token=` form
+field against the `auth_csrf` cookie in the browser's forwarded jar — both of
+which the side channel itself produces.  If the browser's jar has a valid
+`auth_refresh_session` but its `auth_csrf` sidecar has been lost or expired
+(they can be minted by different flows with different scopes and birthdays —
+eg a native login on the auth server's own host plants an unpaired
+`Domain=`-scoped refresh cookie), the BFF and the cold-load renewal simply
+mint a fresh matching pair for the exchange instead of denying it.  A browser
+without access to the `HttpOnly` cookies cannot reach that code, and a
+cross-site form POST cannot carry the `SameSite=Lax` `auth_refresh_session`,
+so the browser-side csrf cookie was not adding protection the refresh cookie
+does not already provide.  On exchange success the response rotates a fresh
+`auth_csrf` cookie into the browser jar, healing the underlying state; if the
+refresh session is genuinely invalid the auth server still 401s and the
+widget escalates as before.  Without this, a live session whose sidecar died
+was classified as dead and the user's whole page was navigated to the auth
+form — trashing eg an in-progress HLS playback for a split-second re-login
+round trip.  These self-heal events (and any remaining denials) are logged at
+`notice` along with a jar summary listing the cookie **names and value
+lengths** only (`lws_login_diag_jar()`), which is enough to tell which cookie
+was missing on a device that cannot be inspected.  The jar itself must never
+be logged verbatim: it carries `auth_session` and the long-term
+`auth_refresh_session`, and anything written to the log is replayable by
+whoever can read the log.
+
+### Denial observability
+
+When an exchange is refused, both ends now say exactly why, attributed to the
+wsi (so the peer is identifiable against interleaved bot traffic): the
+completion log on the app side states the auth server's actual answer —
+`BFF renewal denied: auth server answered HTTP 401 'Invalid session'` — or the
+client-connection failure string when there was no response at all.  On the
+auth server, `/api/sso_exchange` denial logs account for every presented
+credential: which of `auth_session` / `auth_refresh_session` was absent, and
+what happened to each same-named refresh value (`2 value(s) presented: 1
+expired, 1 not in db, 0 live` — browsers legitimately hold several
+`auth_refresh_session` values at once, ordered oldest-first, so resolution
+walks them all rather than trusting the first).  CSRF double-submit failures
+log which half was missing and the lengths, never the values themselves.
+
+### Status probe diagnostics
+
+A "Not logged in" widget on a device you cannot inspect (a tablet, a phone)
+is otherwise a dead end: the only thing that decides that state is the JWT
+cookie the browser presented, and the browser will not show you it.  So when
+the widget's `.lws-login-status` probe finds no usable JWT, the bouncer logs
+at `notice` exactly what the request carried, attributed to the wsi:
+
+ - no `Cookie` header at all, or none of the configured `cookie-name`
+   (listing the cookie names and value lengths that *were* sent);
+ - for **every** same-named cookie in the header, whether its signature
+   verifies against `jwt-jwk`, and if so its `sub` and whether it is live or
+   how long ago it expired.
+
+The second point matters because browsers legitimately hold several
+same-named cookies at once (host-only alongside `Domain=`, or leftovers
+minted under an earlier `cookie-domain` config), ordered oldest-first.
+`lws_jwt_auth_create()` walks every occurrence and uses the first that
+verifies and is unexpired, so a stale duplicate cannot shadow a live one;
+before that, a stale first cookie left the widget "Not logged in" until it
+aged out, since every renewal and login re-minted the *other* scope.  To
+stop such stale duplicates accumulating, every `auth_session` cookie this
+plugin mints has its `Max-Age` capped at the JWT's own remaining `exp`, never
+just `jwt-validity-secs`.  Only the status probe emits these lines, since it
+is the one request a not-logged-in widget always makes and scanners never do.
+
+### Session expiry and the endpoint's known gaps
+
+`lws_jwt_auth_create()` deliberately returns a token that *verified* but has
+already expired, leaving "what an expired token means" to the caller; only its
+signature is being asserted, not that the session is live.  Every gate here
+therefore checks `exp` itself (`lws_login_jwt_expired()`) -- the interceptor
+verdict, the `LWS_CALLBACK_USER + 1` bypass API, and the `LWS_CALLBACK_HTTP`
+path alike.  A gate that only tests the handle for NULL turns any once-valid
+`auth_session` value into a session that never ends.
+
+### `login-assets/` is a sample, not a served page
+
+`login-assets/` (`index.html`, `login.css`, `login.js`) is a static sample
+login page.  `lws-login` never serves it: an unauthenticated request is
+bounced to the auth server, which serves its own form, and the status widget
+(`lws-login.js` / `lws-login.css`) is generated in C.  The sample is only
+`install`ed, for an operator who wants a starting point.
+
+If you do mount it, mount it on the auth server's own origin: its form posts
+to `/api/login`, which is the auth server's endpoint.  A form with no `action`
+posts to the URL of the page it is on, and a form with no `method` submits by
+`GET` -- which for a password form puts the credentials in the address bar,
+the access log, the history and the `Referer`.  Its `?error=` handling
+deliberately maps a fixed set of error *codes* to fixed strings rather than
+rendering the urlarg: the sink is `textContent` so markup is inert, but
+arbitrary attacker-supplied text in the error box of a real login form is a
+phishing surface on its own.
+
+Two known gaps remain, both deliberate for now:
+
+- `/.lws-login-logout` is a state-changing `GET` with no CSRF token, so any
+  page the visitor loads can force them to be logged out.  It is session
+  denial only -- the endpoint grants nothing -- but making it a `POST` with the
+  `auth_csrf` double submit needs the canned widget's Logout link changed at
+  the same time.  Its `redirect_uri` is no longer decoded twice (the URI
+  parser has already percent-decoded the arg), and is rejected outright if it
+  contains a control byte, a backslash, or userinfo in its authority.
+
+- the request URI is read into a 256-byte buffer.  A longer URI cannot be
+  fetched, and rather than silently evaluating the request against the
+  vhost-wide defaults instead of the mount's PMOs, every path now **denies**
+  it.

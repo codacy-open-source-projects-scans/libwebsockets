@@ -12,7 +12,7 @@ set(requirements 1)
 set(MBEDTLS 0)
 require_lws_config(LWS_ROLE_H1 1 requirements)
 require_lws_config(LWS_WITH_CLIENT 1 requirements)
-require_lws_config(LWS_WITH_TLS 1 requirements)
+require_lws_config(LWS_WITH_TCP_TLS 1 requirements)
 require_lws_config(LWS_WITH_SYS_STATE 1 requirements)
 # ctest for this requires server
 require_lws_config(LWS_WITH_SERVER 1 requirements)
@@ -21,21 +21,27 @@ require_lws_config(LWS_WITHOUT_TESTAPPS 0 requirements)
 require_lws_config(LWS_WITH_FILE_OPS 1 requirements)
 
 require_lws_config(LWS_WITH_MBEDTLS 1 MBEDTLS)
+set(has_fault_injection 1)
+require_lws_config(LWS_WITH_SYS_FAULT_INJECTION 1 has_fault_injection)
 
 
 if (requirements)
 	add_executable(${SAMP} ${SRCS})
 	
-	find_program(VALGRIND "valgrind")
+	option(USE_VALGRIND_IF_AVAILABLE "Use valgrind for tests if available" OFF)
+	if (USE_VALGRIND_IF_AVAILABLE)
+		find_program(VALGRIND "valgrind")
+	else()
+		set(VALGRIND "")
+	endif()
 	
        #
        # instantiate the server per sai builder instance, they are running in the same
        # machine context in parallel so they can tread on each other otherwise
        #
-       set(PORT_HCM_SRV "6670")
-       if ("$ENV{SAI_INSTANCE_IDX}")
-	       math(EXPR PORT_HCM_SRV "6671 + $ENV{SAI_INSTANCE_IDX}")
-       endif()
+       lws_get_free_port(PORT_HCM_SRV)
+       lws_get_free_port(PORT_HCMP_SRV)
+
 
 # hack
 if (NOT WIN32 AND LWS_WITH_SERVER)
@@ -45,50 +51,50 @@ if (NOT WIN32 AND LWS_WITH_SERVER)
 	#
 
 if (WIN32)
-	add_test(NAME st_hcm_srv COMMAND cmd.exe /c start /b $<TARGET_FILE:lws-minimal-http-server-tls> --port ${PORT_HCM_SRV})
+	add_test(NAME st_hcm_srv COMMAND cmd.exe /c start /b $<TARGET_FILE:lws-minimal-http-server-tls> -p ${PORT_HCM_SRV})
 	add_test(NAME ki_hcm_srv COMMAND taskkill /F /IM $<TARGET_FILE_NAME:lws-minimal-http-server-tls> /T)
-	add_test(NAME st_hcmp_srv COMMAND cmd.exe /c start /b $<TARGET_FILE:test-server> -s --port 1${PORT_HCM_SRV})
+	add_test(NAME st_hcmp_srv COMMAND cmd.exe /c start /b $<TARGET_FILE:test-server> -s --port ${PORT_HCMP_SRV})
 	add_test(NAME ki_hcmp_srv COMMAND taskkill /F /IM $<TARGET_FILE_NAME:test-server> /T)
 else()
 	#
 	# mbedtls is too slow to keep up on some targets, when ctest is in parallel
 	#
-	if (VALGRIND AND NOT MBEDTLS)
+	if (VALGRIND AND NOT MBEDTLS AND NOT LWS_WITH_ASAN)
 		add_test(NAME st_hcm_srv COMMAND
 			${CMAKE_SOURCE_DIR}/scripts/ctest-background.sh
 				hcm_srv ${VALGRIND} --tool=memcheck $<TARGET_FILE:lws-minimal-http-server-tls>
-				--port ${PORT_HCM_SRV})
+				-p ${PORT_HCM_SRV})
 		add_test(NAME ki_hcm_srv COMMAND
 			${CMAKE_SOURCE_DIR}/scripts/ctest-background-kill.sh
 				hcm_srv ${VALGRIND} $<TARGET_FILE_NAME:lws-minimal-http-server-tls>
-					--port ${PORT_HCM_SRV})
+					-p ${PORT_HCM_SRV})
 		add_test(NAME st_hcmp_srv COMMAND
 				${CMAKE_SOURCE_DIR}/scripts/ctest-background.sh
 					hcmp_srv ${VALGRIND} --tool=memcheck $<TARGET_FILE:test-server> -s
 					-r ${CMAKE_BINARY_DIR}/share/libwebsockets-test-server/
-					--port 1${PORT_HCM_SRV})
+					--port ${PORT_HCMP_SRV})
 		add_test(NAME ki_hcmp_srv COMMAND
 				${CMAKE_SOURCE_DIR}/scripts/ctest-background-kill.sh
 					hcmp_srv ${VALGRIND} $<TARGET_FILE_NAME:test-server>
-					--port 1${PORT_HCM_SRV})
+					--port ${PORT_HCMP_SRV})
 	else()
 		add_test(NAME st_hcm_srv COMMAND
 			${CMAKE_SOURCE_DIR}/scripts/ctest-background.sh
 				hcm_srv $<TARGET_FILE:lws-minimal-http-server-tls>
-				--port ${PORT_HCM_SRV} )
+				-p ${PORT_HCM_SRV} )
 		add_test(NAME ki_hcm_srv COMMAND
 			${CMAKE_SOURCE_DIR}/scripts/ctest-background-kill.sh
 				hcm_srv $<TARGET_FILE_NAME:lws-minimal-http-server-tls>
-					--port ${PORT_HCM_SRV})
+					-p ${PORT_HCM_SRV})
 		add_test(NAME st_hcmp_srv COMMAND
 				${CMAKE_SOURCE_DIR}/scripts/ctest-background.sh
 					hcmp_srv $<TARGET_FILE:test-server> -s
 					-r ${CMAKE_BINARY_DIR}/share/libwebsockets-test-server/
-					--port 1${PORT_HCM_SRV} )
+					--port ${PORT_HCMP_SRV} )
 		add_test(NAME ki_hcmp_srv COMMAND
 				${CMAKE_SOURCE_DIR}/scripts/ctest-background-kill.sh
 					hcmp_srv $<TARGET_FILE_NAME:test-server>
-					--port 1${PORT_HCM_SRV})
+					--port ${PORT_HCMP_SRV})
 	endif()
 endif()
 
@@ -106,7 +112,7 @@ endif()
        		WORKING_DIRECTORY .
 		FIXTURES_SETUP hcmp_srv
 		TIMEOUT 800)
-	set_property(TEST st_hcmp_srv PROPERTY ENVIRONMENT SAI_LIST_PORT=1${PORT_HCM_SRV} )
+	set_property(TEST st_hcmp_srv PROPERTY ENVIRONMENT SAI_LIST_PORT=${PORT_HCMP_SRV} )
 	set_property(TEST st_hcmp_srv PROPERTY ENVIRONMENT VENDOR=$ENV{VENDOR} )
 
 	set_tests_properties(ki_hcmp_srv PROPERTIES
@@ -117,34 +123,57 @@ endif()
 	#
 
 	add_test(NAME http-client-multi COMMAND lws-minimal-http-client-multi
-			-l --port ${PORT_HCM_SRV} -d 1151)
+			-l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCM_SRV} -d 1151)
 	add_test(NAME http-client-multi-h1 COMMAND lws-minimal-http-client-multi
-			--h1 -l --port ${PORT_HCM_SRV} -d1151)
+			--h1 -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCM_SRV} -d1151)
 	add_test(NAME http-client-multi-pipe COMMAND lws-minimal-http-client-multi
-			-p -l --port ${PORT_HCM_SRV} -d1151)
+			-p -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCM_SRV} -d1151)
 	add_test(NAME http-client-multi-h1-pipe COMMAND lws-minimal-http-client-multi
-			--h1 -p -l --port ${PORT_HCM_SRV} -d1151)
+			--h1 -p -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCM_SRV} -d1151)
 	add_test(NAME http-client-multi-stag COMMAND lws-minimal-http-client-multi
-			-s -l --port ${PORT_HCM_SRV} -d1151)
+			-s -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCM_SRV} -d1151)
 	add_test(NAME http-client-multi-stag-h1 COMMAND lws-minimal-http-client-multi
-			--h1 -s -l --port ${PORT_HCM_SRV} -d1151)
+			--h1 -s -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCM_SRV} -d1151)
 	add_test(NAME http-client-multi-stag-pipe COMMAND lws-minimal-http-client-multi
-			-p -s -l --port ${PORT_HCM_SRV} -d1151)
+			-p -s -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCM_SRV} -d1151)
 	add_test(NAME http-client-multi-stag-h1-pipe COMMAND lws-minimal-http-client-multi
-			--h1 -p -s -l --port ${PORT_HCM_SRV} -d1151)
+			--h1 -p -s -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCM_SRV} -d1151)
 
 	# confirm that the pipelined mode really is doing it in one connection
-	add_test(NAME http-client-multi-restrict-pipe COMMAND lws-minimal-http-client-multi -d1151 --limit 1 -p -l --port ${PORT_HCM_SRV})
-	add_test(NAME http-client-multi-restrict-h1-pipe COMMAND lws-minimal-http-client-multi -d1151 --limit 1 --h1 -p -l --port ${PORT_HCM_SRV})
-	add_test(NAME http-client-multi-restrict-stag-pipe COMMAND lws-minimal-http-client-multi -d1151 --limit 1 -p -s -l --port ${PORT_HCM_SRV})
-	add_test(NAME http-client-multi-restrict-stag-h1-pipe COMMAND lws-minimal-http-client-multi -d1151 --limit 1 --h1 -p -s -l --port ${PORT_HCM_SRV})
+	add_test(NAME http-client-multi-restrict-pipe COMMAND lws-minimal-http-client-multi -d1151 --limit 1 -p -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCM_SRV})
+	add_test(NAME http-client-multi-restrict-h1-pipe COMMAND lws-minimal-http-client-multi -d1151 --limit 1 --h1 -p -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCM_SRV})
+	add_test(NAME http-client-multi-restrict-stag-pipe COMMAND lws-minimal-http-client-multi -d1151 --limit 1 -p -s -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCM_SRV})
+	add_test(NAME http-client-multi-restrict-stag-h1-pipe COMMAND lws-minimal-http-client-multi -d1151 --limit 1 --h1 -p -s -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCM_SRV})
 	# confirm that we do fail with a one connection limit and no pipelining
-	add_test(NAME http-client-multi-restrict-nopipe-fail COMMAND lws-minimal-http-client-multi --limit 1 -l --port ${PORT_HCM_SRV} -d1151)
+	add_test(NAME http-client-multi-restrict-nopipe-fail COMMAND lws-minimal-http-client-multi --limit 1 -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCM_SRV} -d1151)
 	set_property(TEST http-client-multi-restrict-nopipe-fail PROPERTY WILL_FAIL TRUE)
-	add_test(NAME http-client-multi-restrict-h1-nopipe-fail COMMAND lws-minimal-http-client-multi --limit 1 --h1 -l --port ${PORT_HCM_SRV} -d1151)
+	add_test(NAME http-client-multi-restrict-h1-nopipe-fail COMMAND lws-minimal-http-client-multi --limit 1 --h1 -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCM_SRV} -d1151)
 	set_property(TEST http-client-multi-restrict-h1-nopipe-fail PROPERTY WILL_FAIL TRUE)
 
-	set_tests_properties(http-client-multi-restrict-pipe
+	# 40 transactions pipelined on one h2 connection: the server advertises
+	# SETTINGS_MAX_CONCURRENT_STREAMS 24, so the rest must queue on the
+	# connection and go as streams complete, not be refused or stall
+	add_test(NAME http-client-multi-pipe-over-max-streams COMMAND lws-minimal-http-client-multi -d1151 --limit 1 -p -c 40 -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCM_SRV})
+
+	if (has_fault_injection)
+		# ... and the peer dropping that connection on its second read,
+		# with streams open and the rest still queued on it: the
+		# queued ones must be failed with the connection, not adopted
+		# on to it as it dies (which left them with a freed parent and
+		# the client waiting on them forever).  The transactions fail,
+		# so the exit code is nonzero and prompt: without the fix the
+		# test times out
+		add_test(NAME http-client-multi-pipe-over-max-streams-conn-lost COMMAND lws-minimal-http-client-multi -d1151 --limit 1 -p -c 40 -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCM_SRV} --fault-injection "wsi/h2cli_nwsi_rx_err(.X)")
+		set_tests_properties(http-client-multi-pipe-over-max-streams-conn-lost
+				     PROPERTIES
+				     FIXTURES_REQUIRED "hcm_srv"
+				     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/minimal-examples-lowlevel/http-client/minimal-http-client-multi
+				     WILL_FAIL TRUE
+				     TIMEOUT 50)
+	endif()
+
+	set_tests_properties(http-client-multi-pipe-over-max-streams
+			     http-client-multi-restrict-pipe
 			     http-client-multi-restrict-h1-pipe
 			     http-client-multi-restrict-stag-pipe
 			     http-client-multi-restrict-stag-h1-pipe
@@ -165,26 +194,26 @@ endif()
 
 	# POSTs against local http-server-form-post
 	add_test(NAME http-client-multi-post COMMAND lws-minimal-http-client-multi
-			--post -l --port 1${PORT_HCM_SRV} -d1151)
+			--post -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCMP_SRV} -d1151)
 	add_test(NAME http-client-multi-post-h1 COMMAND lws-minimal-http-client-multi
-			--post --h1 -l --port 1${PORT_HCM_SRV} -d1151)
+			--post --h1 -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCMP_SRV} -d1151)
 	add_test(NAME http-client-multi-post-pipe COMMAND lws-minimal-http-client-multi
-			--post -p -l --port 1${PORT_HCM_SRV} -d1151)
-	if (VALGRIND)
+			--post -p -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCMP_SRV} -d1151)
+	if (VALGRIND AND NOT LWS_WITH_ASAN)
 		add_test(NAME http-client-multi-post-h1-pipe COMMAND ${VALGRIND} --tool=memcheck $<TARGET_FILE:lws-minimal-http-client-multi>
-			--post --h1 -p -l --port 1${PORT_HCM_SRV} -d1151)	
+			--post --h1 -p -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCMP_SRV} -d1151)	
 	else()
 		add_test(NAME http-client-multi-post-h1-pipe COMMAND lws-minimal-http-client-multi
-			--post --h1 -p -l --port 1${PORT_HCM_SRV} -d1151)
+			--post --h1 -p -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCMP_SRV} -d1151)
 	endif()
 	add_test(NAME http-client-multi-post-stag COMMAND lws-minimal-http-client-multi
-			--post -s -l -d1151 --port 1${PORT_HCM_SRV} -d1151)
+			--post -s -l -d1151 --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCMP_SRV} -d1151)
 	add_test(NAME http-client-multi-post-stag-h1 COMMAND lws-minimal-http-client-multi
-			--post --h1 -d1151 -s -l --port 1${PORT_HCM_SRV} -d1151)
+			--post --h1 -d1151 -s -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCMP_SRV} -d1151)
 	add_test(NAME http-client-multi-post-stag-pipe COMMAND lws-minimal-http-client-multi
-			--post -p -s -l --port 1${PORT_HCM_SRV} -d1151)
+			--post -p -s -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCMP_SRV} -d1151)
 	add_test(NAME http-client-multi-post-stag-h1-pipe COMMAND lws-minimal-http-client-multi
-			--post --h1 -p -s -l --port 1${PORT_HCM_SRV} -d1151)
+			--post --h1 -p -s -l --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_HCMP_SRV} -d1151)
 	set_tests_properties(http-client-multi-post
 			     http-client-multi-post-h1
 			     http-client-multi-post-pipe

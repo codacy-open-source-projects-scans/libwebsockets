@@ -44,17 +44,24 @@ lws_display_dl_init(lws_displaylist_t *dl, lws_display_state_t *ds)
 int
 lws_display_dlo_add(lws_displaylist_t *dl, lws_dlo_t *dlo_parent, lws_dlo_t *dlo)
 {
-	if (!dlo_parent && !dl->dl.head) {
+	if (!dlo_parent && !lws_dll2_get_head(&dl->dl)) {
+		/*
+		 * This one is going on the display list itself, so its list
+		 * node's owner is not any dlo's children owner... mark it so
+		 * nobody tries to walk up from it to a "parent" dlo
+		 */
+
+		dlo->flag_toplevel = 1;
 		lws_dll2_add_tail(&dlo->list, &dl->dl);
 
 		return 0;
 	}
 
 	if (!dlo_parent) {
-		if (!dl->dl.head)
+		if(lws_dll2_is_empty(&dl->dl))
 			return 0;
 
-		dlo_parent = lws_container_of(dl->dl.head, lws_dlo_t, list);
+		dlo_parent = lws_container_of(lws_dll2_get_head(&dl->dl), lws_dlo_t, list);
 	}
 
 	lws_dll2_add_tail(&dlo->list, &dlo_parent->children);
@@ -154,8 +161,8 @@ lws_dlo_contents(lws_dlo_t *parent, lws_dlo_dim_t *dim)
 
 	} lws_end_foreach_dll(d);
 
-	if (parent->col_list.owner) {
-		lhp_table_col_t *tc = lws_container_of(parent->col_list.owner,
+	if (lws_dll2_owner(&parent->col_list)) {
+		lhp_table_col_t *tc = lws_dll2_owner_container(&parent->col_list,
 					lhp_table_col_t, col_dlos);
 
 		if (lws_fx_comp(&dim->w, &tc->width) < 0) {
@@ -165,8 +172,8 @@ lws_dlo_contents(lws_dlo_t *parent, lws_dlo_dim_t *dim)
 		}
 	}
 
-	if (parent->row_list.owner) {
-		lhp_table_row_t *tr = lws_container_of(parent->row_list.owner,
+	if (lws_dll2_owner(&parent->row_list)) {
+		lhp_table_row_t *tr = lws_dll2_owner_container(&parent->row_list,
 					lhp_table_row_t, row_dlos);
 
 		if (lws_fx_comp(&dim->h, &tr->height) < 0) {
@@ -208,17 +215,26 @@ lws_display_dlo_adjust_dims(lws_dlo_t *dlo, lws_dlo_dim_t *dim)
 	/* move peers below him accordingly */
 
 	do {
-		lws_dlo_t *dp = lws_container_of(dlo->list.owner, lws_dlo_t, children);
+		lws_dlo_t *dp;
 
-		if (!dlo->list.owner)
+		/*
+		 * The toplevel dlo's list node is owned by the lws_displaylist_t
+		 * and not by any dlo's children owner, so we must not convert
+		 * its owner to an lws_dlo_t *... and there is nothing above it
+		 * to walk up to anyway.  Same story if we are detached.
+		 */
+
+		if (dlo->flag_toplevel || !lws_dll2_owner(&dlo->list))
 			break;
+
+		dp = lws_dll2_owner_container(&dlo->list, lws_dlo_t, children);
 
 		/*
 		 * Adjust y pos of siblings below us
 		 */
 
 		do {
-			dlo = lws_container_of(dlo->list.next, lws_dlo_t, list);
+			dlo = lws_container_of(lws_dll2_get_next(&dlo->list), lws_dlo_t, list);
 			if (dlo) {
 				//lwsl_notice("%s: dlo %p: adj y %d -> %d\n", __func__, dlo, dlo->box.y.whole, dlo->box.y.whole + delta.h.whole);
 				lws_fx_add(&dlo->box.y, &dlo->box.y, &delta.h);
@@ -242,7 +258,8 @@ lws_display_dlo_adjust_dims(lws_dlo_t *dlo, lws_dlo_dim_t *dim)
 void
 lws_display_dl_dump(lws_displaylist_t *dl)
 {
-	lws_display_render_stack_t	st[64]; /* DLO child stack */
+	lws_display_render_stack_t	st[LWS_DLO_STACK_DEPTH];
+						/* DLO child stack */
 	int				sp = 0;
 	lws_dll2_t *d = lws_dll2_get_head(&dl->dl);
 #if (_LWS_ENABLED_LOGS & dlodump_loglevel)
@@ -286,6 +303,14 @@ lws_display_dl_dump(lws_displaylist_t *dl)
 					(unsigned int)dlo->dc, (unsigned int)text->text_len,
 					(int)text->text_len, text->text ? text->text : "(empty)");
 		}
+		else if (dlo->render == lws_display_render_hit)
+			lws_snprintf(dt, sizeof(dt), "hit: %scur %u %s",
+				lws_container_of(dlo, lws_dlo_hit_t, dlo)->fill ?
+					"fill " : "",
+				lws_container_of(dlo, lws_dlo_hit_t, dlo)->cursor,
+				lws_container_of(dlo, lws_dlo_hit_t, dlo)->url ?
+				lws_container_of(dlo, lws_dlo_hit_t, dlo)->url :
+					"");
 #if defined(LWS_WITH_NETWORK) && defined(LWS_WITH_UPNG) && defined(LWS_WITH_CLIENT)
 		else if (dlo->_destroy == lws_display_dlo_png_destroy)
 			lws_snprintf(dt, sizeof(dt), "png");
@@ -308,7 +333,7 @@ lws_display_dl_dump(lws_displaylist_t *dl)
 				sp, ind, dlo, b[0], b[1], b[2], b[3],
 				b1[0], b1[1], b1[2], b1[3], dt);
 
-		d = dlo->list.next;
+		d = lws_dll2_get_next(&dlo->list);
 		if (d)
 			st[sp].dlo = lws_container_of(d, lws_dlo_t, list);
 		else
@@ -316,13 +341,13 @@ lws_display_dl_dump(lws_displaylist_t *dl)
 
 		/* go into any children */
 
-		if (dlo->children.head) {
+		if(!lws_dll2_is_empty(&dlo->children)) {
 			if (sp + 1 == LWS_ARRAY_SIZE(st)) {
 				lwsl_err("%s: DLO stack overflow\n", __func__);
 				return;
 			}
 			st[++sp].dlo = lws_container_of(
-				dlo->children.head, lws_dlo_t, list);
+				lws_dll2_get_head(&dlo->children), lws_dlo_t, list);
 			st[sp].co = co;
 		}
 
@@ -356,7 +381,10 @@ lws_display_get_ids_boxes(lws_display_render_state_t *rs)
 		lws_fx_t t2;
 
 		if (!dlo) {
-			rs->sp--;
+			if (rs->sp > 0)
+				rs->sp--;
+			else
+				break;
 			continue;
 		}
 
@@ -389,7 +417,7 @@ lws_display_get_ids_boxes(lws_display_render_state_t *rs)
 
 		/* next sibling at this level if any */
 
-		d = dlo->list.next;
+		d = lws_dll2_get_next(&dlo->list);
 		if (d)
 			rs->st[rs->sp].dlo = lws_container_of(d,
 						lws_dlo_t, list);
@@ -398,14 +426,14 @@ lws_display_get_ids_boxes(lws_display_render_state_t *rs)
 
 		/* go into any children */
 
-		if (dlo->children.head) {
+		if(!lws_dll2_is_empty(&dlo->children)) {
 			if (rs->sp + 1 == LWS_ARRAY_SIZE(rs->st)) {
 				lwsl_err("%s: DLO stack overflow A\n",
 						__func__);
 				return LWS_SRET_FATAL;
 			}
 			rs->st[++rs->sp].dlo = lws_container_of(
-				dlo->children.head, lws_dlo_t, list);
+				lws_dll2_get_head(&dlo->children), lws_dlo_t, list);
 			rs->st[rs->sp].co = co;
 			continue;
 		}
@@ -448,7 +476,10 @@ lws_display_list_render_line(lws_display_render_state_t *rs)
 		lws_fx_t t2;
 
 		if (!dlo) {
-			rs->sp--;
+			if (rs->sp > 0)
+				rs->sp--;
+			else
+				break;
 			continue;
 		}
 
@@ -462,12 +493,21 @@ lws_display_list_render_line(lws_display_render_state_t *rs)
 
 		lws_fx_add(&t2, &co.y, &dlo->box.h);
 
+		/*
+		 * A streaming render destroys DLOs once the cursor has
+		 * passed below them, to bound memory on small targets.  A
+		 * retained render (eg, an interactive viewport that will be
+		 * re-scanned at other vertical offsets) must keep them, but
+		 * either way there is no need to descend into them
+		 */
+
 		if (rs->curr > lws_fx_roundup(&t2) && dlo->box.h.whole > 3) {
-			d = dlo->list.next;
+			d = lws_dll2_get_next(&dlo->list);
 			rs->st[rs->sp].dlo = d ? lws_container_of(d, lws_dlo_t,
 								list) : NULL;
 
-			lws_display_dlo_destroy(&dlo);
+			if (!rs->retained)
+				lws_display_dlo_destroy(&dlo);
 			continue;
 		}
 
@@ -488,7 +528,7 @@ lws_display_list_render_line(lws_display_render_state_t *rs)
 
 			/* next sibling at this level if any */
 
-			d = dlo->list.next;
+			d = lws_dll2_get_next(&dlo->list);
 
 			if (d)
 				rs->st[rs->sp].dlo = lws_container_of(d,
@@ -499,21 +539,21 @@ lws_display_list_render_line(lws_display_render_state_t *rs)
 
 			/* go into any children */
 
-			if (dlo->children.head) {
+			if(!lws_dll2_is_empty(&dlo->children)) {
 				if (rs->sp + 1 == LWS_ARRAY_SIZE(rs->st)) {
 					lwsl_err("%s: DLO stack overflow B\n",
 							__func__);
 					return LWS_SRET_FATAL;
 				}
 				rs->st[++rs->sp].dlo = lws_container_of(
-					dlo->children.head, lws_dlo_t, list);
+					lws_dll2_get_head(&dlo->children), lws_dlo_t, list);
 				rs->st[rs->sp].co = co;
 				continue;
 			}
 		} else {
 			/* next sibling at this level if any */
 
-			d = dlo->list.next;
+			d = lws_dll2_get_next(&dlo->list);
 			if (d)
 				rs->st[rs->sp].dlo = lws_container_of(d,
 							lws_dlo_t, list);
@@ -527,10 +567,18 @@ lws_display_list_render_line(lws_display_render_state_t *rs)
 	return LWS_SRET_OK;
 }
 
+/*
+ * Cell dlos still on the row / column list must be unlinked before the owner
+ * is freed, or destroying them later walks freed memory
+ */
+
 static int
 dlo_clean_table_rows(lws_dll2_t *d, void *user)
 {
 	lhp_table_row_t *r = lws_container_of(d, lhp_table_row_t, list);
+
+	while (lws_dll2_get_head(&r->row_dlos))
+		lws_dll2_remove(lws_dll2_get_head(&r->row_dlos));
 
 	lws_dll2_remove(d);
 	lws_free(r);
@@ -542,6 +590,9 @@ static int
 dlo_clean_table_cols(lws_dll2_t *d, void *user)
 {
 	lhp_table_col_t *c = lws_container_of(d, lhp_table_col_t, list);
+
+	while (lws_dll2_get_head(&c->col_dlos))
+		lws_dll2_remove(lws_dll2_get_head(&c->col_dlos));
 
 	lws_dll2_remove(d);
 	lws_free(c);
@@ -561,8 +612,8 @@ lws_display_dlo_destroy(lws_dlo_t **r)
 	lws_dll2_remove(&rr->col_list);
 	lws_dll2_remove(&rr->row_list);
 
-	while (rr->children.head) {
-		lws_dlo_t *d = lws_container_of(rr->children.head,
+	while(!lws_dll2_is_empty(&rr->children)) {
+		lws_dlo_t *d = lws_container_of(lws_dll2_get_head(&rr->children),
 							lws_dlo_t, list);
 
 		lws_display_dlo_destroy(&d);
@@ -585,8 +636,8 @@ lws_display_list_destroy(struct lws_context *cx, lws_displaylist_t *dl)
 
 	//lws_dlo_ss_stop_any_active(cx);
 
-	while (dl->dl.head) {
-		lws_dlo_t *d = lws_container_of(dl->dl.head, lws_dlo_t, list);
+	while(!lws_dll2_is_empty(&dl->dl)) {
+		lws_dlo_t *d = lws_container_of(lws_dll2_get_head(&dl->dl), lws_dlo_t, list);
 
 		lws_display_dlo_destroy(&d);
 	}
@@ -840,4 +891,12 @@ const struct lws_plat_file_ops lws_dlo_fops = {
 	.fi = { { "dlofs/", 6 } },
 };
 
+#endif
+
+#if defined(LWS_WITH_CACHE_BLOB)
+struct lws_cache_ttl_lru *
+lws_dlo_asset_cache(struct lws_context *cx)
+{
+	return cx->dlo_asset_l1;
+}
 #endif

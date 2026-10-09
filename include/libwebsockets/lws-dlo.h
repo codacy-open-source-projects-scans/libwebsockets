@@ -73,6 +73,7 @@ typedef struct lws_font_glyph {
 
 	int8_t			x;	/* x offset inside the glyph */
 
+	void			*pin;	/* font-private: what to unpin on free */
 } lws_font_glyph_t;
 
 typedef lws_stateful_ret_t (*lws_dlo_renderer_t)(struct lws_display_render_state *rs);
@@ -118,7 +119,10 @@ typedef struct lws_dlo {
 	lws_dll2_owner_t		table_cols; /* lhp_table_col_t */
 	lws_dll2_owner_t		table_rows; /* lhp_table_row_t */
 
-	/* may point to dlo whose width or height decides our x or y */
+	/* may point to dlo whose width or height decides our x or y:
+	 * abut_y is the positioned ancestor a bottom-anchored absolute
+	 * box waits on, box.y meanwhile holding the offset up from its
+	 * bottom edge (layout) */
 
 	struct lws_dlo			*abut_x;
 	struct lws_dlo			*abut_y;
@@ -135,10 +139,32 @@ typedef struct lws_dlo {
 	lws_display_colour_t		dc;
 
 	uint8_t				budget; /* limit spinning */
+	int16_t				base_up; /* baseline: distance up from the
+						  * box bottom, 0 = bottom edge
+						  * (layout) */
 
-	uint8_t				flag_runon:1; /* continues same line */
-	uint8_t				flag_done_align:1;
 	uint8_t				flag_toplevel:1; /* don't scan up with me (different owner) */
+	uint8_t				flag_block:1; /* block-level box (layout) */
+	uint8_t				flag_row:1;   /* table row box (layout) */
+	uint8_t				flag_cell:1;  /* table cell box (layout) */
+	uint8_t				flag_abs:1;   /* positioned box (layout) */
+	uint8_t				flag_float:1; /* floated box (layout) */
+	uint8_t				flag_zraise:1; /* positioned, z-index > 0 */
+	uint8_t				flag_online:1; /* item of the line being ended (layout) */
+	uint8_t				flag_bg_homed:1; /* css background image moved into
+						  * its element's own dlo (layout) */
+	uint8_t				flag_inline_bg:1; /* background rect of the text
+						   * run that follows it (layout) */
+	uint8_t				flag_flex_item:1; /* item of a row flex container
+						   * (layout) */
+	uint8_t				flag_fixed_h:1; /* has a css height: not
+						 * stretched (layout) */
+	uint8_t				flag_abs_stretch:1; /* waiting on abut_y
+						 * to stretch between top and
+						 * bottom, box.h meanwhile the
+						 * bottom offset (layout) */
+	uint8_t				flex_grow; /* flex-grow, for flag_flex_item */
+	uint8_t				align_self; /* LCSP_PROPVAL_* or 0 = auto */
 
 	/* render-specific members ... */
 } lws_dlo_t;
@@ -167,11 +193,51 @@ typedef struct lws_dlo_rect {
 
 	uint8_t				init;
 	uint8_t				alt;
+	/* 0 = full box, else fill the triangle at the named corner: the css
+	 * border-triangle idiom (transparent adjacent borders on an empty
+	 * box) */
+	uint8_t				tri;  /* 1 t-l, 2 t-r, 3 b-l, 4 b-r */
 } lws_dlo_rect_t;
 
 typedef struct lws_dlo_circle {
 	lws_dlo_t			dlo;
 } lws_dlo_circle_t;
+
+/*
+ * Non-printing hit region: renders nothing, but marks the area of its box
+ * as belonging to something, eg, the link whose url it carries.  Being a
+ * dlo it is placed and moved by the layout with the things around it, and
+ * its position in the paint order decides which of several overlapping
+ * regions a point belongs to (the last, as a viewer sees it on top).
+ */
+
+/*
+ * The pointer shape a hit region asks for while the pointer is over it, in
+ * platform-neutral terms: a windowing backend maps these to whatever it
+ * has (X11 font cursors, NSCursor, LoadCursor...).  A link asks for the
+ * pointing hand, editable text for the I-beam, css cursor: for the rest.
+ */
+typedef enum {
+	LWS_DLO_CURSOR_DEFAULT,		/* the platform arrow */
+	LWS_DLO_CURSOR_POINTER,		/* pointing hand: links, buttons */
+	LWS_DLO_CURSOR_TEXT,		/* I-beam: editable / selectable text */
+	LWS_DLO_CURSOR_CROSSHAIR,
+	LWS_DLO_CURSOR_MOVE,
+	LWS_DLO_CURSOR_WAIT,
+	LWS_DLO_CURSOR_HELP,
+	LWS_DLO_CURSOR_NOT_ALLOWED,
+	LWS_DLO_CURSOR_NONE,		/* hidden */
+} lws_dlo_cursor_t;
+
+typedef struct lws_dlo_hit {
+	lws_dlo_t			dlo;
+	const char			*url; /* as written in the document, in
+					       * the same allocation; NULL for a
+					       * region that only sets the
+					       * cursor */
+	uint8_t				fill; /* takes its parent's size */
+	uint8_t				cursor; /* lws_dlo_cursor_t */
+} lws_dlo_hit_t;
 
 typedef struct lws_font_choice {
 	const char			*family_name;
@@ -219,6 +285,8 @@ typedef struct lws_dlo_text {
 	struct lwsac			*ac_glyphs;
 	uint8_t				*line;
 	uint16_t			curr;
+	uint16_t			glyph_row; /* rows the glyph run decoders
+						    * have produced since attach */
 
 	char				*text;
 	uint8_t				*kern;
@@ -250,6 +318,17 @@ typedef struct lws_dlo_png {
 	lws_flow_t			flow; /* ordering: second */
 	char				name[25];
 	lws_upng_t			*png;
+	uint32_t			emitted; /* decoded rows issued so far,
+						* for viewport re-scans */
+	uint8_t				*row; /* copy of the last row issued, for
+					       * repeating it when scaled up */
+	uint32_t			row_len;
+	lws_reclaimable_t		rc; /* payload + decoder, once complete */
+	uint8_t				evicted; /* renew from the asset cache
+						  * before the next render */
+	uint8_t				yields; /* consecutive OOM yields */
+	uint8_t				failed; /* the decoder returned FATAL:
+						 * nothing more from it */
 } lws_dlo_png_t;
 
 typedef struct lws_dlo_jpeg {
@@ -257,11 +336,50 @@ typedef struct lws_dlo_jpeg {
 	lws_flow_t			flow; /* ordering: second */
 	char				name[25];
 	lws_jpeg_t			*j;
+	uint32_t			emitted; /* decoded rows issued so far,
+						* for viewport re-scans */
+	uint8_t				*row; /* copy of the last row issued, for
+					       * repeating it when scaled up */
+	uint32_t			row_len;
+	lws_reclaimable_t		rc; /* payload + decoder, once complete */
+	uint8_t				evicted; /* renew from the asset cache
+						  * before the next render */
+	uint8_t				failed; /* the decoder returned FATAL:
+						 * nothing more from it */
 } lws_dlo_jpeg_t;
+
+typedef struct lws_dlo_svg {
+	lws_dlo_t			dlo;  /* ordering: first */
+	lws_flow_t			flow; /* ordering: second */
+	char				name[25];
+	lws_svg_t			*svg;
+} lws_dlo_svg_t;
+
+/*
+ * Unlike the png and jpeg dlos, the gif dlo keeps the whole asset payload
+ * retained in one buffer: interlaced gifs must be re-decoded to reach rows
+ * out of stream order, and a linewise renderer without a framebuffer can
+ * only get interlaced rows that way.  Progressive gifs free it again once
+ * the frame has decoded.
+ */
+
+typedef struct lws_dlo_gif {
+	lws_dlo_t			dlo;  /* ordering: first */
+	lws_flow_t			flow; /* ordering: second */
+	char				name[25];
+	lws_gif_t			*gif;
+	uint8_t				*whole;	/* retained asset payload */
+	size_t				whole_len;
+	size_t				whole_size;
+	size_t				pos;	/* decode feed cursor in whole */
+	char				whole_done; /* whole fully decoded */
+} lws_dlo_gif_t;
 
 typedef enum {
 	LWSDLOSS_TYPE_JPEG,
 	LWSDLOSS_TYPE_PNG,
+	LWSDLOSS_TYPE_SVG,
+	LWSDLOSS_TYPE_GIF,
 	LWSDLOSS_TYPE_CSS,
 } lws_dlo_image_type_t;
 
@@ -269,6 +387,8 @@ typedef struct {
 	union {
 		lws_dlo_jpeg_t		*dlo_jpeg;
 		lws_dlo_png_t		*dlo_png;
+		lws_dlo_svg_t		*dlo_svg;
+		lws_dlo_gif_t		*dlo_gif;
 	} u;
 	lws_dlo_image_type_t		type;
 	char				failed;
@@ -283,12 +403,29 @@ typedef struct lws_dl_rend {
 	lws_displaylist_t		*dl;
 	int				w;
 	int				h;
+	char				clipped; /* the layout dropped content that
+					  * landed below h */
 } lws_dl_rend_t;
 
 typedef struct lws_display_render_stack {
 	lws_dlo_t			*dlo;	/* position in dlo owner */
 	lws_box_t			co;	/* our origin as parent */
 } lws_display_render_stack_t;
+
+/*
+ * How deep a display list the dlo tree walkers (render, dump, hit test) can
+ * follow.  Deeper nesting than this is truncated, it is not an error: the
+ * walkers all carry the stack by value, so on a constrained target the
+ * ceiling is what keeps them off a couple of KB of stack apiece.
+ */
+
+#if !defined(LWS_DLO_STACK_DEPTH)
+#if defined(LWS_ESP_PLATFORM)
+#define LWS_DLO_STACK_DEPTH	16
+#else
+#define LWS_DLO_STACK_DEPTH	64
+#endif
+#endif
 
 typedef struct lws_display_render_state {
 	lws_sorted_usec_list_t		sul; /* return to event loop statefully */
@@ -298,21 +435,39 @@ typedef struct lws_display_render_state {
 
 	const struct lws_surface_info	*ic; /* display dimensions, palette */
 
-#if defined(LWS_ESP_PLATFORM)
-	lws_display_render_stack_t	st[16]; /* DLO child stack */
-#else
-	lws_display_render_stack_t	st[64]; /* DLO child stack */
-#endif
+	lws_display_render_stack_t	st[LWS_DLO_STACK_DEPTH];
+						/* DLO child stack */
 	int				sp;	/* DLO child stack level */
 
 	uint8_t				*line; /* Y or RGB line comp buffer */
 
 	lws_displaylist_t		displaylist;
 
+	/* the html document ss currently bound to this render state, when
+	 * browsed with lws_lhp_ss_browse(); used by lws_lhp_ss_cancel() */
+
+	struct lws_ss_handle		*hss_html;
+
 	lws_display_scalar		curr;
 	lws_display_scalar		lowest_id_y;
 
 	char				html;
+	char				retained; /* nonzero: keep DLOs when the
+						* render cursor passes them, so
+						* the display list can be re-
+						* scanned at other offsets */
+	char				layout_clipped; /* set when the html
+						* completes if the layout dropped
+						* content below the surface: a
+						* taller surface would show more */
+	int32_t				viewport_h; /* 0, or the height css
+						* viewport units and the root
+						* element's height resolve
+						* against, when the layout
+						* surface is taller than what is
+						* shown at once (a scrolling
+						* window) */
+	struct lws_context		*cx; /* set by lws_lhp_ss_browse_filter() */
 
 } lws_display_render_state_t;
 
@@ -398,6 +553,62 @@ LWS_VISIBLE LWS_EXTERN lws_stateful_ret_t
 lws_display_render_rect(struct lws_display_render_state *rs);
 
 /*
+ * hit region
+ */
+
+/**
+ * lws_display_dlo_hit_new() - add a non-printing hit region to the display list
+ *
+ * \param dl: the display list
+ * \param dlo_parent: the dlo whose child it becomes, or NULL for the list head
+ * \param box: its box relative to the parent, or NULL for all zeros
+ * \param url: the url (or other metadata string) the region carries, or NULL
+ * \param url_len: the length of url
+ *
+ * The url is copied into the region's own allocation.  Set .fill on the
+ * result for a region that always has its parent's size, and .cursor to
+ * the lws_dlo_cursor_t the pointer should take over it.
+ */
+LWS_VISIBLE LWS_EXTERN lws_dlo_hit_t *
+lws_display_dlo_hit_new(lws_displaylist_t *dl, lws_dlo_t *dlo_parent,
+			const lws_box_t *box, const char *url, size_t url_len);
+
+LWS_VISIBLE LWS_EXTERN void
+lws_display_dlo_hit_destroy(struct lws_dlo *dlo);
+
+LWS_VISIBLE LWS_EXTERN lws_stateful_ret_t
+lws_display_render_hit(struct lws_display_render_state *rs);
+
+/**
+ * lws_display_dl_hit_test() - find the hit region at a point
+ *
+ * \param dl: the display list
+ * \param x: x in the display list's coordinates
+ * \param y: y in the display list's coordinates
+ * \param abox: NULL, or filled with the region's absolute box if one is hit
+ *
+ * Returns the topmost hit region containing the point, or NULL if none.
+ * For a laid-out html document the coordinates are those of the document,
+ * so a viewport offset must be added to a window position first.
+ */
+LWS_VISIBLE LWS_EXTERN lws_dlo_hit_t *
+lws_display_dl_hit_test(lws_displaylist_t *dl, int x, int y, lws_box_t *abox);
+
+/**
+ * lws_display_dl_cursor_at() - the pointer shape for a point
+ *
+ * \param dl: the display list
+ * \param x: x in the display list's coordinates
+ * \param y: y in the display list's coordinates
+ *
+ * Returns the cursor the topmost hit region containing the point asks for,
+ * or LWS_DLO_CURSOR_DEFAULT if there is none.  A windowing app calls this
+ * on pointer motion and sets the platform cursor to match.
+ */
+LWS_VISIBLE LWS_EXTERN lws_dlo_cursor_t
+lws_display_dl_cursor_at(lws_displaylist_t *dl, int x, int y);
+
+/*
  * dlo text
  */
 
@@ -408,6 +619,20 @@ lws_display_dlo_text_new(lws_displaylist_t *dl, lws_dlo_t *dlo_parent,
 LWS_VISIBLE LWS_EXTERN int
 lws_display_dlo_text_update(lws_dlo_text_t *text, lws_display_colour_t dc,
 		lws_fx_t indent, const char *utf8, size_t text_len);
+
+/**
+ * lws_display_dlo_text_measure() - width of a string in a text dlo's font
+ *
+ * \p text: a text dlo, used for its font
+ * \p utf8: the string
+ * \p text_len: its length in bytes
+ * \p total: set to the width if laid out on one line
+ * \p longest_word: set to the width of the widest space-delimited word
+ */
+LWS_VISIBLE LWS_EXTERN void
+lws_display_dlo_text_measure(lws_dlo_text_t *text, const char *utf8,
+			     size_t text_len, lws_fx_t *total,
+			     lws_fx_t *longest_word);
 
 LWS_VISIBLE LWS_EXTERN void
 lws_display_dlo_text_destroy(struct lws_dlo *dlo);
@@ -447,6 +672,49 @@ LWS_VISIBLE LWS_EXTERN void
 lws_display_dlo_jpeg_destroy(struct lws_dlo *dlo);
 
 /*
+ * SVG
+ */
+
+LWS_VISIBLE LWS_EXTERN lws_dlo_svg_t *
+lws_display_dlo_svg_new(lws_displaylist_t *dl, lws_dlo_t *dlo_parent,
+			lws_box_t *box, const char *name, size_t len);
+
+LWS_VISIBLE LWS_EXTERN lws_stateful_ret_t
+lws_display_render_svg(struct lws_display_render_state *rs);
+
+LWS_VISIBLE LWS_EXTERN lws_stateful_ret_t
+lws_display_dlo_svg_metadata_scan(lws_dlo_svg_t *ds);
+
+LWS_VISIBLE LWS_EXTERN void
+lws_display_dlo_svg_destroy(struct lws_dlo *dlo);
+
+/*
+ * GIF
+ */
+
+LWS_VISIBLE LWS_EXTERN lws_dlo_gif_t *
+lws_display_dlo_gif_new(lws_displaylist_t *dl, lws_dlo_t *dlo_parent,
+			lws_box_t *box, const char *name, size_t len);
+
+LWS_VISIBLE LWS_EXTERN lws_stateful_ret_t
+lws_display_render_gif(struct lws_display_render_state *rs);
+
+LWS_VISIBLE LWS_EXTERN lws_stateful_ret_t
+lws_display_dlo_gif_metadata_scan(lws_dlo_gif_t *dg);
+
+LWS_VISIBLE LWS_EXTERN void
+lws_display_dlo_gif_destroy(struct lws_dlo *dlo);
+
+/*
+ * Take rx payload for a gif dlo into its retained buffer; the gif flow
+ * keeps the payload rather than consuming it from the flow buflist.
+ * Returns 0, or nonzero on allocation failure or over the retention cap.
+ */
+
+LWS_VISIBLE LWS_EXTERN int
+lws_display_dlo_gif_rx(lws_dlo_gif_t *dlo_gif, const uint8_t *buf, size_t len);
+
+/*
  * SS / dlo images
  */
 
@@ -473,22 +741,218 @@ lws_dlo_ss_create(lws_dlo_ss_create_info_t *i, lws_dlo_t **pdlo);
 LWS_VISIBLE LWS_EXTERN int
 lws_dlo_ss_find(struct lws_context *cx, const char *url, lws_dlo_image_t *u);
 
+/**
+ * lws_dlo_ss_assets_active() - are any document assets fetching or queued?
+ *
+ * \param cx: the lws_context
+ *
+ * Returns nonzero if any image or stylesheet asset is being fetched, or is
+ * queued waiting for an in-flight slot.  A document whose own stream has
+ * ended should defer considering itself complete until this returns 0.
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_dlo_ss_assets_active(struct lws_context *cx);
+
+/**
+ * lws_dlo_ss_stop_any_active() - destroy all tracked document assets
+ *
+ * \param cx: the lws_context
+ *
+ * Destroys every document asset that is fetching or queued for a fetch
+ * slot, if any.  Used to tear a document down; see lws_lhp_ss_cancel().
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_dlo_ss_stop_any_active(struct lws_context *cx);
+
+/**
+ * lws_dlo_ss_detach_lhp() - forget a document parser in its asset streams
+ *
+ * \param cx: the lws context
+ * \param lhp: the html parser context that is about to be destroyed
+ *
+ * Asset streams (images, stylesheets) created for a document keep pointers
+ * to its parser context and to the sul and callback of the stream that
+ * owns it, to resume the parse when they have something.  If that stream is
+ * destroyed while assets are still in flight (a failure of the html stream,
+ * a context destroy), call this from its DESTROYING so the assets stop
+ * referring to memory that is going away; they then finish or fail on their
+ * own and are destroyed with their dlos or by lws_dlo_ss_stop_any_active().
+ */
+LWS_VISIBLE LWS_EXTERN void
+lws_dlo_ss_detach_lhp(struct lws_context *cx, struct lhp_ctx *lhp);
+
+/**
+ * lws_dlo_ss_renew_images() - reset tracked images for a re-scan
+ *
+ * \param cx: the lws_context
+ *
+ * Image decode state only moves forwards, but a retained display list can
+ * be re-scanned at a different vertical offset (eg, an interactive
+ * viewport scrolling).  This re-stashes each tracked image's payload from
+ * the document asset cache and gives it a fresh decoder, so the next scan
+ * can decode the rows the viewport wants.  Images not in the cache are
+ * left as they are.
+ */
+LWS_VISIBLE LWS_EXTERN void
+lws_dlo_ss_renew_images(struct lws_context *cx);
+
+/**
+ * lws_dlo_ss_renew_image() - re-stash one image's payload from the asset cache
+ *
+ * \param cx: the lws context
+ * \param dlo: the png or jpeg dlo
+ *
+ * As lws_dlo_ss_renew_images() for one image whose payload and decoder
+ * were evicted to make room: returns 0 if it is decodable again.
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_dlo_ss_renew_image(struct lws_context *cx, lws_dlo_t *dlo);
+
+
+/*
+ * The context dlo asset cache (see the dlo_asset_cache_dir member of
+ * lws_context_creation_info) stores fetched image assets in a self-maintaining
+ * file-backed cache, so still-valid assets are reused instead of refetched.
+ */
+
+#if !defined(LWS_DLO_ASSET_BLOB_DEFAULT_MAX_FOOTPRINT)
+#define LWS_DLO_ASSET_BLOB_DEFAULT_MAX_FOOTPRINT	(64 * 1024 * 1024)
+/**< default max bytes on disk for the asset cache, when the context creation
+ * info gives 0 for dlo_asset_cache_max_footprint */
+#endif
+
+#if !defined(LWS_DLO_ASSET_BLOB_MAX_PAYLOAD)
+#define LWS_DLO_ASSET_BLOB_MAX_PAYLOAD		(16 * 1024 * 1024)
+/**< individual assets larger than this are not cached */
+#endif
+
+#if !defined(LWS_DLO_ASSET_L1_MAX_FOOTPRINT)
+#define LWS_DLO_ASSET_L1_MAX_FOOTPRINT		(8 * 1024 * 1024)
+/**< max heap bytes for the in-memory level of the asset cache */
+#endif
+
+#if !defined(LWS_DLO_ASSET_L1_MAX_ITEMS)
+#define LWS_DLO_ASSET_L1_MAX_ITEMS		256
+/**< max items in the in-memory level of the asset cache */
+#endif
+
+#if !defined(LWS_DLO_ASSET_CACHE_EXPIRY_S)
+#define LWS_DLO_ASSET_CACHE_EXPIRY_S		(24 * 60 * 60)
+/**< how long fetched assets stay valid in the cache, in seconds.  Set to 0
+ * to keep them until the cache needs the space (LRU eviction) */
+#endif
+
+/**
+ * lws_dlo_asset_cache() - get the context's document asset cache, if any
+ *
+ * \param cx: the lws_context
+ *
+ * Returns NULL if the context was created without dlo_asset_cache_dir, else
+ * the L1 cache handle of the context asset cache, for inspection or manual
+ * invalidation using the lws_cache_ttl apis.  The cache belongs to the
+ * context and is destroyed with it.
+ */
+LWS_VISIBLE LWS_EXTERN struct lws_cache_ttl_lru *
+lws_dlo_asset_cache(struct lws_context *cx);
+
 LWS_VISIBLE LWS_EXTERN lws_stateful_ret_t
 lhp_displaylist_layout(struct lhp_ctx *ctx, char reason);
 
+/*
+ * These image accessor macros adapt to the image types that were built in.
+ * Because they are macros, the svg arms have to be selected at compile time
+ * or they would reference svg apis that were not built.
+ */
+
+#if defined(LWS_WITH_SVG) && defined(LWS_WITH_GIF)
+
 #define lws_dlo_image_width(_u) ((_u)->failed ? -1 : \
-		((_u)->type == LWSDLOSS_TYPE_JPEG ? \
-				(int)lws_jpeg_get_width((_u)->u.dlo_jpeg->j) : \
-				(int)lws_upng_get_width((_u)->u.dlo_png->png)))
+	((_u)->type == LWSDLOSS_TYPE_JPEG ? \
+		(int)lws_jpeg_get_width((_u)->u.dlo_jpeg->j) : \
+	 (_u)->type == LWSDLOSS_TYPE_SVG ? \
+		(int)lws_svg_get_width((_u)->u.dlo_svg->svg) : \
+	 (_u)->type == LWSDLOSS_TYPE_GIF ? \
+		(int)lws_gif_get_width((_u)->u.dlo_gif->gif) : \
+		(int)lws_upng_get_width((_u)->u.dlo_png->png)))
 #define lws_dlo_image_height(_u) ((_u)->failed ? -1 : \
-		((_u)->type == LWSDLOSS_TYPE_JPEG ? \
-				(int)lws_jpeg_get_height((_u)->u.dlo_jpeg->j) : \
-				(int)lws_upng_get_height((_u)->u.dlo_png->png)))
+	((_u)->type == LWSDLOSS_TYPE_JPEG ? \
+		(int)lws_jpeg_get_height((_u)->u.dlo_jpeg->j) : \
+	 (_u)->type == LWSDLOSS_TYPE_SVG ? \
+		(int)lws_svg_get_height((_u)->u.dlo_svg->svg) : \
+	 (_u)->type == LWSDLOSS_TYPE_GIF ? \
+		(int)lws_gif_get_height((_u)->u.dlo_gif->gif) : \
+		(int)lws_upng_get_height((_u)->u.dlo_png->png)))
+
+#define lws_dlo_image_metadata_scan(_u) ((_u)->failed ? LWS_SRET_FATAL : \
+	((_u)->type == LWSDLOSS_TYPE_JPEG ? \
+		lws_display_dlo_jpeg_metadata_scan((_u)->u.dlo_jpeg) : \
+	 (_u)->type == LWSDLOSS_TYPE_SVG ? \
+		lws_display_dlo_svg_metadata_scan((_u)->u.dlo_svg) : \
+	 (_u)->type == LWSDLOSS_TYPE_GIF ? \
+		lws_display_dlo_gif_metadata_scan((_u)->u.dlo_gif) : \
+		lws_display_dlo_png_metadata_scan((_u)->u.dlo_png)))
+
+#elif defined(LWS_WITH_SVG)
+
+#define lws_dlo_image_width(_u) ((_u)->failed ? -1 : \
+	((_u)->type == LWSDLOSS_TYPE_JPEG ? \
+		(int)lws_jpeg_get_width((_u)->u.dlo_jpeg->j) : \
+	 (_u)->type == LWSDLOSS_TYPE_SVG ? \
+		(int)lws_svg_get_width((_u)->u.dlo_svg->svg) : \
+		(int)lws_upng_get_width((_u)->u.dlo_png->png)))
+#define lws_dlo_image_height(_u) ((_u)->failed ? -1 : \
+	((_u)->type == LWSDLOSS_TYPE_JPEG ? \
+		(int)lws_jpeg_get_height((_u)->u.dlo_jpeg->j) : \
+	 (_u)->type == LWSDLOSS_TYPE_SVG ? \
+		(int)lws_svg_get_height((_u)->u.dlo_svg->svg) : \
+		(int)lws_upng_get_height((_u)->u.dlo_png->png)))
+
+#define lws_dlo_image_metadata_scan(_u) ((_u)->failed ? LWS_SRET_FATAL : \
+	((_u)->type == LWSDLOSS_TYPE_JPEG ? \
+		lws_display_dlo_jpeg_metadata_scan((_u)->u.dlo_jpeg) : \
+	 (_u)->type == LWSDLOSS_TYPE_SVG ? \
+		lws_display_dlo_svg_metadata_scan((_u)->u.dlo_svg) : \
+		lws_display_dlo_png_metadata_scan((_u)->u.dlo_png)))
+
+#elif defined(LWS_WITH_GIF)
+
+#define lws_dlo_image_width(_u) ((_u)->failed ? -1 : \
+	((_u)->type == LWSDLOSS_TYPE_JPEG ? \
+		(int)lws_jpeg_get_width((_u)->u.dlo_jpeg->j) : \
+	 (_u)->type == LWSDLOSS_TYPE_GIF ? \
+		(int)lws_gif_get_width((_u)->u.dlo_gif->gif) : \
+		(int)lws_upng_get_width((_u)->u.dlo_png->png)))
+#define lws_dlo_image_height(_u) ((_u)->failed ? -1 : \
+	((_u)->type == LWSDLOSS_TYPE_JPEG ? \
+		(int)lws_jpeg_get_height((_u)->u.dlo_jpeg->j) : \
+	 (_u)->type == LWSDLOSS_TYPE_GIF ? \
+		(int)lws_gif_get_height((_u)->u.dlo_gif->gif) : \
+		(int)lws_upng_get_height((_u)->u.dlo_png->png)))
+
+#define lws_dlo_image_metadata_scan(_u) ((_u)->failed ? LWS_SRET_FATAL : \
+	((_u)->type == LWSDLOSS_TYPE_JPEG ? \
+		lws_display_dlo_jpeg_metadata_scan((_u)->u.dlo_jpeg) : \
+	 (_u)->type == LWSDLOSS_TYPE_GIF ? \
+		lws_display_dlo_gif_metadata_scan((_u)->u.dlo_gif) : \
+		lws_display_dlo_png_metadata_scan((_u)->u.dlo_png)))
+
+#else
+
+#define lws_dlo_image_width(_u) ((_u)->failed ? -1 : \
+	((_u)->type == LWSDLOSS_TYPE_JPEG ? \
+			(int)lws_jpeg_get_width((_u)->u.dlo_jpeg->j) : \
+			(int)lws_upng_get_width((_u)->u.dlo_png->png)))
+#define lws_dlo_image_height(_u) ((_u)->failed ? -1 : \
+	((_u)->type == LWSDLOSS_TYPE_JPEG ? \
+			(int)lws_jpeg_get_height((_u)->u.dlo_jpeg->j) : \
+			(int)lws_upng_get_height((_u)->u.dlo_png->png)))
 
 #define lws_dlo_image_metadata_scan(_u) ((_u)->failed ? LWS_SRET_FATAL : \
 	((_u)->type == LWSDLOSS_TYPE_JPEG ? \
 		lws_display_dlo_jpeg_metadata_scan((_u)->u.dlo_jpeg) : \
 		lws_display_dlo_png_metadata_scan((_u)->u.dlo_png)))
+
+#endif
 
 /*
  * Font registry
@@ -499,6 +963,34 @@ lhp_displaylist_layout(struct lhp_ctx *ctx, char reason);
 
 LWS_VISIBLE LWS_EXTERN int
 lws_font_register(struct lws_context *cx, const uint8_t *data, size_t data_len);
+
+/**
+ * lws_font_register_file() - register an mcufont kept in a file
+ *
+ * \param cx: the lws context
+ * \param path: the file, opened through the context's fops
+ *
+ * Only the face's name and metrics stay in memory.  Its dictionary and the
+ * glyph strings text needs are read in when text is set in it, and are
+ * reclaimable heap occupants: they are given back when memory runs short
+ * and read again when next needed.
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_font_register_file(struct lws_context *cx, const char *path);
+
+/**
+ * lws_fonts_register_dir() - register every .mcufont in a directory
+ *
+ * \param cx: the lws context
+ * \param dirpath: the directory to scan
+ *
+ * Returns the number of faces registered (0 if the directory can't be read
+ * or holds none).  Needs LWS_WITH_DIR, which is off by default on esp32;
+ * without it, this always returns 0 and lws_font_register_file() is the
+ * way to register file-backed faces.
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_fonts_register_dir(struct lws_context *cx, const char *dirpath);
 
 LWS_VISIBLE LWS_EXTERN const lws_display_font_t *
 lws_font_choose(struct lws_context *cx, const lws_font_choice_t *hints);

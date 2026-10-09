@@ -133,6 +133,15 @@ static const int PENALTY_N4 = 10;
 LWS_VISIBLE bool qrcodegen_encodeText(const char *text, uint8_t tempBuffer[], uint8_t qrcode[],
 		enum qrcodegen_Ecc ecl, int minVersion, int maxVersion, enum qrcodegen_Mask mask, bool boostEcl) {
 
+	// The asserts in qrcodegen_encodeSegmentsAdvanced() below are compiled
+	// out under NDEBUG, and bufLen is derived from maxVersion, so the
+	// version range has to be checked for real before it is used here.
+	if (minVersion < qrcodegen_VERSION_MIN || maxVersion > qrcodegen_VERSION_MAX
+			|| minVersion > maxVersion) {
+		qrcode[0] = 0;  // Set size to invalid value for safety
+		return false;
+	}
+
 	size_t textLen = strlen(text);
 	if (textLen == 0)
 		return qrcodegen_encodeSegmentsAdvanced(NULL, 0, ecl, minVersion, maxVersion, mask, boostEcl, tempBuffer, qrcode);
@@ -189,7 +198,7 @@ LWS_VISIBLE bool qrcodegen_encodeBinary(uint8_t dataAndTemp[], size_t dataLen, u
 testable void appendBitsToBuffer(unsigned int val, int numBits, uint8_t buffer[], int *bitLen) {
 	assert(0 <= numBits && numBits <= 16 && (unsigned long)val >> numBits == 0);
 	for (int i = numBits - 1; i >= 0; i--, (*bitLen)++)
-		buffer[*bitLen >> 3] |= ((val >> i) & 1) << (7 - (*bitLen & 7));
+		buffer[*bitLen >> 3] |= (uint8_t)(((val >> i) & 1) << (7 - (*bitLen & 7)));
 }
 
 
@@ -210,6 +219,19 @@ LWS_VISIBLE bool qrcodegen_encodeSegmentsAdvanced(const struct qrcodegen_Segment
 	assert(segs != NULL || len == 0);
 	assert(qrcodegen_VERSION_MIN <= minVersion && minVersion <= maxVersion && maxVersion <= qrcodegen_VERSION_MAX);
 	assert(0 <= (int)ecl && (int)ecl <= 3 && -1 <= (int)mask && (int)mask <= 7);
+
+	// These are public entry points and the asserts above vanish under
+	// NDEBUG, so check the ranges the version / ecl tables are indexed
+	// with (and that qrcode[] is sized from) for real.
+	if ((segs == NULL && len != 0)
+			|| minVersion < qrcodegen_VERSION_MIN
+			|| maxVersion > qrcodegen_VERSION_MAX
+			|| minVersion > maxVersion
+			|| (int)ecl < 0 || (int)ecl > 3
+			|| (int)mask < -1 || (int)mask > 7) {
+		qrcode[0] = 0;  // Set size to invalid value for safety
+		return false;
+	}
 
 	// Find the minimal version number to use
 	int version, dataUsedBits;
@@ -408,7 +430,7 @@ testable uint8_t reedSolomonMultiply(uint8_t x, uint8_t y) {
 	uint8_t z = 0;
 	for (int i = 7; i >= 0; i--) {
 		z = (uint8_t)((z << 1) ^ ((z >> 7) * 0x11D));
-		z ^= ((y >> i) & 1) * x;
+		z ^= (uint8_t)(((y >> i) & 1) * x);
 	}
 	return z;
 }
@@ -757,6 +779,13 @@ LWS_VISIBLE int qrcodegen_getSize(const uint8_t qrcode[]) {
 	int result = qrcode[0];
 	assert((qrcodegen_VERSION_MIN * 4 + 17) <= result
 		&& result <= (qrcodegen_VERSION_MAX * 4 + 17));
+	// The assert is compiled out under NDEBUG; callers loop over the
+	// returned size, so a buffer that does not hold a valid symbol (eg,
+	// one a failed encode set to 0) must report 0, not a size that would
+	// walk them off the end.
+	if (result < (qrcodegen_VERSION_MIN * 4 + 17)
+			|| result > (qrcodegen_VERSION_MAX * 4 + 17))
+		return 0;
 	return result;
 }
 
@@ -765,6 +794,12 @@ LWS_VISIBLE int qrcodegen_getSize(const uint8_t qrcode[]) {
 LWS_VISIBLE bool qrcodegen_getModule(const uint8_t qrcode[], int x, int y) {
 	assert(qrcode != NULL);
 	int qrsize = qrcode[0];
+	// qrsize comes from the buffer itself, and getModuleBounded() indexes
+	// with y * qrsize + x, so it has to be a real symbol size before it
+	// can be trusted to bound x and y.
+	if (qrsize < (qrcodegen_VERSION_MIN * 4 + 17)
+			|| qrsize > (qrcodegen_VERSION_MAX * 4 + 17))
+		return false;
 	return (0 <= x && x < qrsize && 0 <= y && y < qrsize) && getModuleBounded(qrcode, x, y);
 }
 
@@ -786,9 +821,9 @@ testable void setModuleBounded(uint8_t qrcode[], int x, int y, bool isDark) {
 	int bitIndex = index & 7;
 	int byteIndex = (index >> 3) + 1;
 	if (isDark)
-		qrcode[byteIndex] |= 1 << bitIndex;
+		qrcode[byteIndex] |= (uint8_t)(1 << bitIndex);
 	else
-		qrcode[byteIndex] &= (1 << bitIndex) ^ 0xFF;
+		qrcode[byteIndex] &= (uint8_t)((1 << bitIndex) ^ 0xFF);
 }
 
 
@@ -824,7 +859,7 @@ LWS_VISIBLE bool qrcodegen_isNumeric(const char *text) {
 LWS_VISIBLE bool qrcodegen_isAlphanumeric(const char *text) {
 	assert(text != NULL);
 	for (; *text != '\0'; text++) {
-		if (strchr(ALPHANUMERIC_CHARSET, *text) == NULL)
+		if ((char *)strchr(ALPHANUMERIC_CHARSET, *text) == NULL)
 			return false;
 	}
 	return true;

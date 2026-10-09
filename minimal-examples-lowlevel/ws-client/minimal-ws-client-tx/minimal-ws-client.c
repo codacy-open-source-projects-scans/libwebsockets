@@ -40,7 +40,7 @@ static const struct lws_switches switches[] = {
 #endif
 #include <pthread.h>
 
-static int interrupted;
+static struct lws_context *context;
 
 /* one of these created for each message */
 
@@ -175,7 +175,7 @@ callback_minimal_broker(struct lws *wsi, enum lws_callback_reasons reason,
 					lws_get_protocol(wsi));
 	const struct msg *pmsg;
 	void *retval;
-	int n, m, r = 0;
+	int n, m;
 
 	switch (reason) {
 
@@ -185,6 +185,8 @@ callback_minimal_broker(struct lws *wsi, enum lws_callback_reasons reason,
 		vhd = lws_protocol_vh_priv_zalloc(lws_get_vhost(wsi),
 				lws_get_protocol(wsi),
 				sizeof(struct per_vhost_data__minimal));
+		if (!vhd)
+			return 1;
 		vhd->context = lws_get_context(wsi);
 		vhd->protocol = lws_get_protocol(wsi);
 		vhd->vhost = lws_get_vhost(wsi);
@@ -202,14 +204,13 @@ callback_minimal_broker(struct lws *wsi, enum lws_callback_reasons reason,
 			if (pthread_create(&vhd->pthread_spam[n], NULL,
 					   thread_spam, vhd)) {
 				lwsl_err("thread creation failed\n");
-				r = 1;
+				vhd->finished = 1;
 				goto init_fail;
 			}
 
 		sul_connect_attempt(&vhd->sul);
 		break;
 
-	case LWS_CALLBACK_PROTOCOL_DESTROY:
 init_fail:
 		vhd->finished = 1;
 		for (n = 0; n < (int)LWS_ARRAY_SIZE(vhd->pthread_spam); n++)
@@ -221,7 +222,20 @@ init_fail:
 		lws_sul_cancel(&vhd->sul);
 		pthread_mutex_destroy(&vhd->lock_ring);
 
-		return r;
+		return 1;
+
+	case LWS_CALLBACK_PROTOCOL_DESTROY:
+		vhd->finished = 1;
+		for (n = 0; n < (int)LWS_ARRAY_SIZE(vhd->pthread_spam); n++)
+			pthread_join(vhd->pthread_spam[n], &retval);
+
+		if (vhd->ring)
+			lws_ring_destroy(vhd->ring);
+
+		lws_sul_cancel(&vhd->sul);
+		pthread_mutex_destroy(&vhd->lock_ring);
+
+		return 0;
 
 	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
 		lwsl_err("CLIENT_CONNECTION_ERROR: %s\n",
@@ -241,8 +255,10 @@ init_fail:
 	case LWS_CALLBACK_CLIENT_WRITEABLE:
 		pthread_mutex_lock(&vhd->lock_ring); /* --------- ring lock { */
 		pmsg = lws_ring_get_element(vhd->ring, &vhd->tail);
-		if (!pmsg)
-			goto skip;
+		if (!pmsg) {
+			pthread_mutex_unlock(&vhd->lock_ring);
+			break;
+		}
 
 		/* notice we allowed for LWS_PRE in the payload already */
 		m = lws_write(wsi, ((unsigned char *)pmsg->payload) + LWS_PRE,
@@ -260,7 +276,6 @@ init_fail:
 			/* come back as soon as we can write more */
 			lws_callback_on_writable(wsi);
 
-skip:
 		pthread_mutex_unlock(&vhd->lock_ring); /* } ring lock ------- */
 		break;
 
@@ -303,21 +318,13 @@ static const struct lws_protocols protocols[] = {
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	struct lws_context *context;
-	const char *p;
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE
-			/* for LLL_ verbosity above NOTICE to be built into lws,
-			 * lws must have been configured and built with
-			 * -DCMAKE_BUILD_TYPE=DEBUG instead of =RELEASE */
-			/* | LLL_INFO */ /* | LLL_PARSER */ /* | LLL_HEADER */
-			/* | LLL_EXT */ /* | LLL_CLIENT */ /* | LLL_LATENCY */
-			/* | LLL_DEBUG */;
+	int n = 0;
 	(void)switches;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
@@ -328,24 +335,22 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal ws client tx\n");
 	lwsl_user("  Run minimal-ws-broker and browse to that\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.port = CONTEXT_PORT_NO_LISTEN; /* we do not run any server */
 	info.protocols = protocols;
 	/*
 	 * since we know this lws context is only ever going to be used with
 	 * one client wsis / fds / sockets at a time, let lws know it doesn't
 	 * have to use the default allocations for fd tables up to ulimit -n.
-	 * It will just allocate for 1 internal and 1 (+ 1 http2 nwsi) that we
-	 * will use.
+	 * It will just allocate for its own fds and overhead
+	 * (LWS_FD_LIMIT_PER_THREAD_MIN) plus the one connection we will use.
 	 */
-	info.fd_limit_per_thread = 1 + 1 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 1;
 
 	context = lws_create_context(&info);
 	if (!context) {
@@ -353,7 +358,7 @@ int main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

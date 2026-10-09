@@ -29,6 +29,21 @@
 set(TEST_APP_LIST)
 if ((LWS_ROLE_H1 OR LWS_ROLE_H2))
 	#
+	# The test apps dlopen protocol plugins listed in the test-server conf
+	# at runtime.  Those plugins only exist as DSOs linked against
+	# websockets_shared, so a test app statically linked against the lib
+	# would end up with two independent lws instances in one process: the
+	# plugin's lws api calls resolve into the shared lib, while its wsis
+	# and role_ops belong to the static one.  Pointer-identity checks like
+	# lwsi_role_h3() then fail across the boundary, eg, h3 response headers
+	# get serialized with the hpack encoder.  If we are building shared
+	# protocol plugins, the test apps must bind the same shared lib.
+	#
+	if (LWS_WITH_PLUGINS AND LWS_WITH_SHARED AND NOT LWS_WITH_PLUGINS_BUILTIN)
+		set(LWS_TESTAPPS_PREFER_SHARED 1)
+		message(STATUS "Test apps link websockets_shared: shared protocol plugins are enabled")
+	endif()
+	#
 	# Helper function for adding a test app.
 	#
 	macro(create_test_app TEST_NAME MAIN_SRC S2 S3 S4 S5 S6)
@@ -72,11 +87,8 @@ if ((LWS_ROLE_H1 OR LWS_ROLE_H2))
 		source_group("Sources"   FILES ${TEST_SRCS})
 		add_executable(${TEST_NAME} ${TEST_SRCS} ${TEST_HDR})
 
-		foreach(libpath ${LWS_DEP_LIB_PATHS})
-			target_link_directories(${TEST_NAME} ${libpath})
-		endforeach()
 
-		if (LWS_LINK_TESTAPPS_DYNAMIC)
+		if (LWS_LINK_TESTAPPS_DYNAMIC OR LWS_TESTAPPS_PREFER_SHARED)
 			if (NOT LWS_WITH_SHARED)
 				message(FATAL_ERROR "Build of the shared library is disabled. LWS_LINK_TESTAPPS_DYNAMIC must be combined with LWS_WITH_SHARED.")
 			endif()
@@ -101,7 +113,7 @@ if ((LWS_ROLE_H1 OR LWS_ROLE_H2))
 
 		# Set test app specific defines.
 		set_property(TARGET ${TEST_NAME}
-					PROPERTY COMPILE_DEFINITIONS
+					APPEND PROPERTY COMPILE_DEFINITIONS
 						INSTALL_DATADIR="${CMAKE_INSTALL_PREFIX}/share"
 					)
 
@@ -157,7 +169,7 @@ if ((LWS_ROLE_H1 OR LWS_ROLE_H2))
 			# Set defines for this executable only.
 			set_property(
 				TARGET test-server-extpoll
-				PROPERTY COMPILE_DEFINITIONS 
+				APPEND PROPERTY COMPILE_DEFINITIONS 
 					INSTALL_DATADIR="${CMAKE_INSTALL_PREFIX}/share"
 				)
 
@@ -177,6 +189,40 @@ if ((LWS_ROLE_H1 OR LWS_ROLE_H2))
 				""
 				"")
 			target_compile_definitions(test-lejp PRIVATE LWS_BUILDING_STATIC)
+		endif()
+
+		#
+		# The parser test apps are self-contained (no network, no
+		# files, no arguments) so they also run under ctest, on every
+		# platform that builds the test apps
+		#
+
+		if (LWS_WITH_HL AND LWS_WITH_HL_LANG_C)
+			create_test_app(
+				test-hl
+				"test-hl.c"
+				""
+				""
+				""
+				""
+				"")
+			target_compile_definitions(test-hl PRIVATE LWS_BUILDING_STATIC)
+			add_test(NAME test-hl COMMAND test-hl)
+			set_tests_properties(test-hl PROPERTIES TIMEOUT 120)
+		endif()
+
+		if (LWS_WITH_MD)
+			create_test_app(
+				test-md
+				"test-md.c"
+				""
+				""
+				""
+				""
+				"")
+			target_compile_definitions(test-md PRIVATE LWS_BUILDING_STATIC)
+			add_test(NAME test-md COMMAND test-md)
+			set_tests_properties(test-md PROPERTIES TIMEOUT 120)
 		endif()
 
 		if (LWS_WITH_CBOR)

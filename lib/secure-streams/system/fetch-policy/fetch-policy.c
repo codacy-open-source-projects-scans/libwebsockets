@@ -47,11 +47,26 @@ ss_fetch_policy_rx(void *userobj, const uint8_t *buf, size_t len, int flags)
 	if (flags & LWSSS_FLAG_SOM) {
 		if (lws_ss_policy_parse_begin(context, 0))
 			return LWSSSSRET_OK;
+		/* this policy JSON is coming from the network */
+		lws_ss_policy_parse_untrusted(context);
 		m->partway = 1;
 	}
 
-	if (len && lws_ss_policy_parse(context, buf, len) < 0)
-		return LWSSSSRET_OK;
+	if (len) {
+		int n = lws_ss_policy_parse(context, buf, len);
+
+		if (n != LEJP_CONTINUE && n < 0) {
+			/*
+			 * The failed parse already abandoned for us... don't
+			 * let the DISCONNECTED handler abandon a second time
+			 * (context->pol_args is gone), and don't feed it any
+			 * more of the response either
+			 */
+			m->partway = 0;
+
+			return LWSSSSRET_DISCONNECT_ME;
+		}
+	}
 
 	if (flags & LWSSS_FLAG_EOM)
 		m->partway = 2;
@@ -77,6 +92,7 @@ policy_set(lws_sorted_usec_list_t *sul)
 	 * ss connection close that was using the vhost from the old policy
 	 */
 
+	context->hss_fetch_policy = NULL;
 	lws_ss_destroy(&m->ss);
 
 	if (lws_ss_policy_set(context, "updated"))
@@ -119,9 +135,25 @@ ss_fetch_policy_state(void *userobj, void *sh, lws_ss_constate_t state,
 	case LWSSSCS_DISCONNECTED:
 		if (m->partway == 1) {
 			lws_ss_policy_parse_abandon(context);
+			m->partway = 0;
 			break;
 		}
 		m->partway = 0;
+		break;
+
+	case LWSSSCS_DESTROYING:
+		/*
+		 * We can be destroyed from outside, eg, by a policy update...
+		 * don't leave the context back-pointer dangling, and don't
+		 * leave a half-done parse owning context->pol_args
+		 */
+		if (m->partway == 1) {
+			lws_ss_policy_parse_abandon(context);
+			m->partway = 0;
+		}
+		if (context->hss_fetch_policy == m->ss)
+			context->hss_fetch_policy = NULL;
+		lws_sul_cancel(&m->sul);
 		break;
 
 	default:

@@ -17,23 +17,28 @@
 #include <libwebsockets.h>
 
 enum {
-	LWS_SW_H2,
 	LWS_SW_D,
 	LWS_SW_T,
+	LWS_SW_SERVER,
+	LWS_SW_PORT,
+	LWS_SW_L,
 	LWS_SW_HELP,
 };
 
 static const struct lws_switches switches[] = {
-	[LWS_SW_H2]	= { "--h2",            "Enable --h2 feature" },
 	[LWS_SW_D]	= { "-d",              "Debug logs (e.g. -d 15)" },
 	[LWS_SW_T]	= { "-t",              "Test flag" },
+	[LWS_SW_SERVER]	= { "--server",        "Server address to connect to" },
+	[LWS_SW_PORT]	= { "-p",              "Port to connect to" },
+	[LWS_SW_L]	= { "-l",              "localhost / selfsigned" },
 	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
 };
 
 #include <string.h>
 #include <signal.h>
 
-static int interrupted, rx_seen, test;
+static int rx_seen, test;
+static struct lws_context *context;
 static struct lws *client_wsi;
 
 static int
@@ -57,7 +62,7 @@ callback_dumb_increment(struct lws *wsi, enum lws_callback_reasons reason,
 		lwsl_user("RX: %s\n", (const char *)in);
 		rx_seen++;
 		if (test && rx_seen == 10)
-			interrupted = 1;
+			lws_default_loop_exit(context);
 		break;
 
 	case LWS_CALLBACK_CLIENT_CLOSED:
@@ -83,22 +88,15 @@ static const struct lws_protocols protocols[] = {
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
 	struct lws_client_connect_info i;
-	struct lws_context *context;
 	const char *p;
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE
-		/* for LLL_ verbosity above NOTICE to be built into lws, lws
-		 * must have been configured with -DCMAKE_BUILD_TYPE=DEBUG
-		 * instead of =RELEASE */
-		/* | LLL_INFO */ /* | LLL_PARSER */ /* | LLL_HEADER */
-		/* | LLL_EXT */ /* | LLL_CLIENT */ /* | LLL_LATENCY */
-		/* | LLL_DEBUG */;
+	int n = 0;
 	(void)switches;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
@@ -108,21 +106,19 @@ int main(int argc, const char **argv)
 
 
 	signal(SIGINT, sigint_handler);
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
 	test = !!lws_cmdline_option(argc, argv, switches[LWS_SW_T].sw);
 
-	lws_set_log_level(logs, NULL);
-	lwsl_user("LWS minimal ws client rx [-d <logs>] [--h2] [-t (test)]\n");
+	lwsl_user("LWS minimal ws client rx [-d <logs>] [-t (test)]\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 	info.port = CONTEXT_PORT_NO_LISTEN; /* we do not run any server */
 	info.protocols = protocols;
 	info.timeout_secs = 10;
 	info.connect_timeout_secs = 30;
-#if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL)
+#if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL) || defined(LWS_WITH_OPENHITLS)
 	/*
 	 * OpenSSL uses the system trust store.  mbedTLS has to be told which
 	 * CA to trust explicitly.
@@ -134,10 +130,10 @@ int main(int argc, const char **argv)
 	 * since we know this lws context is only ever going to be used with
 	 * one client wsis / fds / sockets at a time, let lws know it doesn't
 	 * have to use the default allocations for fd tables up to ulimit -n.
-	 * It will just allocate for 1 internal and 1 (+ 1 http2 nwsi) that we
-	 * will use.
+	 * It will just allocate for its own fds and overhead
+	 * (LWS_FD_LIMIT_PER_THREAD_MIN) plus the one connection we will use.
 	 */
-	info.fd_limit_per_thread = 1 + 1 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 1;
 
 	context = lws_create_context(&info);
 	if (!context) {
@@ -149,19 +145,34 @@ int main(int argc, const char **argv)
 	i.context = context;
 	i.port = 443;
 	i.address = "libwebsockets.org";
+
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_SERVER].sw)))
+		i.address = p;
+
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_PORT].sw)))
+		{
+			int __pt = atoi(p);
+			if (__pt < 0 || __pt > 65535) {
+				lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+				return 1;
+			}
+			i.port = (uint16_t)__pt;
+		}
+
 	i.path = "/";
 	i.host = i.address;
 	i.origin = i.address;
 	i.ssl_connection = LCCSCF_USE_SSL;
+
+	if (lws_cmdline_option(argc, argv, switches[LWS_SW_L].sw))
+		i.ssl_connection |= LCCSCF_ALLOW_SELFSIGNED;
+
 	i.protocol = protocols[0].name; /* "dumb-increment-protocol" */
 	i.pwsi = &client_wsi;
 
-	if (lws_cmdline_option(argc, argv, switches[LWS_SW_H2].sw))
-		i.alpn = "h2";
-
 	lws_client_connect_via_info(&i);
 
-	while (n >= 0 && client_wsi && !interrupted)
+	while (n >= 0 && client_wsi)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

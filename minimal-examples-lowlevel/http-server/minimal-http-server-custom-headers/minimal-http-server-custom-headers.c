@@ -20,12 +20,14 @@
 enum {
 	LWS_SW_AH1,
 	LWS_SW_D,
+	LWS_SW_PORT,
 	LWS_SW_HELP,
 };
 
 static const struct lws_switches switches[] = {
 	[LWS_SW_AH1]	= { "--ah1",           "Enable --ah1 feature" },
 	[LWS_SW_D]	= { "-d",              "Debug logs (e.g. -d 15)" },
+	[LWS_SW_PORT]	= { "--port",          "Port to listen on (default 7681)" },
 	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
 };
 
@@ -33,7 +35,7 @@ static const struct lws_switches switches[] = {
 #include <signal.h>
 #include <time.h>
 
-static int interrupted;
+static struct lws_context *context;
 
 struct pss {
 	char result[128 + LWS_PRE];
@@ -142,15 +144,14 @@ static const struct lws_http_mount mount = {
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	struct lws_context *context;
 	const char *p;
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	int n = 0;
 	(void)switches;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
@@ -161,13 +162,13 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal http server custom headers | visit http://localhost:7681\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	/* a server: size the fds tables to the process limit */
+	info.fd_limit_per_thread = 0;
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT |
 		       LWS_SERVER_OPTION_EXPLICIT_VHOSTS |
 		LWS_SERVER_OPTION_HTTP_HEADERS_SECURITY_BEST_PRACTICES_ENFORCE;
@@ -185,6 +186,15 @@ int main(int argc, const char **argv)
 	/* http on 7681 */
 
 	info.port = 7681;
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_PORT].sw))) {
+		int pt = atoi(p);
+
+		if (pt <= 0 || pt > 65535) {
+			lwsl_err("Port %d is outside valid 16-bit range\n", pt);
+			return 1;
+		}
+		info.port = pt;
+	}
 	info.protocols = protocols;
 	info.mounts = &mount;
 	info.vhost_name = "http";
@@ -209,7 +219,7 @@ int main(int argc, const char **argv)
 		goto bail;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 bail:

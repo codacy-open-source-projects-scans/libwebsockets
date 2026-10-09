@@ -101,7 +101,6 @@ open_serial_port(const char *filepath)
 	memset(&tio, 0, sizeof tio);
 	if (tcgetattr(fd, &tio)) {
 		close(fd);
-		fd = -1;
 		return -1;
 	}
 
@@ -175,16 +174,23 @@ ltm_ch_payload(lws_transport_mux_ch_t *tmc, const uint8_t *buf, size_t len)
 static int
 ltm_ch_opens_serial(lws_transport_mux_ch_t *tmc, int determination)
 {
-	lws_transport_mux_t *tm = lws_container_of(tmc->list.owner,
+	lws_transport_mux_t *tm = lws_dll2_owner_container(&tmc->list,
 						   lws_transport_mux_t, owner);
 	struct lws_sspc_handle *h = (struct lws_sspc_handle *)tmc->priv;
 
 	assert_is_tm(tm);
 
+	if (!h)
+		/*
+		 * The proxy asked for this channel, we have no sspc handle to
+		 * bind it to: refuse it
+		 */
+		return -1;
+
 	lwsl_sspc_err(h, "%d", determination);
 
-       	if (tm->info.txp_cpath.ops_in->event_connect_disposition(h, determination))
-        		return -1;
+	if (lws_txp_inside_sspc.event_connect_disposition(h, determination))
+		return -1;
 
 	return 0;
 }
@@ -206,6 +212,11 @@ static int
 ltm_txp_can_write(lws_transport_mux_ch_t *tmc)
 {
 	assert_is_tmch(tmc);
+
+	if (!tmc->priv)
+		/* no sspc handle bound to this channel... nothing to write */
+		return 0;
+
 	return lws_txp_inside_sspc.event_can_write((struct lws_sspc_handle *)tmc->priv, 2048);
 }
 

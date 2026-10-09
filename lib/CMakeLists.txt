@@ -71,14 +71,45 @@ if (LWS_PLAT_FREERTOS)
 		    $ENV{IDF_PATH}/components/esp32/include
 		    $ENV{IDF_PATH}/components/spi_flash/include
 		    $ENV{IDF_PATH}/components/mdns/include
-		    $ENV{IDF_PATH}/components/lwip/lwip/src/include/lwip
-		    $ENV{IDF_PATH}/components/lwip/lwip/src/include
-		    $ENV{IDF_PATH}/components/lwip/lwip/src/include/lwip
-		    $ENV{IDF_PATH}/components/newlib/platform_include )
+		    $ENV{IDF_PATH}/components/lwip/lwip/src/include)
+
+		# IDF v6 renamed the newlib component to esp_libc; its
+		# platform_include carries esp_newlib.h / esp_libc.h and the
+		# libc override headers.  Pointing at the old dir on v6 loses
+		# those, so esp_newlib.h is not found and the toolchain's newlib
+		# sysroot headers get mixed in with picolibc's.
+		if (EXISTS $ENV{IDF_PATH}/components/esp_libc)
+			list(APPEND LWS_ESP_IDF_DIRS
+			    $ENV{IDF_PATH}/components/esp_libc/platform_include
+			    $ENV{IDF_PATH}/components/esp_libc/include)
+		else()
+			# lwip's own header dir on the search path makes
+			# <errno.h> resolve to lwip/errno.h, which only declares
+			# errno and the E* codes under LWIP_PROVIDE_ERRNO.  The
+			# newlib-era builds set that and have always leant on the
+			# shadowing, so keep it there; on v6 we use the libc errno
+			# (picolibc's is thread-local) and the shadowing would
+			# hide it instead.  Nothing in lws includes a bare lwip
+			# header name.
+			list(APPEND LWS_ESP_IDF_DIRS
+			    $ENV{IDF_PATH}/components/lwip/lwip/src/include/lwip
+			    $ENV{IDF_PATH}/components/newlib/platform_include)
+		endif()
+
+		# mbedtls 4 (IDF v6) keeps the crypto headers, platform_util.h
+		# among them, in the TF-PSA-Crypto submodule.  Needed here so
+		# the configure-time header checks below can see them.
+		set(_lws_tfpsa $ENV{IDF_PATH}/components/mbedtls/mbedtls/tf-psa-crypto)
+		if (EXISTS ${_lws_tfpsa})
+			list(APPEND LWS_ESP_IDF_DIRS
+			    ${_lws_tfpsa}/include
+			    ${_lws_tfpsa}/drivers/builtin/include)
+		endif()
 
 		    include_directories(${LWS_ESP_IDF_DIRS})
 
 		    list(APPEND CMAKE_REQUIRED_INCLUDES ${LWS_ESP_IDF_DIRS})
+
 	endif()
 
 	
@@ -124,6 +155,21 @@ CHECK_C_SOURCE_COMPILES("
 		return pipe2(fd, 0);
 	}" LWS_HAVE_PIPE2)
 
+# ... and accept4(), so the accepted fd is CLOEXEC atomically, and cannot be
+# inherited by a spawn racing on another pt
+
+CHECK_C_SOURCE_COMPILES("
+	#ifndef _GNU_SOURCE
+	#define _GNU_SOURCE
+	#endif
+	#include <sys/types.h>
+	#include <sys/socket.h>
+	int main(void) {
+		struct sockaddr sa;
+		socklen_t sl = (socklen_t)sizeof(sa);
+		return accept4(0, &sa, &sl, SOCK_CLOEXEC);
+	}" LWS_HAVE_ACCEPT4)
+
 # tcp keepalive needs this on linux to work practically... but it only exists
 # after kernel 2.6.37
 
@@ -162,8 +208,10 @@ endif()
 if (LWS_WITH_NETWORK)
 	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/core-net)
 	add_subdirectory(core-net)
-	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/roles)
-	add_subdirectory(roles)
+	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/sansio)
+	add_subdirectory(sansio)
+	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/io)
+	add_subdirectory(io)
 endif()
 
 if (LWS_WITH_JOSE)
@@ -177,48 +225,48 @@ if (LWS_WITH_COSE)
 endif()
 
 if (LWS_ROLE_MQTT)
-	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/roles/mqtt)
+	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/sansio/mqtt)
 endif()
 
 if (LWS_ROLE_DBUS AND NOT LWS_PLAT_FREERTOS)
-	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/roles/dbus)
+	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/io/dbus)
 endif()
 
-if (LWS_ROLE_H1 OR LWS_ROLE_H2)
-	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/roles/http)
-	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/roles/http/compression)
+if (LWS_ROLE_H1 OR LWS_ROLE_H2 OR LWS_ROLE_H3)
+	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/sansio/http)
+	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/sansio/http/compression)
 endif()
 
 if (LWS_ROLE_H1)
-	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/roles/h1)
+	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/sansio/h1)
 endif()
 
 if (LWS_ROLE_H2)
-	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/roles/h2)
+	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/sansio/h2)
 endif()
 
 if (LWS_ROLE_WS)
-	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/roles/ws)
+	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/sansio/ws)
 endif()
 
 if (LWS_ROLE_RAW)
-	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/roles/raw-skt)
+	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/sansio/raw-skt)
 endif()
 
 if (LWS_ROLE_RAW_FILE)
-	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/roles/raw-file)
+	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/io/raw-file)
 endif()
 
 if (LWS_WITH_CGI)
-	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/roles/cgi)
+	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/io/cgi)
 endif()
 
 if (LWS_ROLE_RAW_PROXY)
-	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/roles/raw-proxy)
+	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/sansio/raw-proxy)
 endif()
 
 if (NOT LWS_WITHOUT_SERVER OR LWS_WITH_SECURE_STREAMS_PROCESS_API)
-	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/roles/listen)
+	list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/io/listen)
 endif()
 
 if (LWS_WITH_SECURE_STREAMS)
@@ -239,6 +287,27 @@ list(APPEND LWS_LIB_BUILD_INC_PATHS_TEMP ${CMAKE_CURRENT_SOURCE_DIR}/secure-stre
 add_subdirectory(secure-streams/serialized/client)
 
 add_subdirectory(media)
+
+#
+# The sansIO half (READMEs/README.sans-io-split.md, "The headers"): every
+# source under lib/sansio (SOURCES_SANSIO) compiles with LWS_SANSIO_CHECK, so
+# IO's private prototypes and IO's half of the object are hidden from it,
+# and an implicit declaration is an error: a sansIO call into IO past the
+# interface fails the ordinary build, naming its line.  They are properties
+# of the sources, so both library targets compile them that way, each with
+# its own target defines (LWS_BUILDING_STATIC / LWS_BUILDING_SHARED) as well.
+#
+if (SOURCES_SANSIO)
+	set_property(SOURCE ${SOURCES_SANSIO} APPEND PROPERTY
+		     COMPILE_DEFINITIONS LWS_SANSIO_CHECK)
+	if (MSVC)
+		set_property(SOURCE ${SOURCES_SANSIO} APPEND PROPERTY
+			     COMPILE_OPTIONS /we4013)
+	elseif (CMAKE_COMPILER_IS_GNUCC OR COMPILER_IS_CLANG)
+		set_property(SOURCE ${SOURCES_SANSIO} APPEND PROPERTY
+			     COMPILE_OPTIONS -Werror=implicit-function-declaration)
+	endif()
+endif()
 
 if (LWS_WITH_STATIC)
     if (LWS_STATIC_PIC)
@@ -300,7 +369,7 @@ if (LWS_WITH_SHARED)
 		# Compile as DLL (export function declarations)
 		set_property(
 			TARGET websockets_shared
-			PROPERTY COMPILE_DEFINITIONS
+			APPEND PROPERTY COMPILE_DEFINITIONS
 			LWS_DLL
 			LWS_INTERNAL)
 		target_compile_definitions(websockets_shared INTERFACE LWS_DLL)
@@ -350,6 +419,11 @@ endif()
 
 # Setup the linking for all libs.
 list(APPEND LIB_LIST ${LIB_LIST_AT_END})
+if (LWS_DEP_LIB_PATHS)
+	foreach(libpath ${LWS_DEP_LIB_PATHS})
+		list(APPEND LIB_LIST "-L${libpath}")
+	endforeach()
+endif()
 set(STRIPPED_LIB_LIST "")
 foreach(lib_path IN LISTS LIB_LIST)
 	if(IS_ABSOLUTE "${lib_path}" AND NOT "${lib_path}" MATCHES "^-")
@@ -372,7 +446,189 @@ foreach (lib ${LWS_LIBRARIES})
 	#	target_link_libraries(${lib} PRIVATE ${LIB_LIST})
 	target_link_libraries(${lib} ${STRIPPED_LIB_LIST})
 
+	# On ESP-IDF, inherit the include dirs and defines IDF gives its own
+	# consumers of the components lws uses, transitive requirements
+	# included, so lws stops depending on where each IDF release keeps
+	# its headers and sees the same mbedtls configuration
+	# (MBEDTLS_CONFIG_FILE, TF_PSA_CRYPTO_CONFIG_FILE) as the rest of
+	# the firmware.  Copied across as PRIVATE usage requirements rather
+	# than linked: a link dependency would drag IDF's targets into the
+	# install / build-tree exports below, which cannot describe them,
+	# and LIB_LIST is off limits since it also feeds the try_compile
+	# probes.  IDF links the component libraries into the firmware
+	# itself.  Components absent from this IDF are skipped.
+	if (LWS_PLAT_FREERTOS AND ESP_PLATFORM)
+		foreach(_c freertos esp_libc newlib lwip mbedtls spi_flash
+			   esp_hw_support hal soc esp_rom esp_system esp_common
+			   esp_timer heap log esp_wifi esp_event esp_netif
+			   esp_eth driver esp_driver_gpio esp_driver_spi
+			   esp_driver_ledc esp_partition app_update
+			   bootloader_support nvs_flash esp_app_format
+			   esp_bootloader_format esp_mm xtensa riscv)
+			if (TARGET idf::${_c})
+				target_include_directories(${lib} PRIVATE
+					$<TARGET_PROPERTY:idf::${_c},INTERFACE_INCLUDE_DIRECTORIES>)
+				target_compile_definitions(${lib} PRIVATE
+					$<TARGET_PROPERTY:idf::${_c},INTERFACE_COMPILE_DEFINITIONS>)
+				target_compile_options(${lib} PRIVATE
+					$<TARGET_PROPERTY:idf::${_c},INTERFACE_COMPILE_OPTIONS>)
+			endif()
+		endforeach()
+	endif()
 endforeach()
+
+#
+# The links-alone test (READMEs/README.sans-io-split.md, "The contract"): the
+# sansIO half linked as a shared library of its own, websockets-sansio, from
+# its sources, the substrate neither half owns and the platform's injected
+# clock, random source and file access, with every unresolved symbol an
+# error.  It links only when sansIO references nothing of IO's beyond what
+# the io_ops table and those injected dependencies provide: the C tree's
+# form of the boundary between a sansIO crate and an IO crate.
+#
+# The substrate is listed, not taken by directory: it is the minimal set the
+# sansIO sources need, and each file in it must itself need nothing of IO's.
+# Files this configuration does not build are skipped.
+#
+if (LWS_WITH_SANSIO_LINK_TEST AND LWS_WITH_NETWORK AND SOURCES_SANSIO)
+	if (MSVC)
+		message(STATUS "LWS_WITH_SANSIO_LINK_TEST: not on MSVC")
+	else()
+		set(_sio_substrate
+			core/alloc.c
+			core/buflist.c
+			core/libwebsockets.c
+			core/logs.c
+			core/lws_dll2.c
+			core/region.c
+			core/vfs.c
+			core-net/address.c
+			core-net/client/client.c
+			core-net/roles.c
+			core-net/sorted-usec-list.c
+			core-net/wsi-timeout.c
+			misc/base64-decode.c
+			misc/cache-ttl/lws-cache-ttl.c
+			misc/lwsac/lwsac.c
+			misc/prng.c
+			misc/sha-1.c
+			# fault injection's decisions are data, both halves
+			# ask them
+			system/fault-injection/fault-injection.c
+			# the platform's clock, random source and file
+			# access: injected dependencies, not requests
+			plat/unix/unix-misc.c
+			plat/unix/unix-file.c
+		)
+		# the generic crypto is neither half's, whichever tls
+		# library provides it
+		foreach(_s ${SOURCES})
+			if (_s MATCHES "^tls/(.*/)?lws-gen" OR
+			    _s MATCHES "^tls/(chacha|poly1305)\\.c$")
+				list(APPEND _sio_substrate ${_s})
+			endif()
+		endforeach()
+
+		set(_sio_sources ${SOURCES_SANSIO})
+		foreach(_s ${_sio_substrate})
+			list(FIND SOURCES ${_s} _i)
+			if (NOT _i EQUAL -1)
+				list(APPEND _sio_sources ${_s})
+			endif()
+		endforeach()
+
+		#
+		# The allow-list: symbols sansIO still takes from outside
+		# the ops, the substrate and the platform, each waiting on a
+		# design decision rather than a move (README.sans-io-split.md,
+		# "The contract").  They are provided to the link by a stub
+		# library, websockets-sansio-allow, generated from these lists,
+		# so the rest stays strict.  A symbol leaves the list when its
+		# decision is made; one added to it is a new such decision.
+		#
+		# Secure streams is a layer over both halves, but sansIO calls
+		# into it directly: the close tells a stream it disconnected
+		# or was unreachable (lws_ss_event_helper(), lws_ss_backoff(),
+		# lws_ss_destroy()), an h2 or ws server upgrade binds a stream
+		# (lws_ss_server_accept_bind(), protocol_secstream_ws,
+		# lws_ss_tag() in its logs) and tells it of the upgrade, acting
+		# on its answer (_lws_ss_handle_state_ret_CAN_DESTROY_HANDLE()),
+		# and the h1 client reports its
+		# conmon to one (lws_conmon_ss_json()).  Whether that becomes
+		# callbacks the stream layer registers, as any other protocol,
+		# or something else, is open.
+		#
+		# The system state manager (sansio/state.c) announces its
+		# transitions as SMD messages (lws_smd_msg_printf()); SMD wakes
+		# the loop and talks to secure streams itself, so it is not
+		# substrate as it stands.
+		#
+		# The worker pool (core-net/async-queue.c) takes the file
+		# server's reads off the service thread
+		# (lws_async_queue_submit()), but also runs IO's tls accepts
+		# and wakes IO's loop when a job is done; it needs its jobs to
+		# carry their own work and its wake to be a request of IO
+		# before it is substrate.
+		#
+		set(LWS_SANSIO_LINK_ALLOW_FUNCS
+			lws_ss_event_helper lws_ss_backoff lws_ss_destroy
+			lws_ss_server_accept_bind lws_ss_tag lws_conmon_ss_json
+			_lws_ss_handle_state_ret_CAN_DESTROY_HANDLE
+			lws_smd_msg_printf
+			lws_async_queue_submit)
+		set(LWS_SANSIO_LINK_ALLOW_DATA
+			protocol_secstream_ws)
+
+		set(_sio_allow_c ${CMAKE_CURRENT_BINARY_DIR}/sansio-link-allow.c)
+		set(_c "/* generated by lib/CMakeLists.txt: stand-ins for the symbols the\n * sansIO links-alone test allows, never run */\n\n")
+		string(APPEND _c "#define LWS_SIO_ALLOW __attribute__((visibility(\"default\")))\n\n")
+		foreach(_f ${LWS_SANSIO_LINK_ALLOW_FUNCS})
+			string(APPEND _c "LWS_SIO_ALLOW void ${_f}(void);\n")
+			string(APPEND _c "LWS_SIO_ALLOW void ${_f}(void) { }\n")
+		endforeach()
+		foreach(_d ${LWS_SANSIO_LINK_ALLOW_DATA})
+			string(APPEND _c "LWS_SIO_ALLOW extern const char ${_d}[1];\n")
+			string(APPEND _c "LWS_SIO_ALLOW const char ${_d}[1] = { 0 };\n")
+		endforeach()
+		file(WRITE ${_sio_allow_c}.tmp "${_c}")
+		configure_file(${_sio_allow_c}.tmp ${_sio_allow_c} COPYONLY)
+		add_library(websockets-sansio-allow SHARED ${_sio_allow_c})
+		set_target_properties(websockets-sansio-allow PROPERTIES
+				      LINKER_LANGUAGE C)
+
+		add_library(websockets-sansio SHARED ${_sio_sources})
+		set_target_properties(websockets-sansio PROPERTIES
+				      LINKER_LANGUAGE C)
+		target_include_directories(websockets-sansio PRIVATE
+			${LWS_LIB_BUILD_INC_PATHS} ${LWS_LIB_BUILD_INC_PATHS_TEMP}
+			${CMAKE_CURRENT_SOURCE_DIR}/../core
+			${CMAKE_CURRENT_SOURCE_DIR}/../include
+			${CMAKE_CURRENT_BINARY_DIR}/../include)
+		foreach(inc ${LWS_PUBLIC_INCLUDES})
+			target_include_directories(websockets-sansio PRIVATE ${inc})
+		endforeach()
+		target_include_directories(websockets-sansio INTERFACE
+			$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+			$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/../include>)
+		target_compile_definitions(websockets-sansio PRIVATE
+					   LWS_BUILDING_SHARED)
+		if (APPLE)
+			set(_sio_nu "-Wl,-undefined,error")
+		else()
+			set(_sio_nu "-Wl,--no-undefined")
+		endif()
+		set_property(TARGET websockets-sansio APPEND_STRING PROPERTY
+			     LINK_FLAGS " ${_sio_nu}")
+		target_link_libraries(websockets-sansio websockets-sansio-allow
+				      ${STRIPPED_LIB_LIST})
+		# the generated headers come from the library's build
+		if (LWS_WITH_SHARED)
+			add_dependencies(websockets-sansio websockets_shared)
+		else()
+			add_dependencies(websockets-sansio websockets)
+		endif()
+	endif()
+endif()
 
 #
 # These will be available to parent projects including libwebsockets
@@ -424,8 +680,8 @@ endif()
 file(WRITE "${PROJECT_BINARY_DIR}/libwebsockets.pc"
 "prefix=\"${CMAKE_INSTALL_PREFIX}\"
 exec_prefix=\${prefix}
-libdir=\${exec_prefix}/${LWS_INSTALL_LIB_DIR}
-includedir=\${prefix}/${LWS_INSTALL_INCLUDE_DIR}
+libdir=${PKG_CONFIG_LIBDIR}
+includedir=${PKG_CONFIG_INCLUDEDIR}
 
 Name: libwebsockets
 Description: Websockets server and client library
@@ -446,8 +702,8 @@ endif()
 file(WRITE "${PROJECT_BINARY_DIR}/libwebsockets_static.pc"
 "prefix=\"${CMAKE_INSTALL_PREFIX}\"
 exec_prefix=\${prefix}
-libdir=\${exec_prefix}/${LWS_INSTALL_LIB_DIR}
-includedir=\${prefix}/${LWS_INSTALL_INCLUDE_DIR}
+libdir=${PKG_CONFIG_LIBDIR}
+includedir=${PKG_CONFIG_INCLUDEDIR}
 
 Name: libwebsockets_static
 Description: Websockets server and client static library
@@ -483,12 +739,14 @@ if (DEFINED LWS_PLAT_UNIX)
 	endif()
 endif()
 set(LWS_HAVE_MBEDTLS_NET_SOCKETS ${LWS_HAVE_MBEDTLS_NET_SOCKETS} PARENT_SCOPE)
+set(LWS_HAVE_SSL_set_tlsext_host_name ${LWS_HAVE_SSL_set_tlsext_host_name} PARENT_SCOPE)
 set(LWS_HAVE_MBEDTLS_SSL_NEW_SESSION_TICKET ${LWS_HAVE_MBEDTLS_SSL_NEW_SESSION_TICKET} PARENT_SCOPE)
 set(LWS_HAVE_mbedtls_ssl_conf_alpn_protocols ${LWS_HAVE_mbedtls_ssl_conf_alpn_protocols} PARENT_SCOPE)
 set(TEST_SERVER_SSL_KEY "${TEST_SERVER_SSL_KEY}" PARENT_SCOPE)
 set(TEST_SERVER_SSL_CERT "${TEST_SERVER_SSL_CERT}" PARENT_SCOPE)
 set(TEST_SERVER_DATA ${TEST_SERVER_DATA} PARENT_SCOPE)
 set(LWS_HAVE_PIPE2 ${LWS_HAVE_PIPE2} PARENT_SCOPE)
+set(LWS_HAVE_ACCEPT4 ${LWS_HAVE_ACCEPT4} PARENT_SCOPE)
 set(LWS_LIBRARIES ${LWS_LIBRARIES} PARENT_SCOPE)
 if (DEFINED WIN32_HELPERS_PATH)
 	set(WIN32_HELPERS_PATH ${WIN32_HELPERS_PATH} PARENT_SCOPE)
@@ -503,5 +761,10 @@ if (DEFINED LIB_LIST_AT_END)
 set(LIB_LIST_AT_END ${LIB_LIST_AT_END} PARENT_SCOPE)
 endif()
 set(USE_WOLFSSL ${USE_WOLFSSL} PARENT_SCOPE)
-set(LWS_DEPS_LIB_PATHS ${LWS_DEPS_LIB_PATHS} PARENT_SCOPE)
+set(LWS_DEP_LIB_PATHS ${LWS_DEP_LIB_PATHS} PARENT_SCOPE)
 
+set(LWS_ROLE_QUIC ${LWS_ROLE_QUIC} PARENT_SCOPE)
+set(LWS_WITH_HTTP3 ${LWS_WITH_HTTP3} PARENT_SCOPE)
+set(LWS_ROLE_H3 ${LWS_ROLE_H3} PARENT_SCOPE)
+set(LWS_ROLE_WT ${LWS_ROLE_WT} PARENT_SCOPE)
+set(LWS_WITH_TLS_KEYLOG ${LWS_WITH_TLS_KEYLOG} PARENT_SCOPE)

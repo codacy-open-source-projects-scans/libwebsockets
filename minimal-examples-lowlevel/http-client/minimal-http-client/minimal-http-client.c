@@ -19,6 +19,8 @@ enum {
 	LWS_SW_EXPECTED_EXIT,
 	LWS_SW_C,
 	LWS_SW_W,
+	LWS_SW_URL,
+	LWS_SW_OUTPUT_DIR,
 	LWS_SW_HELP,
 };
 
@@ -27,13 +29,25 @@ static const struct lws_switches switches[] = {
 	[LWS_SW_EXPECTED_EXIT]	= { "--expected-exit", "Enable --expected-exit feature" },
 	[LWS_SW_C]	= { "-c",              "Client connections" },
 	[LWS_SW_W]	= { "-w",              "Enable -w feature" },
+	[LWS_SW_URL]    = { "--url",           "Parse and connect to URL" },
+	[LWS_SW_OUTPUT_DIR] = { "--output-dir", "Save payload to dir" },
 	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
 };
 
 #include <string.h>
 #include <signal.h>
+#include <fcntl.h>
+#if !defined(WIN32)
+#include <unistd.h>
+#endif
 
-static int interrupted, bad = 1, status, conmon, close_after_start;
+static int bad = 1, status, conmon, close_after_start;
+static struct lws_context *context;
+static int out_fd = -1;
+static const char *out_dir = NULL;
+static const char *request_path = "/";
+static char url_path[256];
+static char url_buf[256];
 #if defined(LWS_WITH_HTTP2)
 static int long_poll;
 #endif
@@ -94,7 +108,7 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
 		lwsl_err("CLIENT_CONNECTION_ERROR: %s\n",
 			 in ? (char *)in : "(null)");
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		bad = 3; /* connection failed before we could make connection */
 		lws_cancel_service(lws_get_context(wsi));
 
@@ -110,6 +124,25 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 
 			lws_get_peer_simple(wsi, buf, sizeof(buf));
 			status = (int)lws_http_client_http_response(wsi);
+			lwsl_user("Connected with server response: %d\n", status);
+
+			if (out_dir && status == 200) {
+				char filepath[512];
+				const char *basename = strrchr(request_path, '/');
+				if (basename)
+					basename++;
+				else
+					basename = request_path;
+				if (!basename || !*basename)
+					basename = "index.html";
+
+				snprintf(filepath, sizeof(filepath), "%s/%s", out_dir, basename);
+				out_fd = open(filepath, O_CREAT | O_WRONLY | O_TRUNC, 0644); /* NOSONAR */
+				if (out_fd < 0)
+					lwsl_err("Failed to open output file %s\n", filepath);
+				else
+					lwsl_user("Saving payload to %s\n", filepath);
+			}
 
 #if defined(LWS_WITH_ALLOC_METADATA_LWS)
 			_lws_alloc_metadata_dump_lws(lws_alloc_metadata_dump_stdout, NULL);
@@ -162,6 +195,12 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 	/* chunks of chunked content, with header removed */
 	case LWS_CALLBACK_RECEIVE_CLIENT_HTTP_READ:
 		lwsl_user("RECEIVE_CLIENT_HTTP_READ: read %d\n", (int)len);
+		if (out_fd >= 0) {
+			if (write(out_fd, in, LWS_POSIX_LENGTH_CAST(len)) < 0) {
+				lwsl_err("Failed to write to output file\n");
+				return -1;
+			}
+		}
 #if defined(LWS_WITH_HTTP2)
 		if (long_poll) {
 			char dotstar[128];
@@ -194,13 +233,22 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 
 	case LWS_CALLBACK_COMPLETED_CLIENT_HTTP:
 		lwsl_user("LWS_CALLBACK_COMPLETED_CLIENT_HTTP\n");
-		interrupted = 1;
+		if (out_fd >= 0) {
+			close(out_fd);
+			out_fd = -1;
+		}
+		lws_default_loop_exit(context);
 		bad = status != 200;
 		lws_cancel_service(lws_get_context(wsi)); /* abort poll wait */
 		break;
 
 	case LWS_CALLBACK_CLOSED_CLIENT_HTTP:
-		interrupted = 1;
+		lwsl_user("LWS_CALLBACK_CLOSED_CLIENT_HTTP\n");
+		if (out_fd >= 0) {
+			close(out_fd);
+			out_fd = -1;
+		}
+		lws_default_loop_exit(context);
 		bad = status != 200;
 		lws_cancel_service(lws_get_context(wsi)); /* abort poll wait */
 #if defined(LWS_WITH_CONMON)
@@ -228,7 +276,7 @@ static const struct lws_protocols protocols[] = {
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 struct args {
@@ -240,9 +288,9 @@ static int
 system_notify_cb(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 		   int current, int target)
 {
-	struct lws_context *context = mgr->parent;
+	struct lws_context *cx = mgr->parent;
 	struct lws_client_connect_info i;
-	struct args *a = lws_context_user(context);
+	struct args *a = lws_context_user(cx);
 	const char *p;
 
 	if (current != LWS_SYSTATE_OPERATIONAL || target != LWS_SYSTATE_OPERATIONAL)
@@ -251,7 +299,7 @@ system_notify_cb(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 	lwsl_info("%s: operational\n", __func__);
 
 	memset(&i, 0, sizeof i); /* otherwise uninitialized garbage */
-	i.context = context;
+	i.context = cx;
 	if (!lws_cmdline_option(a->argc, a->argv, "-n")) {
 		i.ssl_connection = LCCSCF_USE_SSL;
 #if defined(LWS_WITH_HTTP2)
@@ -269,7 +317,7 @@ system_notify_cb(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 		i.ssl_connection |= LCCSCF_ALLOW_SELFSIGNED;
 	} else {
 		i.port = 443;
-		i.address = "warmcat.com";
+		i.address = "libwebsockets.org";
 	}
 
 	if (lws_cmdline_option(a->argc, a->argv, "--nossl"))
@@ -280,14 +328,25 @@ system_notify_cb(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 			    LCCSCF_H2_QUIRK_NGHTTP2_END_STREAM;
 
 	i.alpn = "h2,http/1.1";
-	if (lws_cmdline_option(a->argc, a->argv, "--h1"))
-		i.alpn = "http/1.1";
+	if (lws_cmdline_option(a->argc, a->argv, "--h3")) {
+		i.method = "QUIC";
+		i.address = "cloudflare-quic.com";
+		i.port = 443;
+		i.disable_h3_fallback = 1;
+	}
 
 	if (lws_cmdline_option(a->argc, a->argv, "--h2-prior-knowledge"))
 		i.ssl_connection |= LCCSCF_H2_PRIOR_KNOWLEDGE;
 
 	if ((p = lws_cmdline_option(a->argc, a->argv, "-p")))
-		i.port = atoi(p);
+		{
+			int __pt = atoi(p);
+			if (__pt < 0 || __pt > 65535) {
+				lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+				return 1;
+			}
+			i.port = (uint16_t)__pt;
+		}
 
 	if ((p = lws_cmdline_option(a->argc, a->argv, "--user")))
 		ba_user = p;
@@ -331,10 +390,27 @@ system_notify_cb(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 	if ((p = lws_cmdline_option(a->argc, a->argv, "--server")))
 		i.address = p;
 
+	if ((p = lws_cmdline_option(a->argc, a->argv, "--output-dir")))
+		out_dir = p;
+
 	if ((p = lws_cmdline_option(a->argc, a->argv, "--path")))
-		i.path = p;
-	else
-		i.path = "/";
+		request_path = p;
+
+	if ((p = lws_cmdline_option(a->argc, a->argv, "--url"))) {
+		const char *prot, *address, *path;
+		int url_port;
+		lws_strncpy(url_buf, p, sizeof(url_buf));
+		if (lws_parse_uri(url_buf, &prot, &address, &url_port, &path)) {
+			lwsl_err("Failed to parse URL\n");
+			return 1;
+		}
+		i.address = address;
+		i.port = url_port;
+		snprintf(url_path, sizeof(url_path), "/%s", path);
+		request_path = url_path;
+	}
+
+	i.path = request_path;
 
 	i.host = i.address;
 	i.origin = i.address;
@@ -346,9 +422,10 @@ system_notify_cb(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 
 	if (!lws_client_connect_via_info(&i)) {
 		lwsl_err("Client creation failed\n");
-		interrupted = 1;
-		bad = 2; /* could not even start client connection */
-		lws_cancel_service(context);
+		lws_default_loop_exit(cx);
+		if (bad != 3)
+			bad = 3; /* synchronous connection/creation failure */
+		lws_cancel_service(cx);
 
 		return 1;
 	}
@@ -359,13 +436,31 @@ system_notify_cb(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 	return 0;
 }
 
+#if defined(WIN32) && defined(LWS_WITH_SCHANNEL)
+#include <windows.h>
+static int is_quic_supported_on_os(void) {
+    OSVERSIONINFOEXW osvi = { sizeof(osvi), 0, 0, 0, 0, {0}, 0, 0 };
+    DWORDLONG const dwlConditionMask = VerSetConditionMask(
+        VerSetConditionMask(
+        VerSetConditionMask(
+            0, VER_MAJORVERSION, VER_GREATER_EQUAL),
+               VER_MINORVERSION, VER_GREATER_EQUAL),
+               VER_BUILDNUMBER,  VER_GREATER_EQUAL);
+
+    osvi.dwMajorVersion = 10;
+    osvi.dwMinorVersion = 0;
+    osvi.dwBuildNumber  = 20348; /* Windows Server 2022 */
+
+    return VerifyVersionInfoW(&osvi, VER_MAJORVERSION | VER_MINORVERSION | VER_BUILDNUMBER, dwlConditionMask) != FALSE;
+}
+#endif
+
 int main(int argc, const char **argv)
 {
 	lws_state_notify_link_t notifier = { { NULL, NULL, NULL },
 					     system_notify_cb, "app" };
 	lws_state_notify_link_t *na[] = { &notifier, NULL };
 	struct lws_context_creation_info info;
-	struct lws_context *context;
 	int n = 0, expected = 0;
 	struct args args;
 	const char *p;
@@ -376,12 +471,21 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	lws_context_info_defaults(&info, NULL);lws_cmdline_option_handle_builtin(argc, argv, &info);
 
-	lwsl_user("LWS minimal http client [-d<verbosity>] [-l] [--h1]\n");
+#if defined(WIN32) && defined(LWS_WITH_SCHANNEL)
+	if (lws_cmdline_option(argc, argv, "--h3")) {
+		if (!is_quic_supported_on_os()) {
+			lwsl_user("SChannel QUIC requires Windows 11+ / Server 2022+\n");
+			return 0;
+		}
+	}
+#endif
 
-	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT |
+	lwsl_user("LWS minimal http client [-d<verbosity>] [-l]\n");
+
+	info.options &= ~((uint64_t)LWS_SERVER_OPTION_EXPLICIT_VHOSTS);
+	info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT |
 		       LWS_SERVER_OPTION_H2_JUST_FIX_WINDOW_UPDATE_OVERFLOW;
 	info.port = CONTEXT_PORT_NO_LISTEN; /* we do not run any server */
 	info.protocols = protocols;
@@ -399,15 +503,16 @@ int main(int argc, const char **argv)
 	 * since we know this lws context is only ever going to be used with
 	 * one client wsis / fds / sockets at a time, let lws know it doesn't
 	 * have to use the default allocations for fd tables up to ulimit -n.
-	 * It will just allocate for 1 internal and 1 (+ 1 http2 nwsi) that we
-	 * will use.
+	 * It will just allocate for its own fds and overhead
+	 * (LWS_FD_LIMIT_PER_THREAD_MIN) plus the one connection we will use.
 	 */
-	info.fd_limit_per_thread = 1 + 1 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 1;
 
 	if (lws_cmdline_option(argc, argv, switches[LWS_SW_COS].sw))
 		close_after_start = 1;
 
-#if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL) || defined(LWS_WITH_BEARSSL)
+#if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL) || \
+	defined(LWS_WITH_BEARSSL) || defined(LWS_WITH_OPENHITLS)
 	/*
 	 * OpenSSL uses the system trust store.  mbedTLS has to be told which
 	 * CA to trust explicitly.
@@ -417,6 +522,8 @@ int main(int argc, const char **argv)
 		info.client_ssl_ca_filepath = "./wrong.cer";
 	else
 		info.client_ssl_ca_filepath = "./warmcat.com.cer";
+
+	lwsl_user("CA FILEPATH: %s\n", info.client_ssl_ca_filepath);
 #endif
 #if 0
 	n = open("./warmcat.com.cer", O_RDONLY);
@@ -435,7 +542,7 @@ int main(int argc, const char **argv)
 		goto bail;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

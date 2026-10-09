@@ -37,8 +37,10 @@
 
 #if defined(LWS_WITH_MBEDTLS)
 #include <mbedtls/ssl.h>
+#if !defined(LWS_HAVE_MBEDTLS_V4)
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
+#endif
 #include <mbedtls/ssl_cookie.h>
 #elif defined(LWS_WITH_GNUTLS)
 #include <gnutls/gnutls.h>
@@ -46,6 +48,10 @@
 #define SECURITY_WIN32
 #include <security.h>
 #include <schannel.h>
+#elif defined(LWS_WITH_OPENHITLS)
+#include <hitls.h>
+#include <hitls_config.h>
+#include <bsl_uio.h>
 #else /* OpenSSL */
 #include <openssl/ssl.h>
 #endif
@@ -104,11 +110,29 @@ struct lws_gendtls_ctx {
 	/* Store the client address for SChannel DTLS ACCEPT */
 	struct sockaddr_storage			client_addr;
 	size_t					client_addr_len;
+#elif defined(LWS_WITH_OPENHITLS)
+	HITLS_Ctx				*ctx;
+	HITLS_Config				*config;
+	BSL_UIO					*uio;
+	BSL_UIO_Method				*uio_method;
+	struct lws_buflist			*rx_head;
+	struct lws_buflist			*tx_head;
+	struct lws_context			*context;
+	int					mode;
+	unsigned int				mtu;
+	unsigned int				timeout_ms;
+	int					handshake_done;
 #else /* OpenSSL */
 	void					*ssl; /* SSL * */
 	/* OpenSSL Bio mems are handled internally via SSL_set_bio */
+	lws_usec_t				created_us;
+	unsigned int				timeout_ms;
+	uint8_t					failed;
 #endif
 };
+
+/** Default overall DTLS handshake deadline, if info->timeout_ms is 0 */
+#define LWS_GENDTLS_TIMEOUT_DEFAULT_MS 60000
 
 enum lws_gendtls_conn_mode {
 	LWS_GENDTLS_MODE_CLIENT,
@@ -119,7 +143,15 @@ struct lws_gendtls_creation_info {
 	struct lws_context			*context;
 	enum lws_gendtls_conn_mode		mode;
 	unsigned int				mtu;
+	/**< transport MTU, 0 for a backend default */
 	unsigned int				timeout_ms;
+	/**< overall deadline for the DTLS handshake to complete, 0 for
+	 * LWS_GENDTLS_TIMEOUT_DEFAULT_MS.  Handshake flight retransmission is
+	 * driven from lws_gendtls_get_rx() / lws_gendtls_get_tx(), so the
+	 * caller must keep polling those while the handshake is in progress;
+	 * once the deadline passes they return < 0 and the caller must
+	 * lws_gendtls_destroy() the ctx.  A half-open handshake is otherwise
+	 * only reaped when the caller's own object lifetime ends. */
 	const char				*use_srtp;
 };
 
@@ -129,6 +161,22 @@ struct lws_gendtls_creation_info {
  * \param info: creation info struct
  *
  * Creates a DTLS context.
+ *
+ * Minimum protocol version is DTLS 1.2 and renegotiation is disabled, as
+ * RFC 8827 requires for WebRTC.
+ *
+ * In LWS_GENDTLS_MODE_SERVER, the peer certificate is requested but its chain
+ * is deliberately not validated: DTLS-SRTP peers are self-signed and the trust
+ * anchor is the a=fingerprint carried on the signalling channel.  The caller
+ * is therefore responsible for comparing the peer certificate fingerprint
+ * against the signalled one before it uses any exported keying material; a
+ * caller that skips that has an entirely unauthenticated peer.
+ *
+ * Not every backend performs a HelloVerifyRequest cookie exchange (mbedtls and
+ * gnutls do, the OpenSSL and openHiTLS backends do not, since the API takes
+ * datagrams rather than a socket and so has no source address to bind a cookie
+ * to).  Callers feeding datagrams straight in must do their own source
+ * validation first, as the in-tree webrtc consumer does with ICE/STUN.
  *
  * Returns 0 for OK or nonzero for error.
  */
@@ -173,7 +221,10 @@ lws_gendtls_set_key_mem(struct lws_gendtls_ctx *ctx, const uint8_t *key, size_t 
  * \param in: pointer to encrypted data
  * \param len: length of encrypted data
  *
- * Returns 0 for OK or nonzero for error.
+ * Returns 0 if the datagram was taken, or nonzero if it was dropped, eg,
+ * because the session is already over, or because the backend is already
+ * holding as much unread ciphertext as it allows.  A dropped datagram is
+ * the same as one lost on the network.
  */
 LWS_VISIBLE LWS_EXTERN int
 lws_gendtls_put_rx(struct lws_gendtls_ctx *ctx, const uint8_t *in, size_t len);
@@ -185,6 +236,10 @@ lws_gendtls_put_rx(struct lws_gendtls_ctx *ctx, const uint8_t *in, size_t len);
  * \param max_len: maximum length of buffer
  *
  * Returns number of bytes read (>=0) or negative for error.
+ *
+ * A negative return after the handshake completed means the session has
+ * ended, because the peer sent close_notify or because of a fatal error; the
+ * caller should stop feeding it and lws_gendtls_destroy() the ctx.
  */
 LWS_VISIBLE LWS_EXTERN int
 lws_gendtls_get_rx(struct lws_gendtls_ctx *ctx, uint8_t *out, size_t max_len);

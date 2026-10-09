@@ -29,37 +29,28 @@
 struct bucket *
 find_bucket(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id, int af)
 {
-	struct bucket *b = af == AF_INET ? ctx->buckets : ctx->buckets6;
+	struct bucket *b = bucket_head(ctx, af);
 
 	if (!b)
 		return NULL;
 
 	while (1) {
-		if (!b->next)
-			return b;
-		if (id_cmp(id, b->next->first) < 0)
+		struct bucket *nb = bucket_next(b);
+
+		if (!nb || id_cmp(id, nb->first) < 0)
 			return b;
 
-		b = b->next;
+		b = nb;
 	}
 }
 
 struct bucket *
-previous_bucket(struct lws_dht_ctx *ctx, struct bucket *b)
+previous_bucket(struct bucket *b)
 {
-	struct bucket *p = b->af == AF_INET ? ctx->buckets : ctx->buckets6;
-
-	if (b == p)
+	if (!lws_dll2_get_prev(&b->list))
 		return NULL;
 
-	while (1) {
-		if (!p->next)
-			return NULL;
-		if (p->next == b)
-			return p;
-
-		p = p->next;
-	}
+	return lws_container_of(lws_dll2_get_prev(&b->list), struct bucket, list);
 }
 
 /* Every bucket contains an unordered list of nodes. */
@@ -67,17 +58,16 @@ struct node *
 find_node(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id, int af)
 {
 	struct bucket *b = find_bucket(ctx, id, af);
-	struct node *n;
 
 	if (!b)
 		return NULL;
 
-	n = b->nodes;
-	while (n) {
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&b->nodes)) {
+		struct node *n = lws_container_of(d, struct node, list);
+
 		if (!id_cmp(n->id, id))
 			return n;
-		n = n->next;
-	}
+	} lws_end_foreach_dll(d);
 
 	return NULL;
 }
@@ -86,29 +76,37 @@ find_node(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id, int af)
 static struct node *
 random_node(struct lws_dht_ctx *ctx, struct bucket *b)
 {
-	struct node *n;
+	lws_dll2_t *d;
+	uint32_t r;
 	int nn;
 
-	if (!b->count)
+	if (!lws_dll2_count(&b->nodes))
 		return NULL;
 
-	nn = (int)(lws_get_random(ctx->vhost->context, &nn, sizeof(nn)) % (unsigned int)b->count);
-	n = b->nodes;
+	/*
+	 * lws_get_random() returns the number of bytes it set, not the random
+	 * value; using its return here made this always pick index
+	 * 4 % count, so all maintenance probes went to a predictable node.
+	 */
+	lws_get_random(ctx->vhost->context, &r, sizeof(r));
+	nn = (int)(r % (uint32_t)lws_dll2_count(&b->nodes));
+	d = lws_dll2_get_head(&b->nodes);
 
-	while (nn > 0 && n) {
-		n = n->next;
+	while (nn > 0 && d) {
+		d = lws_dll2_get_next(d);
 		nn--;
 	}
 
-	return n;
+	return d ? lws_container_of(d, struct node, list) : NULL;
 }
 
 /* Return the middle id of a bucket. */
 static int
 bucket_middle(struct bucket *b, lws_dht_hash_t *id_return)
 {
+	struct bucket *nb = bucket_next(b);
 	int bit1 = lowbit(b->first);
-	int bit2 = b->next ? lowbit(b->next->first) : -1;
+	int bit2 = nb ? lowbit(nb->first) : -1;
 	int max_bits = id_return->len * 8;
 	int bit;
 	size_t bidx;
@@ -137,8 +135,9 @@ bucket_middle(struct bucket *b, lws_dht_hash_t *id_return)
 static int
 bucket_random(struct lws_dht_ctx *ctx, struct bucket *b, lws_dht_hash_t *id_return)
 {
+	struct bucket *nb = bucket_next(b);
 	int i, r, bit, bit1 = lowbit(b->first);
-	int bit2 = b->next ? lowbit(b->next->first) : -1;
+	int bit2 = nb ? lowbit(nb->first) : -1;
 	int max_bits = id_return->len * 8;
 	size_t bidx;
 
@@ -185,9 +184,7 @@ insert_node(struct lws_dht_ctx *ctx, struct node *node)
 	if (b == NULL)
 		return NULL;
 
-	node->next = b->nodes;
-	b->nodes = node;
-	b->count++;
+	lws_dll2_add_head(&node->list, &b->nodes);
 
 	return node;
 }
@@ -197,13 +194,21 @@ int
 node_good(struct lws_dht_ctx *ctx, struct node *node)
 {
 	return node->pinged <= 2 &&
-		node->reply_time >= ctx->now.tv_sec - LWS_DHT_NODE_EXPIRE_SECS &&
-		node->time >= ctx->now.tv_sec - 900;
+		node->reply_time >= ctx->now - LWS_DHT_NODE_EXPIRE_SECS &&
+		node->time >= ctx->now - 900;
 }
 
 /*
- * The internal blacklist is an LRU cache of nodes that have sent
+ * The internal blacklist is an LRU cache of endpoints that have sent
  * incorrect messages.
+ *
+ * It is the endpoint that is punished.  The id is only what the sender
+ * claimed, so the routing table entry and search nodes holding that id are
+ * only discarded if they live at that endpoint: otherwise anyone naming a
+ * victim's id would get the victim dropped.  And since a datagram's source
+ * address can be spoofed, only use this for a source that has proved it is
+ * there (for example by answering a request we sent it); a malformed
+ * unsolicited datagram is to be dropped, not blacklisted.
  */
 void
 blacklist_node(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id, const struct sockaddr *sa, size_t salen)
@@ -214,22 +219,24 @@ blacklist_node(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id, const struct s
 
 	if (id) {
 		struct node *n;
-		struct search *sr;
 
 		/* Make the node easy to discard. */
 		n = find_node(ctx, id, sa->sa_family);
-		if (n) {
+		if (n && dht_sa_same_peer((const struct sockaddr *)&n->ss, sa)) {
 			n->pinged = LWS_DHT_MAX_PING_FAILURES;
 			mark_as_pinged(ctx, n, NULL);
 		}
 		/* Discard it from any searches in progress. */
-		sr = ctx->searches;
-		while (sr) {
+		lws_start_foreach_dll(struct lws_dll2 *, d,
+				      lws_dll2_get_head(&ctx->searches)) {
+			struct search *sr = lws_container_of(d, struct search, list);
+
 			for (i = 0; i < sr->numnodes; i++)
-				if (id_cmp(sr->nodes[i].id, id) == 0)
+				if (id_cmp(sr->nodes[i].id, id) == 0 &&
+				    dht_sa_same_peer((const struct sockaddr *)
+						     &sr->nodes[i].ss, sa))
 					flush_search_node(&sr->nodes[i], sr);
-			sr = sr->next;
-		}
+		} lws_end_foreach_dll(d);
 	}
 
 	/* And make sure we don't hear from it again. */
@@ -249,7 +256,6 @@ split_bucket(struct lws_dht_ctx *ctx, struct bucket *b)
 {
 	lws_dht_hash_t *new_id;
 	struct bucket *new;
-	struct node *nodes;
 	int rc;
 
 	new_id = lws_dht_hash_dup(b->first);
@@ -275,33 +281,173 @@ split_bucket(struct lws_dht_ctx *ctx, struct bucket *b)
 	new->first = new_id;
 	new->time = b->time;
 
-	nodes = b->nodes;
-	b->nodes = NULL;
-	b->count = 0;
-	new->next = b->next;
-	b->next = new;
+	/* the new bucket takes its place in the chain directly after b */
 
-	while (nodes) {
-		struct node *n = nodes;
+	lws_dll2_add_insert(&new->list, &b->list);
 
-		nodes = nodes->next;
+	/*
+	 * redistribute b's nodes between the two buckets.  The loop body
+	 * removes the current node and re-adds it, possibly back on to the
+	 * head of this same list; the _safe iterator's cached next is never
+	 * itself removed, so it keeps walking the original members.
+	 */
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+				   lws_dll2_get_head(&b->nodes)) {
+		struct node *n = lws_container_of(d, struct node, list);
+
+		lws_dll2_remove(d);
 		insert_node(ctx, n);
-	}
+	} lws_end_foreach_dll_safe(d, d1);
+
 	return b;
+}
+
+/*
+ * A node whose pings to its endpoint have all gone unanswered: its slot may
+ * go to somebody else.
+ */
+static int
+node_known_bad(struct lws_dht_ctx *ctx, const struct node *n)
+{
+	return n->pinged >= LWS_DHT_MAX_PING_FAILURES &&
+	       n->pinged_time < ctx->now - LWS_DHT_PING_TIMEOUT_SECS;
+}
+
+/*
+ * Something names a node we know, but from (or, with confirm 0, reported
+ * at) an endpoint other than the one we hold for it.
+ *
+ * Node ids are self-asserted and public (every reply carries the sender's,
+ * every nodes list carries a handful), so the claim proves nothing.
+ * Believing it let one datagram naming a live node's id point that node's
+ * entry, still good, at the sender: our searches, announces, maintenance
+ * and lws_dht_get_nodes() users then talked to him, and his replies passed
+ * the search reply binding, since they came from where we had sent.
+ *
+ * A node that really moved stops answering at its old endpoint, so the
+ * entry only moves once the old endpoint has failed our pings, the same
+ * known-bad state that already lets any other node take the slot.  Until
+ * then a direct claim just makes us ping the old endpoint (at most once per
+ * ping timeout), so a real move is noticed within a few timeouts.  The moved
+ * entry starts unconfirmed, like a new node: it is not good, and so not
+ * handed out or probed, until it answers a ping at the new endpoint, which
+ * we send it now.
+ */
+static struct node *
+node_endpoint_conflict(struct lws_dht_ctx *ctx, struct bucket *b,
+		       struct node *n, const struct sockaddr *sa, size_t salen,
+		       int confirm)
+{
+	uint8_t tid[4];
+
+	make_tid(tid, "pn", 0);
+
+	if (!node_known_bad(ctx, n)) {
+		if (confirm &&
+		    n->pinged_time < ctx->now - LWS_DHT_PING_TIMEOUT_SECS) {
+#if (_LWS_ENABLED_LOGS & LLL_WARN)
+			/*
+			 * Two live endpoints for one id: two nodes sharing an
+			 * id, eg, one's key copied to another host, which
+			 * keeps the second out of every peer's table, or a
+			 * forged claim.  Said at most once a ping timeout per
+			 * node, with the check we make.
+			 */
+			char nads[64], oads[64], hid[16];
+
+			lws_sa46_write_numeric_address((lws_sockaddr46 *)sa,
+						       nads, sizeof(nads));
+			lws_sa46_write_numeric_address(
+				(lws_sockaddr46 *)&n->ss, oads, sizeof(oads));
+			lws_hex_from_byte_array(n->id->id, n->id->len < 6 ?
+						n->id->len : 6, hid, sizeof(hid));
+			lwsl_warn("%s: node id %s.. claimed from %s:%u while "
+				  "we hold it at %s:%u: two nodes sharing an "
+				  "id (a copied key?), or a forged claim\n",
+				  __func__, hid, nads, ntohs(dht_sa_port(sa)),
+				  oads, ntohs(dht_sa_port(
+					(const struct sockaddr *)&n->ss)));
+#endif
+			send_ping(ctx, (struct sockaddr *)&n->ss, n->sslen,
+				  tid, sizeof(tid));
+			mark_as_pinged(ctx, n, b);
+		}
+
+		return NULL;
+	}
+
+	lwsl_dht_info("%s: old endpoint dead, moving node\n", __func__);
+
+	memcpy(&n->ss, sa, salen);
+	n->sslen	= salen;
+	n->time		= confirm ? ctx->now : 0;
+	n->reply_time	= 0;
+	n->pinged_time	= 0;
+	n->pinged	= 0;
+
+	if (confirm) {
+		send_ping(ctx, sa, salen, tid, sizeof(tid));
+		mark_as_pinged(ctx, n, b);
+	}
+
+	return n;
 }
 
 /*
  * We just learnt about a node, not necessarily a new one.  Confirm is 1 if
  * the node sent a message, 2 if it sent us a reply.
  */
+/* the same host, whatever the port: IPv4 address, or IPv6 /64 */
+static int
+dht_sa_same_host(const struct sockaddr *a, const struct sockaddr *b)
+{
+	if (a->sa_family != b->sa_family)
+		return 0;
+
+	if (a->sa_family == AF_INET)
+		return !memcmp(&((const struct sockaddr_in *)a)->sin_addr,
+			       &((const struct sockaddr_in *)b)->sin_addr, 4);
+
+	if (a->sa_family == AF_INET6)
+		return !memcmp(((const struct sockaddr_in6 *)a)->sin6_addr.s6_addr,
+			       ((const struct sockaddr_in6 *)b)->sin6_addr.s6_addr,
+			       8);
+
+	return 0;
+}
+
+/* a bucket entry is given to a newcomer, in place */
+static struct node *
+node_take_over(struct lws_dht_ctx *ctx, struct node *n,
+	       const lws_dht_hash_t *id, const struct sockaddr *sa,
+	       size_t salen, int confirm, uint8_t bep42_ok)
+{
+	lws_dht_hash_destroy(&n->id);
+	n->id = lws_dht_hash_dup(id);
+	if (!n->id)
+		/* the entry stays, idless, until the bucket is cleaned */
+		return NULL;
+	memcpy((struct sockaddr *)&n->ss, sa, salen);
+	n->sslen = salen;
+	n->bep42_ok = bep42_ok;
+	n->time = confirm ? ctx->now : 0;
+	n->reply_time = confirm >= 2 ? ctx->now : 0;
+	n->pinged_time = 0;
+	n->pinged = 0;
+
+	return n;
+}
+
 struct node *
 maybe_new_node(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id,
 		const struct sockaddr *sa, size_t salen,
 		int confirm)
 {
 	struct bucket *b = find_bucket(ctx, id, sa->sa_family);
+	struct bucket *nb;
 	struct node *n;
 	int mybucket, split;
+	uint8_t bep42_ok;
 
 	lwsl_dht_info("%s: id %02x, confirm %d\n", __func__, id->id[0], confirm);
 
@@ -310,77 +456,116 @@ maybe_new_node(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id,
 		return NULL;
 	}
 
+	nb = bucket_next(b);
 	if (id_cmp(id, ctx->myid) == 0) {
 		lwsl_dht_warn("%s: same id\n", __func__);
 		return NULL;
 	}
 
-	if (is_martian(sa) || node_blacklisted(ctx, sa, salen)) {
-		lwsl_dht_warn("%s: martian or blacklisted\n", __func__);
+	if (is_martian(ctx, sa) || node_blacklisted(ctx, sa, salen)) {
+		char buf[64] = "unknown";
+		lws_sa46_write_numeric_address((lws_sockaddr46 *)sa, buf, sizeof(buf));
+		lwsl_dht_warn("%s: martian or blacklisted: %s\n", __func__, buf);
 		return NULL;
 	}
 
 	mybucket = id_cmp(b->first, ctx->myid) <= 0 &&
-		(b->next == NULL || id_cmp(ctx->myid, b->next->first) < 0);
+		   (nb == NULL || id_cmp(ctx->myid, nb->first) < 0);
 
-	if (confirm == 2)
-		b->time = (int)ctx->now.tv_sec;
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&b->nodes)) {
+		n = lws_container_of(d, struct node, list);
 
-	n = b->nodes;
-	while (n) {
 		if (!id_cmp(n->id, id)) {
-			if (confirm || n->time < ctx->now.tv_sec - LWS_DHT_NODE_MAX_IDLE_SECS) {
-				/* Known node.  Update stuff. */
-				memcpy((struct sockaddr*)&n->ss, sa, salen);
-				if (confirm)
-					n->time = ctx->now.tv_sec;
-				if (confirm >= 2) {
-					n->reply_time = ctx->now.tv_sec;
-					n->pinged = 0;
-					n->pinged_time = 0;
-				}
+			if (!dht_sa_same_peer((const struct sockaddr *)&n->ss,
+					      sa))
+				return node_endpoint_conflict(ctx, b, n, sa,
+							      salen, confirm);
+
+			/* Known node at its known endpoint.  Update stuff. */
+			if (confirm)
+				n->time = ctx->now;
+			if (confirm >= 2) {
+				b->time = ctx->now;
+				n->reply_time = ctx->now;
+				n->pinged = 0;
+				n->pinged_time = 0;
 			}
 			return n;
 		}
-		n = n->next;
-	}
+	} lws_end_foreach_dll(d);
 
 	/* New node. */
 
+	/*
+	 * BEP42: an id is bound to its public address.  One that is not
+	 * (made up, as a host filling a bucket with ids of its choosing
+	 * does) is still admitted while there is room, since a node may not
+	 * know its external address yet, but a conforming one takes its
+	 * place when the bucket is full, and no address gets more than a
+	 * couple of entries in a bucket however many ids it presents.
+	 * Private addresses are exempt from the check, as BEP42 says.
+	 */
+	bep42_ok = lws_dht_ads_is_private(sa) || lws_dht_bep42_check(id, sa);
+
+	if (!lws_dht_ads_is_private(sa)) {
+		int same = 0;
+
+		lws_start_foreach_dll(struct lws_dll2 *, d4,
+				      lws_dll2_get_head(&b->nodes)) {
+			n = lws_container_of(d4, struct node, list);
+			if (dht_sa_same_host((const struct sockaddr *)&n->ss, sa))
+				same++;
+		} lws_end_foreach_dll(d4);
+
+		if (same >= LWS_DHT_MAX_SAME_ADS_PER_BUCKET) {
+			lwsl_dht_info("%s: address already has %d entries in bucket\n",
+				      __func__, same);
+			return NULL;
+		}
+	}
+
+	if (confirm == 2)
+		b->time = ctx->now;
+
 	if (mybucket) {
 		if (sa->sa_family == AF_INET)
-			ctx->mybucket_grow_time = ctx->now.tv_sec;
+			ctx->mybucket_grow_time = ctx->now;
 		else
-			ctx->mybucket6_grow_time = ctx->now.tv_sec;
+			ctx->mybucket6_grow_time = ctx->now;
 	}
 
 	/* First, try to get rid of a known-bad node. */
-	n = b->nodes;
-	while (n) {
-		if (n->pinged >= LWS_DHT_MAX_PING_FAILURES &&
-		    n->pinged_time < ctx->now.tv_sec - LWS_DHT_PING_TIMEOUT_SECS) {
-			lws_dht_hash_destroy(&n->id);
-			n->id = lws_dht_hash_dup(id);
-			if (!n->id) {
-				// Should we remove node from bucket? For now keep but it's broken
-				return NULL;
-			}
-			memcpy((struct sockaddr*)&n->ss, sa, salen);
-			n->time = confirm ? ctx->now.tv_sec : 0;
-			n->reply_time = confirm >= 2 ? ctx->now.tv_sec : 0;
-			n->pinged_time = 0;
-			n->pinged = 0;
-			return n;
-		}
-		n = n->next;
-	}
+	lws_start_foreach_dll(struct lws_dll2 *, d2, lws_dll2_get_head(&b->nodes)) {
+		n = lws_container_of(d2, struct node, list);
 
-	if (b->count >= 8) {
+		if (node_known_bad(ctx, n))
+			return node_take_over(ctx, n, id, sa, salen, confirm,
+					      bep42_ok);
+	} lws_end_foreach_dll(d2);
+
+	if (lws_dll2_count(&b->nodes) >= 8) {
+		/*
+		 * Bucket full: a conforming newcomer displaces an entry whose
+		 * id is not bound to its address, before we start pinging
+		 */
+		if (bep42_ok)
+			lws_start_foreach_dll(struct lws_dll2 *, d5,
+					      lws_dll2_get_head(&b->nodes)) {
+				n = lws_container_of(d5, struct node, list);
+				if (!n->bep42_ok) {
+					lwsl_dht_info("%s: BEP42 node displaces an unbound one\n",
+						      __func__);
+					return node_take_over(ctx, n, id, sa,
+							      salen, confirm, 1);
+				}
+			} lws_end_foreach_dll(d5);
+
 		/* Bucket full.  Ping a dubious node */
 		int dubious = 0;
 
-		n = b->nodes;
-		while (n) {
+		lws_start_foreach_dll(struct lws_dll2 *, d3, lws_dll2_get_head(&b->nodes)) {
+			n = lws_container_of(d3, struct node, list);
+
 			/*
 			 * Pick the first dubious node that we haven't pinged in the
 			 * last 15 seconds.  This gives nodes the time to reply, but
@@ -389,7 +574,7 @@ maybe_new_node(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id,
 			 */
 			if (!node_good(ctx, n)) {
 				dubious = 1;
-				if (n->pinged_time < ctx->now.tv_sec - LWS_DHT_PING_TIMEOUT_SECS) {
+				if (n->pinged_time < ctx->now - LWS_DHT_PING_TIMEOUT_SECS) {
 					uint8_t tid[4];
 					lwsl_dht_info("Sending ping to dubious node.\n");
 					make_tid(tid, "pn", 0);
@@ -399,8 +584,7 @@ maybe_new_node(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id,
 					break;
 				}
 			}
-			n = n->next;
-		}
+		} lws_end_foreach_dll(d3);
 
 		split = 0;
 		if (mybucket) {
@@ -410,15 +594,26 @@ maybe_new_node(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id,
 			 * If there's only one bucket, split eagerly.  This is
 			 * incorrect unless there's more than 8 nodes in the DHT.
 			 */
-			else if (b->af == AF_INET && ctx->buckets->next == NULL)
+			else if (b->af == AF_INET && !bucket_next(bucket_head(ctx, AF_INET)))
 				split = 1;
-			else if (b->af == AF_INET6 && ctx->buckets6->next == NULL)
+			else if (b->af == AF_INET6 && !bucket_next(bucket_head(ctx, AF_INET6)))
 				split = 1;
 		}
 
 		if (split) {
 			lwsl_dht_info("Splitting.\n");
 			b = split_bucket(ctx, b);
+			/*
+			 * split_bucket() returns NULL without changing any
+			 * state (OOM, or no bits left to split on).  Recursing
+			 * with identical arguments and identical state would
+			 * then repeat forever until the stack ran out, so just
+			 * drop the node.  When it does succeed we make
+			 * progress, and the depth is bounded by the id bits.
+			 */
+			if (!b)
+				return NULL;
+
 			return maybe_new_node(ctx, id, sa, salen, confirm);
 		}
 
@@ -444,9 +639,10 @@ maybe_new_node(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id,
 
 	memcpy(&n->ss, sa, (size_t)salen);
 
+	n->bep42_ok		= bep42_ok;
 	n->sslen		= salen;
-	n->time			= confirm ? ctx->now.tv_sec : 0;
-	n->reply_time		= confirm >= 2 ? ctx->now.tv_sec : 0;
+	n->time			= confirm ? ctx->now : 0;
+	n->reply_time		= confirm >= 2 ? ctx->now : 0;
 	n->pinged_time		= 0;
 	n->pinged		= 0;
 
@@ -461,40 +657,38 @@ maybe_new_node(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id,
  * recover as soon as we find better ones.
  */
 int
-expire_buckets(struct lws_dht_ctx *ctx, struct bucket *b)
+expire_buckets(struct lws_dht_ctx *ctx, lws_dll2_owner_t *bo)
 {
-	while (b) {
-		struct node *n, *p;
+	uint32_t r;
+
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, lws_dll2_get_head(bo)) {
+		struct bucket *b = lws_container_of(d, struct bucket, list);
 		int changed = 0;
 
-		while (b->nodes && b->nodes->pinged >= LWS_DHT_NODE_DROP_FAILURES) {
-			n = b->nodes;
-			b->nodes = n->next;
-			b->count--;
-			changed = 1;
-			lws_dht_hash_destroy(&n->id);
-			lws_free(n);
-		}
+		lws_start_foreach_dll_safe(struct lws_dll2 *, nd, nd1,
+					   lws_dll2_get_head(&b->nodes)) {
+			struct node *n = lws_container_of(nd, struct node, list);
 
-		p = b->nodes;
-		while (p) {
-			while (p->next && p->next->pinged >= LWS_DHT_NODE_DROP_FAILURES) {
-				n = p->next;
-				p->next = n->next;
-				b->count--;
+			if (n->pinged >= LWS_DHT_NODE_DROP_FAILURES) {
+				lws_dll2_remove(nd);
 				changed = 1;
 				lws_dht_hash_destroy(&n->id);
 				lws_free(n);
 			}
-			p = p->next;
-		}
+		} lws_end_foreach_dll_safe(nd, nd1);
 
 		if (changed)
 			send_cached_ping(ctx, b);
 
-		b = b->next;
-	}
-	ctx->expire_stuff_time = ctx->now.tv_sec + LWS_DHT_IDLE_EXPIRE_SECS + ((lws_get_random(ctx->vhost->context, &ctx->expire_stuff_time, sizeof(ctx->expire_stuff_time)), ctx->expire_stuff_time) % (2 * LWS_DHT_IDLE_EXPIRE_SECS));
+	} lws_end_foreach_dll_safe(d, d1);
+
+	/*
+	 * Jitter is drawn into an unsigned type: % of a negative signed random
+	 * is negative in C99, which would put the next pass in the past.
+	 */
+	lws_get_random(ctx->vhost->context, &r, sizeof(r));
+	ctx->expire_stuff_time = ctx->now + LWS_DHT_IDLE_EXPIRE_SECS +
+			(time_t)(r % (2 * LWS_DHT_IDLE_EXPIRE_SECS));
 
 	return 1;
 }
@@ -502,18 +696,19 @@ expire_buckets(struct lws_dht_ctx *ctx, struct bucket *b)
 static void
 dump_bucket(struct lws_dht_ctx *ctx, struct bucket *b)
 {
-	struct node *n = b->nodes;
-
 	lwsl_dht_info("Bucket ");
 	lwsl_hexdump_dht(b->first->id, b->first->len);
-	lwsl_dht_info(" count %d age %d%s%s:\n",
-			b->count, (int)(ctx->now.tv_sec - b->time),
+	lwsl_dht_info(" count %u age %d%s%s:\n",
+			(unsigned int)lws_dll2_count(&b->nodes),
+			(int)(ctx->now - b->time),
 			(id_cmp(b->first, ctx->myid) <= 0 &&
-			 (b->next == NULL || id_cmp(ctx->myid, b->next->first) < 0)) ?
+			 (bucket_next(b) == NULL ||
+			  id_cmp(ctx->myid, bucket_next(b)->first) < 0)) ?
 			" (my bucket)" : "",
 			b->cached.ss_family ? " (has cached)" : "");
 
-	while (n) {
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&b->nodes)) {
+		struct node *n = lws_container_of(d, struct node, list);
 		char buf[64];
 		unsigned short port;
 
@@ -536,52 +731,43 @@ dump_bucket(struct lws_dht_ctx *ctx, struct bucket *b)
 		}
 		if (n->reply_time)
 			lwsl_dht_info("age %ld, %ld",
-					(long)(ctx->now.tv_sec - n->time),
-					(long)(ctx->now.tv_sec - n->reply_time));
+					(long)(ctx->now - n->time),
+					(long)(ctx->now - n->reply_time));
 		else
-			lwsl_dht_info("age %ld", (long)(ctx->now.tv_sec - n->time));
+			lwsl_dht_info("age %ld", (long)(ctx->now - n->time));
 		if (n->pinged)
 			lwsl_dht_info(" (%d)", n->pinged);
 		if (node_good(ctx, n))
 			lwsl_dht_info(" (good)");
 		lwsl_dht_info("\n");
-		n = n->next;
-	}
-
+	} lws_end_foreach_dll(d);
 }
 
 void
 lws_dht_dump_tables(struct lws_dht_ctx *ctx)
 {
 	int i;
-	struct bucket *b;
-	struct storage *st;
-	struct search *sr = ctx->searches;
-
-	(void)st;
 
 	lwsl_dht_info("My id ");
 	lwsl_hexdump_dht(ctx->myid->id, ctx->myid->len);
 	lwsl_dht_info("\n");
 
-	b = ctx->buckets;
-	while (b) {
-		dump_bucket(ctx, b);
-		b = b->next;
-	}
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&ctx->buckets)) {
+		dump_bucket(ctx, lws_container_of(d, struct bucket, list));
+	} lws_end_foreach_dll(d);
 
 	lwsl_dht_info("\n");
 
-	b = ctx->buckets6;
-	while (b) {
-		dump_bucket(ctx, b);
-		b = b->next;
-	}
+	lws_start_foreach_dll(struct lws_dll2 *, d6, lws_dll2_get_head(&ctx->buckets6)) {
+		dump_bucket(ctx, lws_container_of(d6, struct bucket, list));
+	} lws_end_foreach_dll(d6);
 
-	while (sr) {
+	lws_start_foreach_dll(struct lws_dll2 *, ds, lws_dll2_get_head(&ctx->searches)) {
+		struct search *sr = lws_container_of(ds, struct search, list);
+
 		lwsl_dht_info("\nSearch%s id ", sr->af == AF_INET6 ? " (IPv6)" : "");
 		lwsl_hexdump_dht(sr->id->id, sr->id->len);
-		lwsl_dht_info(" age %d%s\n", (int)(ctx->now.tv_sec - sr->step_time),
+		lwsl_dht_info(" age %d%s\n", (int)(ctx->now - sr->step_time),
 				sr->done ? " (done)" : "");
 		for (i = 0; i < sr->numnodes; i++) {
 			struct search_node *n = &sr->nodes[i];
@@ -589,19 +775,19 @@ lws_dht_dump_tables(struct lws_dht_ctx *ctx)
 			lwsl_hexdump_dht(n->id->id, n->id->len);
 			lwsl_dht_info(" bits %d age ", common_bits(sr->id, n->id));
 			if (n->request_time)
-				lwsl_dht_info("%d, ", (int)(ctx->now.tv_sec - n->request_time));
-			lwsl_dht_info("%d", (int)(ctx->now.tv_sec - n->reply_time));
+				lwsl_dht_info("%d, ", (int)(ctx->now - n->request_time));
+			lwsl_dht_info("%d", (int)(ctx->now - n->reply_time));
 			if (n->pinged)
 				lwsl_dht_info(" (%d)", n->pinged);
 			lwsl_dht_info("%s%s.\n",
 					find_node(ctx, n->id, AF_INET) ? " (known)" : "",
 					n->replied ? " (replied)" : "");
 		}
-		sr = sr->next;
-	}
+	} lws_end_foreach_dll(ds);
 
-	st = ctx->storage;
-	while (st) {
+	lws_start_foreach_dll(struct lws_dll2 *, dt, lws_dll2_get_head(&ctx->storage)) {
+		struct storage *st = lws_container_of(dt, struct storage, list);
+
 		lwsl_dht_info("\nStorage ");
 		lwsl_hexdump_dht(st->id->id, st->id->len);
 		lwsl_dht_info(" %d/%d nodes:", st->numpeers, st->maxpeers);
@@ -614,10 +800,9 @@ lws_dht_dump_tables(struct lws_dht_ctx *ctx)
 			}
 			lwsl_dht_info(" %s:%u (%ld)",
 					buf, st->peers[i].port,
-					(long)(ctx->now.tv_sec - st->peers[i].time));
+					(long)(ctx->now - st->peers[i].time));
 		}
-		st = st->next;
-	}
+	} lws_end_foreach_dll(dt);
 
 	lwsl_dht_info("\n\n");
 }
@@ -625,13 +810,13 @@ lws_dht_dump_tables(struct lws_dht_ctx *ctx)
 int
 bucket_maintenance(struct lws_dht_ctx *ctx, int af)
 {
-	struct bucket *b;
+	lws_dll2_owner_t *bo = af == AF_INET ? &ctx->buckets : &ctx->buckets6;
 
-	b = af == AF_INET ? ctx->buckets : ctx->buckets6;
-
-	while (b) {
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(bo)) {
+		struct bucket *b = lws_container_of(d, struct bucket, list);
 		struct bucket *q;
-		if (b->time < ctx->now.tv_sec - 600) {
+
+		if (b->time < ctx->now - 600) {
 			/*
 			 * This bucket hasn't seen any positive confirmation for a long
 			 * time.  Pick a random id in this bucket's range, and send
@@ -655,12 +840,14 @@ bucket_maintenance(struct lws_dht_ctx *ctx, int af)
 			 * We also sometimes do it gratuitiously to recover from
 			 * buckets full of broken nodes.
 			 */
-			if (q->next && (q->count == 0 || ((lws_get_random(ctx->vhost->context, &rc, sizeof(rc)), rc) & 7) == 0))
-				q = b->next;
-			if (q && (q->count == 0 || ((lws_get_random(ctx->vhost->context, &rc, sizeof(rc)), rc) & 7) == 0)) {
-				struct bucket *r = previous_bucket(ctx, b);
+			if (bucket_next(q) && (lws_dll2_count(&q->nodes) == 0 ||
+					((lws_get_random(ctx->vhost->context, &rc, sizeof(rc)), rc) & 7) == 0))
+				q = bucket_next(b);
+			if (q && (lws_dll2_count(&q->nodes) == 0 ||
+					((lws_get_random(ctx->vhost->context, &rc, sizeof(rc)), rc) & 7) == 0)) {
+				struct bucket *r = previous_bucket(b);
 
-				if (r && r->count > 0)
+				if (r && lws_dll2_count(&r->nodes) > 0)
 					q = r;
 			}
 
@@ -673,12 +860,12 @@ bucket_maintenance(struct lws_dht_ctx *ctx, int af)
 					if (ctx->wsi_v4 && ctx->wsi_v6) {
 						struct bucket *otherbucket = find_bucket(ctx, id, af == AF_INET ? AF_INET6 : AF_INET);
 
-						if (otherbucket && otherbucket->count < 8)
+						if (otherbucket && lws_dll2_count(&otherbucket->nodes) < 8)
 							/*
 							 * The corresponding bucket in the other family
 							 * is emptyish -- querying both is useful.
 							 */
-								want = WANT4 | WANT6;
+							want = WANT4 | WANT6;
 						else if ((lws_get_random(ctx->vhost->context, &rc, sizeof(rc)), rc) % 37 == 0)
 							/*
 							 * Most of the time, this just adds overhead.
@@ -694,7 +881,7 @@ bucket_maintenance(struct lws_dht_ctx *ctx, int af)
 					make_tid(tid, "fn", 0);
 					send_find_node(ctx, (struct sockaddr*)&n->ss, n->sslen,
 							tid, 4, id, want,
-							n->reply_time >= ctx->now.tv_sec - LWS_DHT_PING_TIMEOUT_SECS);
+							n->reply_time >= ctx->now - LWS_DHT_PING_TIMEOUT_SECS);
 					mark_as_pinged(ctx, n, q);
 					/*
 					 * In order to avoid sending queries back-to-back,
@@ -707,8 +894,8 @@ bucket_maintenance(struct lws_dht_ctx *ctx, int af)
 			}
 			lws_dht_hash_destroy(&id);
 		}
-		b = b->next;
-	}
+	} lws_end_foreach_dll(d);
+
 	return 0;
 }
 
@@ -727,12 +914,14 @@ neighbourhood_maintenance(struct lws_dht_ctx *ctx, int af)
 	if (!id) return 0;
 	id->id[id->len - 1] = (uint8_t)((lws_get_random(ctx->vhost->context, &id->id[id->len - 1], 1), id->id[id->len - 1]) & 0xFF);
 	q = b;
-	if (q->next && (q->count == 0 || ((lws_get_random(ctx->vhost->context, &id->id[0], 1), id->id[0]) & 7) == 0))
-		q = b->next;
-	if (!q || q->count == 0 || ((lws_get_random(ctx->vhost->context, &id->id[0], 1), id->id[0]) & 7) == 0) {
-		struct bucket *r;
-		r = previous_bucket(ctx, b);
-		if (r && r->count > 0)
+	if (bucket_next(q) && (lws_dll2_count(&q->nodes) == 0 ||
+			((lws_get_random(ctx->vhost->context, &id->id[0], 1), id->id[0]) & 7) == 0))
+		q = bucket_next(b);
+	if (!q || lws_dll2_count(&q->nodes) == 0 ||
+	    ((lws_get_random(ctx->vhost->context, &id->id[0], 1), id->id[0]) & 7) == 0) {
+		struct bucket *r = previous_bucket(b);
+
+		if (r && lws_dll2_count(&r->nodes) > 0)
 			q = r;
 	}
 
@@ -751,7 +940,7 @@ neighbourhood_maintenance(struct lws_dht_ctx *ctx, int af)
 			make_tid(tid, "fn", 0);
 			send_find_node(ctx, (struct sockaddr*)&n->ss, n->sslen,
 					tid, 4, id, want,
-					n->reply_time >= ctx->now.tv_sec - LWS_DHT_PING_TIMEOUT_SECS);
+					n->reply_time >= ctx->now - LWS_DHT_PING_TIMEOUT_SECS);
 			mark_as_pinged(ctx, n, q);
 		}
 		lws_dht_hash_destroy(&id);

@@ -38,6 +38,17 @@ struct lws_tls_ctx {
 	br_ec_private_key ec_key;
 	int is_rsa;
 	br_skey_decoder_context skc;
+	/*
+	 * the DER buffer the skey decoder consumed; rsa_key / ec_key point
+	 * into it, so it must be kept until the ctx is destroyed
+	 */
+	uint8_t *key_buf;
+	/*
+	 * .ssl_options_clear / .ssl_client_options_clear as given in the
+	 * creation info: the app's way to lower the protocol floor, see
+	 * lws_bearssl_engine_set_floor()
+	 */
+	long options_clear;
 #if defined(LWS_WITH_TLS_SESSIONS)
 	br_ssl_session_cache_lru lru;
 	uint8_t *lru_buffer;
@@ -53,15 +64,31 @@ struct lws_tls_conn {
 
 	br_x509_minimal_context x509_ctx;
 
-	unsigned char iobuf_in[BR_SSL_BUFSIZE_BIDI];
-	unsigned char iobuf_out[BR_SSL_BUFSIZE_BIDI];
+	/*
+	 * BR_SSL_BUFSIZE_BIDI is the size of the *combined* bidirectional
+	 * buffer, ie, INPUT + OUTPUT... using it for each direction doubles
+	 * the ~33KB per TLS connection an unauthenticated peer can commit
+	 * just by completing the TCP handshake
+	 */
+	unsigned char iobuf_in[BR_SSL_BUFSIZE_INPUT];
+	unsigned char iobuf_out[BR_SSL_BUFSIZE_OUTPUT];
+
+	/*
+	 * A server reads the first record of the ClientHello itself, into
+	 * iobuf_out, to find the SNI before the engine exists: how much of it
+	 * it has so far
+	 */
+	size_t hello_len;
 
 	int is_client;
 	char initialized;
+	/* br_ssl_engine_close() has queued our close_notify */
+	char close_notify_queued;
 
 	struct lws_x509_cert *peer_cert;
 	br_x509_class x509_vtable;
 	int capturing_peer_cert;
+	char peer_cert_verified;
 
 #if defined(LWS_WITH_TLS_JIT_TRUST)
 	struct lws_x509_cert *temp_cert;
@@ -72,6 +99,9 @@ struct lws_tls_conn {
 	size_t pending_app_data_len;
 	struct lws_tls_ctx *ctx;
 	unsigned int tls_use_ssl;
+
+	char **alpn_strings;
+	size_t alpn_strings_count;
 };
 
 typedef struct lws_tls_conn lws_tls_conn;
@@ -81,11 +111,30 @@ typedef void lws_tls_bio;
 struct lws_x509_cert {
 	uint8_t *der;
 	size_t der_len;
+	size_t der_max;	/* allocated size of der */
 };
 typedef struct lws_x509_cert lws_tls_x509;
 
 int lws_bearssl_pump(struct lws *wsi);
 void lws_bearssl_x509_wrap_conn(lws_tls_conn *conn);
 int lws_tls_session_new_bearssl(struct lws *wsi);
+int lws_bearssl_set_alpn(struct lws_tls_conn *conn, const uint8_t *alpn, size_t alpn_len);
+int lws_tls_bearssl_vh_wants_client_certs(struct lws_vhost *vh);
+void lws_bearssl_engine_set_floor(br_ssl_engine_context *eng,
+				  long options_clear);
+
+/*
+ * lws entropy as a BearSSL prng; an entropy failure latches .failed, which
+ * every user must check after the BearSSL operation (see bearssl-x509.c)
+ */
+
+struct lws_br_prng_ctx {
+	const br_prng_class *vtable;
+	struct lws_context *context;
+	char failed;
+};
+
+void
+lws_br_prng_ctx_init(struct lws_br_prng_ctx *prng, struct lws_context *context);
 
 #endif

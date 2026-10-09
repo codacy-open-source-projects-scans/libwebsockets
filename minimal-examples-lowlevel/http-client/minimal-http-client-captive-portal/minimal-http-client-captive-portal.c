@@ -31,7 +31,7 @@ static const struct lws_switches switches[] = {
 #include <signal.h>
 
 static struct lws_context *context;
-static int interrupted, bad = 1, status;
+static int bad = 1, status;
 static lws_state_notify_link_t nl;
 
 /*
@@ -48,7 +48,7 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
 		lwsl_err("CLIENT_CONNECTION_ERROR: %s\n",
 			 in ? (char *)in : "(null)");
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		break;
 
 	case LWS_CALLBACK_ESTABLISHED_CLIENT_HTTP:
@@ -94,13 +94,13 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 
 	case LWS_CALLBACK_COMPLETED_CLIENT_HTTP:
 		lwsl_user("LWS_CALLBACK_COMPLETED_CLIENT_HTTP\n");
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		bad = status != 200;
 		lws_cancel_service(lws_get_context(wsi)); /* abort poll wait */
 		break;
 
 	case LWS_CALLBACK_CLOSED_CLIENT_HTTP:
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		bad = status != 200;
 		lws_cancel_service(lws_get_context(wsi)); /* abort poll wait */
 		break;
@@ -180,7 +180,7 @@ static const struct lws_protocols protocols[] = {
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 /*
@@ -250,7 +250,7 @@ app_system_state_nf(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 
 			if (lws_system_cpd_state_get(cx) != LWS_CPD_INTERNET_OK) {
 				lwsl_warn("%s: There's no internet...\n", __func__);
-				interrupted = 1;
+				lws_default_loop_exit(context);
 				break;
 			}
 
@@ -290,9 +290,8 @@ static lws_state_notify_link_t * const app_notifier_list[] = {
 
 int main(int argc, const char **argv)
 {
-	int logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	
 	struct lws_context_creation_info info;
-	const char *p;
 	(void)switches;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
@@ -303,13 +302,11 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal http client captive portal detect\n");
 
-	memset(&info, 0, sizeof info);
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.port = CONTEXT_PORT_NO_LISTEN;
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 	info.system_ops = &ops;
@@ -327,9 +324,8 @@ int main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (!interrupted)
-		if (lws_service(context, 0))
-			interrupted = 1;
+	while (lws_service(context, 0) >= 0)
+		;
 
 	lws_context_destroy(context);
 

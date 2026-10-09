@@ -53,7 +53,7 @@ static struct lws_protocols protocols[] = {
 };
 
 static struct lws_context *context;
-static int interrupted;
+static int destroy_started;
 static uv_loop_t loop[COUNT_THREADS];
 static uv_signal_t *s, signal_outer[COUNT_THREADS];
 
@@ -102,8 +102,7 @@ void *thread_service(void *threadid)
 	 * The call to lws_service_tsi just starts the related event loop
 	 */
 	while (lws_service_tsi(context, 0,
-			       (int)(lws_intptr_t)threadid) >= 0 &&
-	       !interrupted)
+			       (int)(lws_intptr_t)threadid) >= 0)
 		lwsl_notice("%s\n", __func__);
 
 	lwsl_info("%s: thr %d: exiting\n", __func__, (int)(lws_intptr_t)threadid);
@@ -125,20 +124,25 @@ signal_cb(uv_signal_t *watcher, int signum)
 
 	uv_signal_stop(watcher);
 	uv_close((uv_handle_t *)&signal_outer[n], NULL);
-	if (!interrupted) {
-		interrupted = 1;
+	/*
+	 * lws is a guest on our loops: its off-ramp is lws_context_destroy(),
+	 * once, from whichever thread's watcher saw the signal first.  It
+	 * detaches from the loops asynchronously; lws_service_tsi() returns
+	 * -1 in each thread as its loop empties.
+	 */
+	if (!destroy_started) {
+		destroy_started = 1;
 		lws_context_destroy(context);
 	}
 }
 
 int main(int argc, const char **argv)
 {
-	int n, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	int n;
 	pthread_t pthread_service[COUNT_THREADS];
 	struct lws_context_creation_info info;
 	void *foreign_loops[COUNT_THREADS];
 	int actual_threads;
-	const char *p;
 	void *retval;
 	(void)switches;
 
@@ -148,10 +152,7 @@ int main(int argc, const char **argv)
 	}
 
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal ws server + threads + smp | visit http://localhost:7681\n");
 
 	for (n = 0; n < COUNT_THREADS; n++) {
@@ -164,7 +165,10 @@ int main(int argc, const char **argv)
 		foreign_loops[n] = &loop[n];
 	}
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	/* a server: size the fds tables to the process limit */
+	info.fd_limit_per_thread = 0;
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.port = 7681;
 	info.mounts = &mount;
 	info.pcontext = &context;

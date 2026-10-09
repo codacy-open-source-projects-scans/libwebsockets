@@ -103,7 +103,8 @@ lws_gendtls_create(struct lws_gendtls_ctx *ctx,
 	struct lws_context *context = info->context;
 	enum lws_gendtls_conn_mode mode = info->mode;
 	unsigned int mtu = info->mtu ? info->mtu : 1400;
-	unsigned int timeout_ms = info->timeout_ms ? info->timeout_ms : 1000;
+	unsigned int timeout_ms = info->timeout_ms ? info->timeout_ms :
+						     LWS_GENDTLS_TIMEOUT_DEFAULT_MS;
 	unsigned int flags = GNUTLS_DATAGRAM | GNUTLS_NONBLOCK;
 	int ret;
 
@@ -127,31 +128,36 @@ lws_gendtls_create(struct lws_gendtls_ctx *ctx,
 
 	gnutls_dtls_set_mtu(ctx->session, mtu);
 
-	/* Set default priorities */
-	ret = gnutls_priority_set_direct(ctx->session, "NORMAL", NULL);
+	/*
+	 * Set default priorities.  RFC 8827 6 requires DTLS 1.2 or later; DTLS
+	 * 1.0 drags in the TLS 1.0-era CBC / SHA1 record layer.
+	 */
+	ret = gnutls_priority_set_direct(ctx->session, "NORMAL:-VERS-DTLS1.0",
+					 NULL);
 	if (ret != GNUTLS_E_SUCCESS) {
 		lwsl_err("%s: gnutls_priority_set_direct failed\n", __func__);
 		goto bail;
 	}
 
-#if defined(GNUTLS_SRTP_AES128_CM_HMAC_SHA1_80) /* SRTP is supported in GnuTLS >= 3.1.4 */
+#if 1 /* SRTP is supported in GnuTLS >= 3.1.4 */
 	if (info->use_srtp) {
 		gnutls_srtp_profile_t profiles[4];
 		int n = 0;
+		int i;
 
-		if (strstr(info->use_srtp, "SRTP_AES128_CM_SHA1_80"))
+		if ((char *)strstr(info->use_srtp, "SRTP_AES128_CM_SHA1_80"))
 			profiles[n++] = GNUTLS_SRTP_AES128_CM_HMAC_SHA1_80;
-		if (strstr(info->use_srtp, "SRTP_AES128_CM_SHA1_32"))
+		if ((char *)strstr(info->use_srtp, "SRTP_AES128_CM_SHA1_32"))
 			profiles[n++] = GNUTLS_SRTP_AES128_CM_HMAC_SHA1_32;
-		if (strstr(info->use_srtp, "SRTP_NULL_HMAC_SHA1_80"))
+		if ((char *)strstr(info->use_srtp, "SRTP_NULL_HMAC_SHA1_80"))
 			profiles[n++] = GNUTLS_SRTP_NULL_HMAC_SHA1_80;
-		if (strstr(info->use_srtp, "SRTP_NULL_HMAC_SHA1_32"))
+		if ((char *)strstr(info->use_srtp, "SRTP_NULL_HMAC_SHA1_32"))
 			profiles[n++] = GNUTLS_SRTP_NULL_HMAC_SHA1_32;
 
-		if (n) {
-			ret = gnutls_srtp_set_profile_direct(ctx->session, profiles, n);
+		for (i = 0; i < n; i++) {
+			ret = gnutls_srtp_set_profile(ctx->session, profiles[i]);
 			if (ret != GNUTLS_E_SUCCESS) {
-				lwsl_err("%s: gnutls_srtp_set_profile_direct failed: %s\n",
+				lwsl_err("%s: gnutls_srtp_set_profile failed: %s\n",
 					 __func__, gnutls_strerror(ret));
 				goto bail;
 			}
@@ -174,6 +180,18 @@ lws_gendtls_create(struct lws_gendtls_ctx *ctx,
 	}
 
 	if (mode == LWS_GENDTLS_MODE_SERVER) {
+		/*
+		 * As the DTLS server we must send a CertificateRequest, else
+		 * the peer sends no certificate and there is nothing for the
+		 * caller's a=fingerprint check to bind the media to (RFC 5763
+		 * 5).  GNUTLS_CERT_REQUEST rather than GNUTLS_CERT_REQUIRE, and
+		 * no verification function is installed: DTLS-SRTP peer
+		 * certificates are self-signed by design and the trust anchor
+		 * is the signalled fingerprint, which the caller compares.
+		 */
+		gnutls_certificate_server_set_request(ctx->session,
+						      GNUTLS_CERT_REQUEST);
+
 		ret = gnutls_key_generate(&ctx->cookie_key, GNUTLS_COOKIE_KEY_SIZE);
 		if (ret < 0) {
 			lwsl_err("%s: gnutls_key_generate failed\n", __func__);
@@ -195,7 +213,12 @@ lws_gendtls_create(struct lws_gendtls_ctx *ctx,
 	gnutls_transport_set_errno_function(ctx->session,
 			lws_gendtls_gnutls_errno);
 
-	gnutls_dtls_set_timeouts(ctx->session, timeout_ms, 60000);
+	/*
+	 * info->timeout_ms is the overall handshake deadline (see
+	 * lws-gendtls.h); the per-flight retransmission timeout is the DTLS
+	 * default of 1s.
+	 */
+	gnutls_dtls_set_timeouts(ctx->session, 1000, timeout_ms);
 
 	return 0;
 
@@ -222,6 +245,11 @@ lws_gendtls_destroy(struct lws_gendtls_ctx *ctx)
 	if (ctx->cookie_key.data)
 		gnutls_free(ctx->cookie_key.data);
 
+	/* the cert and key copies taken by set_cert_mem() / set_key_mem() */
+
+	lws_free_set_NULL(ctx->cert_mem);
+	lws_free_set_NULL(ctx->key_mem);
+
 	lws_buflist_destroy_all_segments(&ctx->rx_head);
 	lws_buflist_destroy_all_segments(&ctx->tx_head);
 }
@@ -244,8 +272,9 @@ lws_gendtls_set_cert_mem(struct lws_gendtls_ctx *ctx, const uint8_t *cert, size_
 	if (ctx->key_mem) {
 		gnutls_datum_t c = { ctx->cert_mem, (unsigned int)ctx->cert_len - 1 };
 		gnutls_datum_t k = { ctx->key_mem, (unsigned int)ctx->key_len - 1 };
+		gnutls_x509_crt_fmt_t fmt = (ctx->cert_mem[0] == '-') ? GNUTLS_X509_FMT_PEM : GNUTLS_X509_FMT_DER;
 
-		if (gnutls_certificate_set_x509_key_mem(ctx->cred, &c, &k, GNUTLS_X509_FMT_PEM) < 0) {
+		if (gnutls_certificate_set_x509_key_mem(ctx->cred, &c, &k, fmt) < 0) {
 			lwsl_err("%s: failed to set cert/key\n", __func__);
 			return -1;
 		}
@@ -271,8 +300,9 @@ lws_gendtls_set_key_mem(struct lws_gendtls_ctx *ctx, const uint8_t *key, size_t 
 	if (ctx->cert_mem) {
 		gnutls_datum_t c = { ctx->cert_mem, (unsigned int)ctx->cert_len - 1 };
 		gnutls_datum_t k = { ctx->key_mem, (unsigned int)ctx->key_len - 1 };
+		gnutls_x509_crt_fmt_t fmt = (ctx->cert_mem[0] == '-') ? GNUTLS_X509_FMT_PEM : GNUTLS_X509_FMT_DER;
 
-		if (gnutls_certificate_set_x509_key_mem(ctx->cred, &c, &k, GNUTLS_X509_FMT_PEM) < 0) {
+		if (gnutls_certificate_set_x509_key_mem(ctx->cred, &c, &k, fmt) < 0) {
 			lwsl_err("%s: failed to set cert/key\n", __func__);
 			return -1;
 		}
@@ -431,10 +461,10 @@ lws_gendtls_is_clean(struct lws_gendtls_ctx *ctx)
 const char *
 lws_gendtls_get_srtp_profile(struct lws_gendtls_ctx *ctx)
 {
-#if defined(GNUTLS_SRTP_AES128_CM_HMAC_SHA1_80)
+#if 1
 	gnutls_srtp_profile_t profile = 0;
 
-	if (gnutls_srtp_get_profile(ctx->session, &profile) != GNUTLS_E_SUCCESS)
+	if (gnutls_srtp_get_selected_profile(ctx->session, &profile) != GNUTLS_E_SUCCESS)
 		return NULL;
 
 	switch (profile) {

@@ -20,14 +20,16 @@ enum {
 	LWS_SW_C,
 	LWS_SW_D,
 	LWS_SW_N,
+	LWS_SW_PORT,
 	LWS_SW_HELP,
 };
 
 static const struct lws_switches switches[] = {
-	[LWS_SW_B]	= { "-b",              "Enable -b feature" },
-	[LWS_SW_C]	= { "-c",              "Client connections" },
+	[LWS_SW_B]	= { "-b",              "Send the message as one giant blob" },
+	[LWS_SW_C]	= { "-c",              "Send compressible content" },
 	[LWS_SW_D]	= { "-d",              "Debug logs (e.g. -d 15)" },
-	[LWS_SW_N]	= { "-n",              "Enable -n feature" },
+	[LWS_SW_N]	= { "-n",              "Disable permessage-deflate" },
+	[LWS_SW_PORT]	= { "--port",          "Port to listen on (default 7681)" },
 	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
 };
 
@@ -43,7 +45,8 @@ static struct lws_protocols protocols[] = {
 	LWS_PROTOCOL_LIST_TERM
 };
 
-static int interrupted, options;
+static struct lws_context *context;
+static int options, port = 7681;
 
 /* pass pointers to shared vars to the protocol */
 
@@ -54,16 +57,9 @@ static const struct lws_protocol_vhost_options pvo_options = {
         (void *)&options        /* pvo value */
 };
 
-static const struct lws_protocol_vhost_options pvo_interrupted = {
-        &pvo_options,
-        NULL,
-        "interrupted",          /* pvo name */
-        (void *)&interrupted    /* pvo value */
-};
-
 static const struct lws_protocol_vhost_options pvo = {
         NULL,           /* "next" pvo linked-list */
-        &pvo_interrupted,       /* "child" pvo linked-list */
+        &pvo_options,           /* "child" pvo linked-list */
         "lws-minimal-pmd-bulk", /* protocol name we belong to on this vhost */
         ""              /* ignored */
 };
@@ -89,22 +85,13 @@ static const struct lws_extension extensions[] = {
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	struct lws_context *context;
-	const char *p;
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE
-			/* for LLL_ verbosity above NOTICE to be built into lws,
-			 * lws must have been configured and built with
-			 * -DCMAKE_BUILD_TYPE=DEBUG instead of =RELEASE */
-			/* | LLL_INFO */ /* | LLL_PARSER */ /* | LLL_HEADER */
-			/* | LLL_EXT */ /* | LLL_CLIENT */ /* | LLL_LATENCY */
-			/* | LLL_DEBUG */;
-	(void)switches;
+	int n = 0;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
 		lws_switches_print_help(argv[0], switches, LWS_ARRAY_SIZE(switches));
@@ -114,15 +101,24 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
-	lwsl_user("LWS minimal ws server + permessage-deflate | visit http://localhost:7681\n");
-	lwsl_user("   %s [-n (no exts)] [-c (compressible)] [-b (blob)]\n", argv[0]);
+	{
+		const char *p = lws_cmdline_option(argc, argv,
+						   switches[LWS_SW_PORT].sw);
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
-	info.port = 7681;
+		if (p)
+			port = atoi(p);
+	}
+
+	lwsl_user("LWS minimal ws server + permessage-deflate | visit http://localhost:%d\n", port);
+	lwsl_user("   %s [-n (no exts)] [-c (compressible)] [-b (blob)] [--port <port>]\n", argv[0]);
+
+	lws_context_info_defaults(&info, NULL);
+	/* a server: size the fds tables to the process limit */
+	info.fd_limit_per_thread = 0;
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
+
+	info.port = port;
 	info.mounts = &mount;
 	info.protocols = protocols;
 	info.pvo = &pvo;
@@ -146,7 +142,7 @@ int main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

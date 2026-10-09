@@ -15,25 +15,80 @@ require_lws_config(LWS_WITH_SECURE_STREAMS 1 requirements)
 require_lws_config(LWS_WITH_SECURE_STREAMS_STATIC_POLICY_ONLY 0 requirements)
 require_lws_config(LWS_WITH_SYS_STATE 1 requirements)
 require_lws_config(USE_WOLFSSL 0 requirements)
-require_lws_config(LWS_WITH_TLS 1 requirements)
+require_lws_config(LWS_WITH_TCP_TLS 1 requirements)
+require_lws_config(LWS_WITH_SERVER 1 requirements)
+# the DNS failure tests resolve against a local authoritative mock, so no
+# blocking getaddrinfo() and no external resolver are involved
+require_lws_config(LWS_WITH_SYS_ASYNC_DNS 1 requirements)
+require_lws_config(LWS_WITH_AUTHORITATIVE_DNS 1 requirements)
 
 if (requirements)
 	add_executable(${SAMP} minimal-secure-streams-testsfail.c)
 
 	find_program(VALGRIND "valgrind")
 
-	if (LWS_CTEST_INTERNET_AVAILABLE AND NOT WIN32)
-		if (VALGRIND)
+	if (NOT WIN32)
+		lws_get_free_port(PORT_TF_SRV)
+		lws_get_free_port(PORT_TF_SRV_TLS)
+		lws_get_free_port(PORT_TF_SRV_B_SELF)
+		lws_get_free_port(PORT_TF_DNS)
+
+		configure_file(policy-local.json.in policy-local.json @ONLY)
+
+		#
+		# The mock DNS server is authoritative for sstf.test only: names
+		# in it resolve to the local fixtures, missing names in it get
+		# NXDOMAIN, and anything outside it gets REFUSED.  The test app
+		# and the proxy are pointed at it via the lws async dns env.
+		#
+		configure_file(sstf.test.zone.in
+			       ${CMAKE_CURRENT_BINARY_DIR}/zones/sstf.test_2000000000_2000000000_1.zone @ONLY)
+		if (LWS_IPV4)
+			set(TF_DNS_ADDR "127.0.0.1")
+		else()
+			set(TF_DNS_ADDR "::1")
+		endif()
+		file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/resolv.conf "nameserver ${TF_DNS_ADDR}\n")
+		set(TF_DNS_ENV "LWS_ASYNCDNS_RESOLV_CONF=${CMAKE_CURRENT_BINARY_DIR}/resolv.conf;LWS_ASYNCDNS_PORT=${PORT_TF_DNS}")
+
+		if (VALGRIND AND NOT LWS_WITH_ASAN)
 			add_test(NAME ss-tf COMMAND
 				${VALGRIND} --tool=memcheck --leak-check=yes --num-callers=20
-				$<TARGET_FILE:lws-minimal-secure-streams-testsfail>)
+				$<TARGET_FILE:lws-minimal-secure-streams-testsfail>
+				-c ${CMAKE_CURRENT_BINARY_DIR}/policy-local.json)
 		else()
-			add_test(NAME ss-tf COMMAND lws-minimal-secure-streams-testsfail)
+			add_test(NAME ss-tf COMMAND $<TARGET_FILE:lws-minimal-secure-streams-testsfail>
+				-c ${CMAKE_CURRENT_BINARY_DIR}/policy-local.json -d 1151)
 		endif()
+
+		#
+		# Spin up the local fixtures
+		#
+		add_test(NAME st_hbin COMMAND ${CMAKE_SOURCE_DIR}/scripts/ctest-background.sh hbin $<TARGET_FILE:lws-minimal-http-server-httpbin> -p ${PORT_TF_SRV})
+		add_test(NAME ki_hbin COMMAND ${CMAKE_SOURCE_DIR}/scripts/ctest-background-kill.sh hbin $<TARGET_FILE_NAME:lws-minimal-http-server-httpbin> -p ${PORT_TF_SRV})
+		set_tests_properties(st_hbin PROPERTIES WORKING_DIRECTORY . FIXTURES_SETUP hbin TIMEOUT 800 ENVIRONMENT "SAI_LIST_PORT=${PORT_TF_SRV}")
+		set_tests_properties(ki_hbin PROPERTIES FIXTURES_CLEANUP hbin)
+
+		add_test(NAME st_hbin_tls COMMAND ${CMAKE_SOURCE_DIR}/scripts/ctest-background.sh hbin_tls $<TARGET_FILE:lws-minimal-http-server-httpbin> -s -p ${PORT_TF_SRV_TLS})
+		add_test(NAME ki_hbin_tls COMMAND ${CMAKE_SOURCE_DIR}/scripts/ctest-background-kill.sh hbin_tls $<TARGET_FILE_NAME:lws-minimal-http-server-httpbin> -p ${PORT_TF_SRV_TLS})
+		set_tests_properties(st_hbin_tls PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/minimal-examples-lowlevel/http-server/minimal-http-server-tls FIXTURES_SETUP hbin_tls TIMEOUT 800 ENVIRONMENT "SAI_LIST_PORT=${PORT_TF_SRV_TLS}")
+		set_tests_properties(ki_hbin_tls PROPERTIES FIXTURES_CLEANUP hbin_tls)
+
+		add_test(NAME st_tf_dns COMMAND ${CMAKE_SOURCE_DIR}/scripts/ctest-background.sh tf_dns $<TARGET_FILE:lws-api-test-dns-server> -p ${PORT_TF_DNS} -z ${CMAKE_CURRENT_BINARY_DIR}/zones)
+		add_test(NAME ki_tf_dns COMMAND ${CMAKE_SOURCE_DIR}/scripts/ctest-background-kill.sh tf_dns $<TARGET_FILE_NAME:lws-api-test-dns-server> -p ${PORT_TF_DNS})
+		set_tests_properties(st_tf_dns PROPERTIES WORKING_DIRECTORY . FIXTURES_SETUP tf_dns TIMEOUT 800 ENVIRONMENT "SAI_LIST_PORT=${PORT_TF_DNS};SAI_LIST_IS_UDP=1")
+		set_tests_properties(ki_tf_dns PROPERTIES FIXTURES_CLEANUP tf_dns)
+
+		add_test(NAME st_hbin_b_self COMMAND ${CMAKE_SOURCE_DIR}/scripts/ctest-background.sh hbin_b_self $<TARGET_FILE:lws-minimal-http-server-tls> -p ${PORT_TF_SRV_B_SELF})
+		add_test(NAME ki_hbin_b_self COMMAND ${CMAKE_SOURCE_DIR}/scripts/ctest-background-kill.sh hbin_b_self $<TARGET_FILE_NAME:lws-minimal-http-server-tls> -p ${PORT_TF_SRV_B_SELF})
+		set_tests_properties(st_hbin_b_self PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/minimal-examples-lowlevel/http-server/minimal-http-server-tls FIXTURES_SETUP hbin_b_self TIMEOUT 800 ENVIRONMENT "SAI_LIST_PORT=${PORT_TF_SRV_B_SELF}")
+		set_tests_properties(ki_hbin_b_self PROPERTIES FIXTURES_CLEANUP hbin_b_self)
 
 		set_tests_properties(ss-tf
 				     PROPERTIES
 				     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/minimal-examples-lowlevel/secure-streams/minimal-secure-streams-testsfail
+				     FIXTURES_REQUIRED "tf_dns;hbin;hbin_tls;hbin_b_self"
+				     ENVIRONMENT "${TF_DNS_ENV}"
 				     TIMEOUT 640)
 
 		if (HAS_LWS_WITH_SECURE_STREAMS_PROXY_API OR LWS_WITH_SECURE_STREAMS_PROXY_API)
@@ -58,8 +113,9 @@ if (requirements)
 			add_test(NAME st_sstfproxy COMMAND
 				${CMAKE_SOURCE_DIR}/scripts/ctest-background.sh
 				sstfproxy $<TARGET_FILE:lws-minimal-secure-streams-proxy>
+				-c ${CMAKE_CURRENT_BINARY_DIR}/policy-local.json
 				-i ${CTEST_SOCKET_PATH}  -d1039)
-			set_tests_properties(st_sstfproxy PROPERTIES WORKING_DIRECTORY . FIXTURES_SETUP sstfproxy TIMEOUT 800)
+			set_tests_properties(st_sstfproxy PROPERTIES WORKING_DIRECTORY . FIXTURES_SETUP sstfproxy FIXTURES_REQUIRED "tf_dns;hbin;hbin_tls;hbin_b_self" ENVIRONMENT "${TF_DNS_ENV}" TIMEOUT 800)
 
 			add_test(NAME ki_sstfproxy COMMAND
 				${CMAKE_SOURCE_DIR}/scripts/ctest-background-kill.sh
@@ -71,17 +127,18 @@ if (requirements)
 			# the client part that will connect to the proxy
 			#
 
-			if (VALGRIND)
+			if (VALGRIND AND NOT LWS_WITH_ASAN)
 				add_test(NAME sspc-minimaltf COMMAND
 					${VALGRIND} --tool=memcheck --leak-check=yes --num-callers=20
 					$<TARGET_FILE:lws-minimal-secure-streams-testsfail-client> -i +${CTEST_SOCKET_PATH} -d1039)
 			else()
-				add_test(NAME sspc-minimaltf COMMAND lws-minimal-secure-streams-testsfail-client -i +${CTEST_SOCKET_PATH} -d1039)
+				add_test(NAME sspc-minimaltf COMMAND $<TARGET_FILE:lws-minimal-secure-streams-testsfail-client> -i +${CTEST_SOCKET_PATH} -d1039)
 			endif()
 		
 			set_tests_properties(sspc-minimaltf PROPERTIES
 				WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/minimal-examples-lowlevel/secure-streams/minimal-secure-streams-testsfail
-				FIXTURES_REQUIRED "sstfproxy"
+				FIXTURES_REQUIRED "sstfproxy;tf_dns;hbin;hbin_tls;hbin_b_self"
+				ENVIRONMENT "${TF_DNS_ENV}"
 				TIMEOUT 640)
 
 		endif()
@@ -95,7 +152,7 @@ if (requirements)
 		target_link_libraries(${SAMP} websockets ${LIBWEBSOCKETS_DEP_LIBS})
 	endif()
 
-	CHECK_C_SOURCE_COMPILES("#include <libwebsockets.h>\nint main(void) {\ni#if defined(LWS_WITH_SECURE_STREAMS_PROXY_API)\n return 0;\n #else\n fail\n #endif\n return 0;\n}\n" HAS_LWS_WITH_SECURE_STREAMS_PROXY_API)
+	CHECK_C_SOURCE_COMPILES("#include <libwebsockets.h>\nint main(void) {\n#if defined(LWS_WITH_SECURE_STREAMS_PROXY_API)\n return 0;\n #else\n fail\n #endif\n return 0;\n}\n" HAS_LWS_WITH_SECURE_STREAMS_PROXY_API)
 
 	if (HAS_LWS_WITH_SECURE_STREAMS_PROXY_API OR LWS_WITH_SECURE_STREAMS_PROXY_API)
 		add_compile_options(-DLWS_SS_USE_SSPC)

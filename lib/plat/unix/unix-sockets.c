@@ -55,36 +55,17 @@
 
 #include <netinet/ip.h>
 
+/*
+ * would the socket under wsi, the connection owning it, block a write now.
+ * Asked by IO's lws_io_tx_choked_pollfd() only for a valid socket that is
+ * not under a transport.
+ */
 int
-lws_send_pipe_choked(struct lws *wsi)
+lws_plat_tx_choked(struct lws *wsi)
 {
 	struct lws_pollfd fds;
-	struct lws *wsi_eff;
 
-#if !defined(LWS_WITHOUT_EXTENSIONS)
-	if (wsi->ws && wsi->ws->tx_draining_ext)
-		return 1;
-#endif
-
-#if defined(LWS_WITH_HTTP2)
-	wsi_eff = lws_get_network_wsi(wsi);
-#else
-	wsi_eff = wsi;
-#endif
-
-	/* the fact we checked implies we avoided back-to-back writes */
-	wsi_eff->could_have_pending = 0;
-
-	/* treat the fact we got a truncated send pending as if we're choked */
-	if (lws_has_buffered_out(wsi_eff)
-#if defined(LWS_WITH_HTTP_STREAM_COMPRESSION)
-	    ||wsi->http.comp_ctx.buflist_comp ||
-	    wsi->http.comp_ctx.may_have_more
-#endif
-	    )
-		return 1;
-
-	fds.fd = wsi_eff->desc.sockfd;
+	fds.fd = wsi->io->desc.sockfd;
 	fds.events = POLLOUT;
 	fds.revents = 0;
 
@@ -385,12 +366,15 @@ lws_interface_to_sa(int ipv6, const char *ifname, struct sockaddr_in *addr,
 			continue;
 #endif
 
+#if defined(LWS_WITH_IPV4)
 		case AF_INET:
 #if defined(LWS_WITH_IPV6)
 			if (ipv6) {
 				/* any existing solution is better than this */
 				if (sco != IP_SCORE_NONE)
 					break;
+				if (addrlen < sizeof(struct sockaddr_in6))
+					goto unrepresentable;
 				sco = IP_SCORE_NONNATIVE;
 				rc = LWS_ITOSA_USABLE;
 				/* map IPv4 to IPv6 */
@@ -404,15 +388,30 @@ lws_interface_to_sa(int ipv6, const char *ifname, struct sockaddr_in *addr,
 				lwsl_debug("%s: uplevelling ipv4 bind to ipv6\n", __func__);
 				break;
 			}
-
+#endif
+			if (addrlen < sizeof(struct sockaddr_in))
+				goto unrepresentable;
+#if defined(LWS_WITH_IPV6)
 			sco = IP_SCORE_GLOBAL_NATIVE;
 #endif
 			rc = LWS_ITOSA_USABLE;
 			memcpy(addr, (struct sockaddr_in *)ifc->ifa_addr,
 						    sizeof(struct sockaddr_in));
 			break;
+#endif
 #if defined(LWS_WITH_IPV6)
 		case AF_INET6:
+			/*
+			 * addr6 aliases the caller's buffer, and sin6_addr sits
+			 * at offset 8 of a 24-byte struct sockaddr_in6... so we
+			 * may only touch it if the caller both asked for ipv6
+			 * and gave us something that large.  The AF_INET arm of
+			 * lws_socket_bind() passes a 16-byte struct sockaddr_in
+			 * with ipv6 == 0.
+			 */
+			if (!ipv6 || addrlen < sizeof(struct sockaddr_in6))
+				goto unrepresentable;
+
 			p = (const uint8_t *)
 				&((struct sockaddr_in6 *)ifc->ifa_addr)->sin6_addr;
 			ts = IP_SCORE_IPV6_SCOPE_BASE;
@@ -432,14 +431,43 @@ lws_interface_to_sa(int ipv6, const char *ifname, struct sockaddr_in *addr,
 #endif
 		default:
 			break;
+
+#if defined(LWS_WITH_IPV4) || defined(LWS_WITH_IPV6)
+unrepresentable:
+			/*
+			 * The interface exists, but this address of it is not
+			 * something we may write into what the caller gave us
+			 */
+			if (rc == LWS_ITOSA_NOT_EXIST)
+				rc = LWS_ITOSA_NOT_USABLE;
+			break;
+#endif
 		}
 	}
 
 	freeifaddrs(ifr);
 
-	if (rc &&
-	    !lws_sa46_parse_numeric_address(ifname, (lws_sockaddr46 *)addr))
-		rc = LWS_ITOSA_USABLE;
+	/*
+	 * ifname may be a numeric address literal rather than an interface
+	 * name.  Parse it into a full-width lws_sockaddr46 and copy back only
+	 * as much as fits in the caller's buffer: addr may be as small as a
+	 * struct sockaddr_in (eg, the AF_INET path in lws_socket_bind() passes
+	 * a 16-byte serv_addr4), so casting it to lws_sockaddr46 * and letting
+	 * lws_sa46_parse_numeric_address() memset sizeof(lws_sockaddr46) (28
+	 * bytes when IPv6 is enabled) straight through it overflows that buffer.
+	 */
+	if (rc) {
+		lws_sockaddr46 sa46;
+
+		if (!lws_sa46_parse_numeric_address(ifname, &sa46)) {
+			size_t n = (size_t)sa46_socklen(&sa46);
+
+			if (n > addrlen)
+				n = addrlen;
+			memcpy(addr, &sa46, n);
+			rc = LWS_ITOSA_USABLE;
+		}
+	}
 
 	return rc;
 }
@@ -562,7 +590,11 @@ lws_plat_BINDTODEVICE(lws_sockfd_type fd, const char *ifname)
 	struct ifreq i;
 
 	memset(&i, 0, sizeof(i));
+#if defined(LWS_WITH_IPV4)
 	i.ifr_addr.sa_family = AF_INET;
+#else
+	i.ifr_addr.sa_family = AF_INET6;
+#endif
 	lws_strncpy(i.ifr_ifrn.ifrn_name, ifname,
 		    sizeof(i.ifr_ifrn.ifrn_name));
 	if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, &i, sizeof(i)) < 0) {
@@ -598,6 +630,7 @@ lws_plat_ifconfig(int fd, lws_dhcpc_ifstate_t *is)
 		return 1;
 	}
 
+#if defined(LWS_WITH_IPV4)
 	if (is->sa46[LWSDH_SA46_IP].sa4.sin_family == AF_INET) {
 		struct sockaddr_in sin;
 
@@ -632,6 +665,7 @@ lws_plat_ifconfig(int fd, lws_dhcpc_ifstate_t *is)
 			return 1;
 		}
 	} else
+#endif
 		lws_plat_if_up(is->ifname, fd, 1);
 
 	return 0;

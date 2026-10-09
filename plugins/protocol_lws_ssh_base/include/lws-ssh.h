@@ -29,13 +29,6 @@
 #include <sys/types.h>
 #endif
 
-#if defined(LWS_WITH_MBEDTLS)
-#include "mbedtls/sha1.h"
-#include "mbedtls/sha256.h"
-#include "mbedtls/sha512.h"
-#include "mbedtls/rsa.h"
-#endif
-
 #include "lws-plugin-ssh.h"
 
 #define LWS_SIZE_EC25519	32
@@ -423,6 +416,14 @@ struct lws_kex {
 	uint8_t match_bitfield;
 	uint8_t newkeys; /* which sides newkeys have been applied */
 
+	/*
+	 * The peer's host key name-list is parsed one name at a time; cache
+	 * the type of our host key here so we read + parse the key file once
+	 * per KEX and not once per name the peer chose to send
+	 */
+	char hostkey_type[32];
+	uint8_t hostkey_checked;
+
 	struct lws_ssh_keys keys_next_cts;
 	struct lws_ssh_keys keys_next_stc;
 };
@@ -442,7 +443,7 @@ typedef union {
 struct per_session_data__sshd;
 
 struct lws_ssh_channel {
-	struct lws_ssh_channel *next;
+	lws_dll2_t list; /* membership of pss->ch_list */
 
 	struct per_session_data__sshd *pss;
 
@@ -466,7 +467,7 @@ struct lws_ssh_channel {
 struct per_vhost_data__sshd;
 
 struct per_session_data__sshd {
-	struct per_session_data__sshd *next;
+	lws_dll2_t list;	/* vhd->live_pss_list membership */
 	struct per_vhost_data__sshd *vhd;
 	struct lws *wsi;
 
@@ -476,13 +477,19 @@ struct per_session_data__sshd {
 	uint8_t K[LWS_SIZE_EC25519]; /* shared secret */
 	uint8_t session_id[LWS_SIZE_SHA256]; /* H from first working KEX */
 	char name[64];
+	/*
+	 * name[] is the rx parser's scratch and is rewritten by every string
+	 * the peer sends; the service name has to survive until the deferred
+	 * SERVICE_ACCEPT write task is rendered, so keep a copy of it
+	 */
+	char service[64];
 	char last_auth_req_username[32];
 	char last_auth_req_service[32];
 
 	struct lws_ssh_keys active_keys_cts;
 	struct lws_ssh_keys active_keys_stc;
 	struct lws_ssh_userauth *ua;
-	struct lws_ssh_channel *ch_list;
+	lws_dll2_owner_t ch_list;
 	struct lws_ssh_channel *ch_temp;
 
 	uint8_t *last_alloc;
@@ -520,6 +527,7 @@ struct per_session_data__sshd {
 	uint32_t sent_banner:1;
 	uint32_t seen_auth_req_before:1;
 	uint32_t serviced_stderr_last:1;
+	uint32_t wt_overflow:1; /* a write task had to be dropped */
 	uint32_t kex_state;
 	uint32_t chrq_server_port;
 	uint32_t ch_recip;
@@ -542,7 +550,7 @@ struct per_vhost_data__sshd {
 	struct lws_context *context;
 	struct lws_vhost *vhost;
 	const struct lws_protocols *protocol;
-	struct per_session_data__sshd *live_pss_list;
+	lws_dll2_owner_t live_pss_list;
 	const struct lws_ssh_ops *ops;
 };
 

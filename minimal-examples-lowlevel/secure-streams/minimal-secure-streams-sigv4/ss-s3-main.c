@@ -34,7 +34,8 @@ static const struct lws_switches switches[] = {
 #include "static_policy.h"
 #endif
 
-int interrupted, bad = 1;
+int bad = 1;
+static struct lws_context *context;
 static lws_state_notify_link_t nl;
 extern const lws_ss_info_t s3_ssi;
 
@@ -225,14 +226,13 @@ static lws_state_notify_link_t * const app_notifier_list[] = {
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
-	int logs = LLL_USER | LLL_ERR | LLL_WARN /* | LLL_NOTICE */ ;
+	
 	struct lws_context_creation_info info;
-	struct lws_context *context;
 	int n = 0;
 	(void)switches;
 
@@ -243,14 +243,12 @@ int main(int argc, const char **argv)
 
 
 	signal(SIGINT, sigint_handler);
-	lws_set_log_level(logs, NULL);
 
-	memset(&info, 0, sizeof info);
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	lws_context_info_defaults(&info, NULL);lws_cmdline_option_handle_builtin(argc, argv, &info);
 
 	lwsl_user("LWS minimal secure streams sigv4 \n");
 
-	info.fd_limit_per_thread = 1 + 6 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 6;
 	info.port = CONTEXT_PORT_NO_LISTEN;
 
 #if defined(LWS_SS_USE_SSPC)
@@ -261,7 +259,14 @@ int main(int argc, const char **argv)
 		/* connect to ssproxy via UDS by default, else via
 		 * tcp connection to this port */
 		if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_P].sw)))
-			info.ss_proxy_port = (uint16_t)atoi(p);
+			{
+				int __pt = atoi(p);
+				if (__pt < 0 || __pt > 65535) {
+					lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+					return 1;
+				}
+				info.ss_proxy_port = (uint16_t)__pt;
+			}
 
 		/* UDS "proxy.ss.lws" in abstract namespace, else this socket
 		 * path; when -p given this can specify the network interface
@@ -304,7 +309,7 @@ int main(int argc, const char **argv)
 
 	/* the event loop */
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

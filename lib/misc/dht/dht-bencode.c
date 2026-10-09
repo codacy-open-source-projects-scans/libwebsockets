@@ -40,8 +40,13 @@ dht_strtoull(const char *p, size_t max_len, char **endptr)
 		i++;
 	}
 
+	/*
+	 * Every caller looks at the byte after the digits (for ':' or 'e'):
+	 * if the digits ran to the end of the buffer there is no such byte,
+	 * say so rather than hand back a pointer one past the datagram.
+	 */
 	if (endptr)
-		*endptr = (char *)p + i;
+		*endptr = i < max_len ? (char *)p + i : NULL;
 
 	return n;
 }
@@ -70,10 +75,9 @@ parse_hash(const uint8_t *dict, const uint8_t *end, const char *key,
 
 		if (hash_data && lws_dht_hash_validate(type, len)) {
 			*h_ret = lws_dht_hash_create(type, len, hash_data);
-		} else {
+		} else
 			lwsl_notice("%s: rejecting invalid/unsupported hash type %d len %d\n",
 					__func__, type, len);
-		}
 	}
 }
 
@@ -237,6 +241,47 @@ dht_bencode_get_int(const uint8_t *dict, const uint8_t *end, const char *key)
 	return dht_strtoull((const char *)p + 1, vlen - 1, &q);
 }
 
+/*
+ * The "e" member of a BEP 5 error reply: a list of the numeric code and the
+ * message string, "li203e24:find_node with no targete".  find_key() has
+ * already checked the list is structurally complete inside the datagram, so
+ * vend[-1] is its closing 'e' and both elements lie before it.  The message
+ * is left pointing into the datagram.
+ */
+static int
+parse_error(const uint8_t *buf, const uint8_t *end, struct lws_dht_mparams *mp)
+{
+	const uint8_t *p, *vend;
+	unsigned long long n;
+	size_t vlen;
+	char *q;
+
+	p = dht_bencode_find_key(buf, end, "e", &vlen);
+	if (!p || vlen < 2 || *p != 'l' || p[1] != 'i')
+		return -1;
+	vend = p + vlen;
+	p += 2;
+
+	/* BEP 5 codes are three digits; refuse anything not shaped like one */
+	n = dht_strtoull((const char *)p, lws_ptr_diff_size_t(vend, p), &q);
+	if (!q || q == (char *)p || *q != 'e' || n > 999)
+		return -1;
+	mp->error_code = (int)n;
+	p = (const uint8_t *)q + 1;
+
+	n = dht_strtoull((const char *)p, lws_ptr_diff_size_t(vend, p), &q);
+	if (!q || *q != ':')
+		return -1;
+	p = (const uint8_t *)q + 1;
+	if (p >= vend || n > lws_ptr_diff_size_t(vend - 1, p))
+		return -1;
+
+	mp->error_msg = p;
+	mp->error_msg_len = (size_t)n;
+
+	return 0;
+}
+
 static int
 parse_message(const uint8_t *buf, size_t buflen, struct lws_dht_mparams *mp)
 {
@@ -254,8 +299,13 @@ parse_message(const uint8_t *buf, size_t buflen, struct lws_dht_mparams *mp)
 		return -1;
 	}
 
+	/*
+	 * A tid may use the whole of mp->tid: the notify / ack exchange uses
+	 * 16-byte tids (a subscriber's random one), which must survive here
+	 * for the ack to find the pending notification it answers.
+	 */
 	p = dht_bencode_get_string(buf, end, "t", &l);
-	if (p && l > 0 && l < sizeof(mp->tid)) {
+	if (p && l > 0 && l <= sizeof(mp->tid)) {
 		memcpy(mp->tid, p, l);
 		mp->tid_len = l;
 	} else
@@ -307,28 +357,17 @@ parse_message(const uint8_t *buf, size_t buflen, struct lws_dht_mparams *mp)
 		break;
 
 	case 'e':
+		/*
+		 * A peer refusing a query of ours.  It carries no sender id
+		 * and no a / r dict, so none of the member handling below
+		 * applies to it.
+		 */
+		if (parse_error(buf, end, mp))
+			return -1;
+
 		return DHT_ERROR;
 	default:
 		return -1;
-	}
-
-	p = dht_memmem(buf, buflen, "5:token", 7);
-	if (p) {
-		size_t l;
-		char *q;
-
-		l = dht_strtoull((char*)p + 7,
-			buflen - lws_ptr_diff_size_t(p + 7, buf), &q);
-		if (q && (uint8_t *)q < buf + buflen && *q == ':' && l > 0 && l < mp->token_len) {
-			if (l > lws_ptr_diff_size_t(end, (const uint8_t *)(q + 1))) {
-				lwsl_notice("%s: Token length invalid", __func__);
-				lwsl_hexdump_notice(buf, buflen);
-				goto fail;
-			}
-			memcpy(mp->token, q + 1, l);
-			mp->token_len = l;
-		} else
-			mp->token_len = 0;
 	}
 
 	if (!meta || *meta != 'd') {
@@ -461,55 +500,33 @@ parse_message(const uint8_t *buf, size_t buflen, struct lws_dht_mparams *mp)
 	} else
 		mp->sender_ip_len = 0;
 
-	if (dht_memmem(buf, buflen, "1:y1:r", 6) || dht_memmem(buf, buflen, "1:y1:re", 7))
-		return DHT_REPLY;
-	if (dht_memmem(buf, buflen, "1:y1:e", 6))
-		return DHT_ERROR;
-	if (!dht_memmem(buf, buflen, "1:y1:q", 6))
-		return -1;
-	/* Parse query type robustly */
-	{
-		uint8_t *p = dht_memmem(buf, buflen, "1:q", 3);
-		if (p) {
-			char *endptr;
-			long qlen;
-			/* Value should be string: "N:value" */
-			qlen = (long)dht_strtoull((char*)p + 3,
-				buflen - lws_ptr_diff_size_t(p + 3, buf), &endptr);
-
-			if (endptr && (uint8_t *)endptr < buf + buflen && *endptr == ':') {
-				p = (uint8_t *)endptr + 1;
-				/*
-				 * Check bounds? buflen unknown relative to p here easily without math.
-				 * Assuming dht_memmem ensures it's within buf.
-				 */
-				if (qlen == 4 && memcmp(p, "ping", 4) == 0)
-					return DHT_PING;
-				if (qlen == 9 && memcmp(p, "find_node", 9) == 0)
-					return DHT_FIND_NODE;
-				if (qlen == 9 && memcmp(p, "get_peers", 9) == 0)
-					return DHT_GET_PEERS;
-				if (qlen == 13 && memcmp(p, "announce_peer", 13) == 0)
-					return DHT_ANNOUNCE_PEER;
-				if (qlen == 4 && memcmp(p, "data", 4) == 0)
-					return DHT_DATA;
-				if (qlen == 9 && memcmp(p, "subscribe", 9) == 0)
-					return DHT_SUBSCRIBE;
-				if (qlen == 17 && memcmp(p, "subscribe_confirm", 17) == 0)
-					return DHT_SUBSCRIBE_CONFIRM;
-				if (qlen == 6 && memcmp(p, "notify", 6) == 0)
-					return DHT_NOTIFY;
-
-				lwsl_dht_rx_warn("%s: Unknown q: %.*s\n", __func__, (int)qlen, p);
-			}
-		}
-	}
+	/*
+	 * The message type was determined structurally from the y / q fields
+	 * at the top of this function.  An earlier version re-classified the
+	 * datagram here by searching the raw bytes for fragments like "1:y1:r",
+	 * which match inside attacker-chosen string values as easily as in the
+	 * real fields and so could misroute a query as a reply (or vice versa).
+	 */
 
 	return message;
-
-fail:
-	return -1;
 }
+
+#if defined(LWS_WITH_DHT_BACKEND)
+/*
+ * Did we send this node something it could be replying to?  A known node
+ * with a ping outstanding qualifies, if the reply comes from the endpoint we
+ * sent it to; an address we never spoke to does not, whatever id it claims.
+ */
+static int
+lws_dht_reply_solicited(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id,
+			const struct sockaddr *from)
+{
+	struct node *n = id ? find_node(ctx, id, from->sa_family) : NULL;
+
+	return n && n->pinged &&
+	       dht_sa_same_peer((const struct sockaddr *)&n->ss, from);
+}
+#endif
 
 static void
 lws_dht_reply_pong(struct lws_dht_ctx *ctx, struct lws_dht_mparams *mp,
@@ -517,25 +534,92 @@ lws_dht_reply_pong(struct lws_dht_ctx *ctx, struct lws_dht_mparams *mp,
 {
 	lwsl_dht_rx("%s: Pong!\n", __func__);
 #if defined(LWS_WITH_DHT_BACKEND)
-	maybe_new_node(ctx, mp->id, from, fromlen, 2);
+	/*
+	 * A pong only confirms a node we pinged; nothing stops anyone
+	 * sending y=r from any address, and confirming those would let a
+	 * blind sender promote itself to a good node.  Unsolicited replies
+	 * may introduce a candidate, which we ping before trusting.
+	 */
+	maybe_new_node(ctx, mp->id, from, fromlen,
+		       lws_dht_reply_solicited(ctx, mp->id, from) ? 2 : 1);
 #endif
+}
+
+/*
+ * Is this "sb" reply the answer to a subscribe we sent, from the node we
+ * sent it to?  Each pending subscribe is answered once.  If so, \p ih is
+ * set to the hash that subscribe was for.
+ */
+
+static int
+lws_dht_sb_pending_take(struct lws_dht_ctx *ctx, unsigned short seq,
+			const struct sockaddr *from, lws_dht_hash_t *ih)
+{
+	int n;
+
+	for (n = 0; n < (int)LWS_ARRAY_SIZE(ctx->sb_pending); n++)
+		if (ctx->sb_pending[n].sslen &&
+		    ctx->sb_pending[n].seq == seq &&
+		    ctx->sb_pending[n].sent >=
+				ctx->now - LWS_DHT_PING_TIMEOUT_SECS &&
+		    dht_sa_same_peer((const struct sockaddr *)
+				     &ctx->sb_pending[n].ss, from)) {
+			ctx->sb_pending[n].sslen = 0;
+			ih->type = ctx->sb_pending[n].ih_type;
+			ih->len	 = ctx->sb_pending[n].ih_len;
+			memcpy(ih->id, ctx->sb_pending[n].ih, ih->len);
+
+			return 1;
+		}
+
+	return 0;
 }
 
 static void
 lws_dht_reply_nodes(struct lws_dht_ctx *ctx, struct lws_dht_mparams *mp,
 		    const struct sockaddr *from, size_t fromlen)
 {
-	int gp = 0;
+	/* the hash the request this answers was about */
+	uint8_t ihbuf[sizeof(lws_dht_hash_t) + LWS_GENHASH_LARGEST];
+	lws_dht_hash_t *ih = (lws_dht_hash_t *)ihbuf;
+	int gp = 0, bound = 0;
 #if defined(LWS_WITH_DHT_BACKEND)
 	struct search *sr = NULL;
 #endif
 	unsigned short ttid;
 	size_t offset;
 
-	if (tid_match(mp->tid, "gp", &ttid)) {
+	ih->len = 0;
+
+	if (tid_match(mp->tid, "sb", &ttid)) {
+		/*
+		 * Replies are free and unlimited, and the dnssec plugin
+		 * answers a subscription token with a larger datagram to the
+		 * sender: only a reply to a subscribe of ours, from where we
+		 * sent it, may surface one
+		 */
+		bound = lws_dht_sb_pending_take(ctx, ttid, from, ih);
+		if (!bound)
+			lwsl_dht_rx_warn("%s: subscribe reply with no subscribe "
+					 "outstanding\n", __func__);
+	} else if (tid_match(mp->tid, "gp", &ttid)) {
 		gp = 1;
 #if defined(LWS_WITH_DHT_BACKEND)
 		sr = find_search(ctx, ttid, from->sa_family);
+		/*
+		 * find_search() matches on the 16-bit tid alone, so bind the
+		 * reply to the address we actually sent that tid to before we
+		 * let it touch the search: otherwise anyone who guesses a tid
+		 * can stuff our lookup with his own nodes, token and values.
+		 * The reply may still teach the routing table below.
+		 */
+		if (sr && !search_awaiting_reply_from(ctx, sr, from)) {
+			lwsl_dht_rx_warn("%s: get_peers reply from an address "
+					 "with no request outstanding\n",
+					 __func__);
+			sr = NULL;
+		}
+		bound = !!sr;
 #endif
 	}
 
@@ -544,16 +628,26 @@ lws_dht_reply_nodes(struct lws_dht_ctx *ctx, struct lws_dht_mparams *mp,
 			gp ? " for get_peers" : "");
 
 #if defined(LWS_WITH_DHT_BACKEND)
-	/* Credit the sender for replying so their pinged count resets to 0 */
-	maybe_new_node(ctx, mp->id, from, fromlen, 2);
+	/*
+	 * Credit the sender for replying so their pinged count resets to 0,
+	 * but only if we actually asked them (a search or subscribe of ours
+	 * had this tid outstanding to this address, or we pinged the node):
+	 * see the pong
+	 */
+	maybe_new_node(ctx, mp->id, from, fromlen,
+		       (bound || lws_dht_reply_solicited(ctx, mp->id, from)) ?
+									2 : 1);
 #endif
 
 	if (ctx->legacy && (mp->nodes_len % LWS_DHT_NODE_INFO_LEGACY_IP4_VLEN != 0 ||
 			    mp->nodes6_len % LWS_DHT_NODE_INFO_LEGACY_IP6_VLEN != 0)) {
+		/*
+		 * Dropped, not blacklisted: a reply's source is unverified,
+		 * so blacklisting it would let a spoofer have any node he
+		 * names evicted and refused (the sibling sites were fixed
+		 * the same way in C-496)
+		 */
 		lwsl_dht_rx_warn("%s: Unexpected length for node info\n", __func__);
-#if defined(LWS_WITH_DHT_BACKEND)
-		blacklist_node(ctx, mp->id, from, fromlen);
-#endif
 		return;
 	}
 
@@ -670,11 +764,22 @@ lws_dht_reply_nodes(struct lws_dht_ctx *ctx, struct lws_dht_mparams *mp,
 	}
 #endif
 
-	if (mp->token_len > 0) {
-		if (ctx->cb) {
-			(*ctx->cb)(ctx->closure, LWS_DHT_EVENT_TOKEN, mp->id, mp->token, mp->token_len, from, fromlen);
-		}
+	/*
+	 * Only a token in reply to a request of ours to this node is news
+	 * for the app, the same as the values below.  It is reported with
+	 * the hash that request was for, which is what the app must name
+	 * when it uses the token.
+	 */
+#if defined(LWS_WITH_DHT_BACKEND)
+	if (sr && sr->id->len <= LWS_GENHASH_LARGEST) {
+		ih->type = sr->id->type;
+		ih->len	 = sr->id->len;
+		memcpy(ih->id, sr->id->id, ih->len);
 	}
+#endif
+	if (bound && ih->len && mp->token_len > 0 && ctx->cb)
+		(*ctx->cb)(ctx->closure, LWS_DHT_EVENT_TOKEN, ih, mp->token,
+			   mp->token_len, from, fromlen);
 
 	if (mp->values_len > 0 || mp->values6_len > 0) {
 		lwsl_dht_rx("%s: Got values (%d+%d)\n", __func__, (int)(mp->values_len / LWS_DHT_NODE_INFO_IP4_VLEN), (int)(mp->values6_len / LWS_DHT_NODE_INFO_IP6_VLEN));
@@ -702,20 +807,52 @@ lws_dht_reply_nodes(struct lws_dht_ctx *ctx, struct lws_dht_mparams *mp,
 		search_send_get_peers(ctx, sr, NULL);
 #endif
 
-#if defined(LWS_WITH_DHT_BACKEND)
-	if (0) {
-	}
-#endif
 }
 
 #if defined(LWS_WITH_DHT_BACKEND)
+/*
+ * The search node an announce_peer reply acknowledges, or NULL if we have no
+ * announce outstanding to that node at that address.
+ *
+ * search_step() only sends announce_peer to nodes that already answered the
+ * search's get_peers, and only on a search with a port to announce; the
+ * request time it stamps then is cleared again by the ack.  So the node must
+ * have replied, not yet acked, have been sent the announce recently, and be
+ * both the id and the endpoint we sent it to: the 16-bit tid alone goes out
+ * in every get_peers of the search and proves nothing about the sender.
+ */
+static struct search_node *
+search_announce_awaiting_ack(struct lws_dht_ctx *ctx, struct search *sr,
+			     const lws_dht_hash_t *id,
+			     const struct sockaddr *from)
+{
+	int i;
+
+	if (!sr->port)
+		return NULL;
+
+	for (i = 0; i < sr->numnodes; i++) {
+		struct search_node *n = &sr->nodes[i];
+
+		if (!n->replied || n->acked || !n->request_time ||
+		    n->request_time < ctx->now - LWS_DHT_PING_TIMEOUT_SECS)
+			continue;
+
+		if (!id_cmp(n->id, id) &&
+		    dht_sa_same_peer((const struct sockaddr *)&n->ss, from))
+			return n;
+	}
+
+	return NULL;
+}
+
 static void
 lws_dht_reply_announce(struct lws_dht_ctx *ctx, struct lws_dht_mparams *mp,
 		       const struct sockaddr *from, size_t fromlen)
 {
+	struct search_node *n;
 	struct search *sr;
 	unsigned short ttid;
-	size_t i;
 
 	if (!tid_match(mp->tid, "ap", &ttid))
 		return;
@@ -726,22 +863,63 @@ lws_dht_reply_announce(struct lws_dht_ctx *ctx, struct lws_dht_mparams *mp,
 		return;
 	}
 
+	/*
+	 * Like the get_peers reply, only an ack from the node we sent the
+	 * announce to, at the address we sent it to, may touch the search or
+	 * confirm the sender: otherwise anyone who learns the tid can mark
+	 * our announcement stored without it being sent, and promote himself
+	 * (or relocate a known node id to his address) to a good node without
+	 * ever answering a ping.
+	 */
+	n = search_announce_awaiting_ack(ctx, sr, mp->id, from);
+	if (!n) {
+		lwsl_dht_rx_warn("%s: announce reply from a node with no "
+				 "announce outstanding\n", __func__);
+		return;
+	}
+
 	lwsl_dht_rx("%s: Announce peer reply!\n", __func__);
 
 	maybe_new_node(ctx, mp->id, from, fromlen, 2);
 
-	for (i = 0; i < (size_t)sr->numnodes; i++)
-		if (id_cmp(sr->nodes[i].id, mp->id) == 0) {
-			sr->nodes[i].request_time = 0;
-			sr->nodes[i].reply_time = (time_t)lws_now_secs();
-			sr->nodes[i].acked = 1;
-			sr->nodes[i].pinged = 0;
-			break;
-		}
+	n->request_time	= 0;
+	n->reply_time	= ctx->now;
+	n->acked	= 1;
+	n->pinged	= 0;
 
 	search_send_get_peers(ctx, sr, NULL);
 }
 #endif
+
+/*
+ * A peer answered something we sent it with a BEP 5 error ("y":"e").  It
+ * names no sender id, so there is nothing to confirm the source against, and
+ * it changes nothing in our tables: it is reported to the application with
+ * the address it came from, which is as unauthenticated as any datagram's.
+ */
+static void
+lws_dht_rx_error(struct lws_dht_ctx *ctx, const struct lws_dht_mparams *mp,
+		 const struct sockaddr *from, size_t fromlen)
+{
+	struct lws_dht_error_info ei;
+
+	lwsl_dht_rx("%s: error reply %d '%.*s' (tid len %d)\n", __func__,
+		    mp->error_code, (int)mp->error_msg_len,
+		    (const char *)mp->error_msg, (int)mp->tid_len);
+
+	if (!ctx->cb)
+		return;
+
+	memset(&ei, 0, sizeof(ei));
+	ei.tid		= mp->tid;
+	ei.tid_len	= mp->tid_len;
+	ei.message	= (const char *)mp->error_msg;
+	ei.message_len	= mp->error_msg_len;
+	ei.code		= mp->error_code;
+
+	ctx->cb(ctx->closure, LWS_DHT_EVENT_ERROR, NULL, &ei, sizeof(ei),
+		from, fromlen);
+}
 
 int
 lws_dht_process_packet(struct lws_dht_ctx *ctx, const void *buf, size_t buflen,
@@ -753,9 +931,9 @@ lws_dht_process_packet(struct lws_dht_ctx *ctx, const void *buf, size_t buflen,
 	memset(&mp, 0, sizeof(mp));
 	mp.offset = (uint64_t)-1;
 
-	ctx->now.tv_sec = (time_t)lws_now_secs();
+	ctx->now = (time_t)lws_now_secs();
 
-	if (is_martian(from))
+	if (is_martian(ctx, from))
 		return 0;
 
 	if (node_blacklisted(ctx, from, fromlen)) {
@@ -764,7 +942,11 @@ lws_dht_process_packet(struct lws_dht_ctx *ctx, const void *buf, size_t buflen,
 	}
 
 	message = parse_message(buf, buflen, &mp);
-	if (message < 0 || message == DHT_ERROR || lws_dht_hash_is_zero(mp.id)) {
+	if (message == DHT_ERROR) {
+		lws_dht_rx_error(ctx, &mp, from, fromlen);
+		goto done;
+	}
+	if (message < 0 || lws_dht_hash_is_zero(mp.id)) {
 		ctx->stats_current.rx_drops++;
 		lwsl_dht_rx_warn("%s: Unparseable message. msg=%d id_ptr=%p\n", __func__, message, mp.id);
 		goto done;
@@ -784,21 +966,65 @@ lws_dht_process_packet(struct lws_dht_ctx *ctx, const void *buf, size_t buflen,
 		goto done;
 	}
 
-	if (message > DHT_REPLY && message != DHT_DATA) {
-		/* Rate limit requests. */
-#if defined(LWS_WITH_DHT_BACKEND)
-		if (!token_bucket(ctx)) {
+	/*
+	 * Rate limit requests.
+	 *
+	 * This used to read "message > DHT_REPLY", which was correct for the
+	 * original enum where REPLY was 1 and every request sorted above it.
+	 * With the lws numbering (see private-lib-misc-dht.h) that expression
+	 * selects only DHT_ERROR (already dropped above) and DHT_PING, ie, it
+	 * had stopped limiting anything that matters.  Enumerate the request
+	 * verbs explicitly instead so renumbering cannot silently disable it
+	 * again.
+	 *
+	 * DHT_DATA stays outside the limiter: it is one chunk of an in-progress
+	 * reliable transfer rather than a standalone query, and 100/s would
+	 * throttle legitimate bulk transfer.  Its cost is bounded instead by
+	 * the LWS_DHT_MAX_TS cap on concurrent sequencers.
+	 */
+	if (message == DHT_PING || message == DHT_FIND_NODE ||
+	    message == DHT_GET_PEERS || message == DHT_ANNOUNCE_PEER ||
+	    message == DHT_SUBSCRIBE || message == DHT_SUBSCRIBE_CONFIRM ||
+	    message == DHT_NOTIFY) {
+		/* in every build: a frontend-only one still acks notify */
+		if (!lws_dht_admit_request(ctx, mp.id, from)) {
 			ctx->stats_current.rx_drops++;
 			lwsl_dht_warn("%s: Dropping request due to rate limiting\n", __func__);
 			goto done;
 		}
-#endif
 	} else if (message == DHT_REPLY && mp.sender_ip_len) {
-		/* Track reported external address */
+		/*
+		 * A reply to our external-address probe, telling us what our
+		 * address looks like from outside.  It counts only if it
+		 * carries the random nonce we sent to that very node and comes
+		 * from where we sent it, once per probe; each host (IP address)
+		 * gets one vote however many ports it answers from, and nothing
+		 * is believed until a quorum of distinct hosts agree.
+		 */
 		struct sockaddr_storage ss;
 		size_t sslen;
-		int found = 0, j;
-		int is_nonce_validated = 0;
+		int found = -1, j, k, flag, probe = -1, quorum;
+
+		if (mp.tid_len != LWS_DHT_IP_PROBE_TID_LEN ||
+		    !tid_match(mp.tid, "ip", NULL))
+			goto skip_ip_tracking;
+
+		for (j = 0; j < ctx->ip_probe_count; j++)
+			if (!ctx->ip_probes[j].answered &&
+			    ctx->ip_probes[j].sslen == fromlen &&
+			    dht_sa_same_peer((const struct sockaddr *)
+					     &ctx->ip_probes[j].ss, from) &&
+			    !lws_timingsafe_bcmp(ctx->ip_probes[j].nonce,
+						 mp.tid + 2,
+						 LWS_DHT_IP_PROBE_NONCE_LEN)) {
+				probe = j;
+				break;
+			}
+
+		if (probe < 0) {
+			lwsl_dht_warn("%s: IP tracking reply matches no probe, dropped\n", __func__);
+			goto skip_ip_tracking;
+		}
 
 		memset(&ss, 0, sizeof(ss));
 		if (mp.sender_ip_len == 4) {
@@ -814,114 +1040,149 @@ lws_dht_process_packet(struct lws_dht_ctx *ctx, const void *buf, size_t buflen,
 			sin6->sin6_port = htons(mp.sender_port);
 			sslen = sizeof(*sin6);
 		}
-
-		if (tid_match(mp.tid, "ip", NULL)) {
-			uint16_t decoded_seq;
-			memcpy(&decoded_seq, mp.tid + 2, 2);
-			if (decoded_seq == ctx->ip_monitor_seqno) {
-				is_nonce_validated = 1;
-				lwsl_notice("%s: IP Challenge matched sequence %u from %s!\n", __func__, decoded_seq, (ss.ss_family == AF_INET ? "IPv4" : "IPv6"));
-			} else {
-				lwsl_dht_warn("%s: Spurious IP tracking reply dropped!\n", __func__);
-			}
-		}
-
-		if (!is_nonce_validated)
+		/*
+		 * The quorum is counted over the probes of the reported
+		 * address's family: a v4 node reporting a v6 address for us
+		 * would be its own quorum of one.  A node can only see us on
+		 * the family it was probed on.
+		 */
+		if (ss.ss_family != ctx->ip_probes[probe].ss.ss_family) {
+			lwsl_dht_warn("%s: IP tracking reply family mismatch, dropped\n", __func__);
 			goto skip_ip_tracking;
+		}
+		ctx->ip_probes[probe].answered = 1;
+		flag = (ss.ss_family == AF_INET) ? 1 : 2;
 
-		for (j = 0; j < ctx->num_reported_ads; j++) {
+		for (j = 0; j < ctx->num_reported_ads; j++)
 			if (ctx->reported_ads[j].sslen == sslen &&
 			    !memcmp(&ctx->reported_ads[j].ss, &ss, sslen)) {
-				int k, peer_found = 0;
-				for (k = 0; k < ctx->reported_ads[j].num_peers; k++) {
-					if (!memcmp(&ctx->reported_ads[j].peer_ss[k], from, fromlen)) {
-						peer_found = 1;
-						break;
-					}
-				}
-				if (!peer_found && ctx->reported_ads[j].num_peers < 8) {
-					memcpy(&ctx->reported_ads[j].peer_ss[ctx->reported_ads[j].num_peers++], from, fromlen);
-				}
-
-				if (!peer_found)
-					ctx->reported_ads[j].count++;
-				found = 1;
-				int flag = (ss.ss_family == AF_INET) ? 1 : 2;
-				if (!peer_found && (!(ctx->external_ads_set & flag) || ctx->reported_ads[j].count <= 8)) {
-					struct lws_dht_consensus_info ci;
-					memset(&ci, 0, sizeof(ci));
-					memcpy(&ci.ss, &ss, sslen);
-					ci.sslen = sslen;
-					ci.num_peers = ctx->reported_ads[j].num_peers;
-					for (k = 0; k < ci.num_peers; k++)
-						memcpy(&ci.peer_ss[k], &ctx->reported_ads[j].peer_ss[k], sizeof(struct sockaddr_storage));
-
-					if (!(ctx->external_ads_set & flag)) {
-						lwsl_notice("%s: reached initial consensus on external address (%s)\n", __func__, ss.ss_family == AF_INET ? "IPv4" : "IPv6");
-						ctx->external_ads_set |= flag;
-					}
-
-					if (ctx->cb)
-						ctx->cb(ctx->closure,
-							ss.ss_family == AF_INET ?
-								LWS_DHT_EVENT_EXTERNAL_ADDR :
-								LWS_DHT_EVENT_EXTERNAL_ADDR6,
-							NULL, &ci, sizeof(ci), from, fromlen);
-				}
+				found = j;
 				break;
 			}
+
+		if (found < 0) {
+			if (ctx->num_reported_ads >= (int)LWS_ARRAY_SIZE(ctx->reported_ads))
+				goto skip_ip_tracking;
+			found = ctx->num_reported_ads++;
+			memset(&ctx->reported_ads[found], 0, sizeof(ctx->reported_ads[found]));
+			ctx->reported_ads[found].ss = ss;
+			ctx->reported_ads[found].sslen = sslen;
 		}
 
-		/* If the verified return address shifts away from ANY tracked consensus, we accept it as a confirmed network shift */
-		int flag = (ss.ss_family == AF_INET) ? 1 : 2;
-		if ((ctx->external_ads_set & flag) && !found) {
+		{
+			int peer_found = 0;
+
+			/*
+			 * One vote per host: a host that holds several routing
+			 * table entries on different ports was probed on each,
+			 * but it is still one witness
+			 */
+			for (k = 0; k < ctx->reported_ads[found].num_peers; k++)
+				if (!lws_sa46_compare_ads((const lws_sockaddr46 *)
+						&ctx->reported_ads[found].peer_ss[k],
+						(const lws_sockaddr46 *)from)) {
+					peer_found = 1;
+					break;
+				}
+			if (peer_found)
+				goto skip_ip_tracking;
+			if (ctx->reported_ads[found].num_peers <
+			    (int)LWS_ARRAY_SIZE(ctx->reported_ads[found].peer_ss))
+				memcpy(&ctx->reported_ads[found].peer_ss[ctx->reported_ads[found].num_peers++],
+				       from, fromlen);
+			ctx->reported_ads[found].count++;
+		}
+
+		/*
+		 * Three distinct probed hosts agreeing is what we want, but a
+		 * small network may not contain three hosts to ask: then the
+		 * quorum is every host of this family the round could be sent
+		 * to, which is all the confirmation that exists.  ip_probes[]
+		 * is what we sent, so a peer cannot deflate it, and since it
+		 * is counted by IP address, a host cannot inflate it with
+		 * extra ports either.  A two-node network still learns its
+		 * address.
+		 */
+		quorum = 0;
+		for (j = 0; j < ctx->ip_probe_count; j++) {
+			if (ctx->ip_probes[j].ss.ss_family != ss.ss_family)
+				continue;
+
+			for (k = 0; k < j; k++)
+				if (!lws_sa46_compare_ads((const lws_sockaddr46 *)
+						&ctx->ip_probes[k].ss,
+						(const lws_sockaddr46 *)
+						&ctx->ip_probes[j].ss))
+					break;
+			if (k == j) /* first probe to this host */
+				quorum++;
+		}
+		if (quorum > 3)
+			quorum = 3;
+		if (quorum < 1)
+			quorum = 1;
+
+		if (ctx->reported_ads[found].count < quorum)
+			goto skip_ip_tracking; /* no quorum yet */
+
+		{
 			struct lws_dht_consensus_info ci;
+			const void *marker = NULL;
+
 			memset(&ci, 0, sizeof(ci));
 			memcpy(&ci.ss, &ss, sslen);
 			ci.sslen = sslen;
-			ci.num_peers = 1;
-			memcpy(&ci.peer_ss[0], from, fromlen);
+			ci.num_peers = ctx->reported_ads[found].num_peers;
+			for (k = 0; k < ci.num_peers; k++)
+				memcpy(&ci.peer_ss[k], &ctx->reported_ads[found].peer_ss[k],
+				       sizeof(struct sockaddr_storage));
 
-			lwsl_notice("%s: actively validated new external address shift!\n", __func__);
-			if (ctx->cb) {
-			/* High level plugins will differentiate via lws_extip_report(cx, LWS_EXTIP_SRC_DHT, sa46, af, 1) */
-				ctx->cb(ctx->closure,
-						ss.ss_family == AF_INET ?
-							LWS_DHT_EVENT_EXTERNAL_ADDR :
-							LWS_DHT_EVENT_EXTERNAL_ADDR6,
-						(const void*)"SHIFT", &ci, sizeof(ci), from, fromlen);
-			}
+			if (!ctx->reported_ads[found].confirmed) {
+				ctx->reported_ads[found].confirmed = 1;
+				if (!(ctx->external_ads_set & flag)) {
+					lwsl_notice("%s: reached consensus on external address (%s), %d agreeing nodes, quorum %d\n", __func__, ss.ss_family == AF_INET ? "IPv4" : "IPv6", ctx->reported_ads[found].count, quorum);
+					ctx->external_ads_set |= flag;
+					lws_dht_bep42_own_id(ctx,
+						(const struct sockaddr *)&ss);
+				} else {
+					/*
+					 * A quorum of probed hosts agree on a
+					 * different address than the one
+					 * confirmed before: the network
+					 * shifted.  Forget the old one.
+					 */
+					lwsl_notice("%s: consensus on new external address, shift!\n", __func__);
+					marker = "SHIFT";
+					for (j = 0; j < ctx->num_reported_ads; j++)
+						if (j != found &&
+						    ctx->reported_ads[j].ss.ss_family == ss.ss_family) {
+							/*
+							 * Drop the superseded
+							 * tally along with its
+							 * confirmation: a peer
+							 * already in its list
+							 * can never report it
+							 * again, so leaving the
+							 * tally would pin the
+							 * address below quorum
+							 * for good and we would
+							 * never notice a shift
+							 * back to it.
+							 */
+							ctx->reported_ads[j].confirmed = 0;
+							ctx->reported_ads[j].count = 0;
+							ctx->reported_ads[j].num_peers = 0;
+						}
+				}
+			} else if (ctx->reported_ads[found].count > 8)
+				goto skip_ip_tracking; /* enough said */
 
-			/* Clear our old tallies so we start tracking the new one natively */
-			ctx->num_reported_ads = 0;
-		}
-
-		if (!found && ctx->num_reported_ads < (int)LWS_ARRAY_SIZE(ctx->reported_ads)) {
-			ctx->reported_ads[ctx->num_reported_ads].ss = ss;
-			ctx->reported_ads[ctx->num_reported_ads].sslen = sslen;
-			ctx->reported_ads[ctx->num_reported_ads].count = 1;
-			ctx->reported_ads[ctx->num_reported_ads].num_peers = 1;
-			memcpy(&ctx->reported_ads[ctx->num_reported_ads].peer_ss[0], from, fromlen);
-
-			struct lws_dht_consensus_info ci;
-			memset(&ci, 0, sizeof(ci));
-			memcpy(&ci.ss, &ss, sslen);
-			ci.sslen = sslen;
-			ci.num_peers = 1;
-			memcpy(&ci.peer_ss[0], from, fromlen);
-
-			if (!(ctx->external_ads_set & flag)) {
-				lwsl_notice("%s: reached initial consensus on external address (%s)\n", __func__, ss.ss_family == AF_INET ? "IPv4" : "IPv6");
-				ctx->external_ads_set |= flag;
-			}
 			if (ctx->cb)
 				ctx->cb(ctx->closure,
 					ss.ss_family == AF_INET ?
 						LWS_DHT_EVENT_EXTERNAL_ADDR :
 						LWS_DHT_EVENT_EXTERNAL_ADDR6,
-					NULL, &ci, sizeof(ci), from, fromlen);
-
-			ctx->num_reported_ads++;
+					marker, &ci, sizeof(ci), from, fromlen);
 		}
 skip_ip_tracking:
 		;
@@ -929,25 +1190,37 @@ skip_ip_tracking:
 
 	switch(message) {
 	case DHT_REPLY:
-		if (mp.tid_len != 4 && mp.tid_len != 16) {
-			lwsl_dht_rx_warn("%s: Broken node truncates transaction ids\n", __func__);
-#if defined(LWS_WITH_DHT_BACKEND)
-			blacklist_node(ctx, mp.id, from, fromlen);
-#endif
-			break;
-		}
-		if (mp.tid_len == 16) {
-#if defined(LWS_WITH_DHT_BACKEND)
-			lws_dht_clear_pending_notify(ctx, mp.tid, mp.tid_len);
-#endif
-			break;
-		}
-		if (tid_match(mp.tid, "pn", NULL) || tid_match(mp.tid, "nt", NULL) || tid_match(mp.tid, "ip", NULL)) {
+		if (mp.tid_len == LWS_DHT_IP_PROBE_TID_LEN &&
+		    tid_match(mp.tid, "ip", NULL)) {
+			/* the pong to an external-address probe */
 			ctx->stats_current.rx_pong++;
 			lws_dht_reply_pong(ctx, &mp, from, fromlen);
 			break;
 		}
-		if (tid_match(mp.tid, "fn", NULL) || tid_match(mp.tid, "gp", NULL)) {
+		if (mp.tid_len != 4 && mp.tid_len != 16) {
+			/*
+			 * Not blacklisted: a reply's source is unverified, so a
+			 * malformed one with a spoofed source would blacklist
+			 * whoever the attacker names for us
+			 */
+			lwsl_dht_rx_warn("%s: Broken node truncates transaction ids\n", __func__);
+			break;
+		}
+		if (mp.tid_len == 16) {
+#if defined(LWS_WITH_DHT_BACKEND)
+			lws_dht_clear_pending_notify(ctx, mp.tid, mp.tid_len,
+						     from);
+#endif
+			break;
+		}
+		if (tid_match(mp.tid, "pn", NULL) || tid_match(mp.tid, "nt", NULL)) {
+			ctx->stats_current.rx_pong++;
+			lws_dht_reply_pong(ctx, &mp, from, fromlen);
+			break;
+		}
+		/* a subscribe is answered like a get_peers: nodes + token */
+		if (tid_match(mp.tid, "fn", NULL) || tid_match(mp.tid, "gp", NULL) ||
+		    tid_match(mp.tid, "sb", NULL)) {
 			lws_dht_reply_nodes(ctx, &mp, from, fromlen);
 			break;
 		}
@@ -971,7 +1244,8 @@ skip_ip_tracking:
 
                 int p2 = 0;
                 if (from->sa_family == AF_INET) p2 = ntohs(((struct sockaddr_in *)from)->sin_port);
-				lwsl_err("%s: ACK received from %s:%d (len %d) but no sequencer found!\n", __func__, ads, p2, (int)fromlen);
+                else if (from->sa_family == AF_INET6) p2 = ntohs(((struct sockaddr_in6 *)from)->sin6_port);
+				lwsl_info("%s: Duplicate/Late ACK received from %s:%d (len %d) - no active sequencer\n", __func__, ads, p2, (int)fromlen);
 
                 lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&ctx->ts_owner)) {
                     lws_dht_ts_t *dts = lws_container_of(d, lws_dht_ts_t, list);
@@ -979,7 +1253,8 @@ skip_ip_tracking:
                     lws_sa46_write_numeric_address((lws_sockaddr46 *)&dts->sa, d_ads, sizeof(d_ads));
                     int p1 = 0;
                     if (dts->sa.ss_family == AF_INET) p1 = ntohs(((struct sockaddr_in *)&dts->sa)->sin_port);
-                    lwsl_err("   ... Active Sequencer in pool: dest %s:%d (family %d vs %d)\n", d_ads, p1, dts->sa.ss_family, from->sa_family);
+                    else if (dts->sa.ss_family == AF_INET6) p1 = ntohs(((struct sockaddr_in6 *)&dts->sa)->sin6_port);
+                    lwsl_debug("   ... Active Sequencer in pool: dest %s:%d (family %d vs %d)\n", d_ads, p1, dts->sa.ss_family, from->sa_family);
                 } lws_end_foreach_dll(d);
 			}
 			break;
@@ -989,7 +1264,7 @@ skip_ip_tracking:
 		lwsl_dht_rx_warn("%s: Unexpected reply (tid '%.*s' len %d)\n", __func__, (int)mp.tid_len, mp.tid, (int)mp.tid_len);
 		lwsl_hexdump_dht(buf, buflen);
 #if defined(LWS_WITH_DHT_BACKEND)
-		blacklist_node(ctx, mp.id, from, fromlen);
+		(void)0; /* not blacklisted: unverified source, see above */
 #endif
 		break;
 
@@ -1007,6 +1282,16 @@ skip_ip_tracking:
 		ctx->stats_current.rx_find_node++;
 		lwsl_dht_rx("%s: Find node!\n", __func__);
 #if defined(LWS_WITH_DHT_BACKEND)
+		/*
+		 * A find_node without a target, or with one the validator
+		 * refused, leaves mp.target NULL; the closest-nodes walk
+		 * compares against it.  Refuse it like the sibling verbs do.
+		 */
+		if (!mp.target) {
+			send_error(ctx, from, fromlen, mp.tid, mp.tid_len,
+				   203, "find_node with no target");
+			goto fail;
+		}
 		maybe_new_node(ctx, mp.id, from, fromlen, 1);
 #endif
 		lwsl_dht_rx("%s: Sending closest nodes (%d)\n", __func__, mp.want);
@@ -1029,7 +1314,15 @@ skip_ip_tracking:
 		{
 			struct storage *st = find_storage(ctx, mp.info_hash);
 
+			/*
+			 * The freshly derived token must actually go out in
+			 * the reply: send_closest_nodes() only includes the
+			 * token member when token_len is set, and without it
+			 * peers can never announce on this hash, since a
+			 * valid token is what authorize announce_peer.
+			 */
 			make_token(ctx, from, 0, mp.token);
+			mp.token_len = TOKEN_SIZE;
 
 			/* Has it? */
 			if (st && st->numpeers > 0) {
@@ -1057,39 +1350,79 @@ skip_ip_tracking:
 		/* Validation passed, register the subscriber */
 		{
 			struct storage *st = find_storage(ctx, mp.info_hash);
-			struct subscriber *sub;
-			int found = 0;
+			struct subscriber *sub = NULL;
+			uint8_t key[16], skey[16];
+			int found = 0, from_src = 0;
+
+			if (dht_source_key(from, key))
+				goto fail;
 
 			if (!st) {
+				if (lws_dll2_count(&ctx->storage) >= DHT_MAX_HASHES)
+					goto fail;
+
 				st = lws_zalloc(sizeof(*st), "dht storage");
 				if (!st) goto fail;
 				st->id = lws_dht_hash_dup(mp.info_hash);
-				st->next = ctx->storage;
-				ctx->storage = st;
+				if (!st->id) {
+					lws_free(st);
+					goto fail;
+				}
+				lws_dll2_add_head(&st->list, &ctx->storage);
 			}
 
-			sub = st->subscribers;
-			while (sub) {
-				if (sub->sslen == fromlen && !memcmp(&sub->ss, from, fromlen) &&
-				    sub->tid_len == mp.tid_len && !memcmp(sub->tid, mp.tid, mp.tid_len)) {
+			/*
+			 * A subscriber is an endpoint: a renewed confirm from
+			 * it, whatever tid it now wants its notifies under,
+			 * refreshes its one entry.  Keying on (endpoint, tid)
+			 * let one source take a slot per tid it made up, so
+			 * with 32 datagrams an hour it held every slot of a
+			 * hash and real subscribers were refused.  New
+			 * endpoints also get only a small share per source,
+			 * like announced peers (C-073).
+			 */
+			lws_start_foreach_dll(struct lws_dll2 *, d,
+					      lws_dll2_get_head(&st->subscribers)) {
+				sub = lws_container_of(d, struct subscriber, list);
+
+				if (dht_sa_same_peer((const struct sockaddr *)
+						     &sub->ss, from)) {
 					found = 1;
 					break;
 				}
-				sub = sub->next;
-			}
+				if (!dht_source_key((const struct sockaddr *)
+						    &sub->ss, skey) &&
+				    sub->ss.ss_family == from->sa_family &&
+				    !memcmp(skey, key, sizeof(key)))
+					from_src++;
+			} lws_end_foreach_dll(d);
 
 			if (!found) {
+				if (from_src >= LWS_DHT_MAX_SUBSCRIBERS_PER_SRC) {
+					lwsl_dht_rx_warn("%s: source subscriber "
+							 "limit reached\n",
+							 __func__);
+					goto fail;
+				}
+				/* the scan above is O(n) per packet: cap n */
+				if (lws_dll2_count(&st->subscribers) >=
+						    LWS_DHT_MAX_SUBSCRIBERS) {
+					lwsl_dht_rx_warn("%s: subscriber limit "
+							 "reached\n", __func__);
+					goto fail;
+				}
+
 				sub = lws_zalloc(sizeof(*sub), "dht subscriber");
 				if (!sub) goto fail;
 				memcpy(&sub->ss, from, fromlen);
 				sub->sslen = fromlen;
-				memcpy(sub->tid, mp.tid, mp.tid_len);
-				sub->tid_len = mp.tid_len;
-				sub->next = st->subscribers;
-				st->subscribers = sub;
+				lws_dll2_add_head(&sub->list, &st->subscribers);
 			}
 
-			sub->expire = ctx->now.tv_sec + 3600; /* 1 hour TTL */
+			/* notifies go out under the tid it asked for last */
+			memcpy(sub->tid, mp.tid, mp.tid_len);
+			sub->tid_len = mp.tid_len;
+			sub->expire = ctx->now + 3600; /* 1 hour TTL */
 			memcpy(sub->current_sha256, mp.sha256, 32);
 
 			/* Acknowledge */
@@ -1128,7 +1461,14 @@ skip_ip_tracking:
 			struct lws_transport_sequencer *ts;
 			lwsl_dht_rx("%s: Received reliable data payload (%d bytes, offset %llu)\n",
 				    __func__, (int)mp.data_len, (unsigned long long)mp.offset);
-			ts = lws_dht_get_ts(ctx, from, fromlen, 1);
+			/*
+			 * Making a sequencer for a source we have never heard
+			 * from costs ~160KB of allocation and an ACK to an
+			 * unverified address: that is rate limited, and the
+			 * sequencer won't repeat anything to such a source
+			 * until it has acknowledged it
+			 */
+			ts = lws_dht_ts_rx(ctx, from, fromlen, mp.id);
 			if (ts)
 				lws_transport_sequencer_rx(ts, mp.offset, mp.data, mp.data_len);
 		}

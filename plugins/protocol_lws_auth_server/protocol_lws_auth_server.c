@@ -25,6 +25,11 @@
 #include <string.h>
 #include <time.h>
 
+/* auth_peer_is_own(): close() for the UDP source-address probe */
+#if !defined(WIN32)
+#include <unistd.h>
+#endif
+
 #define LWS_AUTH_MAX_COOKIE_LEN LWS_SSO_MAX_COOKIE
 
 static const char * const param_names[] = {
@@ -41,7 +46,13 @@ static const char * const param_names[] = {
 	"code",
 	"client_secret",
 	"code_verifier",
-	"service_name"
+	"service_name",
+	"device_code",
+	"user_code",
+	"email",
+	"reset_token",
+	"new_password",
+	"h"
 };
 
 enum enum_param_names {
@@ -59,8 +70,108 @@ enum enum_param_names {
         EP_CLIENT_SECRET,
         EP_CODE_VERIFIER,
         EP_SERVICE_NAME,
+        EP_DEVICE_CODE,
+        EP_USER_CODE,
+        EP_EMAIL,
+        EP_RESET_TOKEN,
+        EP_NEW_PASS,
+        EP_VERIFY_HASH,
         EP_COUNT
 };
+
+/*
+ * F-048: worst-case composed cookie *clearing* Set-Cookie (empty value +
+ * Expires):  cookie_name (<= 63, vhd cap) + '=' + "; Path=/" (8) +
+ * "; Domain=" (9) + cookie_domain (<= 127, vhd cap) + "; Expires=" (10) +
+ * RFC 1123 date (29) + "; Max-Age=0" (11) + "; HttpOnly; SameSite=Lax;
+ * Secure" (32) + NUL.  The logout / session-destroy paths used to compose
+ * these into 256-byte buffers with lws_snprintf, which silently truncated
+ * exactly the Expires / Max-Age=0 / HttpOnly / SameSite / Secure tail when
+ * cookie_domain approached its 127-byte cap, so the browser never actually
+ * cleared the cookie and the empty value was emitted without HttpOnly /
+ * Secure.  Composition goes through the fail-closed lws_http_cookie_compose()
+ * (F-022 class) and this sizing, matching the login plugin's conversion.
+ */
+#define AUTH_SERVER_CLEAR_COOKIE_SZ \
+	(63 + 1 + 8 + 9 + 127 + 10 + 29 + 11 + 32 + 1)
+
+/*
+ * How many clearing Set-Cookies a session teardown emits: the session
+ * JWT, auth_csrf and auth_refresh_session, each in its Domain-scoped and
+ * its host-only form.
+ */
+#define AUTH_SERVER_CLEAR_COOKIES 6
+
+/*
+ * Room for a whole response header block.
+ *
+ * It has to hold the status line, content-type and content-length, the
+ * no-cache trio, any CSP the mount adds, and then the Set-Cookies.  A single
+ * session Set-Cookie carries a JWT and is composed into a buffer of
+ * LWS_SSO_MAX_COOKIE, so it alone may be that big; a successful login emits
+ * two of them (the session JWT and auth_refresh_session), and a session
+ * teardown emits AUTH_SERVER_CLEAR_COOKIES clearing ones.
+ *
+ * Sizing this block for one cookie guaranteed failure for exactly the
+ * responses that emit more than one, and the failure drops the connection
+ * with no response at all: the peer sees a closed socket rather than a
+ * status, so a successful login is indistinguishable from the network being
+ * down.
+ */
+#define AUTH_SERVER_RESP_HDR_SZ						\
+	((2 * LWS_SSO_MAX_COOKIE) +					\
+	 (AUTH_SERVER_CLEAR_COOKIES * AUTH_SERVER_CLEAR_COOKIE_SZ) + 1024)
+
+/*
+ * How often an idle admin ws re-checks the session it was opened with, so an
+ * expiry or a revocation nobody announced still closes it
+ */
+#define AUTH_ADMIN_WS_RECHECK_US	(10 * LWS_US_PER_SEC)
+
+/*
+ * Add one response header, saying exactly what did not fit when it does not.
+ * Returns 0 if it was added, 1 if it would not fit (the caller must fail the
+ * response: a truncated header block is not recoverable).
+ */
+static int
+auth_add_hdr(struct lws *wsi, const char *name, const char *value,
+	     uint8_t **p, uint8_t *end)
+{
+	if (!lws_add_http_header_by_name(wsi, (const unsigned char *)name,
+					 (const unsigned char *)value,
+					 (int)strlen(value), p, end))
+		return 0;
+
+	lwsl_wsi_err(wsi, "response header '%s' (%d bytes of value) did not "
+			  "fit: %d bytes left of a %d byte header block",
+		     name, (int)strlen(value), (int)lws_ptr_diff(end, *p),
+		     (int)AUTH_SERVER_RESP_HDR_SZ);
+
+	return 1;
+}
+
+/*
+ * F-048: compose one of the logout / session-destroy *clearing* Set-Cookies
+ * (empty value, Expires at epoch, Max-Age=0) into out
+ * (AUTH_SERVER_CLEAR_COOKIE_SZ bytes); domain may be NULL / "" for the
+ * host-only variant.  On failure out is emptied and the error logged: the
+ * caller must skip the cookie rather than emit a truncated attribute tail --
+ * a clearing cookie missing its Expires / Max-Age=0 / HttpOnly / SameSite /
+ * Secure tail is not actually cleared by the browser, so the session would
+ * survive logout on shared machines.
+ */
+static void
+auth_server_clear_cookie(char *out, const char *name, const char *domain,
+			 const char *expires)
+{
+	if (lws_http_cookie_compose(out, AUTH_SERVER_CLEAR_COOKIE_SZ, name,
+				    "", domain, 0, expires) < 0) {
+		lwsl_err("auth-server: clearing Set-Cookie for %s too "
+			 "large for the composed buffer (domain %d)",
+			 name, domain ? (int)strlen(domain) : 0);
+		out[0] = '\0';
+	}
+}
 
 struct per_vhost_data__auth_server {
 	struct lws_context		*context;
@@ -79,9 +190,12 @@ struct per_vhost_data__auth_server {
 	char				email_from[128];
 	char				email_subject[256];
 	char				email_body[1024];
-	const lws_smtp_client_ops_t	*smtp;
+	struct lws_smtpc		*smtp;
 	lws_dll2_owner_t		ip_strikes;
+	lws_dll2_owner_t		user_strikes; /* per account, keyed on name */
 	lws_dll2_owner_t		ip_bans;
+	/* comma-separated addresses whose X-Forwarded-For we believe */
+	char				trusted_proxies[256];
 	char				jwks_json[8192];
 	char				ui_title[256];
 	char				ui_subtitle[256];
@@ -143,6 +257,15 @@ struct per_session_data__auth_server {
 	unsigned int                    http_response_code;
 	int                             totp_required;
 	struct lws_buflist              *tx_buflist;
+
+	/*
+	 * admin ws only: the session it was authorised with at the upgrade,
+	 * since the cookie is gone by the time the ops arrive
+	 */
+	char				ws_did[128];
+	uint64_t			ws_exp;
+	uint32_t			ws_uid;
+	uint32_t			ws_sec;
 };
 
 static const char *schema_init =
@@ -152,7 +275,9 @@ static const char *schema_init =
 	"  username VARCHAR UNIQUE,"
 	"  password_hash VARCHAR,"
 	"  salt VARCHAR,"
-	"  totp_secret VARCHAR"
+	"  totp_secret VARCHAR,"
+	"  session_epoch INTEGER DEFAULT 0,"
+	"  totp_last INTEGER DEFAULT 0"
 	");"
 	"CREATE TABLE IF NOT EXISTS services ("
 	"  service_id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -202,6 +327,30 @@ static const char *schema_init =
 	"  uid INTEGER REFERENCES users(uid),"
 	"  issue_time INTEGER,"
 	"  ip_address TEXT"
+	");"
+	"CREATE TABLE IF NOT EXISTS device_codes ("
+	"  device_code VARCHAR PRIMARY KEY,"
+	"  user_code VARCHAR,"
+	"  uid INTEGER,"
+	"  expires INTEGER,"
+	"  status INTEGER"
+	");"
+	"CREATE TABLE IF NOT EXISTS devices ("
+	"  device_id VARCHAR PRIMARY KEY,"
+	"  uid INTEGER REFERENCES users(uid),"
+	"  name VARCHAR,"
+	"  created INTEGER"
+	");"
+	"CREATE TABLE IF NOT EXISTS password_recovery ("
+	"  token VARCHAR PRIMARY KEY,"
+	"  uid INTEGER REFERENCES users(uid),"
+	"  expires INTEGER"
+	");"
+	"CREATE TABLE IF NOT EXISTS backup_codes ("
+	"  code VARCHAR,"
+	"  uid INTEGER REFERENCES users(uid),"
+	"  used INTEGER DEFAULT 0,"
+	"  PRIMARY KEY(code, uid)"
 	");";
 
 static int
@@ -239,20 +388,72 @@ lws_auth_totp_compute(const char *secret_b32, uint64_t t, uint32_t *code)
 	return 0;
 }
 
+/*
+ * Verify a TOTP code, and on success report *which* counter matched in
+ * *matched_t, so the caller can refuse a second use of it (RFC 6238 5.2: the
+ * verifier must not accept the same OTP twice).  Without that, a code
+ * observed once -- shoulder-surfed, phished through a proxy, or read out of a
+ * logged form post -- stayed usable for the whole +-1 window, ~90s.
+ */
 static int
-lws_auth_totp_verify(const char *secret_b32, uint32_t code)
+lws_auth_totp_verify(const char *secret_b32, uint32_t code, uint64_t *matched_t)
 {
 	uint64_t t = (uint64_t)time(NULL) / 30;
 	uint32_t c;
 	int i;
 
 	/* check current, previous, and next window to allow for clock drift */
-	for (i = -1; i <= 1; i++)
-		if (!lws_auth_totp_compute(secret_b32, (uint64_t)((int64_t)t + i), &c) &&
-		    c == code)
+	for (i = -1; i <= 1; i++) {
+		uint64_t tt = (uint64_t)((int64_t)t + i);
+
+		if (!lws_auth_totp_compute(secret_b32, tt, &c) && c == code) {
+			*matched_t = tt;
+
 			return 0;
+		}
+	}
 
 	return -1;
+}
+
+static int
+pbkdf2_sha512(const char *password, const char *salt, int iterations, uint8_t *out_hash)
+{
+	struct lws_genhmac_ctx ctx;
+	uint8_t u[64];
+	uint8_t salt_block[256];
+	size_t salt_len = strlen(salt);
+	int i, j;
+
+	if (salt_len > sizeof(salt_block) - 4) return -1;
+	memcpy(salt_block, salt, salt_len);
+	salt_block[salt_len] = 0;
+	salt_block[salt_len+1] = 0;
+	salt_block[salt_len+2] = 0;
+	salt_block[salt_len+3] = 1;
+
+	/* U_1 */
+	if (lws_genhmac_init(&ctx, LWS_GENHMAC_TYPE_SHA512, (const uint8_t *)password, strlen(password))) return -1;
+	if (lws_genhmac_update(&ctx, salt_block, salt_len + 4)) {
+		/* a failed update leaves the backend context to free */
+		lws_genhmac_destroy(&ctx, NULL);
+		return -1;
+	}
+	if (lws_genhmac_destroy(&ctx, u)) return -1;
+
+	memcpy(out_hash, u, 64);
+
+	for (i = 1; i < iterations; i++) {
+		if (lws_genhmac_init(&ctx, LWS_GENHMAC_TYPE_SHA512, (const uint8_t *)password, strlen(password))) return -1;
+		if (lws_genhmac_update(&ctx, u, 64)) {
+			lws_genhmac_destroy(&ctx, NULL);
+			return -1;
+		}
+		if (lws_genhmac_destroy(&ctx, u)) return -1;
+		for (j = 0; j < 64; j++)
+			out_hash[j] ^= u[j];
+	}
+	return 0;
 }
 
 static int
@@ -264,18 +465,62 @@ lws_auth_issue_jwt(struct per_vhost_data__auth_server *vhd,
 	char temp[2048]; /* scratchpad for JWK/JWS generation */
 	uint64_t now = (uint64_t)time(NULL);
 	uint64_t exp = now + vhd->jwt_validity_secs;
+	sqlite3_stmt *stmt;
+	uint32_t session_epoch = 0;
+
+	if (sqlite3_prepare_v2(vhd->db, "SELECT session_epoch FROM users WHERE uid = ?", -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_int(stmt, 1, (int)uid);
+		if (sqlite3_step(stmt) == SQLITE_ROW)
+			session_epoch = (uint32_t)sqlite3_column_int(stmt, 0);
+		sqlite3_finalize(stmt);
+	}
 
 	/* The format string maps directly to the JWS payload */
 	int sig_ret = lws_jwt_sign_compact(vhd->context, &vhd->jwk, vhd->jwt_alg,
 	                         out, out_len, temp, sizeof(temp),
-	                         "{\"iss\":\"%s\",\"sub\":\"%s\",\"uid\":%u,"
+	                         "{\"iss\":\"%s\",\"sub\":\"%s\",\"uid\":%u,\"sec\":%u,"
 	                         "\"iat\":%llu,\"exp\":%llu%s%s}",
-	                         vhd->auth_domain, username, uid,
+	                         vhd->auth_domain, username, uid, session_epoch,
 	                         (unsigned long long)now, (unsigned long long)exp,
 	                         claims_json ? "," : "",
 	                         claims_json ? claims_json : "");
 	if (sig_ret) {
 		lwsl_err("JWT sig failed (%d)\n", sig_ret);
+		return sig_ret;
+	}
+
+	return 0;
+}
+
+static int
+lws_auth_issue_device_jwt(struct per_vhost_data__auth_server *vhd,
+                          const char *username, uint32_t uid, const char *device_id,
+                          const char *claims_json,
+                          char *out, size_t *out_len)
+{
+	char temp[2048];
+	uint64_t now = (uint64_t)time(NULL);
+	uint64_t exp = now + (10ULL * 365 * 24 * 3600); /* 10 years */
+	sqlite3_stmt *stmt;
+	uint32_t session_epoch = 0;
+
+	if (sqlite3_prepare_v2(vhd->db, "SELECT session_epoch FROM users WHERE uid = ?", -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_int(stmt, 1, (int)uid);
+		if (sqlite3_step(stmt) == SQLITE_ROW)
+			session_epoch = (uint32_t)sqlite3_column_int(stmt, 0);
+		sqlite3_finalize(stmt);
+	}
+
+	int sig_ret = lws_jwt_sign_compact(vhd->context, &vhd->jwk, vhd->jwt_alg,
+	                         out, out_len, temp, sizeof(temp),
+	                         "{\"iss\":\"%s\",\"sub\":\"%s\",\"uid\":%u,\"sec\":%u,"
+	                         "\"did\":\"%s\",\"iat\":%llu,\"exp\":%llu%s%s}",
+	                         vhd->auth_domain, username, uid, session_epoch, device_id,
+	                         (unsigned long long)now, (unsigned long long)exp,
+	                         claims_json ? "," : "",
+	                         claims_json ? claims_json : "");
+	if (sig_ret) {
+		lwsl_err("Device JWT sig failed (%d)\n", sig_ret);
 		return sig_ret;
 	}
 
@@ -350,6 +595,66 @@ lws_auth_generate_token(struct per_vhost_data__auth_server *vhd,
 }
 
 static int
+lws_auth_generate_device_token(struct per_vhost_data__auth_server *vhd,
+                               const char *username, uint32_t uid,
+                               const char *device_id, const char *peer_ip,
+                               char *out, size_t *out_len)
+{
+	char claims[512];
+	char *p = claims;
+	char *end = claims + sizeof(claims);
+	sqlite3_stmt *stmt;
+	const char *query =
+		"SELECT s.name, g.grant_level "
+		"FROM grants g JOIN services s ON g.service_id = s.service_id "
+		"WHERE g.uid = ?";
+	int first = 1;
+
+	p += lws_snprintf(p, lws_ptr_diff_size_t(end, p), "\"grants\":{");
+
+	if (sqlite3_prepare_v2(vhd->db, query, -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_int(stmt, 1, (int)uid);
+		while (sqlite3_step(stmt) == SQLITE_ROW) {
+			const char *svc_name = (const char *)sqlite3_column_text(stmt, 0);
+			int level = sqlite3_column_int(stmt, 1);
+
+			if (!svc_name)
+				continue;
+
+			if (!first)
+				p += lws_snprintf(p, lws_ptr_diff_size_t(end, p), ",");
+			first = 0;
+
+			p += lws_snprintf(p, lws_ptr_diff_size_t(end, p),
+				"\"%s\":%d", svc_name, level);
+		}
+		sqlite3_finalize(stmt);
+	}
+
+	(void)lws_snprintf(p, lws_ptr_diff_size_t(end, p), "}");
+
+	if (vhd->auth_log_limit > 0 && peer_ip && peer_ip[0]) {
+		if (sqlite3_prepare_v2(vhd->db, "INSERT INTO auth_log (uid, issue_time, ip_address) VALUES (?, ?, ?)", -1, &stmt, NULL) == SQLITE_OK) {
+			sqlite3_bind_int(stmt, 1, (int)uid);
+			sqlite3_bind_int64(stmt, 2, (sqlite_int64)time(NULL));
+			sqlite3_bind_text(stmt, 3, peer_ip, -1, SQLITE_STATIC);
+			sqlite3_step(stmt);
+			sqlite3_finalize(stmt);
+		}
+
+		if (sqlite3_prepare_v2(vhd->db, "DELETE FROM auth_log WHERE uid = ? AND rowid NOT IN (SELECT rowid FROM auth_log WHERE uid = ? ORDER BY issue_time DESC LIMIT ?)", -1, &stmt, NULL) == SQLITE_OK) {
+			sqlite3_bind_int(stmt, 1, (int)uid);
+			sqlite3_bind_int(stmt, 2, (int)uid);
+			sqlite3_bind_int(stmt, 3, (int)vhd->auth_log_limit);
+			sqlite3_step(stmt);
+			sqlite3_finalize(stmt);
+		}
+	}
+
+	return lws_auth_issue_device_jwt(vhd, username, uid, device_id, claims, out, out_len);
+}
+
+static int
 lws_auth_check_credentials(struct per_vhost_data__auth_server *vhd,
                            const char *username, const char *password,
                            uint32_t *uid)
@@ -357,7 +662,6 @@ lws_auth_check_credentials(struct per_vhost_data__auth_server *vhd,
 	sqlite3_stmt *stmt;
 	const char *query = "SELECT uid, password_hash, salt FROM users WHERE username = ?";
         const char *stored_hash, *salt;
-        struct lws_genhash_ctx ctx;
         uint8_t hash[64]; /* SHA-512 outputs 64 bytes */
 	char hex[129]; /* 64 * 2 + 1 */
 	int match = -1;
@@ -370,7 +674,20 @@ lws_auth_check_credentials(struct per_vhost_data__auth_server *vhd,
 	sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
 
 	if (sqlite3_step(stmt) != SQLITE_ROW) {
+		/*
+		 * Do the same work for an unknown username as for a known one.
+		 * Returning here immediately while a real account pays 100000
+		 * PBKDF2 rounds is an unambiguous account-existence oracle:
+		 * the response is identical either way, but the latency
+		 * differs by tens of ms, needing no statistics at all.  The
+		 * result is discarded; only the cost matters.
+		 */
+		uint8_t dummy[64];
+
 		lwsl_notice("CHECK_CREDENTIALS: User '%s' not found in DB\n", username);
+		(void)pbkdf2_sha512(password,
+				    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+				    100000, dummy);
                 goto bail;
 	}
 
@@ -380,31 +697,16 @@ lws_auth_check_credentials(struct per_vhost_data__auth_server *vhd,
 
 	// lwsl_notice("CHECK_CREDENTIALS: user='%s'\n", username);
 
-	/* hash the input password with SHA-512 and salt */
-	if (!stored_hash || !salt || lws_genhash_init(&ctx, LWS_GENHASH_TYPE_SHA512)) {
-		lwsl_notice("CHECK_CREDENTIALS: init failed\n");
-		goto bail;
-	}
-
-	if (lws_genhash_update(&ctx, (const uint8_t *)salt, strlen(salt))) {
-		lwsl_notice("CHECK_CREDENTIALS: salt update failed\n");
-		goto bail;
-	}
-
-	if (lws_genhash_update(&ctx, (const uint8_t *)password, strlen(password))) {
-		lwsl_notice("CHECK_CREDENTIALS: pwd update failed\n");
-		goto bail;
-	}
-
-	if (lws_genhash_destroy(&ctx, hash)) {
-		lwsl_notice("CHECK_CREDENTIALS: hash destroy failed\n");
+	/* hash the input password with PBKDF2-SHA-512 and salt */
+	if (!stored_hash || !salt || pbkdf2_sha512(password, salt, 100000, hash)) {
+		lwsl_notice("CHECK_CREDENTIALS: pbkdf2 failed\n");
 		goto bail;
 	}
 
 	lws_genhash_render(LWS_GENHASH_TYPE_SHA512, hash, hex, sizeof(hex));
 	// lwsl_notice("CHECK_CREDENTIALS: Calculated hex='%s' (len %d)\n", hex, (int)strlen(hex));
 
-        if (!strcmp(stored_hash, hex)) {
+        if (strlen(stored_hash) == strlen(hex) && !lws_timingsafe_bcmp(stored_hash, hex, (uint32_t)strlen(stored_hash))) {
 		// lwsl_notice("CHECK_CREDENTIALS: MATCH OK!\n");
 		match = 0;
 	} else
@@ -416,6 +718,296 @@ bail:
 	return match;
 }
 
+/*
+ * Decide whether an address is this server itself.
+ *
+ * The renewal side channel (and the other server-side API clients, eg
+ * lws-oauth2-client's /api/token POST) all originate from lwsws on the same
+ * machine as the auth server, so they present one of the machine's own
+ * addresses -- or loopback -- as the peer.  Their failures are ours, not an
+ * external attacker's: an external user cannot do anything with a banned
+ * lwsws egress address except take out every delegated login and renewal
+ * from that box for the ban's duration.  So the strike/ban machinery must
+ * never act on them.
+ *
+ * Two tests, either is sufficient:
+ *
+ *  - the peer is loopback (v4 127/8, ::1, or v4-mapped loopback); or
+ *
+ *  - the kernel, asked which local source address it would use to reach the
+ *    peer, answers with the peer itself.  connect() on an unconnected UDP
+ *    socket only installs routing state (no packets are sent), and the
+ *    following getsockname() is the source address routing would choose for
+ *    that destination.  If source == destination, the peer is one of this
+ *    machine's own addresses -- identified without needing to enumerate
+ *    them, and correctly whatever transport the original connection arrived
+ *    on (h1, h2 or h3; the server-side quic socket is wildcard-bound, so
+ *    comparing the wsi's own socket endpoints cannot see this case).
+ */
+static int
+auth_peer_is_own(const char *peer)
+{
+	lws_sockaddr46 d46, s46;
+	lws_sockfd_type fd;
+	socklen_t sl;
+	int n = 0;
+
+	if (lws_sa46_parse_numeric_address(peer, &d46))
+		return 0;
+
+	if (d46.sa4.sin_family == AF_INET) {
+		if ((ntohl(d46.sa4.sin_addr.s_addr) & 0xff000000u) == 0x7f000000u)
+			return 1;
+	}
+#if defined(LWS_WITH_IPV6)
+	else {
+		const uint8_t *a = d46.sa6.sin6_addr.s6_addr;
+		static const uint8_t lo6[16] = { [15] = 0x01 };
+
+		/* ::1 */
+		if (!memcmp(a, lo6, sizeof(lo6)))
+			return 1;
+
+		/* v4-mapped 127/8 */
+		if (a[10] == 0xff && a[11] == 0xff && a[12] == 127)
+			return 1;
+	}
+#endif
+
+	fd = socket(d46.sa4.sin_family, SOCK_DGRAM, 0);
+#if defined(WIN32)
+	if (fd == INVALID_SOCKET)
+		return 0;
+#else
+	if (fd < 0)
+		return 0;
+#endif
+
+	sl = sizeof(s46);
+	if (!connect(fd, sa46_sockaddr(&d46), sa46_socklen(&d46)) &&
+	    !getsockname(fd, sa46_sockaddr(&s46), &sl))
+		n = !lws_sa46_compare_ads(&s46, &d46);
+
+#if defined(WIN32)
+	closesocket(fd);
+#else
+	close(fd);
+#endif
+
+	return n;
+}
+
+/*
+ * The address the strikes, bans and audit rows are keyed on: the socket peer,
+ * unless that peer is one of the operator's trusted reverse proxies, in which
+ * case it is the client the proxy says it is forwarding for, the last address
+ * in X-Forwarded-For (the one the trusted proxy itself appended; anything
+ * before it was supplied by the client or an untrusted hop).  A proxy not in
+ * the list is treated as the client it is, so a forged header from an
+ * ordinary peer changes nothing.
+ */
+static void
+auth_client_address(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
+		    char *buf, size_t len)
+{
+	char xff[512], *last;
+	struct lws_tokenize ts;
+	lws_sockaddr46 sa46;
+	int trusted = 0, n;
+
+	lws_get_peer_simple(wsi, buf, len);
+
+	if (!vhd || !vhd->trusted_proxies[0])
+		return;
+
+	lws_tokenize_init(&ts, vhd->trusted_proxies, LWS_TOKENIZE_F_NO_INTEGERS |
+			  LWS_TOKENIZE_F_DOT_NONTERM | LWS_TOKENIZE_F_MINUS_NONTERM |
+			  LWS_TOKENIZE_F_COLON_NONTERM);
+	ts.len = strlen(vhd->trusted_proxies);
+	do {
+		ts.e = (int8_t)lws_tokenize(&ts);
+		if (ts.e == LWS_TOKZE_TOKEN && ts.token_len == strlen(buf) &&
+		    !strncmp(ts.token, buf, ts.token_len))
+			trusted = 1;
+	} while (ts.e > 0 && !trusted);
+
+	if (!trusted)
+		return;
+
+	n = lws_hdr_copy(wsi, xff, sizeof(xff), WSI_TOKEN_X_FORWARDED_FOR);
+	if (n <= 0)
+		return;
+
+	last = strrchr(xff, ',');
+	last = last ? last + 1 : xff;
+	while (*last == ' ' || *last == '\t')
+		last++;
+	n = (int)strlen(last);
+	while (n && (last[n - 1] == ' ' || last[n - 1] == '\t'))
+		last[--n] = '\0';
+
+	/* only a numeric address: never a name, never anything else */
+	if (!n || lws_sa46_parse_numeric_address(last, &sa46))
+		return;
+
+	lws_strncpy(buf, last, len);
+}
+
+/*
+ * Age one strike record.
+ *
+ * Forgive one strike per 120s elapsed rather than resetting the whole record
+ * to zero: a flat reset let an attacker pace guesses at (threshold - 1) per
+ * 121s and never accrue a ban, for ever, from one address.  As a leaky bucket
+ * any sustained rate above one attempt / 120s still converges on the ban.
+ * last_strike advances only by the periods actually consumed, so this is
+ * idempotent and safe to call from the read-only lookups too.
+ */
+static void
+auth_strike_decay(auth_server_strike_t *strike, uint64_t now)
+{
+	uint64_t elapsed, decay;
+
+	if (now <= strike->last_strike)
+		return;
+
+	elapsed = now - strike->last_strike;
+	if (elapsed < 120)
+		return;
+
+	decay = elapsed / 120;
+	if (decay >= (uint64_t)strike->strikes) {
+		/* fully drained (also the clock-jumped-forward case) */
+		strike->strikes = 0;
+		strike->last_strike = now;
+
+		return;
+	}
+
+	strike->strikes -= (int)decay;
+	strike->last_strike += decay * 120;
+}
+
+/*
+ * Current (decayed) strike count for an address, without recording one.  Used
+ * to apply the limiter *before* expensive work is done on an unauthenticated
+ * request.  Addresses that never accrue strikes (our own / loopback, see
+ * auth_record_strike()) simply have no record and answer 0.
+ */
+static int
+auth_peer_strikes(struct per_vhost_data__auth_server *vhd, const char *ip)
+{
+	uint64_t now = (uint64_t)time(NULL);
+
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+				   lws_dll2_get_head(&vhd->ip_strikes)) {
+		auth_server_strike_t *s = lws_container_of(d,
+					auth_server_strike_t, list);
+
+		if (!strcmp(s->ip, ip)) {
+			auth_strike_decay(s, now);
+
+			return s->strikes;
+		}
+	} lws_end_foreach_dll_safe(d, d1);
+
+	return 0;
+}
+
+/* the ip_bans list is walked for every inbound request: keep it bounded */
+#define AUTH_SERVER_MAX_BANS 512
+
+/*
+ * Failures are also counted per account, keyed on the lowercased name, with
+ * the same leaky bucket as the address strikes: a guessing campaign spread
+ * over many addresses then still runs into a wall at the account.  No ban
+ * list here, the count itself is the brake (auth_account_strikes() is read
+ * before the KDF), so the worst a known name buys an attacker is keeping
+ * that account's logins refused while it keeps trying.
+ */
+static void
+auth_account_key(const char *user, char *key, size_t len)
+{
+	size_t n = 0;
+
+	while (user[n] && n < len - 1) {
+		key[n] = (char)((user[n] >= 'A' && user[n] <= 'Z') ?
+					user[n] + ('a' - 'A') : user[n]);
+		n++;
+	}
+	key[n] = '\0';
+}
+
+static int
+auth_account_strikes(struct per_vhost_data__auth_server *vhd, const char *user)
+{
+	char key[64];
+
+	auth_account_key(user, key, sizeof(key));
+
+	lws_start_foreach_dll(struct lws_dll2 *, d,
+			      lws_dll2_get_head(&vhd->user_strikes)) {
+		auth_server_strike_t *s = lws_container_of(d,
+					auth_server_strike_t, list);
+
+		if (!strcmp(s->ip, key)) {
+			auth_strike_decay(s, (uint64_t)time(NULL));
+
+			return s->strikes;
+		}
+	} lws_end_foreach_dll(d);
+
+	return 0;
+}
+
+static void
+auth_account_record_strike(struct per_vhost_data__auth_server *vhd,
+			   const char *user)
+{
+	auth_server_strike_t *strike = NULL;
+	uint64_t now = (uint64_t)time(NULL);
+	char key[64];
+
+	auth_account_key(user, key, sizeof(key));
+
+	lws_start_foreach_dll(struct lws_dll2 *, d,
+			      lws_dll2_get_head(&vhd->user_strikes)) {
+		auth_server_strike_t *s = lws_container_of(d,
+					auth_server_strike_t, list);
+
+		if (!strcmp(s->ip, key)) {
+			strike = s;
+			break;
+		}
+	} lws_end_foreach_dll(d);
+
+	if (!strike) {
+		if (lws_dll2_count(&vhd->user_strikes) >= 128) {
+			/* LRU eviction */
+			auth_server_strike_t *s = lws_container_of(
+				lws_dll2_get_head(&vhd->user_strikes),
+				auth_server_strike_t, list);
+
+			lws_dll2_remove(&s->list);
+			free(s);
+		}
+		strike = malloc(sizeof(*strike));
+		if (!strike)
+			return;
+		memset(strike, 0, sizeof(*strike));
+		lws_strncpy(strike->ip, key, sizeof(strike->ip));
+	} else {
+		auth_strike_decay(strike, now);
+		lws_dll2_remove(&strike->list);
+	}
+
+	lws_dll2_add_tail(&strike->list, &vhd->user_strikes); /* LRU tail */
+	strike->last_strike = now;
+	strike->strikes++;
+
+	lwsl_notice("%s: account strike %d\n", __func__, strike->strikes);
+}
+
 static void
 auth_record_strike(struct per_vhost_data__auth_server *vhd, const char *ip)
 {
@@ -423,8 +1015,20 @@ auth_record_strike(struct per_vhost_data__auth_server *vhd, const char *ip)
 	uint64_t now = (uint64_t)time(NULL);
 	int strikes = 1;
 
+	/*
+	 * Never accrue strikes against this server's own addresses: the
+	 * in-process API clients (renewal side channel, /api/token fetch)
+	 * present them, and their failures are ours, not an attacker's.
+	 * Banning them would only block our own delegated logins.
+	 */
+	if (auth_peer_is_own(ip)) {
+		lwsl_info("%s: strike from own/loopback address %s ignored\n",
+			  __func__, ip);
+		return;
+	}
+
 	/* Find existing strike record */
-	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, vhd->ip_strikes.head) {
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, lws_dll2_get_head(&vhd->ip_strikes)) {
 		auth_server_strike_t *s = lws_container_of(d, auth_server_strike_t, list);
 		if (!strcmp(s->ip, ip)) {
 			strike = s;
@@ -433,9 +1037,10 @@ auth_record_strike(struct per_vhost_data__auth_server *vhd, const char *ip)
 	} lws_end_foreach_dll_safe(d, d1);
 
 	if (!strike) {
-		if (vhd->ip_strikes.count >= 128) {
+		if (lws_dll2_count(&vhd->ip_strikes) >= 128) {
 			/* LRU eviction */
-			auth_server_strike_t *s = lws_container_of(vhd->ip_strikes.head, auth_server_strike_t, list);
+			auth_server_strike_t *s = lws_container_of(lws_dll2_get_head(
+				&vhd->ip_strikes), auth_server_strike_t, list);
 			lws_dll2_remove(&s->list);
 			free(s);
 		}
@@ -445,9 +1050,7 @@ auth_record_strike(struct per_vhost_data__auth_server *vhd, const char *ip)
 		lws_strncpy(strike->ip, ip, sizeof(strike->ip));
 		lws_dll2_add_tail(&strike->list, &vhd->ip_strikes);
 	} else {
-		/* Apply decay: if last strike was > 120s ago, reset to 1 */
-		if (now - strike->last_strike > 120)
-			strike->strikes = 0;
+		auth_strike_decay(strike, now);
 		lws_dll2_remove(&strike->list);
 		lws_dll2_add_tail(&strike->list, &vhd->ip_strikes); /* move to tail (LRU) */
 	}
@@ -459,16 +1062,54 @@ auth_record_strike(struct per_vhost_data__auth_server *vhd, const char *ip)
 	lwsl_notice("%s: IP %s recorded strike %d\n", __func__, ip, strikes);
 
 	if (strikes >= 5) {
+		auth_server_ban_t *ban = NULL;
+		sqlite3_stmt *stmt;
+
 		lwsl_warn("%s: Banning IP %s due to heavy abuse\n", __func__, ip);
 
-		auth_server_ban_t *ban = malloc(sizeof(*ban));
-		if (!ban) return;
-		memset(ban, 0, sizeof(*ban));
-		lws_strncpy(ban->ip, ip, sizeof(ban->ip));
-		ban->banned_until = now + (24 * 3600); /* 24 hours */
-		lws_dll2_add_tail(&ban->list, &vhd->ip_bans);
+		/*
+		 * Exactly one entry per address, and a hard ceiling on the
+		 * list: it is walked linearly for every inbound HTTP request,
+		 * so appending a fresh entry on every re-ban (and never
+		 * sweeping) let a distributed attacker set our resident memory
+		 * and our per-request CPU cost.  Sweep anything already aged
+		 * out as we pass it.
+		 */
+		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+					   lws_dll2_get_head(&vhd->ip_bans)) {
+			auth_server_ban_t *b = lws_container_of(d,
+						auth_server_ban_t, list);
 
-		sqlite3_stmt *stmt;
+			if (!strcmp(b->ip, ip)) {
+				ban = b;
+				break;
+			}
+			if (now > b->banned_until) {
+				lws_dll2_remove(&b->list);
+				free(b);
+			}
+		} lws_end_foreach_dll_safe(d, d1);
+
+		if (!ban) {
+			if (lws_dll2_count(&vhd->ip_bans) >=
+						AUTH_SERVER_MAX_BANS) {
+				auth_server_ban_t *b = lws_container_of(
+					lws_dll2_get_head(&vhd->ip_bans),
+					auth_server_ban_t, list);
+
+				lws_dll2_remove(&b->list);
+				free(b);
+			}
+			ban = malloc(sizeof(*ban));
+			if (!ban)
+				return;
+			memset(ban, 0, sizeof(*ban));
+			lws_strncpy(ban->ip, ip, sizeof(ban->ip));
+			lws_dll2_add_tail(&ban->list, &vhd->ip_bans);
+		}
+
+		ban->banned_until = now + (24 * 3600); /* 24 hours */
+
 		if (sqlite3_prepare_v2(vhd->db, "INSERT OR REPLACE INTO bans (ip, banned_until) VALUES (?, ?)", -1, &stmt, NULL) == SQLITE_OK) {
 			sqlite3_bind_text(stmt, 1, ip, -1, SQLITE_STATIC);
 			sqlite3_bind_int64(stmt, 2, (sqlite_int64)ban->banned_until);
@@ -485,7 +1126,7 @@ auth_record_strike(struct per_vhost_data__auth_server *vhd, const char *ip)
 static void
 auth_clear_strike(struct per_vhost_data__auth_server *vhd, const char *ip)
 {
-	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, vhd->ip_strikes.head) {
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, lws_dll2_get_head(&vhd->ip_strikes)) {
 		auth_server_strike_t *s = lws_container_of(d, auth_server_strike_t, list);
 		if (!strcmp(s->ip, ip)) {
 			lws_dll2_remove(&s->list);
@@ -495,72 +1136,396 @@ auth_clear_strike(struct per_vhost_data__auth_server *vhd, const char *ip)
 	} lws_end_foreach_dll_safe(d, d1);
 }
 
+/*
+ * The request Host is replayed into the "iss" parameter of the redirect the
+ * OAuth client is sent to, which the client compares byte-for-byte against its
+ * configured remote-auth-url (RFC 9207 code mix-up defence).  It arrives from
+ * the peer, so constrain it to what a reg-name (with optional port) may
+ * actually contain and fall back to the configured auth-domain otherwise --
+ * percent-encoding it instead would break that byte-for-byte comparison.
+ */
+static void
+auth_sanitise_host(char *host, size_t host_len, const char *fallback)
+{
+	size_t n;
+
+	for (n = 0; host[n]; n++)
+		if (!((host[n] >= 'a' && host[n] <= 'z') ||
+		      (host[n] >= 'A' && host[n] <= 'Z') ||
+		      (host[n] >= '0' && host[n] <= '9') ||
+		      host[n] == '.' || host[n] == '-' || host[n] == ':')) {
+			host[0] = '\0';
+			break;
+		}
+
+	if (!host[0])
+		lws_strncpy(host, fallback, host_len);
+}
+
+/*
+ * Is the session described by these token claims still live?  0 if so, or 1
+ * if it expired or was revoked.  The checks auth_session_jwt() applies to a
+ * presented token, split out so the admin ws can repeat them for as long as
+ * it is open, from the claims it kept at the upgrade.
+ */
+
+static int
+auth_session_claims_live(struct lws *wsi,
+			 struct per_vhost_data__auth_server *vhd,
+			 uint32_t uid, uint32_t sec, uint64_t exp,
+			 const char *did)
+{
+	sqlite3_stmt *stmt;
+	int ok = 0;
+
+	if (exp <= (uint64_t)time(NULL)) {
+		lwsl_wsi_info(wsi, "%s: session JWT expired", __func__);
+		return 1;
+	}
+
+	if (!uid)
+		return 1;
+
+	if (sqlite3_prepare_v2(vhd->db, "SELECT session_epoch FROM users "
+			       "WHERE uid = ?", -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_int(stmt, 1, (int)uid);
+		if (sqlite3_step(stmt) == SQLITE_ROW &&
+		    (uint32_t)sqlite3_column_int(stmt, 0) == sec)
+			ok = 1;
+		sqlite3_finalize(stmt);
+	}
+
+	if (!ok) {
+		lwsl_wsi_notice(wsi, "%s: uid %u session epoch stale, or user "
+				"gone: token revoked", __func__, uid);
+		return 1;
+	}
+
+	if (!did || !did[0])
+		return 0;
+
+	ok = 0;
+	if (sqlite3_prepare_v2(vhd->db, "SELECT 1 FROM devices WHERE "
+			       "device_id = ? AND uid = ?", -1, &stmt,
+			       NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, did, -1, SQLITE_TRANSIENT);
+		sqlite3_bind_int(stmt, 2, (int)uid);
+		if (sqlite3_step(stmt) == SQLITE_ROW)
+			ok = 1;
+		sqlite3_finalize(stmt);
+	}
+
+	if (!ok) {
+		lwsl_wsi_notice(wsi, "%s: device token for a device row that "
+				"no longer exists: revoked", __func__);
+		return 1;
+	}
+
+	return 0;
+}
+
+/*
+ * Resolve the session JWT presented on wsi, or NULL if there is no *usable*
+ * one.  Every lws_jwt_auth_create() in this plugin must come through here.
+ *
+ * Three things the library deliberately leaves to the caller:
+ *
+ *  - lws_jwt_auth_create() documents that when no presented occurrence of the
+ *    cookie is live, it returns the first that merely *verified*, "so the
+ *    caller decides what an expired token means (check lws_jwt_auth_get_exp())".
+ *    On the issuer itself an expired token means nothing: every use of it here
+ *    asks "is this request a live session".  Accepting one made jwt-validity
+ *    unenforceable -- worse, /api/sso_exchange minted a *fresh* JWT from it, so
+ *    a captured cookie renewed itself for ever, admin included.
+ *
+ *  - "sec" (the session epoch) is minted into every token by
+ *    lws_auth_issue_jwt() precisely so that bumping users.session_epoch (which
+ *    a password reset does) evicts live sessions.  Nothing compared it, so the
+ *    documented revocation was inert on the IdP.  Mirrors
+ *    protocol_lws_login.c's check.
+ *
+ *  - a device token carries "did" naming the devices row inserted by
+ *    /api/device_token "for granular revocation".  Nothing read that table, so
+ *    nothing could revoke a device token before its (ten-year) exp.  Require
+ *    the row to still exist.
+ */
+static struct lws_jwt_auth *
+auth_session_jwt(struct lws *wsi, struct per_vhost_data__auth_server *vhd)
+{
+	struct lws_jwt_auth *ja;
+
+	if (!vhd->cookie_name[0])
+		return NULL;
+
+	ja = lws_jwt_auth_create(wsi, &vhd->jwk, vhd->cookie_name, NULL, NULL,
+				 NULL);
+	if (!ja)
+		return NULL;
+
+	if (auth_session_claims_live(wsi, vhd, lws_jwt_auth_get_uid(ja),
+				     lws_jwt_auth_get_sec(ja),
+				     lws_jwt_auth_get_exp(ja),
+				     lws_jwt_auth_get_did(ja))) {
+		lws_jwt_auth_destroy(&ja);
+
+		return NULL;
+	}
+
+	return ja;
+}
+
+/* does uid hold the '*' grant in the grants table now? */
+
+static int
+auth_uid_is_admin(struct per_vhost_data__auth_server *vhd, uint32_t uid)
+{
+	sqlite3_stmt *stmt;
+	int r = 0;
+
+	if (sqlite3_prepare_v2(vhd->db, "SELECT 1 FROM grants g JOIN services "
+			       "s ON g.service_id = s.service_id WHERE "
+			       "g.uid = ? AND s.name = '*' AND "
+			       "g.grant_level >= 1", -1, &stmt,
+			       NULL) != SQLITE_OK)
+		return 0;
+
+	sqlite3_bind_int(stmt, 1, (int)uid);
+	r = sqlite3_step(stmt) == SQLITE_ROW;
+	sqlite3_finalize(stmt);
+
+	return r;
+}
+
+/*
+ * The admin ws is authorised by the session cookie at the upgrade, but lives
+ * on after it: a password reset, the account's deletion or demotion, or the
+ * token simply expiring, must end it too.  So every admin op, every write and
+ * a periodic timer come back here with the claims kept at the upgrade.
+ * Returns 0 if the socket may carry on, else sets the close reason and returns
+ * 1, the caller then returns -1 to close it.
+ */
+
+static int
+auth_admin_ws_revoked(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
+		      struct per_session_data__auth_server *pss)
+{
+	static const char reason[] = "admin session ended";
+
+	if (!auth_session_claims_live(wsi, vhd, pss->ws_uid, pss->ws_sec,
+				      pss->ws_exp, pss->ws_did) &&
+	    auth_uid_is_admin(vhd, pss->ws_uid))
+		return 0;
+
+	lwsl_wsi_notice(wsi, "%s: closing admin ws of uid %u", __func__,
+			pss->ws_uid);
+	lws_close_reason(wsi, LWS_CLOSE_STATUS_POLICY_VIOLATION,
+			 (uint8_t *)reason, sizeof(reason) - 1);
+
+	return 1;
+}
+
+/*
+ * A session was just revoked or an account's grants changed: have every admin
+ * ws on the vhost re-check itself now (in SERVER_WRITEABLE), rather than at
+ * its next op or timer
+ */
+
+static void
+auth_admin_ws_recheck_all(struct per_vhost_data__auth_server *vhd)
+{
+	lws_callback_on_writable_all_protocol_vhost(vhd->vhost, vhd->protocol);
+}
+
+/*
+ * Cross-site WebSocket hijacking: a ws upgrade is not subject to the
+ * same-origin policy and carries the ambient session cookie, and SameSite=Lax
+ * does not stop a page on a *same-site* host (a sibling subdomain, or the
+ * apps on the parent domain) from sending it.  The only legitimate client of
+ * the admin ws is the console page this vhost serves, so the Origin must be
+ * this vhost's own: https://<the Host / :authority the request was sent to>.
+ * A browser always sends Origin on a ws upgrade, and "null" never matches.
+ * 0 if it is ours, 1 to refuse.
+ */
+
+static int
+auth_admin_ws_origin_ok(struct lws *wsi)
+{
+	char origin[256], host[256];
+	const char *p;
+
+	if (lws_hdr_copy(wsi, origin, sizeof(origin),
+			 WSI_TOKEN_ORIGIN) <= 0 || !origin[0])
+		return 1;
+
+	/* h2 and h3 carry the authority in :authority, h1 in Host */
+
+	if (lws_hdr_copy(wsi, host, sizeof(host),
+			 WSI_TOKEN_HTTP_COLON_AUTHORITY) <= 0 &&
+	    lws_hdr_copy(wsi, host, sizeof(host), WSI_TOKEN_HOST) <= 0)
+		return 1;
+
+	if (!strncmp(origin, "https://", 8))
+		p = origin + 8;
+	else if (!lws_is_ssl(wsi) && !strncmp(origin, "http://", 7))
+		/*
+		 * Not the TLS terminator ourselves, so an https deployment
+		 * behind a proxy looks the same as an http one: accept our
+		 * own host over either scheme then.  A vhost doing its own
+		 * TLS only ever accepts https.
+		 */
+		p = origin + 7;
+	else
+		return 1;
+
+	return !!strcasecmp(p, host);
+}
+
+/*
+ * The browser resolves the redirect_uri it is sent to by the WHATWG URL
+ * rules: in the path, "%2e" in any case is a '.', a '\' is a '/' for http(s),
+ * and tab / CR / LF are dropped.  Read the path the way it will, and refuse
+ * one with a ".." segment, which would leave the registered path prefix;
+ * anything that would need its bytes dropped is refused outright.  An
+ * escaped '/' ("%2f") is taken as a '/' as well, since the page it reaches
+ * may decode it.
+ */
+static int
+auth_redirect_uri_unsafe(const char *uri)
+{
+	const char *p = strstr(uri, "://");
+	int dots = 0, seg = 1; /* dots so far in a segment that is all dots */
+
+	/*
+	 * The authority is compared with the registration as it is.  A "://"
+	 * after the first '/', '?' or '#' is not the scheme's, and then there
+	 * is no authority: all of it is read as a path
+	 */
+	if (p && lws_ptr_diff_size_t(p, uri) == strcspn(uri, "/?#")) {
+		p += 3;
+		while (*p && *p != '/' && *p != '\\' && *p != '?' && *p != '#') {
+			if ((unsigned char)*p <= ' ' || *p == 0x7f)
+				return 1;
+			p++;
+		}
+	} else
+		p = uri;
+
+	while (1) {
+		char c = *p;
+
+		if (c && ((unsigned char)c <= ' ' || c == 0x7f))
+			return 1;
+
+		if (c == '%' && p[1] == '2' && (p[2] == 'e' || p[2] == 'E')) {
+			c = '.';
+			p += 2;
+		} else if (c == '%' && p[1] == '2' && (p[2] == 'f' || p[2] == 'F')) {
+			c = '/';
+			p += 2;
+		} else if (c == '\\')
+			c = '/';
+
+		if (!c || c == '/' || c == '?' || c == '#') {
+			/* the segment that just ended */
+			if (seg && dots == 2)
+				return 1;
+			if (!c || c == '?' || c == '#')
+				return 0;
+
+			dots = 0;
+			seg = 1;
+		} else if (c == '.')
+			dots++;
+		else
+			seg = 0;
+
+		p++;
+	}
+}
+
+/*
+ * Is redirect_uri under one of the comma-separated registered uris?  The
+ * scheme and authority compare case-insensitively, the path exactly, and
+ * the registered part must end at a path, query or fragment boundary of
+ * redirect_uri.
+ */
+static int
+auth_redirect_uri_listed(const char *redirect_uri, const char *uris)
+{
+	const char *p = uris;
+
+	while (p && *p) {
+		const char *comma, *ps;
+		size_t len, alen;
+		char next;
+
+		while (*p == ' ' || *p == '\r' || *p == '\n')
+			p++;
+		comma = strchr(p, ',');
+		len = comma ? lws_ptr_diff_size_t(comma, p) : strlen(p);
+		while (len && (p[len - 1] == ' ' || p[len - 1] == '\r' ||
+			       p[len - 1] == '\n'))
+			len--;
+		while (len && p[len - 1] == '/')
+			len--;
+
+		if (len) {
+			/* where the registration's path starts, if it has one */
+			ps = strstr(p, "://");
+			ps = ps && ps < p + len ? ps + 3 : p;
+			while (ps < p + len && *ps != '/' && *ps != '?' &&
+			       *ps != '#')
+				ps++;
+			alen = lws_ptr_diff_size_t(ps, p);
+
+			if (!strncasecmp(redirect_uri, p, alen) &&
+			    !strncmp(redirect_uri + alen, ps, len - alen)) {
+				next = redirect_uri[len];
+				if (next == '\0' || next == '/' || next == '?' ||
+				    next == '#')
+					return 1;
+			}
+		}
+
+		p = comma ? comma + 1 : NULL;
+	}
+
+	return 0;
+}
+
 static int
 auth_verify_redirect_uri(struct per_vhost_data__auth_server *vhd,
 			 const char *client_id, const char *redirect_uri)
 {
+	const char *uris;
 	sqlite3_stmt *stmt;
 	int valid = 0;
 
-	if (!redirect_uri || !redirect_uri[0])
-		return 0;
-
-	if (strstr(redirect_uri, "../") || strstr(redirect_uri, "..%2F") ||
-	    strstr(redirect_uri, "..%2f"))
+	if (!redirect_uri || !redirect_uri[0] ||
+	    auth_redirect_uri_unsafe(redirect_uri))
 		return 0;
 
 	if (client_id && client_id[0]) {
 		if (sqlite3_prepare_v2(vhd->db, "SELECT redirect_uris FROM oauth_clients WHERE client_id = ?", -1, &stmt, NULL) == SQLITE_OK) {
 			sqlite3_bind_text(stmt, 1, client_id, -1, SQLITE_STATIC);
 			if (sqlite3_step(stmt) == SQLITE_ROW) {
-				const char *uris = (const char *)sqlite3_column_text(stmt, 0);
-				if (uris) {
-					const char *p = uris;
-					while (p && *p) {
-						while (*p == ' ') p++;
-						const char *comma = strchr(p, ',');
-						size_t len = comma ? lws_ptr_diff_size_t(comma, p) : strlen(p);
-						while (len > 0 && p[len - 1] == ' ') len--;
-						while (len > 0 && p[len - 1] == '/') len--;
-						if (len > 0) {
-							if (!strncmp(redirect_uri, p, len)) {
-								char next = redirect_uri[len];
-								if (next == '\0' || next == '/' || next == '?' || next == '#') {
-									valid = 1;
-									break;
-								}
-							}
-						}
-						p = comma ? comma + 1 : NULL;
-					}
-				}
+				uris = (const char *)sqlite3_column_text(stmt, 0);
+				if (uris)
+					valid = auth_redirect_uri_listed(
+							redirect_uri, uris);
+			} else {
+				lwsl_info("%s: no oauth_clients row for client_id='%s'\n",
+					  __func__, client_id);
 			}
 			sqlite3_finalize(stmt);
 		}
 	} else {
 		if (sqlite3_prepare_v2(vhd->db, "SELECT redirect_uris FROM oauth_clients", -1, &stmt, NULL) == SQLITE_OK) {
 			while (!valid && sqlite3_step(stmt) == SQLITE_ROW) {
-				const char *uris = (const char *)sqlite3_column_text(stmt, 0);
-				if (uris) {
-					const char *p = uris;
-					while (p && *p) {
-						while (*p == ' ') p++;
-						const char *comma = strchr(p, ',');
-						size_t len = comma ? lws_ptr_diff_size_t(comma, p) : strlen(p);
-						while (len > 0 && p[len - 1] == ' ') len--;
-						while (len > 0 && p[len - 1] == '/') len--;
-						if (len > 0) {
-							if (!strncmp(redirect_uri, p, len)) {
-								char next = redirect_uri[len];
-								if (next == '\0' || next == '/' || next == '?' || next == '#') {
-									valid = 1;
-									break;
-								}
-							}
-						}
-						p = comma ? comma + 1 : NULL;
-					}
-				}
+				uris = (const char *)sqlite3_column_text(stmt, 0);
+				if (uris)
+					valid = auth_redirect_uri_listed(
+							redirect_uri, uris);
 			}
 			sqlite3_finalize(stmt);
 		}
@@ -571,38 +1536,50 @@ auth_verify_redirect_uri(struct per_vhost_data__auth_server *vhd,
 static int
 send_auth_headers(struct lws *wsi, struct per_session_data__auth_server *pss, const char *content_type, const char *cookie1, const char *cookie2)
 {
-	uint8_t buf[LWS_SSO_MAX_COOKIE + LWS_PRE], *start = &buf[LWS_PRE], *p = start, *end = &buf[sizeof(buf) - 1], *pq;
+	uint8_t buf[AUTH_SERVER_RESP_HDR_SZ + LWS_PRE], *start = &buf[LWS_PRE],
+		*p = start, *end = &buf[sizeof(buf) - 1], *pq;
 	unsigned int resp_code = pss->http_response_code ? pss->http_response_code : HTTP_STATUS_OK;
         size_t amount = (size_t)lws_buflist_next_segment_len(&pss->tx_buflist, &pq);
 
         if (lws_add_http_common_headers(wsi, resp_code, content_type,
                                         (unsigned int)(amount ? amount - LWS_PRE: LWS_ILLEGAL_HTTP_CONTENT_LEN), &p,
                                         end)) {
-                lwsl_info("send_auth_headers custom hdr err\n");
-
-                return -1;
-        }
-        if (pss->totp_required &&
-            lws_add_http_header_by_name(wsi, (unsigned char *)"X-Requires-TOTP:", (unsigned char *)"1", 1, &p, end)) {
-                lwsl_info("send_auth_headers custom hdr err\n");
+                lwsl_wsi_err(wsi, "common headers for %u did not fit a %d "
+				  "byte header block", resp_code,
+			     (int)AUTH_SERVER_RESP_HDR_SZ);
 
                 return -1;
         }
 
-        if (lws_add_http_header_by_name(wsi, (unsigned char *)"Cache-Control:", (unsigned char *)"no-cache, no-store, must-revalidate", 35, &p, end)) return -1;
-        if (lws_add_http_header_by_name(wsi, (unsigned char *)"Pragma:", (unsigned char *)"no-cache", 8, &p, end)) return -1;
-        if (lws_add_http_header_by_name(wsi, (unsigned char *)"Expires:", (unsigned char *)"0", 1, &p, end)) return -1;
+	if (pss->totp_required &&
+	    auth_add_hdr(wsi, "X-Requires-TOTP:", "1", &p, end))
+		return -1;
 
-	if (cookie1 && lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie1, (int)strlen(cookie1), &p, end)) {
-		lwsl_info("send_auth_headers cookie1 hdr err\n");
+	if (auth_add_hdr(wsi, "Cache-Control:",
+			 "no-cache, no-store, must-revalidate", &p, end) ||
+	    auth_add_hdr(wsi, "Pragma:", "no-cache", &p, end) ||
+	    auth_add_hdr(wsi, "Expires:", "0", &p, end))
 		return -1;
-	}
-	if (cookie2 && lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie2, (int)strlen(cookie2), &p, end)) {
-		lwsl_info("send_auth_headers cookie2 hdr err\n");
+
+	/*
+	 * These two are the large ones: the session JWT and
+	 * auth_refresh_session.  They are only present on the responses that
+	 * establish a session, ie exactly the ones the user cares about, so a
+	 * failure here must be loud.
+	 */
+
+	if (cookie1 && auth_add_hdr(wsi, "set-cookie:", cookie1, &p, end))
 		return -1;
-	}
+
+	if (cookie2 && auth_add_hdr(wsi, "set-cookie:", cookie2, &p, end))
+		return -1;
+
 	if (lws_finalize_write_http_header(wsi, start, &p, end)) {
-		lwsl_info("send_auth_headers final hdr err\n");
+		lwsl_wsi_err(wsi, "unable to write the response header block "
+				  "(%d bytes used of %d)",
+			     (int)lws_ptr_diff(p, start),
+			     (int)AUTH_SERVER_RESP_HDR_SZ);
+
 		return -1;
 	}
 
@@ -621,19 +1598,280 @@ auth_check_csrf(struct lws *wsi, struct per_vhost_data__auth_server *vhd, struct
 	char csrf_ck[64] = {0};
 	size_t csrf_len = sizeof(csrf_ck);
 
+	lwsl_wsi_debug(wsi, "sso_exchange: Cookie header is %d bytes",
+				lws_hdr_total_length(wsi, WSI_TOKEN_HTTP_COOKIE));
+
 	lws_http_cookie_get(wsi, "auth_csrf", csrf_ck, &csrf_len);
 
-	if (!csrf_form || !csrf_ck[0] || strcmp(csrf_ck, csrf_form)) {
-		char dbg_cookie[LWS_SSO_MAX_COOKIE] = {0};
-		if (lws_hdr_copy(wsi, dbg_cookie, sizeof(dbg_cookie), WSI_TOKEN_HTTP_COOKIE) < 0)
-			strncpy(dbg_cookie, "<overrun or empty>", sizeof(dbg_cookie) - 1);
-		lwsl_notice("%s: CSRF validation natively failed. form='%s' cookie='%s' RAW_COOKIE='%s'\n", __func__, csrf_form ? csrf_form : "NULL", csrf_ck[0] ? csrf_ck : "NULL", dbg_cookie);
+	if (!csrf_form || !csrf_ck[0] || strlen(csrf_ck) != strlen(csrf_form) || lws_timingsafe_bcmp(csrf_ck, csrf_form, (uint32_t)strlen(csrf_ck))) {
 		char peer[64];
-		lws_get_peer_simple(wsi, peer, sizeof(peer));
+		/*
+		 * State the mismatch precisely (which half is missing, and the
+		 * lengths) but never log the values themselves: they are
+		 * session credentials.  Logging the whole raw Cookie header
+		 * here used to copy live refresh tokens into the logs.
+		 */
+		lwsl_wsi_notice(wsi, "csrf double-submit failed: form %s, "
+				"cookie %s (lens %d vs %d)",
+				csrf_form ? "present" : "MISSING",
+				csrf_ck[0] ? "present" : "MISSING",
+				csrf_form ? (int)strlen(csrf_form) : 0,
+				(int)strlen(csrf_ck));
+		auth_client_address(wsi, vhd, peer, sizeof(peer));
 		auth_record_strike(vhd, peer);
 		return -1;
 	}
 	return 0;
+}
+
+/*
+ * Return the caller's auth_csrf token in csrf (which must be at least 33
+ * bytes), minting a fresh one when the caller presented none.
+ *
+ * A presented value is only adopted if it has the exact 32-lowercase-hex
+ * shape we are the only setter of: the token is composed into a JSON
+ * string (/api/status) and into an HTML attribute (/api/device), and a
+ * cookie planted by, say, a sibling host must not be able to break out
+ * of either context.  Anything else is treated as "no token": the caller
+ * is given a fresh one, which also overwrites the bogus cookie.
+ *
+ * Returns 1 if the caller already holds this token (no Set-Cookie
+ * needed), 0 if it was just minted and must be handed out.
+ */
+static int
+auth_csrf_get_or_make(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
+		      char *csrf, size_t csrf_size)
+{
+	size_t csrf_len = csrf_size;
+	uint8_t rnd[16];
+	int n;
+
+	csrf[0] = '\0';
+
+	if (!lws_http_cookie_get(wsi, "auth_csrf", csrf, &csrf_len) &&
+	    strlen(csrf) == 32) {
+		for (n = 0; n < 32; n++)
+			if (!((csrf[n] >= '0' && csrf[n] <= '9') ||
+			      (csrf[n] >= 'a' && csrf[n] <= 'f')))
+				break;
+
+		if (n == 32)
+			return 1;
+
+		lwsl_wsi_notice(wsi, "discarding malformed auth_csrf cookie");
+	}
+
+	lws_get_random(vhd->context, rnd, sizeof(rnd));
+	lws_hex_from_byte_array(rnd, sizeof(rnd), csrf, csrf_size);
+
+	return 0;
+}
+
+/*
+ * Delete the auth_sessions row for EVERY auth_refresh_session value the
+ * browser presented: jars can legitimately hold several same-named values
+ * (host-only alongside Domain-scoped), and deleting only the
+ * first-or-nothing left live rows behind -- which then keep "silent
+ * renewal" half-alive on other hosts after this logout.
+ *
+ * Returns the number of rows deleted; *seen, if given, gets the number of
+ * cookie values presented.
+ */
+static int
+auth_server_destroy_refresh_sessions(struct lws *wsi,
+				     struct per_vhost_data__auth_server *vhd,
+				     int *seen)
+{
+	char refresh_tk[128];
+	int n, deleted = 0, saw = 0;
+
+	for (n = 0; n < 16; n++) {
+		size_t rl = sizeof(refresh_tk);
+		sqlite3_stmt *stmt;
+		int m;
+
+		m = lws_http_cookie_get_nth(wsi, "auth_refresh_session", n,
+					    refresh_tk, &rl);
+		if (m) {
+			/*
+			 * 2 is "too large for the buffer": skip it and look
+			 * behind it, or one planted oversized value would
+			 * hide every real one and logout would delete no
+			 * rows at all.
+			 */
+			if (m != 2)
+				break;
+			continue;
+		}
+		saw++;
+		if (!refresh_tk[0])
+			continue;
+		if (sqlite3_prepare_v2(vhd->db,
+				       "DELETE FROM auth_sessions "
+				       "WHERE session_id = ?",
+				       -1, &stmt, NULL) == SQLITE_OK) {
+			sqlite3_bind_text(stmt, 1, refresh_tk, -1,
+					  SQLITE_TRANSIENT);
+			sqlite3_step(stmt);
+			sqlite3_finalize(stmt);
+			deleted++;
+		} else
+			lwsl_wsi_err(wsi, "DB prepare failed: %s",
+				     sqlite3_errmsg(vhd->db));
+	}
+
+	if (seen)
+		*seen = saw;
+
+	return deleted;
+}
+
+/*
+ * Compose the six clearing Set-Cookie headers a session teardown emits:
+ * the session JWT, auth_csrf and auth_refresh_session, each in its
+ * Domain-scoped and its host-only form (a jar can hold both).  Entries
+ * that would not fit come back empty and must be skipped by the caller,
+ * see auth_server_clear_cookie().
+ */
+static void
+auth_server_clear_session_cookies(struct per_vhost_data__auth_server *vhd,
+				  char hdr[AUTH_SERVER_CLEAR_COOKIES]
+					  [AUTH_SERVER_CLEAR_COOKIE_SZ])
+{
+	char exp[64];
+	time_t t = 0;
+#if defined(WIN32) || defined(_WIN32)
+	struct tm tmp;
+	struct tm *tm = gmtime_s(&tmp, &t) == 0 ? &tmp : NULL;
+#else
+	struct tm tmp;
+	struct tm *tm = gmtime_r(&t, &tmp);
+#endif
+
+	if (tm)
+		strftime(exp, sizeof(exp), "%a, %d %b %Y %H:%M:%S GMT", tm);
+	else
+		exp[0] = '\0';
+
+	auth_server_clear_cookie(hdr[0], vhd->cookie_name,
+				 vhd->cookie_domain, exp);
+	auth_server_clear_cookie(hdr[1], vhd->cookie_name, NULL, exp);
+	auth_server_clear_cookie(hdr[2], "auth_csrf",
+				 vhd->cookie_domain, exp);
+	auth_server_clear_cookie(hdr[3], "auth_csrf", NULL, exp);
+	auth_server_clear_cookie(hdr[4], "auth_refresh_session",
+				 vhd->cookie_domain, exp);
+	auth_server_clear_cookie(hdr[5], "auth_refresh_session", NULL, exp);
+}
+
+/*
+ * Emit the composed clearing Set-Cookies, skipping any that did not fit.
+ * Returns nonzero if a header did not fit in the caller's header buffer.
+ */
+static int
+auth_server_add_clear_cookies(struct lws *wsi,
+			      char hdr[AUTH_SERVER_CLEAR_COOKIES]
+				      [AUTH_SERVER_CLEAR_COOKIE_SZ],
+			      unsigned char **p, unsigned char *end)
+{
+	int n;
+
+	for (n = 0; n < AUTH_SERVER_CLEAR_COOKIES; n++)
+		if (hdr[n][0] &&
+		    lws_add_http_header_by_name(wsi,
+				(unsigned char *)"set-cookie:",
+				(unsigned char *)hdr[n],
+				(int)strlen(hdr[n]), p, end))
+			return 1;
+
+	return 0;
+}
+
+/*
+ * Resolve the uid behind the auth_refresh_session cookie(s) presented on wsi.
+ *
+ * A browser can legitimately hold several cookies sharing this one name at
+ * once -- a host-only cookie from one login flow alongside a Domain-scoped one
+ * from another -- and RFC 6265 orders same-path cookies oldest-first.  The
+ * live session is therefore not necessarily the first value in the header:
+ * walk every presented value against auth_sessions and use the first that
+ * resolves to an unexpired row.
+ *
+ * Every value is walked even after one resolves or when none do, and a
+ * one-line account of what was seen (counts and states only, never the secret
+ * values) is composed into note[] so denial logs can say exactly why renewal
+ * failed -- "2 values: 1 expired, 1 not in db" instead of a bare 401.
+ *
+ * Returns the resolved uid, or 0 if no presented value resolves.
+ */
+static uint32_t
+auth_resolve_refresh_session(struct lws *wsi,
+			     struct per_vhost_data__auth_server *vhd,
+			     char *note, size_t note_len)
+{
+	int n, expired = 0, unknown = 0, seen = 0, oversized = 0;
+	char refresh_tk[128];
+	uint64_t now = (uint64_t)time(NULL);
+	uint32_t uid = 0;
+
+	for (n = 0; n < 16; n++) {
+		size_t rl = sizeof(refresh_tk);
+		sqlite3_stmt *stmt;
+		int m;
+
+		m = lws_http_cookie_get_nth(wsi, "auth_refresh_session", n,
+					    refresh_tk, &rl);
+		if (m) {
+			if (m != 2)
+				break; /* no more occurrences */
+			/*
+			 * 2 means "too large for the buffer", not "no more":
+			 * treating them the same let anyone able to set a
+			 * cookie in this scope (a sibling subdomain under
+			 * cookie-domain, ie cookie tossing) plant one
+			 * oversized same-named value that hid every real one
+			 * behind it.  Skip it and keep walking, exactly as
+			 * lws_jwt_auth_create() does.
+			 */
+			oversized++;
+			continue;
+		}
+
+		seen++;
+
+		if (!refresh_tk[0]) {
+			unknown++;
+			continue;
+		}
+
+		if (sqlite3_prepare_v2(vhd->db,
+				       "SELECT uid, expires FROM auth_sessions "
+				       "WHERE session_id = ?",
+				       -1, &stmt, NULL) != SQLITE_OK) {
+			unknown++;
+			continue;
+		}
+
+		sqlite3_bind_text(stmt, 1, refresh_tk, -1, SQLITE_TRANSIENT);
+		if (sqlite3_step(stmt) == SQLITE_ROW) {
+			uint64_t exp = (uint64_t)sqlite3_column_int64(stmt, 1);
+			if (now < exp) {
+				uid = (uint32_t)sqlite3_column_int(stmt, 0);
+				sqlite3_finalize(stmt);
+				break;
+			}
+			expired++;
+		} else
+			unknown++;
+		sqlite3_finalize(stmt);
+	}
+
+	lws_snprintf(note, note_len, "%d auth_refresh_session value(s) "
+			"presented: %d expired, %d not in db, %d live, "
+			"%d oversized",
+			seen, expired, unknown, uid ? 1 : 0, oversized);
+
+	return uid;
 }
 
 static int
@@ -651,49 +1889,56 @@ lws_auth_api_sso_exchange(struct lws *wsi, struct per_vhost_data__auth_server *v
 
 	char cookie_hdr[LWS_SSO_MAX_COOKIE] = {0};
 	char refresh_hdr[LWS_SSO_MAX_COOKIE] = {0};
-	uint32_t uid = 0;
 
 	const char *redirect_uri = lws_spa_get_string(pss->spa, EP_REDIRECT_URI);
 	if (redirect_uri && redirect_uri[0]) {
-		if (!auth_verify_redirect_uri(vhd, NULL, redirect_uri)) {
+		char alt_uri[512];
+		lws_strncpy(alt_uri, redirect_uri, sizeof(alt_uri));
+		char *sfx = strstr(alt_uri, "/.lws-login-sso");
+		if (sfx) *sfx = '\0';
+
+		if (!auth_verify_redirect_uri(vhd, NULL, alt_uri)) {
 			pss->http_response_code = HTTP_STATUS_BAD_REQUEST;
 			len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"Untrusted redirect URI\"}");
+			lwsl_wsi_notice(wsi, "denied: untrusted redirect_uri "
+					"'%s'", redirect_uri);
 			goto send;
 		}
 	}
 
-	struct lws_jwt_auth *ja = lws_jwt_auth_create(wsi, &vhd->jwk, vhd->cookie_name, NULL, NULL);
-	int was_refreshed = 0;
+	struct lws_jwt_auth *ja = auth_session_jwt(wsi, vhd);
+	char rnote[96] = "no auth_refresh_session cookie presented";
+	int was_refreshed = 0, had_jwt = !!ja;
+	uint32_t uid = 0;
 
 	if (ja) {
 		uid = lws_jwt_auth_get_uid(ja);
 		lws_jwt_auth_destroy(&ja);
 	} else if (vhd->refresh_token_validity_secs > 0) {
-		char refresh_tk[128] = {0};
-		size_t refresh_len = sizeof(refresh_tk);
-
-		if (lws_http_cookie_get(wsi, "auth_refresh_session", refresh_tk, &refresh_len) == 0 && refresh_tk[0]) {
-			sqlite3_stmt *stmt;
-			uint64_t now = (uint64_t)time(NULL);
-			if (sqlite3_prepare_v2(vhd->db, "SELECT uid, expires FROM auth_sessions WHERE session_id = ?", -1, &stmt, NULL) == SQLITE_OK) {
-				sqlite3_bind_text(stmt, 1, refresh_tk, -1, SQLITE_TRANSIENT);
-				if (sqlite3_step(stmt) == SQLITE_ROW) {
-					uint64_t exp = (uint64_t)sqlite3_column_int64(stmt, 1);
-					if (now < exp) {
-						uid = (uint32_t)sqlite3_column_int(stmt, 0);
-						was_refreshed = 1;
-					}
-				}
-				sqlite3_finalize(stmt);
-			}
-		}
+		uid = auth_resolve_refresh_session(wsi, vhd, rnote,
+						   sizeof(rnote));
+		was_refreshed = !!uid;
 	}
 
 	if (!uid) {
 		pss->http_response_code = HTTP_STATUS_UNAUTHORIZED;
 		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"Invalid session\"}");
+		/*
+		 * This is THE renewal failure path: say which credential was
+		 * missing and what happened to each refresh value, so "why was
+		 * it denied" is answerable from the log alone.
+		 */
+		lwsl_wsi_notice(wsi, "denied: auth_session JWT %s; %s",
+				had_jwt ? "presented but unusable" : "absent",
+				vhd->refresh_token_validity_secs > 0 ?
+					rnote :
+					"refresh sessions disabled on this server");
 		goto send;
 	}
+
+	lwsl_wsi_info(wsi, "uid %u resolved via %s", uid,
+		      was_refreshed ? "auth_refresh_session" :
+				      "auth_session JWT");
 
 	char username[128] = {0};
 	sqlite3_stmt *stmt;
@@ -707,24 +1952,29 @@ lws_auth_api_sso_exchange(struct lws *wsi, struct per_vhost_data__auth_server *v
 	char jwt[1024];
 	size_t jwt_len = sizeof(jwt);
 	char peer[64];
-	lws_get_peer_simple(wsi, peer, sizeof(peer));
+	auth_client_address(wsi, vhd, peer, sizeof(peer));
 
 	if (!lws_auth_generate_token(vhd, username, uid, peer, jwt, &jwt_len)) {
 		pss->http_response_code = HTTP_STATUS_OK;
 		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"token\":\"%s\"}", jwt);
 		
-		if (was_refreshed && vhd->cookie_name[0]) {
-			if (vhd->cookie_domain[0]) {
-				lws_snprintf(cookie_hdr, sizeof(cookie_hdr),
-					"%s=%s; Path=/; Domain=%s; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
-					vhd->cookie_name, jwt, vhd->cookie_domain,
-					vhd->jwt_validity_secs);
-			} else {
-				lws_snprintf(cookie_hdr, sizeof(cookie_hdr),
-					"%s=%s; Path=/; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
-					vhd->cookie_name, jwt,
-					vhd->jwt_validity_secs);
-			}
+		if (was_refreshed && vhd->cookie_name[0] &&
+		    lws_http_cookie_compose(cookie_hdr, sizeof(cookie_hdr),
+					    vhd->cookie_name, jwt,
+					    vhd->cookie_domain,
+					    vhd->jwt_validity_secs,
+					    NULL) < 0) {
+			/*
+			 * F-048: fail closed rather than emit a Set-Cookie
+			 * whose HttpOnly / SameSite / Secure tail was
+			 * truncated; the token is still in the JSON body
+			 */
+			lwsl_wsi_err(wsi, "%s: %s Set-Cookie too large "
+				     "for the composed buffer (token %d, "
+				     "domain %d)", __func__, vhd->cookie_name,
+				     (int)strlen(jwt),
+				     (int)strlen(vhd->cookie_domain));
+			cookie_hdr[0] = '\0';
 		}
 		goto send;
 	}
@@ -737,6 +1987,596 @@ send:
 		return -1;
 
 	return send_auth_headers(wsi, pss, "application/json", cookie_hdr[0] ? cookie_hdr : NULL, refresh_hdr[0] ? refresh_hdr : NULL);
+}
+
+static void
+generate_user_code(struct lws_context *cx, char *out)
+{
+	uint8_t rnd[8];
+	const char *charset = "BCDFGHJKLMNPQRSTVWXZ23456789";
+	size_t clen = strlen(charset);
+	int i;
+
+	lws_get_random(cx, rnd, sizeof(rnd));
+	for (i = 0; i < 4; i++) {
+		out[i] = charset[rnd[i] % clen];
+	}
+	out[4] = '-';
+	for (i = 0; i < 4; i++) {
+		out[i + 5] = charset[rnd[i + 4] % clen];
+	}
+	out[9] = '\0';
+}
+
+static int
+lws_auth_api_device_auth(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
+			 struct per_session_data__auth_server *pss)
+{
+	char pl[1024 + LWS_PRE];
+	int len;
+	char device_code[65];
+	char user_code[16];
+	uint8_t rnd[32];
+	sqlite3_stmt *stmt;
+	uint64_t now = (uint64_t)time(NULL);
+	uint64_t expires = now + (15 * 60); /* 15 minutes to pair */
+	int pending = 0;
+
+	/*
+	 * This endpoint is a bare unauthenticated POST -- no session, no CSRF
+	 * check -- and the only DELETE FROM device_codes is on a *successful*
+	 * /api/device_token redemption, so rows from abandoned or synthetic
+	 * pairings used to accumulate for ever, growing the database and the
+	 * table every device_token poll scans.  Reap what has expired, then
+	 * refuse to mint more than a sane number of simultaneously pending
+	 * codes: a real deployment has a handful in flight at a time.
+	 */
+	if (sqlite3_prepare_v2(vhd->db, "DELETE FROM device_codes WHERE "
+			       "expires <= ?", -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_int64(stmt, 1, (sqlite_int64)now);
+		sqlite3_step(stmt);
+		sqlite3_finalize(stmt);
+	}
+
+	if (sqlite3_prepare_v2(vhd->db, "SELECT COUNT(*) FROM device_codes",
+			       -1, &stmt, NULL) == SQLITE_OK) {
+		if (sqlite3_step(stmt) == SQLITE_ROW)
+			pending = sqlite3_column_int(stmt, 0);
+		sqlite3_finalize(stmt);
+	}
+
+	if (pending >= 1024) {
+		lwsl_wsi_warn(wsi, "%s: %d device codes already pending, "
+			      "refusing", __func__, pending);
+		pss->http_response_code = HTTP_STATUS_SERVICE_UNAVAILABLE;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE,
+				   "{\"error\":\"slow_down\"}");
+		goto send;
+	}
+
+	lws_get_random(vhd->context, rnd, 32);
+	lws_hex_from_byte_array(rnd, 32, device_code, 65);
+	generate_user_code(vhd->context, user_code);
+
+	if (sqlite3_prepare_v2(vhd->db, "INSERT INTO device_codes (device_code, user_code, uid, expires, status) VALUES (?, ?, 0, ?, 0)", -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, device_code, -1, SQLITE_STATIC);
+		sqlite3_bind_text(stmt, 2, user_code, -1, SQLITE_STATIC);
+		sqlite3_bind_int64(stmt, 3, (sqlite_int64)expires);
+		sqlite3_step(stmt);
+		sqlite3_finalize(stmt);
+	}
+
+	pss->http_response_code = HTTP_STATUS_OK;
+	len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE,
+			"{\"device_code\":\"%s\",\"user_code\":\"%s\",\"verification_uri\":\"https://%s/\",\"expires_in\":900,\"interval\":5}",
+			device_code, user_code, vhd->auth_domain);
+
+send:
+	if (lws_buflist_append_segment(&pss->tx_buflist, (uint8_t *)pl, (size_t)len + LWS_PRE) < 0)
+		return -1;
+
+	return send_auth_headers(wsi, pss, "application/json", NULL, NULL);
+}
+
+static int
+lws_auth_api_device_token(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
+			  struct per_session_data__auth_server *pss)
+{
+	char pl[1024 + LWS_PRE];
+	int len;
+	const char *device_code = lws_spa_get_string(pss->spa, EP_DEVICE_CODE);
+	sqlite3_stmt *stmt;
+	uint64_t now = (uint64_t)time(NULL);
+	int status = -1;
+	uint32_t uid = 0;
+	uint64_t expires = 0;
+
+	if (!device_code || !device_code[0]) {
+		pss->http_response_code = HTTP_STATUS_BAD_REQUEST;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"invalid_request\"}");
+		goto send;
+	}
+
+	if (sqlite3_prepare_v2(vhd->db, "SELECT status, uid, expires FROM device_codes WHERE device_code = ?", -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, device_code, -1, SQLITE_STATIC);
+		if (sqlite3_step(stmt) == SQLITE_ROW) {
+			status = sqlite3_column_int(stmt, 0);
+			uid = (uint32_t)sqlite3_column_int(stmt, 1);
+			expires = (uint64_t)sqlite3_column_int64(stmt, 2);
+		}
+		sqlite3_finalize(stmt);
+	}
+
+	if (status == -1) {
+		pss->http_response_code = HTTP_STATUS_BAD_REQUEST;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"expired_token\"}");
+		goto send;
+	}
+
+	if (now > expires) {
+		pss->http_response_code = HTTP_STATUS_BAD_REQUEST;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"expired_token\"}");
+		goto send;
+	}
+
+	if (status == 0) {
+		pss->http_response_code = HTTP_STATUS_BAD_REQUEST;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"authorization_pending\"}");
+		goto send;
+	}
+
+	if (status == 1 && uid > 0) {
+		char username[128] = {0};
+		if (sqlite3_prepare_v2(vhd->db, "SELECT username FROM users WHERE uid = ?", -1, &stmt, NULL) == SQLITE_OK) {
+			sqlite3_bind_int(stmt, 1, (int)uid);
+			if (sqlite3_step(stmt) == SQLITE_ROW)
+				lws_strncpy(username, (const char *)sqlite3_column_text(stmt, 0), sizeof(username));
+			sqlite3_finalize(stmt);
+		}
+
+		char jwt[1024];
+		size_t jwt_len = sizeof(jwt);
+		char peer[64];
+		auth_client_address(wsi, vhd, peer, sizeof(peer));
+
+		if (!lws_auth_generate_device_token(vhd, username, uid, device_code, peer, jwt, &jwt_len)) {
+			pss->http_response_code = HTTP_STATUS_OK;
+			len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"access_token\":\"%s\",\"token_type\":\"bearer\"}", jwt);
+
+			/* Insert into devices table for granular revocation */
+			if (sqlite3_prepare_v2(vhd->db, "INSERT OR IGNORE INTO devices (device_id, uid, name, created) VALUES (?, ?, ?, ?)", -1, &stmt, NULL) == SQLITE_OK) {
+				sqlite3_bind_text(stmt, 1, device_code, -1, SQLITE_STATIC);
+				sqlite3_bind_int(stmt, 2, (int)uid);
+				sqlite3_bind_text(stmt, 3, "Headless Device", -1, SQLITE_STATIC);
+				sqlite3_bind_int64(stmt, 4, (sqlite_int64)time(NULL));
+
+				sqlite3_step(stmt);
+				sqlite3_finalize(stmt);
+			} else {
+				lwsl_err("%s: Failed to prepare device registration query: %s\n", __func__, sqlite3_errmsg(vhd->db));
+			}
+
+			/* Consume code */
+			if (sqlite3_prepare_v2(vhd->db, "DELETE FROM device_codes WHERE device_code = ?", -1, &stmt, NULL) == SQLITE_OK) {
+				sqlite3_bind_text(stmt, 1, device_code, -1, SQLITE_STATIC);
+				sqlite3_step(stmt);
+				sqlite3_finalize(stmt);
+			}
+			goto send;
+		} else {
+			pss->http_response_code = HTTP_STATUS_INTERNAL_SERVER_ERROR;
+			len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"server_error\"}");
+			goto send;
+		}
+	}
+
+	pss->http_response_code = HTTP_STATUS_BAD_REQUEST;
+	len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"access_denied\"}");
+
+send:
+	if (lws_buflist_append_segment(&pss->tx_buflist, (uint8_t *)pl, (size_t)len + LWS_PRE) < 0)
+		return -1;
+
+	return send_auth_headers(wsi, pss, "application/json", NULL, NULL);
+}
+
+static int
+lws_auth_api_device_approve(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
+			    struct per_session_data__auth_server *pss)
+{
+	char pl[1024 + LWS_PRE];
+	int len;
+
+	if (auth_check_csrf(wsi, vhd, pss)) {
+		pss->http_response_code = HTTP_STATUS_FORBIDDEN;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"CSRF validation failed\"}");
+		goto send;
+	}
+
+	struct lws_jwt_auth *ja = auth_session_jwt(wsi, vhd);
+	uint32_t uid = 0;
+	if (ja) {
+		uid = lws_jwt_auth_get_uid(ja);
+		lws_jwt_auth_destroy(&ja);
+	}
+
+	if (!uid) {
+		pss->http_response_code = HTTP_STATUS_UNAUTHORIZED;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"invalid_session\"}");
+		goto send;
+	}
+
+	const char *user_code = lws_spa_get_string(pss->spa, EP_USER_CODE);
+	if (!user_code || !user_code[0]) {
+		pss->http_response_code = HTTP_STATUS_BAD_REQUEST;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"missing_code\"}");
+		goto send;
+	}
+
+	sqlite3_stmt *stmt;
+	int found = 0;
+	if (sqlite3_prepare_v2(vhd->db, "UPDATE device_codes SET status = 1, uid = ? WHERE user_code = ? AND status = 0", -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_int(stmt, 1, (int)uid);
+		sqlite3_bind_text(stmt, 2, user_code, -1, SQLITE_STATIC);
+		sqlite3_step(stmt);
+		if (sqlite3_changes(vhd->db) > 0) {
+			found = 1;
+		}
+		sqlite3_finalize(stmt);
+	}
+
+	if (found) {
+		pss->http_response_code = HTTP_STATUS_OK;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"status\":\"ok\"}");
+	} else {
+		pss->http_response_code = HTTP_STATUS_BAD_REQUEST;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"Invalid or expired code\"}");
+	}
+
+send:
+	if (lws_buflist_append_segment(&pss->tx_buflist, (uint8_t *)pl, (size_t)len + LWS_PRE) < 0)
+		return -1;
+
+	return send_auth_headers(wsi, pss, "application/json", NULL, NULL);
+}
+
+/*
+ * POST /api/logout: tear the session down.
+ *
+ * This is the state-changing sibling of the GET /api/logout link
+ * lws-login points a top-level navigation at.  Having a body, it can
+ * carry -- and require -- the auth_csrf double submit, so a third-party
+ * page cannot force a logout with a scripted fetch or form post.  It is
+ * what assets/auth.js uses, replacing the CSRF-free GET
+ * /api/status?destroy=1 it used to fetch.
+ */
+static int
+lws_auth_api_logout(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
+		    struct per_session_data__auth_server *pss)
+{
+	char hdr[AUTH_SERVER_CLEAR_COOKIES][AUTH_SERVER_CLEAR_COOKIE_SZ];
+	char buf[AUTH_SERVER_RESP_HDR_SZ + LWS_PRE], pl[LWS_PRE + 64];
+	uint8_t *start = (uint8_t *)buf + LWS_PRE, *p = start,
+		*end = (uint8_t *)buf + sizeof(buf) - 1;
+	size_t pl_len;
+	int deleted;
+
+	if (auth_check_csrf(wsi, vhd, pss)) {
+		pss->http_response_code = HTTP_STATUS_FORBIDDEN;
+		pl_len = (size_t)lws_snprintf(pl + LWS_PRE,
+					      sizeof(pl) - LWS_PRE,
+					      "{\"error\":\"CSRF validation "
+					      "failed\"}");
+		if (lws_buflist_append_segment(&pss->tx_buflist, (uint8_t *)pl,
+					       pl_len + LWS_PRE) < 0)
+			return -1;
+
+		return send_auth_headers(wsi, pss, "application/json", NULL,
+					 NULL);
+	}
+
+	deleted = auth_server_destroy_refresh_sessions(wsi, vhd, NULL);
+	lwsl_wsi_notice(wsi, "logout: %d session row(s) deleted", deleted);
+
+	auth_server_clear_session_cookies(vhd, hdr);
+
+	pss->http_response_code = HTTP_STATUS_OK;
+	pl_len = (size_t)lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE,
+				      "{\"destroy\":1}");
+
+	if (lws_add_http_common_headers(wsi, HTTP_STATUS_OK, "application/json",
+					(lws_filepos_t)pl_len, &p, end) ||
+	    lws_add_http_header_by_name(wsi, (unsigned char *)"Cache-Control:",
+			(unsigned char *)"no-cache, no-store, must-revalidate",
+			35, &p, end) ||
+	    auth_server_add_clear_cookies(wsi, hdr, &p, end) ||
+	    lws_finalize_write_http_header(wsi, start, &p, end)) {
+		lwsl_wsi_err(wsi, "logout: unable to compose the response "
+				  "header block with %d clearing cookies "
+				  "(%d bytes used of %d)",
+			     AUTH_SERVER_CLEAR_COOKIES,
+			     (int)lws_ptr_diff(p, start),
+			     (int)AUTH_SERVER_RESP_HDR_SZ);
+
+		return -1;
+	}
+
+	if (lws_buflist_append_segment(&pss->tx_buflist, (uint8_t *)pl,
+				       pl_len + LWS_PRE) < 0)
+		return -1;
+
+	lws_callback_on_writable(wsi);
+
+	return 0;
+}
+
+static int
+lws_auth_api_forgot_password(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
+			     struct per_session_data__auth_server *pss)
+{
+	char peer[64], pl[1024 + LWS_PRE];
+	const char *email;
+	int len;
+	sqlite3_stmt *stmt;
+	uint32_t uid = 0;
+
+	if (auth_check_csrf(wsi, vhd, pss)) {
+		pss->http_response_code = HTTP_STATUS_FORBIDDEN;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"CSRF validation failed\"}");
+		goto send;
+	}
+
+	email = lws_spa_get_string(pss->spa, EP_EMAIL);
+	auth_client_address(wsi, vhd, peer, sizeof(peer));
+
+	if (!email || !email[0]) {
+		auth_record_strike(vhd, peer);
+		pss->http_response_code = HTTP_STATUS_BAD_REQUEST;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"Missing email parameter\"}");
+		goto send;
+	}
+
+	if (sqlite3_prepare_v2(vhd->db, "SELECT uid FROM users WHERE username = ?", -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, email, -1, SQLITE_STATIC);
+		if (sqlite3_step(stmt) == SQLITE_ROW) {
+			uid = (uint32_t)sqlite3_column_int(stmt, 0);
+		}
+		sqlite3_finalize(stmt);
+	}
+
+	if (uid) {
+		int pending = 0;
+
+		/* expired recovery rows are only ever deleted on a successful
+		 * reset, so reap them here rather than let them accumulate */
+		if (sqlite3_prepare_v2(vhd->db, "DELETE FROM password_recovery "
+				       "WHERE expires <= ?", -1, &stmt,
+				       NULL) == SQLITE_OK) {
+			sqlite3_bind_int64(stmt, 1, (sqlite_int64)time(NULL));
+			sqlite3_step(stmt);
+			sqlite3_finalize(stmt);
+		}
+
+		if (sqlite3_prepare_v2(vhd->db, "SELECT 1 FROM password_recovery WHERE uid = ? AND expires > ?", -1, &stmt, NULL) == SQLITE_OK) {
+			sqlite3_bind_int(stmt, 1, (int)uid);
+			sqlite3_bind_int64(stmt, 2, (sqlite_int64)time(NULL));
+			if (sqlite3_step(stmt) == SQLITE_ROW)
+				pending = 1;
+			sqlite3_finalize(stmt);
+		}
+
+		if (!pending) {
+			char token[64], token_b64[64];
+			int tl;
+
+			lws_get_random(vhd->context, token, 32);
+			/*
+			 * The token travels as a query argument of the mailed
+			 * link: standard base64's '+' comes back from
+			 * URLSearchParams as a space and '/' is not safe there
+			 * either, so about half the links could never work.
+			 * base64url, without the '=' padding, needs no escaping
+			 */
+			tl = lws_b64_encode_string_url(token, 32, token_b64,
+						       sizeof(token_b64));
+			lws_explicit_bzero(token, sizeof(token));
+			if (tl <= 0)
+				goto done_mail;
+			while (tl && token_b64[tl - 1] == '=')
+				token_b64[--tl] = '\0';
+
+			uint64_t expires = (uint64_t)time(NULL) + (15 * 60);
+
+			if (sqlite3_prepare_v2(vhd->db, "INSERT INTO password_recovery (token, uid, expires) VALUES (?, ?, ?)", -1, &stmt, NULL) == SQLITE_OK) {
+				sqlite3_bind_text(stmt, 1, token_b64, -1, SQLITE_STATIC);
+				sqlite3_bind_int(stmt, 2, (int)uid);
+				sqlite3_bind_int64(stmt, 3, (sqlite_int64)expires);
+				if (sqlite3_step(stmt) == SQLITE_DONE) {
+					if (vhd->smtp) {
+						char url[512], mbody[1024];
+						/* the UI lives at the root of the auth vhost */
+						lws_snprintf(url, sizeof(url), "https://%s/?reset_token=%s", lws_get_vhost_name(vhd->vhost), token_b64);
+						lws_snprintf(mbody, sizeof(mbody), "To reset your password, click this link within 15 minutes:\n%s\nIf you did not request this, please ignore it.", url);
+						lws_smtp_email_t payload;
+						memset(&payload, 0, sizeof(payload));
+						payload.from = vhd->email_from;
+						payload.to = email;
+						payload.subject = "Password Recovery";
+						payload.body = mbody;
+						if (lws_smtpc_queue(vhd->smtp, &payload,
+								    NULL, NULL))
+							lwsl_vhost_err(vhd->vhost,
+								"failed to queue recovery mail");
+					}
+				}
+				sqlite3_finalize(stmt);
+			}
+		}
+	}
+
+done_mail:
+	pss->http_response_code = HTTP_STATUS_OK;
+	len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"status\":\"If an account exists, a recovery link has been sent.\"}");
+
+send:
+	if (lws_buflist_append_segment(&pss->tx_buflist, (uint8_t *)pl, (size_t)len + LWS_PRE) < 0)
+		return -1;
+	return send_auth_headers(wsi, pss, "application/json", NULL, NULL);
+}
+
+static int
+lws_auth_api_reset_password(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
+			    struct per_session_data__auth_server *pss)
+{
+	char peer[64], pl[1024 + LWS_PRE];
+	const char *token, *new_password;
+	int len;
+	sqlite3_stmt *stmt;
+	uint32_t uid = 0;
+
+	if (auth_check_csrf(wsi, vhd, pss)) {
+		pss->http_response_code = HTTP_STATUS_FORBIDDEN;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"CSRF validation failed\"}");
+		goto send;
+	}
+
+	token = lws_spa_get_string(pss->spa, EP_RESET_TOKEN);
+	new_password = lws_spa_get_string(pss->spa, EP_NEW_PASS);
+	auth_client_address(wsi, vhd, peer, sizeof(peer));
+
+	if (!token || !token[0] || !new_password || strlen(new_password) < 8) {
+		auth_record_strike(vhd, peer);
+		pss->http_response_code = HTTP_STATUS_BAD_REQUEST;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"Invalid token or password too short (min 8 chars)\"}");
+		goto send;
+	}
+
+	if (sqlite3_prepare_v2(vhd->db, "SELECT uid FROM password_recovery WHERE token = ? AND expires > ?", -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, token, -1, SQLITE_STATIC);
+		sqlite3_bind_int64(stmt, 2, (sqlite_int64)time(NULL));
+		if (sqlite3_step(stmt) == SQLITE_ROW) {
+			uid = (uint32_t)sqlite3_column_int(stmt, 0);
+		}
+		sqlite3_finalize(stmt);
+	}
+
+	if (!uid) {
+		auth_record_strike(vhd, peer);
+		pss->http_response_code = HTTP_STATUS_UNAUTHORIZED;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"Invalid or expired reset token\"}");
+		goto send;
+	}
+
+	uint8_t salt[16], hash[64];
+	char salt_hex[33], hash_hex[129];
+
+	lws_get_random(vhd->context, salt, sizeof(salt));
+	lws_b64_encode_string((char *)salt, sizeof(salt), salt_hex, sizeof(salt_hex));
+
+	if (!pbkdf2_sha512(new_password, salt_hex, 100000, hash)) {
+
+		lws_genhash_render(LWS_GENHASH_TYPE_SHA512, hash, hash_hex, sizeof(hash_hex));
+
+		if (sqlite3_prepare_v2(vhd->db, "UPDATE users SET password_hash = ?, salt = ?, session_epoch = session_epoch + 1 WHERE uid = ?", -1, &stmt, NULL) == SQLITE_OK) {
+			sqlite3_bind_text(stmt, 1, hash_hex, -1, SQLITE_STATIC);
+			sqlite3_bind_text(stmt, 2, salt_hex, -1, SQLITE_STATIC);
+			sqlite3_bind_int(stmt, 3, (int)uid);
+			if (sqlite3_step(stmt) == SQLITE_DONE) {
+				sqlite3_stmt *del_stmt;
+
+				sqlite3_finalize(stmt);
+				/* the epoch moved: an open admin ws of his closes */
+				auth_admin_ws_recheck_all(vhd);
+
+				if (sqlite3_prepare_v2(vhd->db, "DELETE FROM auth_sessions WHERE uid = ?", -1, &del_stmt, NULL) == SQLITE_OK) {
+					sqlite3_bind_int(del_stmt, 1, (int)uid);
+					sqlite3_step(del_stmt);
+					sqlite3_finalize(del_stmt);
+				}
+				if (sqlite3_prepare_v2(vhd->db, "DELETE FROM password_recovery WHERE token = ?", -1, &del_stmt, NULL) == SQLITE_OK) {
+					sqlite3_bind_text(del_stmt, 1, token, -1, SQLITE_STATIC);
+					sqlite3_step(del_stmt);
+					sqlite3_finalize(del_stmt);
+				}
+
+				auth_clear_strike(vhd, peer);
+				pss->http_response_code = HTTP_STATUS_OK;
+				len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"status\":\"Password updated successfully. Please log in.\"}");
+				goto send;
+			}
+			sqlite3_finalize(stmt);
+		}
+	}
+
+	pss->http_response_code = HTTP_STATUS_INTERNAL_SERVER_ERROR;
+	len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"Internal Error\"}");
+
+send:
+	if (lws_buflist_append_segment(&pss->tx_buflist, (uint8_t *)pl, (size_t)len + LWS_PRE) < 0)
+		return -1;
+	return send_auth_headers(wsi, pss, "application/json", NULL, NULL);
+}
+
+/*
+ * Mint a fresh long-term refresh session for `uid`: generate a random code,
+ * insert an `auth_sessions` row expiring at now + refresh_token_validity_secs,
+ * and return the raw code in refresh_code_out (caller-owned buffer, >=65 chars)
+ * so it can be placed in the /api/token JSON for the delegate flow.  If
+ * refresh_hdr_out is non-NULL, also format the auth_refresh_session Set-Cookie
+ * into it (used by the native/direct login path, which sets the cookie on the
+ * auth server's own host); the delegate path passes NULL and sets the cookie
+ * itself on the app host.
+ *
+ * Returns 1 on success (code minted), 0 if refresh is disabled
+ * (refresh_token_validity_secs == 0) or the DB insert failed.
+ */
+static int
+lws_auth_mint_refresh(struct per_vhost_data__auth_server *vhd, uint32_t uid,
+		      char *refresh_code_out, char *refresh_hdr_out)
+{
+	sqlite3_stmt *stmt;
+	uint8_t r_rnd[32];
+	uint64_t r_exp;
+
+	if (vhd->refresh_token_validity_secs == 0)
+		return 0;
+
+	r_exp = (uint64_t)time(NULL) + vhd->refresh_token_validity_secs;
+	lws_get_random(vhd->context, r_rnd, 32);
+	lws_hex_from_byte_array(r_rnd, 32, refresh_code_out, 65);
+
+	if (sqlite3_prepare_v2(vhd->db, "INSERT INTO auth_sessions "
+			       "(session_id, uid, expires) VALUES (?, ?, ?)",
+			       -1, &stmt, NULL) != SQLITE_OK)
+		return 0;
+	sqlite3_bind_text(stmt, 1, refresh_code_out, -1, SQLITE_STATIC);
+	sqlite3_bind_int(stmt, 2, (int)uid);
+	sqlite3_bind_int64(stmt, 3, (sqlite_int64)r_exp);
+	if (sqlite3_step(stmt) != SQLITE_DONE) {
+		sqlite3_finalize(stmt);
+		return 0;
+	}
+	sqlite3_finalize(stmt);
+
+	if (refresh_hdr_out &&
+	    lws_http_cookie_compose(refresh_hdr_out, LWS_SSO_MAX_COOKIE,
+				    "auth_refresh_session", refresh_code_out,
+				    vhd->cookie_domain,
+				    vhd->refresh_token_validity_secs,
+				    NULL) < 0) {
+		/*
+		 * F-048: fail closed rather than emit a truncated attribute
+		 * tail; callers gate on refresh_hdr_out[0], so the refresh
+		 * cookie is simply skipped (the code stays in the JSON body
+		 * for the delegate flow)
+		 */
+		lwsl_err("auth-server: auth_refresh_session Set-Cookie "
+			 "too large for the composed buffer (domain %d)",
+			 (int)strlen(vhd->cookie_domain));
+		refresh_hdr_out[0] = '\0';
+	}
+
+	return 1;
 }
 
 static int
@@ -763,7 +2603,7 @@ lws_auth_api_login(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
         char totp_secret[64] = {0};
         uint32_t uid = 0;
 
-        lws_get_peer_simple(wsi, peer, sizeof(peer));
+        auth_client_address(wsi, vhd, peer, sizeof(peer));
 
         if (sqlite3_prepare_v2(vhd->db, "SELECT COUNT(*) FROM users", -1,
 				   &stmt_chk, NULL) == SQLITE_OK) {
@@ -793,10 +2633,47 @@ lws_auth_api_login(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
 		goto send;
 	}
 
+	/*
+	 * Apply the limiter *before* the KDF, not only after it.  Each
+	 * credential check is 100000 HMAC-SHA512 rounds run inline on the
+	 * single event loop thread, so an unauthenticated peer could aim tens
+	 * of ms of stall per small POST at the whole process while the only
+	 * brake -- the 5-strike ban -- was still three failures away.  Once an
+	 * address has accrued strikes, make it wait for them to decay rather
+	 * than spend more CPU on it.
+	 *
+	 * (The KDF really belongs off the event loop thread, on the lws
+	 * threadpool, with the login response completed from the worker; that
+	 * is a larger change than this fix.)
+	 */
+	if (auth_peer_strikes(vhd, peer) >= 3) {
+		lwsl_wsi_notice(wsi, "%s: %s rate limited before KDF",
+				__func__, peer);
+		auth_record_strike(vhd, peer);
+		pss->http_response_code = HTTP_STATUS_SERVICE_UNAVAILABLE;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"Too many attempts, try again shortly\"}");
+		goto send;
+	}
+
+	/*
+	 * The same brake per account: eight wrong passwords for one name,
+	 * from however many addresses, and its logins wait for the strikes
+	 * to decay (one per 120 s) before the KDF is spent on them again
+	 */
+	if (auth_account_strikes(vhd, user) >= 8) {
+		lwsl_wsi_notice(wsi, "%s: account rate limited before KDF",
+				__func__);
+		auth_record_strike(vhd, peer);
+		pss->http_response_code = HTTP_STATUS_SERVICE_UNAVAILABLE;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"Too many attempts, try again shortly\"}");
+		goto send;
+	}
+
 	if (lws_auth_check_credentials(vhd, user, pass, &uid)) {
 		lwsl_err("%s: Validation failed for user '%s'\n", __func__, user);
 		lwsl_info("login bad credentials\n");
 		auth_record_strike(vhd, peer);
+		auth_account_record_strike(vhd, user);
 		pss->http_response_code = HTTP_STATUS_UNAUTHORIZED;
 		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"Validation failed\"}");
 		goto send;
@@ -828,13 +2705,91 @@ lws_auth_api_login(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
 			goto send;
 		}
 
-		uint32_t code = (uint32_t)atoi(totp_code_str);
-		if (lws_auth_totp_verify(totp_secret, code)) {
+		uint64_t matched_t = 0;
+		uint32_t code;
+		size_t cn;
+
+		/*
+		 * Both TOTP codes and backup codes are exactly six decimal
+		 * digits.  atoi() of anything else silently yields 0, ie the
+		 * code "000000" was tested instead of the submission being
+		 * rejected; validate the shape explicitly first.
+		 */
+		for (cn = 0; cn < 7 && totp_code_str[cn]; cn++)
+			if (totp_code_str[cn] < '0' || totp_code_str[cn] > '9')
+				break;
+
+		if (cn != 6 || totp_code_str[6]) {
 			auth_record_strike(vhd, peer);
-			lwsl_info("login bad TOTP\n");
+			lwsl_info("login malformed TOTP\n");
 			pss->http_response_code = HTTP_STATUS_UNAUTHORIZED;
 			len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"Invalid Authenticator Code\"}");
 			goto send;
+		}
+
+		code = (uint32_t)atoi(totp_code_str);
+		if (!lws_auth_totp_verify(totp_secret, code, &matched_t)) {
+			uint64_t last = 0;
+
+			/*
+			 * RFC 6238 5.2: a code must be accepted once only.
+			 * Nothing recorded consumption, so a code seen once
+			 * (shoulder-surfed, phished via a proxy, read out of
+			 * a logged form post) stayed valid for the whole +-1
+			 * window.  Remember the highest counter accepted for
+			 * this uid and refuse anything not strictly newer.
+			 */
+			if (sqlite3_prepare_v2(vhd->db, "SELECT totp_last FROM "
+					       "users WHERE uid = ?", -1, &stmt,
+					       NULL) == SQLITE_OK) {
+				sqlite3_bind_int(stmt, 1, (int)uid);
+				if (sqlite3_step(stmt) == SQLITE_ROW)
+					last = (uint64_t)sqlite3_column_int64(stmt, 0);
+				sqlite3_finalize(stmt);
+			}
+
+			if (matched_t <= last) {
+				auth_record_strike(vhd, peer);
+				lwsl_notice("%s: uid %u replayed TOTP counter "
+					    "%llu\n", __func__, uid,
+					    (unsigned long long)matched_t);
+				pss->http_response_code = HTTP_STATUS_UNAUTHORIZED;
+				len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"Invalid Authenticator Code\"}");
+				goto send;
+			}
+
+			if (sqlite3_prepare_v2(vhd->db, "UPDATE users SET "
+					       "totp_last = ? WHERE uid = ?", -1,
+					       &stmt, NULL) == SQLITE_OK) {
+				sqlite3_bind_int64(stmt, 1, (sqlite_int64)matched_t);
+				sqlite3_bind_int(stmt, 2, (int)uid);
+				sqlite3_step(stmt);
+				sqlite3_finalize(stmt);
+			}
+		} else {
+			int backup_ok = 0;
+			if (sqlite3_prepare_v2(vhd->db, "SELECT 1 FROM backup_codes WHERE uid = ? AND code = ? AND used = 0", -1, &stmt, NULL) == SQLITE_OK) {
+				sqlite3_bind_int(stmt, 1, (int)uid);
+				sqlite3_bind_text(stmt, 2, totp_code_str, -1, SQLITE_STATIC);
+				if (sqlite3_step(stmt) == SQLITE_ROW)
+					backup_ok = 1;
+				sqlite3_finalize(stmt);
+			}
+			if (backup_ok) {
+				if (sqlite3_prepare_v2(vhd->db, "UPDATE backup_codes SET used = 1 WHERE uid = ? AND code = ?", -1, &stmt, NULL) == SQLITE_OK) {
+					sqlite3_bind_int(stmt, 1, (int)uid);
+					sqlite3_bind_text(stmt, 2, totp_code_str, -1, SQLITE_STATIC);
+					sqlite3_step(stmt);
+					sqlite3_finalize(stmt);
+				}
+				lwsl_notice("%s: User %u consumed a backup code\n", __func__, uid);
+			} else {
+				auth_record_strike(vhd, peer);
+				lwsl_info("login bad TOTP\n");
+				pss->http_response_code = HTTP_STATUS_UNAUTHORIZED;
+				len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"Invalid Authenticator Code\"}");
+				goto send;
+			}
 		}
 	}
 
@@ -882,13 +2837,74 @@ lws_auth_api_login(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
 		}
 
 		pss->http_response_code = HTTP_STATUS_OK;
-		char host[128] = {0};
+		char host[128] = {0}, enc_state[384];
+		char rurl[768], jurl[1024];
+
 		lws_hdr_copy(wsi, host, sizeof(host), WSI_TOKEN_HOST);
+		auth_sanitise_host(host, sizeof(host), vhd->auth_domain);
+
+		/*
+		 * state comes from the lws_spa, which -- unlike the urlarg
+		 * parser -- does no filtering at all, and it is replayed into
+		 * a URL that is itself a JSON string value.  So percent-encode
+		 * it (a raw '&' or '#' would otherwise reshape or truncate the
+		 * query the browser is sent to, defeating the iss mix-up
+		 * defence of RFC 9207), and JSON-escape the finished URL (a
+		 * raw '"' would otherwise break out of the JSON the login page
+		 * parses).  This is the treatment the anonymous /authorize
+		 * branch already documents and applies.
+		 */
+		lws_urlencode(enc_state, state ? state : "", (int)sizeof(enc_state));
+
 		const char *delim = strchr(redirect_uri, '?') ? "&" : "?";
 		if (state && state[0])
-			len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"redirect\":\"%s%scode=%s&state=%s&iss=https%%3A%%2F%%2F%s\"}", redirect_uri, delim, code, state, host);
+			lws_snprintf(rurl, sizeof(rurl), "%s%scode=%s&state=%s&iss=https%%3A%%2F%%2F%s", redirect_uri, delim, code, enc_state, host);
 		else
-			len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"redirect\":\"%s%scode=%s&iss=https%%3A%%2F%%2F%s\"}", redirect_uri, delim, code, host);
+			lws_snprintf(rurl, sizeof(rurl), "%s%scode=%s&iss=https%%3A%%2F%%2F%s", redirect_uri, delim, code, host);
+
+		lws_json_purify(jurl, rurl, (int)sizeof(jurl), NULL);
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"redirect\":\"%s\"}", jurl);
+
+		/*
+		 * The delegate login is still a login on the auth server's
+		 * own origin: plant the same auth_session JWT cookie and
+		 * long-term auth_refresh_session the native branch does.
+		 * Without these, the user authenticates, the oauth2 code
+		 * flow completes -- and the auth server immediately forgets
+		 * them: the next /api/authorize can neither see a session
+		 * nor fall back to a refresh session, and the app-side
+		 * .lws-login-refresh BFF has no auth_refresh_session to
+		 * forward, so the user must do a full credential (and TOTP)
+		 * login again every time the 1h app JWT expires.
+		 */
+		if (lws_auth_generate_token(vhd, user, uid, peer, jwt, &jwt_len)) {
+			lwsl_wsi_err(wsi, "%s: delegate login: session "
+				     "token generation failed (uid %u)",
+				     __func__, uid);
+		} else {
+			if (vhd->cookie_name[0] &&
+			    lws_http_cookie_compose(cookie_hdr,
+						    sizeof(cookie_hdr),
+						    vhd->cookie_name, jwt,
+						    vhd->cookie_domain,
+						    vhd->jwt_validity_secs,
+						    NULL) < 0) {
+				/* F-048: fail closed, never a truncated tail */
+				lwsl_wsi_err(wsi, "%s: %s Set-Cookie too "
+					     "large for the composed buffer "
+					     "(token %d, domain %d)",
+					     __func__, vhd->cookie_name,
+					     (int)strlen(jwt),
+					     (int)strlen(vhd->cookie_domain));
+				cookie_hdr[0] = '\0';
+			}
+
+			if (vhd->refresh_token_validity_secs > 0) {
+				char refresh_code[65];
+				lws_auth_mint_refresh(vhd, uid, refresh_code,
+						      refresh_hdr);
+			}
+		}
 		goto send;
 	}
 
@@ -896,44 +2912,24 @@ lws_auth_api_login(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
 	if (!lws_auth_generate_token(vhd, user, uid, peer, jwt, &jwt_len)) {
 		pss->http_response_code = HTTP_STATUS_OK;
 		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"token\":\"%s\"}", jwt);
-		if (vhd->cookie_name[0]) {
-			if (vhd->cookie_domain[0]) {
-				lws_snprintf(cookie_hdr, sizeof(cookie_hdr),
-					"%s=%s; Path=/; Domain=%s; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
-					vhd->cookie_name, jwt, vhd->cookie_domain,
-					vhd->jwt_validity_secs);
-			} else {
-				lws_snprintf(cookie_hdr, sizeof(cookie_hdr),
-					"%s=%s; Path=/; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
-					vhd->cookie_name, jwt,
-					vhd->jwt_validity_secs);
-			}
+		if (vhd->cookie_name[0] &&
+		    lws_http_cookie_compose(cookie_hdr, sizeof(cookie_hdr),
+					    vhd->cookie_name, jwt,
+					    vhd->cookie_domain,
+					    vhd->jwt_validity_secs,
+					    NULL) < 0) {
+			/* F-048: fail closed, never a truncated tail */
+			lwsl_wsi_err(wsi, "%s: %s Set-Cookie too large "
+				     "for the composed buffer (token %d, "
+				     "domain %d)", __func__, vhd->cookie_name,
+				     (int)strlen(jwt),
+				     (int)strlen(vhd->cookie_domain));
+			cookie_hdr[0] = '\0';
 		}
 
 		if (vhd->refresh_token_validity_secs > 0) {
-			uint8_t r_rnd[32];
 			char refresh_code[65];
-			uint64_t r_exp = (uint64_t)time(NULL) + vhd->refresh_token_validity_secs;
-			lws_get_random(vhd->context, r_rnd, 32);
-			lws_hex_from_byte_array(r_rnd, 32, refresh_code, 65);
-			
-			if (sqlite3_prepare_v2(vhd->db, "INSERT INTO auth_sessions (session_id, uid, expires) VALUES (?, ?, ?)", -1, &stmt, NULL) == SQLITE_OK) {
-				sqlite3_bind_text(stmt, 1, refresh_code, -1, SQLITE_STATIC);
-				sqlite3_bind_int(stmt, 2, (int)uid);
-				sqlite3_bind_int64(stmt, 3, (sqlite_int64)r_exp);
-				sqlite3_step(stmt);
-				sqlite3_finalize(stmt);
-			}
-
-			if (vhd->cookie_domain[0]) {
-				lws_snprintf(refresh_hdr, sizeof(refresh_hdr),
-					"auth_refresh_session=%s; Path=/; Domain=%s; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
-					refresh_code, vhd->cookie_domain, vhd->refresh_token_validity_secs);
-			} else {
-				lws_snprintf(refresh_hdr, sizeof(refresh_hdr),
-					"auth_refresh_session=%s; Path=/; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
-					refresh_code, vhd->refresh_token_validity_secs);
-			}
+			lws_auth_mint_refresh(vhd, uid, refresh_code, refresh_hdr);
 		}
 
 		goto send;
@@ -954,7 +2950,7 @@ static int
 lws_auth_api_token(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
 		   struct per_session_data__auth_server *pss)
 {
-	char jwt[1024], pl[1024 + LWS_PRE];
+	char jwt[1024], pl[1280 + LWS_PRE];
 	const char *grant_type = lws_spa_get_string(pss->spa, EP_GRANT_TYPE);
 	const char *code = lws_spa_get_string(pss->spa, EP_CODE);
 	const char *client_id = lws_spa_get_string(pss->spa, EP_CLIENT_ID);
@@ -976,20 +2972,42 @@ lws_auth_api_token(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
 		goto send;
 	}
 
-	if (sqlite3_prepare_v2(vhd->db, "SELECT 1 FROM oauth_clients WHERE client_id = ? AND client_secret_hash = ?", -1, &stmt, NULL) == SQLITE_OK) {
+	if (sqlite3_prepare_v2(vhd->db, "SELECT client_secret_hash FROM oauth_clients WHERE client_id = ?", -1, &stmt, NULL) == SQLITE_OK) {
 		sqlite3_bind_text(stmt, 1, client_id, -1, SQLITE_TRANSIENT);
-		sqlite3_bind_text(stmt, 2, client_secret ? client_secret : "", -1, SQLITE_TRANSIENT);
-		if (sqlite3_step(stmt) == SQLITE_ROW)
-			valid_client = 1;
+		if (sqlite3_step(stmt) == SQLITE_ROW) {
+			const char *stored_secret = (const char *)sqlite3_column_text(stmt, 0);
+			const char *cs = client_secret ? client_secret : "";
+			
+			/* F-97: Hash the incoming client_secret with SHA-256 */
+			struct lws_genhash_ctx hctx;
+			uint8_t hash[32];
+			char cs_hash_hex[65] = {0};
+			
+			if (!lws_genhash_init(&hctx, LWS_GENHASH_TYPE_SHA256) &&
+			    !lws_genhash_update(&hctx, cs, strlen(cs)) &&
+			    !lws_genhash_destroy(&hctx, hash)) {
+				
+				lws_hex_from_byte_array(hash, 32, cs_hash_hex, sizeof(cs_hash_hex));
+				
+				if (stored_secret && strlen(stored_secret) == strlen(cs_hash_hex) && 
+				    !lws_timingsafe_bcmp(stored_secret, cs_hash_hex, (uint32_t)strlen(cs_hash_hex)))
+					valid_client = 1;
+			}
+		}
 		sqlite3_finalize(stmt);
 	}
 
-	if (!valid_client) {
-		pss->http_response_code = HTTP_STATUS_UNAUTHORIZED;
-		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"invalid_client\"}");
-		goto send;
-	}
-
+	/*
+	 * Look up the code before deciding client validity: a client may
+	 * authenticate either with a client_secret (confidential client) OR, per
+	 * RFC 7636, with PKCE -- a code_verifier that matches the code_challenge
+	 * stored when /api/authorize issued the code.  PKCE is specifically how
+	 * public clients (eg a web app server acting as OAuth client, which cannot
+	 * hold a secret) authenticate at the token endpoint, so we must not reject
+	 * a PKCE flow merely because no client_secret was sent.  The PKCE proof
+	 * itself is verified below; here we only establish that one of the two
+	 * authentication factors is available, and that the code is valid.
+	 */
 	uint32_t uid = 0;
 	char stored_challenge[128] = {0};
 	char stored_method[16] = {0};
@@ -1010,6 +3028,17 @@ lws_auth_api_token(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
 	if (!uid) {
 		pss->http_response_code = HTTP_STATUS_BAD_REQUEST;
 		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"invalid_grant\"}");
+		goto send;
+	}
+
+	/*
+	 * Client is authenticated if a secret matched, or if the code was issued
+	 * with a PKCE challenge (the challenge is verified below).  Reject only
+	 * when neither factor is present.
+	 */
+	if (!valid_client && !stored_challenge[0]) {
+		pss->http_response_code = HTTP_STATUS_UNAUTHORIZED;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"invalid_client\"}");
 		goto send;
 	}
 
@@ -1049,13 +3078,39 @@ lws_auth_api_token(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
 					q++;
 				}
 			}
-			if (strcmp(b64, stored_challenge)) {
-				pss->http_response_code = HTTP_STATUS_BAD_REQUEST;
-				len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"invalid_grant\",\"error_description\":\"PKCE mismatch\"}");
-				goto send;
+			/*
+			 * RFC 7636: code_challenge is base64url, which has no
+			 * '=' padding.  Some client encoders (lws's own
+			 * lws_b64_encode_string_url, used by lws-oauth2-client)
+			 * emit '=' padding anyway; strip it from the stored
+			 * challenge before the comparison so a correctly-computed
+			 * challenge is not rejected as a "PKCE mismatch" purely on
+			 * padding differences.
+			 */
+			{
+				char stored_nopad[128];
+				const char *sp = stored_challenge;
+				size_t sm = 0;
+				while (*sp && *sp != '=' &&
+				       sm < sizeof(stored_nopad) - 1)
+					stored_nopad[sm++] = *sp++;
+				stored_nopad[sm] = '\0';
+
+				if (strlen(b64) != sm ||
+				    lws_timingsafe_bcmp(b64, stored_nopad,
+							(uint32_t)sm)) {
+					pss->http_response_code =
+							HTTP_STATUS_BAD_REQUEST;
+					len = lws_snprintf(pl + LWS_PRE,
+						sizeof(pl) - LWS_PRE,
+						"{\"error\":\"invalid_grant\","
+						"\"error_description\":"
+						"\"PKCE mismatch\"}");
+					goto send;
+				}
 			}
 		} else {
-			if (strcmp(code_verifier, stored_challenge)) {
+			if (strlen(code_verifier) != strlen(stored_challenge) || lws_timingsafe_bcmp(code_verifier, stored_challenge, (uint32_t)strlen(code_verifier))) {
 				pss->http_response_code = HTTP_STATUS_BAD_REQUEST;
 				len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"invalid_grant\",\"error_description\":\"PKCE mismatch\"}");
 				goto send;
@@ -1073,11 +3128,35 @@ lws_auth_api_token(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
 
 	size_t jwt_len = sizeof(jwt);
 	char peer[64];
-	lws_get_peer_simple(wsi, peer, sizeof(peer));
+	auth_client_address(wsi, vhd, peer, sizeof(peer));
 
 	if (!lws_auth_generate_token(vhd, username, uid, peer, jwt, &jwt_len)) {
+		/*
+		 * If long-term refresh sessions are enabled, mint one for this
+		 * user and include it in the response so the OAuth client (the
+		 * app server) can set auth_refresh_session on the app host --
+		 * the browser never talks to us directly here, so we cannot set
+		 * that cookie ourselves in the delegate flow.  Without this,
+		 * silent renewal (background + cold-load) has nothing to renew.
+		 */
+		char refresh_code[65];
+
 		pss->http_response_code = HTTP_STATUS_OK;
-		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"access_token\":\"%s\",\"token_type\":\"Bearer\",\"expires_in\":%llu}", jwt, vhd->jwt_validity_secs);
+		if (vhd->refresh_token_validity_secs > 0 &&
+		    lws_auth_mint_refresh(vhd, uid, refresh_code, NULL))
+			len = lws_snprintf(pl + LWS_PRE,
+				sizeof(pl) - LWS_PRE,
+				"{\"access_token\":\"%s\",\"token_type\":\"Bearer\","
+				"\"expires_in\":%llu,\"refresh_token\":\"%s\","
+				"\"refresh_expires_in\":%llu}",
+				jwt, vhd->jwt_validity_secs, refresh_code,
+				vhd->refresh_token_validity_secs);
+		else
+			len = lws_snprintf(pl + LWS_PRE,
+				sizeof(pl) - LWS_PRE,
+				"{\"access_token\":\"%s\",\"token_type\":\"Bearer\","
+				"\"expires_in\":%llu}",
+				jwt, vhd->jwt_validity_secs);
 		goto send;
 	}
 
@@ -1085,10 +3164,258 @@ lws_auth_api_token(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
 	len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"server_error\"}");
 
 send:
+	/*
+	 * Never log the body: on the success path it is the complete bearer
+	 * credential -- the signed access token and the long-lived refresh
+	 * token -- and LLL_INFO is compiled in by default, so debugging an
+	 * OAuth integration used to persist live credentials to disk.  Same
+	 * rule auth_check_csrf() already follows.  The status code is enough
+	 * to tell the flows apart.
+	 */
+	lwsl_wsi_info(wsi, "%s: /api/token -> HTTP %u (%d byte body)",
+			__func__, pss->http_response_code, len);
 	if (lws_buflist_append_segment(&pss->tx_buflist, (uint8_t *)pl, (size_t)len + LWS_PRE) < 0)
 		return -1;
 
 	return send_auth_headers(wsi, pss, "application/json", NULL, NULL);
+}
+
+struct auth_registration {
+	char email[129], pass[129], salt[33], totp[65];
+};
+
+/*
+ * The registration verify_hash h names, if it has not expired.  Returns 0 and
+ * fills r if there is one.
+ */
+static int
+auth_registration_lookup(struct per_vhost_data__auth_server *vhd,
+			 const char *h, struct auth_registration *r)
+{
+	sqlite3_stmt *stmt;
+	int ret = 1;
+
+	/* the hash is the one-time registration credential: never log it */
+
+	if (sqlite3_prepare_v2(vhd->db, "SELECT email, password_hash, salt, "
+			       "totp_secret FROM registrations WHERE "
+			       "verify_hash = ? AND expires >= ?", -1, &stmt,
+			       NULL) != SQLITE_OK) {
+		lwsl_err("verify: db prepare failed: %s\n",
+			 sqlite3_errmsg(vhd->db));
+
+		return 1;
+	}
+
+	sqlite3_bind_text(stmt, 1, h, -1, SQLITE_TRANSIENT);
+	sqlite3_bind_int64(stmt, 2, (sqlite_int64)time(NULL));
+
+	if (sqlite3_step(stmt) == SQLITE_ROW) {
+		lws_strncpy(r->email, (const char *)sqlite3_column_text(stmt, 0),
+			    sizeof(r->email));
+		lws_strncpy(r->pass, (const char *)sqlite3_column_text(stmt, 1),
+			    sizeof(r->pass));
+		lws_strncpy(r->salt, (const char *)sqlite3_column_text(stmt, 2),
+			    sizeof(r->salt));
+		lws_strncpy(r->totp, (const char *)sqlite3_column_text(stmt, 3),
+			    sizeof(r->totp));
+		ret = 0;
+	} else
+		lwsl_info("verify: no live registration for the hash\n");
+
+	sqlite3_finalize(stmt);
+
+	return ret;
+}
+
+static int
+auth_is_post(struct lws *wsi)
+{
+	char *uri;
+	int ulen;
+
+	return lws_http_get_uri_and_method(wsi, &uri, &ulen) == LWSHUMETH_POST;
+}
+
+/*
+ * POST /api/verify, from the page the mailed link shows: the registration
+ * becomes the account, and the TOTP seed and backup codes are shown, once.
+ */
+static int
+lws_auth_api_verify(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
+		    struct per_session_data__auth_server *pss)
+{
+	const char *h = lws_spa_get_string(pss->spa, EP_VERIFY_HASH);
+	struct auth_registration r;
+	sqlite3_stmt *stmt;
+	char hbuf[64], uri[256];
+	int ins_ok;
+
+	if (auth_check_csrf(wsi, vhd, pss)) {
+		lws_return_http_status(wsi, HTTP_STATUS_FORBIDDEN, "Forbidden");
+
+		return lws_http_transaction_completed(wsi);
+	}
+
+	if (!h || !h[0] || strlen(h) >= sizeof(hbuf)) {
+		lws_return_http_status(wsi, HTTP_STATUS_BAD_REQUEST, "Missing Hash");
+
+		return lws_http_transaction_completed(wsi);
+	}
+	lws_strncpy(hbuf, h, sizeof(hbuf));
+
+	if (auth_registration_lookup(vhd, hbuf, &r)) {
+		char peer[64];
+
+		auth_client_address(wsi, vhd, peer, sizeof(peer));
+		auth_record_strike(vhd, peer);
+
+		lws_return_http_status(wsi, HTTP_STATUS_BAD_REQUEST, "Invalid or Expired Link");
+
+		return lws_http_transaction_completed(wsi);
+	}
+
+	/*
+	 * The registration is a one-time credential: everything below is gated
+	 * on the users INSERT succeeding.  A replay fails UNIQUE(username) and
+	 * gets the same answer as an invalid link, so the TOTP seed is shown,
+	 * and one set of ten backup codes is minted, exactly once.  It also
+	 * makes the users_count == 1 "first user gets the '*' grant" decision
+	 * below sound.
+	 */
+	ins_ok = 0;
+	if (sqlite3_prepare_v2(vhd->db, "INSERT INTO users (username, password_hash, salt, totp_secret) VALUES (?, ?, ?, ?)", -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, r.email, -1, SQLITE_STATIC);
+		sqlite3_bind_text(stmt, 2, r.pass, -1, SQLITE_STATIC);
+		sqlite3_bind_text(stmt, 3, r.salt, -1, SQLITE_STATIC);
+		sqlite3_bind_text(stmt, 4, r.totp, -1, SQLITE_STATIC);
+		if (sqlite3_step(stmt) == SQLITE_DONE)
+			ins_ok = 1;
+		sqlite3_finalize(stmt);
+	}
+
+	if (!ins_ok) {
+		char peer[64];
+
+		lwsl_notice("verify: registration already "
+			    "consumed or user exists\n");
+		auth_client_address(wsi, vhd, peer, sizeof(peer));
+		auth_record_strike(vhd, peer);
+		lws_return_http_status(wsi,
+			HTTP_STATUS_BAD_REQUEST,
+			"Invalid or Expired Link");
+
+		return lws_http_transaction_completed(wsi);
+	}
+
+	int users_count = 0;
+	if (sqlite3_prepare_v2(vhd->db, "SELECT COUNT(*) FROM users", -1, &stmt, NULL) == SQLITE_OK) {
+		if (sqlite3_step(stmt) == SQLITE_ROW) users_count = sqlite3_column_int(stmt, 0);
+		sqlite3_finalize(stmt);
+	}
+
+	char backup_codes_html[2048] = "";
+	char *b_p = backup_codes_html;
+	char *b_end = backup_codes_html + sizeof(backup_codes_html);
+
+	for (int i = 0; i < 10; i++) {
+		uint8_t rand_bytes[4];
+		lws_get_random(vhd->context, rand_bytes, sizeof(rand_bytes));
+		uint32_t raw_code = (uint32_t)rand_bytes[0] | ((uint32_t)rand_bytes[1] << 8) | ((uint32_t)rand_bytes[2] << 16) | ((uint32_t)rand_bytes[3] << 24);
+		uint32_t bcode = raw_code % 1000000;
+
+		if (sqlite3_prepare_v2(vhd->db, "INSERT INTO backup_codes (uid, code) VALUES ((SELECT uid FROM users WHERE username=?), ?)", -1, &stmt, NULL) == SQLITE_OK) {
+			char bcode_str[16];
+			lws_snprintf(bcode_str, sizeof(bcode_str), "%06u", bcode);
+			sqlite3_bind_text(stmt, 1, r.email, -1, SQLITE_STATIC);
+			sqlite3_bind_text(stmt, 2, bcode_str, -1, SQLITE_STATIC);
+			sqlite3_step(stmt);
+			sqlite3_finalize(stmt);
+
+			b_p += lws_snprintf(b_p, lws_ptr_diff_size_t(b_end, b_p), "<span class=\"backup-code\">%06u</span>", bcode);
+		}
+	}
+
+	/* Always add public grant to newly minted users */
+	sqlite3_exec(vhd->db, "INSERT OR IGNORE INTO services (name) VALUES ('public')", NULL, NULL, NULL);
+	sqlite3_stmt *gstmt = NULL;
+	if (sqlite3_prepare_v2(vhd->db, "INSERT INTO grants (uid, service_id, grant_level) VALUES ((SELECT uid FROM users WHERE username=?), (SELECT service_id FROM services WHERE name='public'), 1)", -1, &gstmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(gstmt, 1, r.email, -1, SQLITE_TRANSIENT);
+		sqlite3_step(gstmt);
+		sqlite3_finalize(gstmt);
+	}
+
+	if (users_count == 1) {
+		/*
+		 * First user gets the TOFU "god" wildcard grant
+		 * over the '*' service.  Insert the '*' service by
+		 * name only and let sqlite pick its service_id:
+		 * hardcoding service_id=1 collides with the
+		 * 'public' service created above (which also
+		 * autoincrements to 1), and INSERT OR IGNORE then
+		 * silently drops the '*' row, leaving the TOFU
+		 * user without superpowers.  Grant on whatever id
+		 * '*' actually got, the same way every other code
+		 * path looks up '*' by name.
+		 */
+		sqlite3_exec(vhd->db, "INSERT OR IGNORE INTO services (name) VALUES ('*')", NULL, NULL, NULL);
+		gstmt = NULL;
+		if (sqlite3_prepare_v2(vhd->db, "INSERT INTO grants (uid, service_id, grant_level) VALUES ((SELECT uid FROM users WHERE username=?), (SELECT service_id FROM services WHERE name='*'), 2)", -1, &gstmt, NULL) == SQLITE_OK) {
+			sqlite3_bind_text(gstmt, 1, r.email, -1, SQLITE_TRANSIENT);
+			sqlite3_step(gstmt);
+			sqlite3_finalize(gstmt);
+		}
+	}
+
+	lws_snprintf(uri, sizeof(uri), "otpauth://totp/%s:%s?secret=%s&issuer=%s",
+		vhd->auth_domain, r.email, r.totp, vhd->auth_domain);
+
+	size_t alloc_size = 32768 + LWS_PRE;  /* Plenty for verify HTML */
+	uint8_t *buf = malloc(alloc_size);
+	if (!buf) {
+		lwsl_info("verify OOM for HTML buffer\n");
+		lws_return_http_status(wsi, HTTP_STATUS_INTERNAL_SERVER_ERROR, "OOM");
+		return lws_http_transaction_completed(wsi);
+	}
+
+	uint8_t *body_start = buf + LWS_PRE;
+	uint8_t *body_end = buf + alloc_size - LWS_PRE - 1;
+	uint8_t *p = body_start;
+
+	p += lws_snprintf((char *)p, lws_ptr_diff_size_t(body_end, p),
+		"<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Account Confirmed</title>"
+		"<link rel=\"stylesheet\" href=\"../auth.css\">"
+		"%s%s%s"
+		"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+		"</head>"
+		"<body><div class=\"background-elements\"><div class=\"orb orb-1\"></div><div class=\"orb orb-2\"></div><div class=\"orb orb-3\"></div></div>"
+		"<div class=\"auth-container\"><div class=\"glass-panel totp-setup-box\"><div class=\"panel-header\"><h1>Account Confirmed</h1>"
+		"<p>Scan this into your Authenticator app within 5 minutes!</p>"
+		"<div class=\"qr-container\">"
+		"<p class=\"qr-hint\">(Or tap the QR code on mobile devices)</p></div>"
+		"</div>"
+		"<div class=\"qrcode-container\"><a href=\"%s\" title=\"Tap to open Authenticator App\">"
+		"<img src=\"totp_svg?h=%s\" width=\"200\" height=\"200\" alt=\"TOTP Setup QR\"></a></div>"
+		"<p class=\"totp-secret-text\">%s</p>"
+		"<hr class=\"auth-divider\">"
+		"<h3>Emergency Backup Codes</h3>"
+		"<p class=\"warning-text\">Save these codes in a secure place. This is the <b>ONLY</b> time they will be shown.</p>"
+		"<div class=\"backup-codes-container\">%s</div>"
+		"<div class=\"panel-footer\"><a href=\"../\" class=\"btn-link\">Proceed to Login</a></div>"
+		"</div></div></body></html>",
+		vhd->ui_css[0] ? "<link rel=\"stylesheet\" href=\"" : "",
+		vhd->ui_css[0] ? vhd->ui_css : "",
+		vhd->ui_css[0] ? "\">" : "",
+		uri, hbuf, r.totp, backup_codes_html);
+
+	size_t body_len = lws_ptr_diff_size_t(p, body_start);
+	if (lws_buflist_append_segment(&pss->tx_buflist, buf, body_len + LWS_PRE) < 0) {
+		free(buf);
+		return -1;
+	}
+	free(buf);
+
+	return send_auth_headers(wsi, pss, "text/html", NULL, NULL);
 }
 
 static int
@@ -1099,7 +3426,6 @@ lws_auth_api_register(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
 	char pl[1024 + LWS_PRE], peer[64], auto_salt[64] = {0}, hex[129] = {0}, totp_b32[64] = {0}, verify_hash[64] = {0};
         uint8_t salt_raw[16], hash[64], totp_bytes[10], vhash_raw[16];
         sqlite3_stmt *stmt_chk, *stmt;
-        struct lws_genhash_ctx ctx;
         int len, users_empty = 0;
         const char *user, *pass;
 
@@ -1112,7 +3438,7 @@ lws_auth_api_register(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
             sqlite3_finalize(stmt_chk);
         }
 
-        lws_get_peer_simple(wsi, peer, sizeof(peer));
+        auth_client_address(wsi, vhd, peer, sizeof(peer));
 
 	if (users_empty) {
 		/* Allow initial TOFU admin bootstrap globally across interfaces without IP restriction */
@@ -1142,6 +3468,20 @@ lws_auth_api_register(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
 		lwsl_info("reg missing credentials POST\n");
 		pss->http_response_code = HTTP_STATUS_BAD_REQUEST;
 		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"Missing Credentials\"}");
+		goto send;
+	}
+
+	/*
+	 * The reset flow enforces a minimum of 8 (see
+	 * lws_auth_api_reset_password()) but registration checked only that a
+	 * password field was *present*, so an account -- including the TOFU
+	 * administrator created during bootstrap -- could be created with a
+	 * one-character or empty password.  Same policy on both paths.
+	 */
+	if (strlen(pass) < 8) {
+		lwsl_info("reg password too short\n");
+		pss->http_response_code = HTTP_STATUS_BAD_REQUEST;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"Password too short (min 8 chars)\"}");
 		goto send;
 	}
 
@@ -1176,11 +3516,18 @@ lws_auth_api_register(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
 		sqlite3_finalize(stmt_chk);
 	}
 
+	/*
+	 * A registered address, and one with a verification pending, get the
+	 * same answer as a free one: an address-specific refusal told anyone
+	 * which addresses have accounts here.  The attempt still costs a
+	 * strike, so the probing rate is bounded like a wrong password's.
+	 */
 	if (exists) {
-		lwsl_info("reg denied: email already fully registered\n");
+		lwsl_info("reg: email already fully registered, answering as "
+			  "if sent\n");
 		auth_record_strike(vhd, peer);
-		pss->http_response_code = 409;
-		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"Email already registered\"}");
+		pss->http_response_code = HTTP_STATUS_OK;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"status\":\"If the address is free, a verification email has been sent\"}");
 		goto send;
 	}
 
@@ -1191,10 +3538,11 @@ lws_auth_api_register(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
 	}
 
 	if (exists) {
-		lwsl_info("reg denied: pending verification already circulating\n");
+		lwsl_info("reg: pending verification already circulating, "
+			  "answering as if sent\n");
 		auth_record_strike(vhd, peer);
-		pss->http_response_code = 409;
-		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"Verification pending. Check your email or wait for it to naturally expire.\"}");
+		pss->http_response_code = HTTP_STATUS_OK;
+		len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"status\":\"If the address is free, a verification email has been sent\"}");
 		goto send;
 	}
 
@@ -1211,10 +3559,7 @@ lws_auth_api_register(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
 
 	uint64_t expires = (uint64_t)time(NULL) + 600;
 
-	if (!lws_genhash_init(&ctx, LWS_GENHASH_TYPE_SHA512) &&
-	    !lws_genhash_update(&ctx, auto_salt, strlen(auto_salt)) &&
-	    !lws_genhash_update(&ctx, pass, strlen(pass)) &&
-	    !lws_genhash_destroy(&ctx, hash)) {
+	if (!pbkdf2_sha512((const char *)pass, (const char *)auto_salt, 100000, hash)) {
 		lws_genhash_render(LWS_GENHASH_TYPE_SHA512, hash, hex, sizeof(hex));
 
 		if (sqlite3_prepare_v2(vhd->db, query, -1, &stmt, NULL) != SQLITE_OK)
@@ -1237,7 +3582,7 @@ lws_auth_api_register(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
                         goto send;
                 }
 
-                if (vhd->smtp && vhd->smtp->send_email) {
+                if (vhd->smtp) {
                         char url[512], mbody[1024];
 
                         lws_snprintf(url, sizeof(url), "https://%s/api/verify?h=%s",
@@ -1251,7 +3596,7 @@ lws_auth_api_register(struct lws *wsi, struct per_vhost_data__auth_server *vhd,
                         payload.subject = vhd->email_subject;
                         payload.body = mbody;
 
-                        if (vhd->smtp->send_email(vhd->context, vhd->vhost, &payload)) {
+                        if (lws_smtpc_queue(vhd->smtp, &payload, NULL, NULL)) {
                                 lwsl_err("Failed to queue verification email\n");
                                 pss->http_response_code = HTTP_STATUS_INTERNAL_SERVER_ERROR;
                                 len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"error\":\"Email Delivery Failed\"}");
@@ -1280,6 +3625,50 @@ send:
 	return send_auth_headers(wsi, pss, "application/json", NULL, NULL);
 }
 
+/*
+ * Releases what the vhd holds.  PROTOCOL_DESTROY uses it, and so does a
+ * PROTOCOL_INIT that fails part way: the library frees a failed protocol's
+ * vhd itself and never sends it PROTOCOL_DESTROY, so what init already
+ * opened (db, key) has to be released before returning the failure.
+ */
+
+static void
+auth_server_vhd_release(struct per_vhost_data__auth_server *vhd)
+{
+	if (vhd->db) {
+		sqlite3_close(vhd->db);
+		vhd->db = NULL;
+	}
+	lws_jwk_destroy(&vhd->jwk);
+
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+				   lws_dll2_get_head(&vhd->ip_strikes)) {
+		auth_server_strike_t *s = lws_container_of(d,
+						auth_server_strike_t, list);
+
+		lws_dll2_remove(&s->list);
+		free(s);
+	} lws_end_foreach_dll_safe(d, d1);
+
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+				   lws_dll2_get_head(&vhd->user_strikes)) {
+		auth_server_strike_t *s = lws_container_of(d,
+						auth_server_strike_t, list);
+
+		lws_dll2_remove(&s->list);
+		free(s);
+	} lws_end_foreach_dll_safe(d, d1);
+
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+				   lws_dll2_get_head(&vhd->ip_bans)) {
+		auth_server_ban_t *b = lws_container_of(d, auth_server_ban_t,
+							list);
+
+		lws_dll2_remove(&b->list);
+		free(b);
+	} lws_end_foreach_dll_safe(d, d1);
+}
+
 static int
 callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 		     void *user, void *in, size_t len)
@@ -1291,12 +3680,11 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 			lws_protocol_vh_priv_get(lws_get_vhost(wsi),
 					lws_get_protocol(wsi));
 	const struct lws_protocol_vhost_options *pvo;
-        uint8_t tempBuffer[qrcodegen_BUFFER_LEN_MAX];
-        uint8_t qrcode[qrcodegen_BUFFER_LEN_MAX];
-        char uri[256];
 
         switch (reason) {
 	case LWS_CALLBACK_PROTOCOL_INIT:
+		if (lws_cmdline_option_cx(lws_get_context(wsi), "--lws-stub"))
+			return 0;
 		if (!in)
 			return 0;
 
@@ -1382,6 +3770,10 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 		if (pvo)
 			lws_strncpy(vhd->cookie_name, pvo->value, sizeof(vhd->cookie_name));
 
+		pvo = lws_pvo_search((const struct lws_protocol_vhost_options *)in, "trusted-proxies");
+		if (pvo && pvo->value)
+			lws_strncpy(vhd->trusted_proxies, pvo->value, sizeof(vhd->trusted_proxies));
+
 		pvo = lws_pvo_search((const struct lws_protocol_vhost_options *)in, "ui-title");
 		if (pvo) lws_strncpy(vhd->ui_title, pvo->value, sizeof(vhd->ui_title));
 
@@ -1421,41 +3813,90 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 			                     LWS_GENCRYPTO_KTY_EC, 256, "P-256") ||
 			    lws_jwk_save(&vhd->jwk, vhd->jwk_path)) {
 				lwsl_vhost_err(vhd->vhost, "Auth plugin failed to generate or save JWK\n");
+				auth_server_vhd_release(vhd);
 				return -1;
 			}
 		}
 
-		/* Export public key strictly for downstream distribution */
+		/*
+		 * Export public key strictly for downstream distribution.
+		 *
+		 * A symmetric (HS*) key has no public part, it is the signing
+		 * secret itself, so it is never published: validators must be
+		 * given it out of band, and the JWKS stays an empty key set
+		 */
+		lws_strncpy(vhd->jwks_json, "{\"keys\":[]}",
+			    sizeof(vhd->jwks_json));
 		{
-			char pub[LWS_SSO_MAX_COOKIE];
-			int plen = sizeof(pub);
-			if (lws_jwk_export(&vhd->jwk, 0, pub, &plen) > 0) {
-				char pub_path[300];
-				FILE *f;
+			char pub_path[300];
 
-				lws_snprintf(pub_path, sizeof(pub_path), "%s.pub", vhd->jwk_path);
-				f = fopen(pub_path, "w");
-				if (f) {
-					fwrite(pub, 1, strlen(pub), f);
-					fclose(f);
+			lws_snprintf(pub_path, sizeof(pub_path), "%s.pub",
+				     vhd->jwk_path);
+
+			if (vhd->jwk.kty == LWS_GENCRYPTO_KTY_OCT) {
+				struct lws_jwk stale;
+
+				lwsl_vhost_notice(vhd->vhost, "symmetric jwk: "
+						  "not published in the JWKS");
+
+				/*
+				 * Before C-633, an oct key's export here
+				 * included its secret k, and it was written to
+				 * the .pub "for downstream distribution" and
+				 * served as the JWKS.  Nothing written now
+				 * replaces that file, so say what it means if
+				 * one is still there holding a symmetric key
+				 */
+				memset(&stale, 0, sizeof(stale));
+				if (!lws_jwk_load(&stale, pub_path, NULL, NULL) &&
+				    stale.kty == LWS_GENCRYPTO_KTY_OCT)
+					lwsl_vhost_warn(vhd->vhost, "%s holds a "
+						"symmetric key, as written by "
+						"versions that published the "
+						"HS* signing secret: treat the "
+						"key at %s as disclosed, "
+						"replace it and delete %s",
+						pub_path, vhd->jwk_path,
+						pub_path);
+				lws_jwk_destroy(&stale);
+			} else {
+				char pub[LWS_SSO_MAX_COOKIE];
+				int plen = sizeof(pub);
+
+				if (lws_jwk_export(&vhd->jwk, 0, pub, &plen) > 0) {
+					/* for downstream distribution */
+					if (lws_plat_write_file(pub_path, pub,
+								strlen(pub)))
+						lwsl_vhost_warn(vhd->vhost,
+							"unable to write %s",
+							pub_path);
+
+					/* Cache the JWKS JSON response natively */
+					lws_snprintf(vhd->jwks_json,
+						     sizeof(vhd->jwks_json),
+						     "{\"keys\":[%s]}", pub);
 				}
-
-				/* Cache the JWKS JSON response natively */
-				lws_snprintf(vhd->jwks_json, sizeof(vhd->jwks_json), "{\"keys\":[%s]}", pub);
 			}
 		}
 
 		/* Initialize sqlite database using lws_struct */
 		if (lws_struct_sq3_open(vhd->context, vhd->db_path, 1, &vhd->db)) {
-			lwsl_vhost_err(vhd->vhost, "Auth plugin failed to open database\n");
-			return -1; /* fail plugin init */
+			lwsl_err("%s: could not open local database at %s. FATAL.\n", __func__, vhd->db_path);
+			auth_server_vhd_release(vhd);
+			return -1;
 		}
 
 		if (sqlite3_exec(vhd->db, schema_init, NULL, NULL, NULL) != SQLITE_OK) {
 			lwsl_vhost_err(vhd->vhost, "Auth plugin schema creation failed: %s\n",
 				 sqlite3_errmsg(vhd->db));
+			auth_server_vhd_release(vhd);
 			return -1;
 		}
+
+		/* attempt to add session_epoch / totp_last if upgrading from an
+		 * older schema (harmless failure when they already exist) */
+		sqlite3_exec(vhd->db, "ALTER TABLE users ADD COLUMN session_epoch INTEGER DEFAULT 0;", NULL, NULL, NULL);
+		sqlite3_exec(vhd->db, "ALTER TABLE users ADD COLUMN totp_last INTEGER DEFAULT 0;", NULL, NULL, NULL);
 
 #if !defined(WIN32)
 		{
@@ -1474,7 +3915,7 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 				else
 					lwsl_notice("Auth plugin chowned database file '%s' to %d:%d\n", parent, (int)uid, (int)gid);
 
-				last_slash = strrchr(parent, '/');
+				last_slash = (char *)strrchr(parent, '/');
 				if (last_slash && last_slash != parent) {
 					*last_slash = '\0';
 					if (chown(parent, uid, gid))
@@ -1520,47 +3961,77 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 				sqlite3_step(stmt);
 				sqlite3_finalize(stmt);
 			}
-		}
+			/*
+			 * device_codes, password_recovery and registrations
+			 * all carry an `expires` but had no sweeper at all:
+			 * only a *successful* redemption removed a row, so
+			 * everything abandoned accumulated for ever.
+			 */
+			{
+				static const char * const sweep[] = {
+					"DELETE FROM device_codes WHERE expires <= ?",
+					"DELETE FROM password_recovery WHERE expires <= ?",
+					"DELETE FROM registrations WHERE expires <= ?",
+				};
+				size_t sn;
 
-		{
-			const struct lws_protocols *pp = lws_vhost_name_to_protocol(vhd->vhost, "lws-smtp-client");
-			if (pp) {
-				vhd->smtp = (const lws_smtp_client_ops_t *)pp->user;
+				for (sn = 0; sn < LWS_ARRAY_SIZE(sweep); sn++)
+					if (sqlite3_prepare_v2(vhd->db, sweep[sn],
+							       -1, &stmt,
+							       NULL) == SQLITE_OK) {
+						sqlite3_bind_int64(stmt, 1,
+							  (sqlite_int64)now);
+						sqlite3_step(stmt);
+						sqlite3_finalize(stmt);
+					}
 			}
 		}
+
+		/*
+		 * the vhost's smtp client, as its "lws-smtp-client" pvos say:
+		 * a local relay on 127.0.0.1:25 if they say nothing
+		 */
+		vhd->smtp = lws_smtpc_vhost(vhd->vhost);
+		if (!vhd->smtp)
+			lwsl_vhost_err(vhd->vhost, "no smtp client: no mail "
+				       "can be sent");
 
 		break;
 
 	case LWS_CALLBACK_PROTOCOL_DESTROY:
-		if (vhd) {
-			if (vhd->db)
-				sqlite3_close(vhd->db);
-			lws_jwk_destroy(&vhd->jwk);
-
-			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, vhd->ip_strikes.head) {
-				auth_server_strike_t *s = lws_container_of(d, auth_server_strike_t, list);
-				lws_dll2_remove(&s->list);
-				free(s);
-			} lws_end_foreach_dll_safe(d, d1);
-
-			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, vhd->ip_bans.head) {
-				auth_server_ban_t *b = lws_container_of(d, auth_server_ban_t, list);
-				lws_dll2_remove(&b->list);
-				free(b);
-			} lws_end_foreach_dll_safe(d, d1);
-		}
+		if (vhd)
+			auth_server_vhd_release(vhd);
 		break;
 
 	case LWS_CALLBACK_HTTP:
 		lwsl_info("HTTP: path='%s'\n", in ? (const char *)in : "NULL");
+
+		/*
+		 * No vhd means PROTOCOL_INIT did not set us up on this vhost:
+		 * either the vhost gave no options for us (init returns
+		 * without one) or init failed (unwritable key or db path,
+		 * schema failure), in which case the library frees the vhd,
+		 * warns and carries on.  The mount and the ws protocol stay
+		 * reachable regardless, so every entry that needs the vhd
+		 * refuses without it rather than dereferencing NULL.
+		 */
+		if (!vhd) {
+			lwsl_wsi_warn(wsi, "auth server not initialized on "
+					   "this vhost, 503");
+			if (lws_return_http_status(wsi,
+					HTTP_STATUS_SERVICE_UNAVAILABLE, NULL))
+				return -1;
+
+			return lws_http_transaction_completed(wsi);
+		}
 		{
 			char peer[64];
-			lws_get_peer_simple(wsi, peer, sizeof(peer));
+			auth_client_address(wsi, vhd, peer, sizeof(peer));
 			uint64_t now = (uint64_t)time(NULL);
 
 			/* Rapid ban-check */
 			int is_banned = 0;
-			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, vhd->ip_bans.head) {
+			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, lws_dll2_get_head(&vhd->ip_bans)) {
 				auth_server_ban_t *b = lws_container_of(d, auth_server_ban_t, list);
 				if (!strcmp(b->ip, peer)) {
 					if (now > b->banned_until) {
@@ -1574,6 +4045,26 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 							sqlite3_step(st);
 							sqlite3_finalize(st);
 						}
+					} else if (auth_peer_is_own(peer)) {
+						/*
+						 * A ban recorded before own-address
+						 * strikes were exempted (or raced in
+						 * from another vhost): our own
+						 * address must never be blocked,
+						 * sweep it exactly like an expired
+						 * one rather than enforce it.
+						 */
+						lws_dll2_remove(&b->list);
+						free(b);
+						sqlite3_stmt *st;
+						if (sqlite3_prepare_v2(vhd->db, "DELETE FROM bans WHERE ip = ?", -1, &st, NULL) == SQLITE_OK) {
+							sqlite3_bind_text(st, 1, peer, -1, SQLITE_STATIC);
+							sqlite3_step(st);
+							sqlite3_finalize(st);
+						}
+						lwsl_wsi_notice(wsi, "discarded stale "
+							"ban on own address %s",
+							peer);
 					} else {
 						is_banned = 1;
 					}
@@ -1582,14 +4073,14 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 			} lws_end_foreach_dll_safe(d, d1);
 
 			if (is_banned) {
-				lwsl_notice("%s: Banned IP %s blocked\n", __func__, peer);
+				lwsl_wsi_notice(wsi, "Banned IP %s blocked", peer);
 				return -1;
 			}
 		}
 
 
 		if (in && (!strcmp((const char *)in, "/admin"))) {
-			struct lws_jwt_auth *ja = lws_jwt_auth_create(wsi, &vhd->jwk, vhd->cookie_name, NULL, NULL);
+			struct lws_jwt_auth *ja = auth_session_jwt(wsi, vhd);
 			if (!ja || lws_jwt_auth_query_grant(ja, "*") < 1) {
 				if (ja) lws_jwt_auth_destroy(&ja);
 				lws_return_http_status(wsi, HTTP_STATUS_FORBIDDEN, "Forbidden");
@@ -1653,6 +4144,106 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 			return send_auth_headers(wsi, pss, "text/html", NULL, NULL);
 		}
 
+		if (in && (!strcmp((const char *)in, "/device"))) {
+			struct lws_jwt_auth *ja = auth_session_jwt(wsi, vhd);
+			if (!ja || lws_jwt_auth_query_grant(ja, "*") < 1) {
+				if (ja) lws_jwt_auth_destroy(&ja);
+				lws_return_http_status(wsi, HTTP_STATUS_FORBIDDEN, "Forbidden");
+				return lws_http_transaction_completed(wsi);
+			}
+			lws_jwt_auth_destroy(&ja);
+
+			const char *html_fmt = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+				"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
+				"<title>Authorize Device</title>"
+				"%s%s%s"
+				"<link rel=\"stylesheet\" href=\"/assets/device.css\">"
+				"</head><body><div class=\"card\">"
+				"<h2>Authorize Device</h2>"
+				"<p>Enter the 8-character code displayed on your device or in the waiting room.</p>"
+				"<input type=\"text\" id=\"userCode\" maxlength=\"9\" placeholder=\"XXXX-YYYY\" value=\"%s\" />"
+				/*
+				 * The auth_csrf cookie is HttpOnly, so
+				 * device.js cannot read the double-submit
+				 * token out of document.cookie: hand it to
+				 * the page here instead, the way
+				 * /api/status hands it to auth.js.  The
+				 * value is 32 hex chars (enforced by
+				 * auth_csrf_get_or_make()), so it cannot
+				 * break out of the attribute.
+				 */
+				"<button id=\"authBtn\" data-csrf=\"%s\">Authorize Device</button>"
+				"<div id=\"statusMsg\" class=\"status\"></div>"
+				"</div>"
+				"<script src=\"/assets/device.js\"></script></body></html>";
+
+			size_t max_html_len = LWS_SSO_MAX_COOKIE;
+			char *pl = malloc(LWS_PRE + max_html_len);
+			if (!pl) return -1;
+
+			char prefill[32] = {0};
+			int pn;
+
+			/*
+			 * The urlarg is interpolated into a value="..."
+			 * attribute below.  The URI parser refuses control
+			 * bytes post-decode (F-018) but '"', '<', '>' and
+			 * space all pass, so 'x" autofocus onfocus=...' used
+			 * to close the attribute and inject a handler --
+			 * reflected XSS at an admin-gated page (and the
+			 * README's example config only puts the CSP on the
+			 * file mount, not on the callback:// API mount).
+			 * A user_code is exactly what generate_user_code()
+			 * emits, so accept only that alphabet and drop the
+			 * prefill entirely otherwise.
+			 */
+			lws_get_urlarg_by_name_safe(wsi, "code=", prefill,
+						    sizeof(prefill));
+			for (pn = 0; prefill[pn]; pn++)
+				if (pn >= 9 ||
+				    !((prefill[pn] >= 'A' && prefill[pn] <= 'Z') ||
+				      (prefill[pn] >= '0' && prefill[pn] <= '9') ||
+				      prefill[pn] == '-')) {
+					prefill[0] = '\0';
+					break;
+				}
+
+			char csrf[33];
+			int has_csrf = auth_csrf_get_or_make(wsi, vhd, csrf,
+							     sizeof(csrf));
+
+			size_t html_len = (size_t)lws_snprintf(pl + LWS_PRE, max_html_len, html_fmt,
+				vhd->ui_css[0] ? "<link rel=\"stylesheet\" href=\"" : "",
+				vhd->ui_css[0] ? vhd->ui_css : "",
+				vhd->ui_css[0] ? "\">" : "", prefill, csrf);
+
+			if (lws_buflist_append_segment(&pss->tx_buflist, (uint8_t *)pl, html_len + LWS_PRE) < 0) {
+				free(pl);
+				return -1;
+			}
+			free(pl);
+
+			if (!has_csrf) {
+				/*
+				 * Same fixed-shape composition as /status:
+				 * a browser-session cookie (no Max-Age),
+				 * which lws_http_cookie_compose()'s scoping
+				 * does not express, and provably 82 bytes.
+				 */
+				char cookie_hdr[128];
+
+				lws_snprintf(cookie_hdr, sizeof(cookie_hdr),
+					     "auth_csrf=%s; Path=/; "
+					     "SameSite=Lax; HttpOnly; Secure",
+					     csrf);
+
+				return send_auth_headers(wsi, pss, "text/html",
+							 cookie_hdr, NULL);
+			}
+
+			return send_auth_headers(wsi, pss, "text/html", NULL, NULL);
+		}
+
 		if (in && (!strcmp((const char *)in, "/.well-known/jwks.json") ||
 				   !strcmp((const char *)in, "/jwks.json"))) {
 			char buf[1024 + LWS_PRE];
@@ -1679,7 +4270,14 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 			return 0;
 		}
 
-		if (in && (!strncmp((const char *)in, "/logout", 7))) {
+		/*
+		 * The GET form: a top-level navigation the app-side bouncer
+		 * links to, which ends in a redirect.  A POST to the same
+		 * path falls through to the SPA path below, where
+		 * lws_auth_api_logout() can require the CSRF double submit.
+		 */
+		if (in && (!strncmp((const char *)in, "/logout", 7)) &&
+		    !lws_hdr_total_length(wsi, WSI_TOKEN_POST_URI)) {
 			lwsl_notice("%s: Hit /logout endpoint. in=%s\n", __func__, (const char *)in);
 			char redirect_uri[512] = {0};
 			char buf[LWS_SSO_MAX_COOKIE + LWS_PRE];
@@ -1687,65 +4285,62 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 
 			lws_get_urlarg_by_name_safe(wsi, "redirect_uri=", redirect_uri, sizeof(redirect_uri));
 			lws_urldecode(redirect_uri, redirect_uri, sizeof(redirect_uri));
-			if (!redirect_uri[0])
+			if (!redirect_uri[0] || !auth_verify_redirect_uri(vhd, NULL, redirect_uri))
 				lws_strncpy(redirect_uri, "/", sizeof(redirect_uri));
 
 			lwsl_notice("%s: Extracted redirect_uri: %s\n", __func__, redirect_uri);
 
-			char cookie_val[LWS_AUTH_MAX_COOKIE_LEN] = {0};
-			int ck_len = lws_hdr_total_length(wsi, WSI_TOKEN_HTTP_COOKIE);
-			if (ck_len >= (int)sizeof(cookie_val)) {
-				lwsl_err("%s: OVERRUN! HTTP cookie header length (%d) exceeds allocated buffer size (%d), auth tracking tokens may be truncated!\n", __func__, ck_len, (int)sizeof(cookie_val));
-			}
+#if defined(LWS_WITH_CUSTOM_HEADERS)
+			/*
+			 * This GET changes state (it is kept for the top-level
+			 * navigation lws-login links to), so it must not be
+			 * reachable by a third-party page navigating or
+			 * embedding the victim at it.  The browser says where
+			 * the navigation came from: a same-site or same-origin
+			 * one, or the user typing it (none), is the real
+			 * thing; cross-site is refused, with nothing torn
+			 * down.  A browser too old to send Sec-Fetch-Site is
+			 * taken at its word, as before.
+			 */
+			{
+				char sfs[24];
 
-			if (lws_hdr_copy(wsi, cookie_val, sizeof(cookie_val), WSI_TOKEN_HTTP_COOKIE) > 0) {
-				const char *rp = strstr(cookie_val, "auth_refresh_session=");
-				if (rp) {
-					char refresh_tk[128] = {0};
-					rp += 21;
-					size_t i = 0;
-					while (*rp && *rp != ';' && i < sizeof(refresh_tk) - 1)
-						refresh_tk[i++] = *rp++;
-					refresh_tk[i] = 0;
-					if (refresh_tk[0]) {
-						lwsl_notice("%s: Found auth_refresh_session in cookie, executing DB delete...\n", __func__);
-						sqlite3_stmt *stmt;
-						if (sqlite3_prepare_v2(vhd->db, "DELETE FROM auth_sessions WHERE session_id = ?", -1, &stmt, NULL) == SQLITE_OK) {
-							sqlite3_bind_text(stmt, 1, refresh_tk, -1, SQLITE_TRANSIENT);
-							sqlite3_step(stmt);
-							sqlite3_finalize(stmt);
-							lwsl_notice("%s: DB delete complete.\n", __func__);
-						} else {
-							lwsl_notice("%s: DB prepare failed\n", __func__);
-						}
-					}
-				} else {
-					lwsl_notice("%s: auth_refresh_session NOT found in cookie!\n", __func__);
+				if (lws_hdr_custom_copy(wsi, sfs, sizeof(sfs),
+							"sec-fetch-site:", 15) > 0 &&
+				    !strcmp(sfs, "cross-site")) {
+					char html[LWS_PRE + 256];
+					int html_len;
+
+					lwsl_wsi_notice(wsi, "logout: cross-site navigation refused");
+					html_len = lws_snprintf(html + LWS_PRE, sizeof(html) - LWS_PRE,
+						"<html><body>Use the logout control on the site itself.</body></html>");
+					if (lws_buflist_append_segment(&pss->tx_buflist, (uint8_t *)html, (size_t)html_len + LWS_PRE) < 0)
+						return -1;
+					if (lws_add_http_common_headers(wsi, HTTP_STATUS_FORBIDDEN, "text/html", (unsigned int)html_len, (unsigned char **)&p, (unsigned char *)end) ||
+					    lws_finalize_http_header(wsi, (unsigned char **)&p, (unsigned char *)end))
+						return 1;
+					lws_write(wsi, (unsigned char *)buf + LWS_PRE, lws_ptr_diff_size_t(p, buf + LWS_PRE), LWS_WRITE_HTTP_HEADERS);
+					lws_callback_on_writable(wsi);
+					return 0;
 				}
-			} else {
-				lwsl_notice("%s: No cookies provided by client in /logout\n", __func__);
+			}
+#endif
+
+			{
+				int seen = 0, deleted =
+					auth_server_destroy_refresh_sessions(wsi,
+								vhd, &seen);
+
+				lwsl_wsi_notice(wsi, "logout: %d "
+					"auth_refresh_session value(s) "
+					"presented, %d session row(s) deleted",
+					seen, deleted);
 			}
 
-			char cookie_hdr1[256], cookie_hdr1_host[256];
-			char cookie_hdr2[256], cookie_hdr2_host[256];
-			char cookie_hdr3[256], cookie_hdr3_host[256];
-			char exp[64];
-			time_t t = 0;
-			struct tm *tm = gmtime(&t);
-			strftime(exp, sizeof(exp), "%a, %d %b %Y %H:%M:%S GMT", tm);
+			char hdr[AUTH_SERVER_CLEAR_COOKIES]
+				[AUTH_SERVER_CLEAR_COOKIE_SZ];
 
-			if (vhd->cookie_domain[0]) {
-				lws_snprintf(cookie_hdr1, sizeof(cookie_hdr1), "%s=; Path=/; Domain=%s; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", vhd->cookie_name, vhd->cookie_domain, exp);
-				lws_snprintf(cookie_hdr2, sizeof(cookie_hdr2), "auth_csrf=; Path=/; Domain=%s; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", vhd->cookie_domain, exp);
-				lws_snprintf(cookie_hdr3, sizeof(cookie_hdr3), "auth_refresh_session=; Path=/; Domain=%s; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", vhd->cookie_domain, exp);
-			} else {
-				lws_snprintf(cookie_hdr1, sizeof(cookie_hdr1), "%s=; Path=/; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", vhd->cookie_name, exp);
-				lws_snprintf(cookie_hdr2, sizeof(cookie_hdr2), "auth_csrf=; Path=/; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", exp);
-				lws_snprintf(cookie_hdr3, sizeof(cookie_hdr3), "auth_refresh_session=; Path=/; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", exp);
-			}
-			lws_snprintf(cookie_hdr1_host, sizeof(cookie_hdr1_host), "%s=; Path=/; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", vhd->cookie_name, exp);
-			lws_snprintf(cookie_hdr2_host, sizeof(cookie_hdr2_host), "auth_csrf=; Path=/; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", exp);
-			lws_snprintf(cookie_hdr3_host, sizeof(cookie_hdr3_host), "auth_refresh_session=; Path=/; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", exp);
+			auth_server_clear_session_cookies(vhd, hdr);
 
 			char html[LWS_PRE + 1024];
 			char urlenc_path[512];
@@ -1763,12 +4358,10 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 			if (lws_add_http_common_headers(wsi, HTTP_STATUS_SEE_OTHER, "text/html", (unsigned int)html_len, (unsigned char **)&p, (unsigned char *)end))
 				return 1;
 
-			if (lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie_hdr1, (int)strlen(cookie_hdr1), (unsigned char **)&p, (unsigned char *)end)) return 1;
-			if (lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie_hdr1_host, (int)strlen(cookie_hdr1_host), (unsigned char **)&p, (unsigned char *)end)) return 1;
-			if (lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie_hdr2, (int)strlen(cookie_hdr2), (unsigned char **)&p, (unsigned char *)end)) return 1;
-			if (lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie_hdr2_host, (int)strlen(cookie_hdr2_host), (unsigned char **)&p, (unsigned char *)end)) return 1;
-			if (lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie_hdr3, (int)strlen(cookie_hdr3), (unsigned char **)&p, (unsigned char *)end)) return 1;
-			if (lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie_hdr3_host, (int)strlen(cookie_hdr3_host), (unsigned char **)&p, (unsigned char *)end)) return 1;
+			if (auth_server_add_clear_cookies(wsi, hdr,
+						(unsigned char **)&p,
+						(unsigned char *)end))
+				return 1;
 			if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_LOCATION,
 							 (unsigned char *)redirect_uri, (int)strlen(redirect_uri),
 							 (unsigned char **)&p, (unsigned char *)end))
@@ -1807,33 +4400,28 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 			if (pss) {
 				char peer[64] = {0};
 				int strikes = 0;
-				lws_get_peer_simple(wsi, peer, sizeof(peer));
+				auth_client_address(wsi, vhd, peer, sizeof(peer));
 
-				lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, vhd->ip_strikes.head) {
+				lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, lws_dll2_get_head(&vhd->ip_strikes)) {
 					auth_server_strike_t *s = lws_container_of(d, auth_server_strike_t, list);
 					if (!strcmp(s->ip, peer)) {
-						if ((uint64_t)time(NULL) - s->last_strike > 120)
-							s->strikes = 0;
+						/* same leaky-bucket ageing the limiter uses */
+						auth_strike_decay(s, (uint64_t)time(NULL));
 						strikes = s->strikes;
 						break;
 					}
 				} lws_end_foreach_dll_safe(d, d1);
 
-				char csrf[33] = {0};
-				size_t csrf_len = sizeof(csrf);
-				int has_csrf = lws_http_cookie_get(wsi, "auth_csrf", csrf, &csrf_len) == 0 && csrf[0] ? 1 : 0;
-
-				if (!has_csrf) {
-					uint8_t rnd[16];
-					lws_get_random(vhd->context, rnd, 16);
-					lws_hex_from_byte_array(rnd, 16, csrf, 33);
-				}
+				char csrf[33];
+				int has_csrf = auth_csrf_get_or_make(wsi, vhd,
+							csrf, sizeof(csrf));
 
 				int logged_in = 0;
+				int is_admin = 0;
 				int lacks_grant = 0;
 				char sname[128] = {0};
 				char user_email[128] = {0};
-				char grants[256] = {0};
+				char grants[2048] = {0};
 				char *gp = grants, *gend = grants + sizeof(grants);
 				char logs[LWS_SSO_MAX_COOKIE] = {0};
 				lws_get_urlarg_by_name_safe(wsi, "service_name=", sname, sizeof(sname));
@@ -1843,30 +4431,15 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 				if (vhd->cookie_name[0]) {
 					uint32_t suid = 0;
 					int was_refreshed = 0;
-					struct lws_jwt_auth *ja = lws_jwt_auth_create(wsi, &vhd->jwk, vhd->cookie_name, NULL, NULL);
+					struct lws_jwt_auth *ja = auth_session_jwt(wsi, vhd);
 
 					if (ja) {
 						suid = lws_jwt_auth_get_uid(ja);
 						lws_jwt_auth_destroy(&ja);
 					} else if (vhd->refresh_token_validity_secs > 0) {
-						char refresh_tk[128] = {0};
-						size_t refresh_len = sizeof(refresh_tk);
-
-						if (lws_http_cookie_get(wsi, "auth_refresh_session", refresh_tk, &refresh_len) == 0 && refresh_tk[0]) {
-							sqlite3_stmt *stmt;
-							uint64_t now = (uint64_t)time(NULL);
-							if (sqlite3_prepare_v2(vhd->db, "SELECT uid, expires FROM auth_sessions WHERE session_id = ?", -1, &stmt, NULL) == SQLITE_OK) {
-								sqlite3_bind_text(stmt, 1, refresh_tk, -1, SQLITE_TRANSIENT);
-								if (sqlite3_step(stmt) == SQLITE_ROW) {
-									uint64_t exp = (uint64_t)sqlite3_column_int64(stmt, 1);
-									if (now < exp) {
-										suid = (uint32_t)sqlite3_column_int(stmt, 0);
-										was_refreshed = 1;
-									}
-								}
-								sqlite3_finalize(stmt);
-							}
-						}
+						char rnote[96];
+						suid = auth_resolve_refresh_session(wsi, vhd, rnote, sizeof(rnote));
+						was_refreshed = !!suid;
 					}
 
 					if (suid) {
@@ -1887,18 +4460,23 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 							char jwt[1024];
 							size_t jwt_len = sizeof(jwt);
 							
-							if (!lws_auth_generate_token(vhd, username, suid, peer, jwt, &jwt_len)) {
-								if (vhd->cookie_domain[0]) {
-									lws_snprintf(set_cookie_jwt, sizeof(set_cookie_jwt),
-										"%s=%s; Path=/; Domain=%s; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
-										vhd->cookie_name, jwt, vhd->cookie_domain,
-										(unsigned long long)vhd->jwt_validity_secs);
-								} else {
-									lws_snprintf(set_cookie_jwt, sizeof(set_cookie_jwt),
-										"%s=%s; Path=/; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
-										vhd->cookie_name, jwt,
-										(unsigned long long)vhd->jwt_validity_secs);
-								}
+							if (!lws_auth_generate_token(vhd, username, suid, peer, jwt, &jwt_len) &&
+							    lws_http_cookie_compose(set_cookie_jwt,
+										    sizeof(set_cookie_jwt),
+										    vhd->cookie_name, jwt,
+										    vhd->cookie_domain,
+										    vhd->jwt_validity_secs,
+										    NULL) < 0) {
+								/* F-048: fail closed, never a truncated tail */
+								lwsl_wsi_err(wsi, "%s: %s "
+									"Set-Cookie too large for "
+									"the composed buffer "
+									"(token %d, domain %d)",
+									__func__,
+									vhd->cookie_name,
+									(int)strlen(jwt),
+									(int)strlen(vhd->cookie_domain));
+								set_cookie_jwt[0] = '\0';
 							}
 						}
 
@@ -1907,11 +4485,14 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 						if (sqlite3_prepare_v2(vhd->db, "SELECT s.name, g.grant_level FROM grants g JOIN services s ON g.service_id = s.service_id WHERE g.uid = ?", -1, &stmt_u, NULL) == SQLITE_OK) {
 							sqlite3_bind_int(stmt_u, 1, (int)suid);
 							while (sqlite3_step(stmt_u) == SQLITE_ROW) {
+								const char *sname_db = (const char *)sqlite3_column_text(stmt_u, 0);
+								int gl = sqlite3_column_int(stmt_u, 1);
+								if (!strcmp(sname_db, "*") && gl >= 1)
+									is_admin = 1;
+
 								if (!first) gp += lws_snprintf(gp, lws_ptr_diff_size_t(gend, gp), ", ");
 								first = 0;
-								gp += lws_snprintf(gp, lws_ptr_diff_size_t(gend, gp), "\"%s\": %d",
-									(const char *)sqlite3_column_text(stmt_u, 0),
-									sqlite3_column_int(stmt_u, 1));
+								gp += lws_snprintf(gp, lws_ptr_diff_size_t(gend, gp), "\"%s\": %d", sname_db, gl);
 							}
 							sqlite3_finalize(stmt_u);
 						}
@@ -1946,66 +4527,6 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 					}
 				}
 
-				if (lws_get_urlarg_by_name_safe(wsi, "destroy=", sname, sizeof(sname)) > 0) {
-					/* client wants to terminate session via async fetch */
-					lwsl_info("-> TERMINATING SESSION MANUALLY! destroy URL arg present. Emitting 200 OK JSON.\n");
-					logged_in = 0;
-					users_empty = 0;
-					lacks_grant = 0;
-
-					char cookie_hdr1[256], cookie_hdr1_host[256], cookie_hdr2[256], cookie_hdr2_host[256], cookie_hdr3[256], cookie_hdr3_host[256];
-					char exp[64];
-					time_t t = 0;
-					struct tm *tm = gmtime(&t);
-					strftime(exp, sizeof(exp), "%a, %d %b %Y %H:%M:%S GMT", tm);
-
-					if (vhd->cookie_domain[0]) {
-						lws_snprintf(cookie_hdr1, sizeof(cookie_hdr1), "%s=; Path=/; Domain=%s; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", vhd->cookie_name, vhd->cookie_domain, exp);
-						lws_snprintf(cookie_hdr2, sizeof(cookie_hdr2), "auth_csrf=; Path=/; Domain=%s; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", vhd->cookie_domain, exp);
-						lws_snprintf(cookie_hdr3, sizeof(cookie_hdr3), "auth_refresh_session=; Path=/; Domain=%s; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", vhd->cookie_domain, exp);
-					} else {
-						lws_snprintf(cookie_hdr1, sizeof(cookie_hdr1), "%s=; Path=/; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", vhd->cookie_name, exp);
-						lws_snprintf(cookie_hdr2, sizeof(cookie_hdr2), "auth_csrf=; Path=/; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", exp);
-						lws_snprintf(cookie_hdr3, sizeof(cookie_hdr3), "auth_refresh_session=; Path=/; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", exp);
-					}
-					lws_snprintf(cookie_hdr1_host, sizeof(cookie_hdr1_host), "%s=; Path=/; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", vhd->cookie_name, exp);
-					lws_snprintf(cookie_hdr2_host, sizeof(cookie_hdr2_host), "auth_csrf=; Path=/; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", exp);
-					lws_snprintf(cookie_hdr3_host, sizeof(cookie_hdr3_host), "auth_refresh_session=; Path=/; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", exp);
-
-					char refresh_tk[128] = {0};
-					size_t refresh_len = sizeof(refresh_tk);
-					if (lws_http_cookie_get(wsi, "auth_refresh_session", refresh_tk, &refresh_len) == 0 && refresh_tk[0]) {
-						sqlite3_stmt *stmt;
-						if (sqlite3_prepare_v2(vhd->db, "DELETE FROM auth_sessions WHERE session_id = ?", -1, &stmt, NULL) == SQLITE_OK) {
-							sqlite3_bind_text(stmt, 1, refresh_tk, -1, SQLITE_TRANSIENT);
-							sqlite3_step(stmt);
-							sqlite3_finalize(stmt);
-						}
-					}
-
-					pss->http_response_code = HTTP_STATUS_OK;
-					char buf[LWS_SSO_MAX_COOKIE + LWS_PRE];
-					uint8_t *start = (uint8_t *)buf + LWS_PRE, *p = start, *end = (uint8_t *)buf + sizeof(buf) - 1;
-
-					size_t payload_len = 13; /* {"destroy":1} */
-
-					if (lws_add_http_common_headers(wsi, HTTP_STATUS_OK, "application/json", (lws_filepos_t)payload_len, &p, end)) return -1;
-					if (lws_add_http_header_by_name(wsi, (unsigned char *)"Cache-Control:", (unsigned char *)"no-cache, no-store, must-revalidate", 35, &p, end)) return -1;
-					if (lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie_hdr1, (int)strlen(cookie_hdr1), &p, end)) return -1;
-					if (lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie_hdr1_host, (int)strlen(cookie_hdr1_host), &p, end)) return -1;
-					if (lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie_hdr2, (int)strlen(cookie_hdr2), &p, end)) return -1;
-					if (lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie_hdr2_host, (int)strlen(cookie_hdr2_host), &p, end)) return -1;
-					if (lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie_hdr3, (int)strlen(cookie_hdr3), &p, end)) return -1;
-					if (lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie_hdr3_host, (int)strlen(cookie_hdr3_host), &p, end)) return -1;
-					if (lws_finalize_write_http_header(wsi, start, &p, end)) return -1;
-
-					char pl[LWS_PRE + 64];
-					size_t pl_len = (size_t)lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE, "{\"destroy\":1}");
-					if (lws_buflist_append_segment(&pss->tx_buflist, (uint8_t *)pl, pl_len + LWS_PRE) < 0) return -1;
-
-					lws_callback_on_writable(wsi);
-					return 0;
-				}
 
 #if 0
 				{
@@ -2021,14 +4542,26 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 				pss->http_response_code = HTTP_STATUS_OK;
 				char pl[LWS_SSO_MAX_COOKIE + LWS_PRE];
 		                int len = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE,
-					"{\"users_empty\":%d, \"csrf_token\":\"%s\", \"logged_in\":%d, \"lacks_grant\":%d, \"email\":\"%s\", \"strikes\":%d, \"grants\":{%s}, \"logs\":[%s]}",
-					users_empty, csrf, logged_in, lacks_grant, user_email, strikes, grants, logs);
+					"{\"users_empty\":%d, \"csrf_token\":\"%s\", \"logged_in\":%d, \"is_admin\":%d, \"lacks_grant\":%d, \"email\":\"%s\", \"strikes\":%d, \"grants\":{%s}, \"logs\":[%s]}",
+					users_empty, csrf, logged_in, is_admin, lacks_grant, user_email, strikes, grants, logs);
 				if (lws_buflist_append_segment(&pss->tx_buflist, (uint8_t *)pl, (size_t)len + LWS_PRE) < 0)
 					return -1;
 
 				if (!has_csrf) {
+					/*
+					 * F-048: deliberately NOT composed via
+					 * lws_http_cookie_compose(): this is a
+					 * browser-session cookie (no Max-Age),
+					 * which that api's fixed scoping does
+					 * not express.  Every input here is
+					 * fixed-shape (name "auth_csrf", a
+					 * 32-hex-char value, no Domain), so
+					 * the result is provably 82 bytes and
+					 * cannot truncate in the 128-byte
+					 * buffer.
+					 */
 					char cookie_hdr[128];
-					lws_snprintf(cookie_hdr, sizeof(cookie_hdr), "auth_csrf=%s; Path=/; SameSite=None; HttpOnly; Secure", csrf);
+					lws_snprintf(cookie_hdr, sizeof(cookie_hdr), "auth_csrf=%s; Path=/; SameSite=Lax; HttpOnly; Secure", csrf);
 					return send_auth_headers(wsi, pss, "application/json", cookie_hdr, set_cookie_jwt[0] ? set_cookie_jwt : NULL);
 				}
 
@@ -2072,8 +4605,17 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 			char totp[64];
 			char email[128];
 
-			if (sqlite3_prepare_v2(vhd->db, "SELECT email, totp_secret FROM registrations WHERE verify_hash = ?", -1, &stmt, NULL) == SQLITE_OK) {
+			/*
+			 * Only while the registration is live, and only once
+			 * the confirming POST made it the account: the image
+			 * is part of the page that answers that POST, and is
+			 * the seed itself.  Registrations are only swept at
+			 * init and by /api/register, so without the expiry the
+			 * seed stayed fetchable until the next restart.
+			 */
+			if (sqlite3_prepare_v2(vhd->db, "SELECT r.email, r.totp_secret FROM registrations r JOIN users u ON u.username = r.email WHERE r.verify_hash = ? AND r.expires >= ?", -1, &stmt, NULL) == SQLITE_OK) {
 				sqlite3_bind_text(stmt, 1, hbuf, -1, SQLITE_TRANSIENT);
+				sqlite3_bind_int64(stmt, 2, (sqlite_int64)time(NULL));
 				if (sqlite3_step(stmt) == SQLITE_ROW) {
 					found = 1;
 					lws_strncpy(email, (const char *)sqlite3_column_text(stmt, 0), sizeof(email));
@@ -2158,132 +4700,81 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 			return 0;
 		}
 
-		if (!strncmp((const char *)in, "/verify", 7)) {
-			char hbuf[64];
+		if (!strncmp((const char *)in, "/verify", 7) &&
+		    !auth_is_post(wsi)) {
+			struct auth_registration r;
+			char hbuf[64], csrf[33], cookie_hdr[128], pl[4096 + LWS_PRE];
+			int has_csrf, n;
+
+			/*
+			 * The mailed link only finds the registration and asks
+			 * for a POST to confirm it: mail gateways and "safe
+			 * link" scanners GET every link in a message before
+			 * the user sees it, and a GET that created the account
+			 * handed them the TOTP seed and backup codes, locking
+			 * the real user out.  Nothing is consumed here.
+			 */
 			if (lws_get_urlarg_by_name_safe(wsi, "h=", hbuf, sizeof(hbuf)) < 0) {
 				lws_return_http_status(wsi, HTTP_STATUS_BAD_REQUEST, "Missing Hash");
 				return lws_http_transaction_completed(wsi);
 			}
 
-			sqlite3_stmt *stmt;
-			int found = 0;
-			uint64_t now = (uint64_t)time(NULL);
-			char email[129], pass[129], salt[33], totp[65];
-			lwsl_info("verify: looking for hash='%s'\n", hbuf);
-
-			if (sqlite3_prepare_v2(vhd->db, "SELECT email, password_hash, salt, totp_secret, expires FROM registrations WHERE verify_hash = ?", -1, &stmt, NULL) == SQLITE_OK) {
-				sqlite3_bind_text(stmt, 1, hbuf, -1, SQLITE_TRANSIENT);
-				int s_res = sqlite3_step(stmt);
-				if (s_res == SQLITE_ROW) {
-					uint64_t exp = (uint64_t)sqlite3_column_int64(stmt, 4);
-					if (now <= exp) {
-						found = 1;
-						lws_strncpy(email, (const char *)sqlite3_column_text(stmt, 0), sizeof(email));
-						lws_strncpy(pass,  (const char *)sqlite3_column_text(stmt, 1), sizeof(pass));
-						lws_strncpy(salt,  (const char *)sqlite3_column_text(stmt, 2), sizeof(salt));
-						lws_strncpy(totp,  (const char *)sqlite3_column_text(stmt, 3), sizeof(totp));
-					} else {
-						lwsl_info("verify: link expired! now=%llu, exp=%llu\n", (unsigned long long)now, (unsigned long long)exp);
-					}
-				} else {
-					lwsl_info("verify: db step failed or no row: %d %s\n", s_res, sqlite3_errmsg(vhd->db));
-				}
-				sqlite3_finalize(stmt);
-			} else {
-				lwsl_err("verify: db prepare failed: %s\n", sqlite3_errmsg(vhd->db));
-			}
-
-			if (!found) {
+			if (auth_registration_lookup(vhd, hbuf, &r)) {
 				char peer[64];
 
-				lws_get_peer_simple(wsi, peer, sizeof(peer));
+				auth_client_address(wsi, vhd, peer, sizeof(peer));
 				auth_record_strike(vhd, peer);
 
 				lws_return_http_status(wsi, HTTP_STATUS_BAD_REQUEST, "Invalid or Expired Link");
 
 				return lws_http_transaction_completed(wsi);
 			}
+			lws_explicit_bzero(&r, sizeof(r));
 
-			if (sqlite3_prepare_v2(vhd->db, "INSERT INTO users (username, password_hash, salt, totp_secret) VALUES (?, ?, ?, ?)", -1, &stmt, NULL) == SQLITE_OK) {
-				sqlite3_bind_text(stmt, 1, email, -1, SQLITE_STATIC);
-				sqlite3_bind_text(stmt, 2, pass, -1, SQLITE_STATIC);
-				sqlite3_bind_text(stmt, 3, salt, -1, SQLITE_STATIC);
-				sqlite3_bind_text(stmt, 4, totp, -1, SQLITE_STATIC);
-				sqlite3_step(stmt);
-				sqlite3_finalize(stmt);
-			}
+			/* the confirming POST carries the auth_csrf double submit */
+			has_csrf = auth_csrf_get_or_make(wsi, vhd, csrf, sizeof(csrf));
 
-
-
-			int users_count = 0;
-			if (sqlite3_prepare_v2(vhd->db, "SELECT COUNT(*) FROM users", -1, &stmt, NULL) == SQLITE_OK) {
-				if (sqlite3_step(stmt) == SQLITE_ROW) users_count = sqlite3_column_int(stmt, 0);
-				sqlite3_finalize(stmt);
-			}
-
-			/* Always add public grant to newly minted users */
-			sqlite3_exec(vhd->db, "INSERT OR IGNORE INTO services (name) VALUES ('public')", NULL, NULL, NULL);
-			char public_grant_query[256];
-			lws_snprintf(public_grant_query, sizeof(public_grant_query), "INSERT INTO grants (uid, service_id, grant_level) VALUES ((SELECT uid FROM users WHERE username='%s'), (SELECT service_id FROM services WHERE name='public'), 1)", email);
-			sqlite3_exec(vhd->db, public_grant_query, NULL, NULL, NULL);
-
-			if (users_count == 1) {
-				sqlite3_exec(vhd->db, "INSERT OR IGNORE INTO services (service_id, name) VALUES (1, '*')", NULL, NULL, NULL);
-				char grant_query[256];
-				lws_snprintf(grant_query, sizeof(grant_query), "INSERT INTO grants (uid, service_id, grant_level) VALUES ((SELECT uid FROM users WHERE username='%s'), 1, 2)", email);
-				sqlite3_exec(vhd->db, grant_query, NULL, NULL, NULL);
-			}
-
-			lws_snprintf(uri, sizeof(uri), "otpauth://totp/%s:%s?secret=%s&issuer=%s",
-				vhd->auth_domain, email, totp, vhd->auth_domain);
-
-			qrcodegen_encodeText(uri, tempBuffer, qrcode, qrcodegen_Ecc_MEDIUM,
-				qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX, qrcodegen_Mask_AUTO, true);
-
-			size_t alloc_size = 16384 + LWS_PRE;  /* Plenty for verify HTML */
-			uint8_t *buf = malloc(alloc_size);
-			if (!buf) {
-				lwsl_info("verify OOM for HTML buffer\n");
-				lws_return_http_status(wsi, HTTP_STATUS_INTERNAL_SERVER_ERROR, "OOM");
-				return lws_http_transaction_completed(wsi);
-			}
-
-			uint8_t *body_start = buf + LWS_PRE;
-			uint8_t *body_end = buf + alloc_size - LWS_PRE - 1;
-			uint8_t *p = body_start;
-
-			p += lws_snprintf((char *)p, lws_ptr_diff_size_t(body_end, p),
-				"<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Account Confirmed</title>"
+			/*
+			 * hbuf matched a stored verify_hash, which is our own
+			 * hex, and csrf is 32 hex: neither can leave the
+			 * attribute they are composed into
+			 */
+			n = lws_snprintf(pl + LWS_PRE, sizeof(pl) - LWS_PRE,
+				"<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Confirm Account</title>"
 				"<link rel=\"stylesheet\" href=\"../auth.css\">"
 				"%s%s%s"
-				"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head>"
+				"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+				"</head>"
 				"<body><div class=\"background-elements\"><div class=\"orb orb-1\"></div><div class=\"orb orb-2\"></div><div class=\"orb orb-3\"></div></div>"
-				"<div class=\"auth-container\"><div class=\"glass-panel totp-setup-box\"><div class=\"panel-header\"><h1>Account Confirmed</h1>"
-				"<p>Scan this into your Authenticator app within 5 minutes!</p>"
-				"<p style=\"font-size: 0.9em; margin-top: -10px; opacity: 0.8;\">(Or tap the QR code on mobile devices)</p></div>"
-				"<div class=\"qrcode-container\"><a href=\"%s\" title=\"Tap to open Authenticator App\">"
-				"<img src=\"totp_svg?h=%s\" width=\"200\" height=\"200\" alt=\"TOTP Setup QR\"></a></div>"
-				"<p class=\"totp-secret-text\">%s</p>"
-				"<div class=\"panel-footer\"><a href=\"../\" class=\"btn-link\">Proceed to Login</a></div>"
-				"</div></div></body></html>",
+				"<div class=\"auth-container\"><div class=\"glass-panel\"><div class=\"panel-header\"><h1>Confirm Account</h1>"
+				"<p>Confirm to create your account.  The next page shows your authenticator setup and backup codes, once only.</p></div>"
+				"<form method=\"post\" action=\"verify\">"
+				"<input type=\"hidden\" name=\"h\" value=\"%s\">"
+				"<input type=\"hidden\" name=\"csrf_token\" value=\"%s\">"
+				"<button type=\"submit\" class=\"btn primary-btn\">Confirm Account</button>"
+				"</form></div></div></body></html>",
 				vhd->ui_css[0] ? "<link rel=\"stylesheet\" href=\"" : "",
 				vhd->ui_css[0] ? vhd->ui_css : "",
 				vhd->ui_css[0] ? "\">" : "",
-				uri, hbuf, totp);
+				hbuf, csrf);
 
-			size_t body_len = lws_ptr_diff_size_t(p, body_start);
-			if (lws_buflist_append_segment(&pss->tx_buflist, buf, body_len + LWS_PRE) < 0) {
-				free(buf);
+			pss->http_response_code = HTTP_STATUS_OK;
+			if (lws_buflist_append_segment(&pss->tx_buflist, (uint8_t *)pl, (size_t)n + LWS_PRE) < 0)
 				return -1;
-			}
-			free(buf);
 
-			return send_auth_headers(wsi, pss, "text/html", NULL, NULL);
+			if (has_csrf)
+				return send_auth_headers(wsi, pss, "text/html", NULL, NULL);
+
+			/* fixed shape, as for /api/status (F-048) */
+			lws_snprintf(cookie_hdr, sizeof(cookie_hdr), "auth_csrf=%s; Path=/; SameSite=Lax; HttpOnly; Secure", csrf);
+
+			return send_auth_headers(wsi, pss, "text/html", cookie_hdr, NULL);
 		}
 
 		if (!strncmp((const char *)in, "/authorize", 10)) {
 			char client_id[128] = {0}, redirect_uri[256] = {0}, response_type[16] = {0}, state[128] = {0};
 			char code_challenge[128] = {0}, code_challenge_method[16] = {0};
+			char service_name[128] = {0};
 
 			if (lws_get_urlarg_by_name_safe(wsi, "client_id=", client_id, sizeof(client_id)) < 0 ||
 			    lws_get_urlarg_by_name_safe(wsi, "redirect_uri=", redirect_uri, sizeof(redirect_uri)) < 0) {
@@ -2291,12 +4782,18 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 				return lws_http_transaction_completed(wsi);
 			}
 
+			lwsl_info("%s: /authorize client_id='%s' redirect_uri='%s'\n",
+				    __func__, client_id, redirect_uri);
+
 			lws_get_urlarg_by_name_safe(wsi, "response_type=", response_type, sizeof(response_type));
 			lws_get_urlarg_by_name_safe(wsi, "state=", state, sizeof(state));
 			lws_get_urlarg_by_name_safe(wsi, "code_challenge=", code_challenge, sizeof(code_challenge));
 			lws_get_urlarg_by_name_safe(wsi, "code_challenge_method=", code_challenge_method, sizeof(code_challenge_method));
 
 			if (strcmp(response_type, "code")) {
+				lwsl_info("%s: /authorize rejected: response_type "
+					  "('%s') != 'code'\n", __func__,
+					  response_type);
 				lws_return_http_status(wsi, HTTP_STATUS_BAD_REQUEST, "Unsupported response_type");
 				return lws_http_transaction_completed(wsi);
 			}
@@ -2309,55 +4806,111 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 				return lws_http_transaction_completed(wsi);
 			}
 
-			char cookies[LWS_AUTH_MAX_COOKIE_LEN] = {0};
-			char session_id[65] = {0};
-			int has_session = 0;
+			/*
+			 * Resolve who is calling /authorize.  The auth_session cookie is a
+			 * signed JWT (not an opaque session id), so validate it via the
+			 * JWT helper; if that fails (eg the short-lived JWT has expired,
+			 * common when re-authenticating after the app's session lapsed but
+			 * the user is still validly logged in here), fall back to the
+			 * long-lived auth_refresh_session opaque token -- exactly the
+			 * resolution /api/status and /api/sso_exchange use.  Without this
+			 * fallback, /authorize bounces a still-logged-in user to /auth,
+			 * which (seeing logged_in from /api/status) bounces straight back
+			 * to /authorize -> infinite redirect loop.
+			 */
 			uint32_t session_uid = 0;
 
-			int ck_len = lws_hdr_total_length(wsi, WSI_TOKEN_HTTP_COOKIE);
-			if (ck_len >= (int)sizeof(cookies)) {
-				lwsl_err("%s: OVERRUN! HTTP cookie header length (%d) exceeds allocated buffer size (%d), auth tracking tokens may be truncated!\n", __func__, ck_len, (int)sizeof(cookies));
-			}
-
-			if (lws_hdr_copy(wsi, cookies, sizeof(cookies), WSI_TOKEN_HTTP_COOKIE) > 0) {
-				const char *p = strstr(cookies, "auth_session=");
-				if (p) {
-					p += 13;
-					size_t i = 0;
-					while (*p && *p != ';' && i < sizeof(session_id) - 1)
-						session_id[i++] = *p++;
-					session_id[i] = 0;
-					has_session = 1;
+			if (vhd->cookie_name[0]) {
+				struct lws_jwt_auth *ja =
+						auth_session_jwt(wsi, vhd);
+				if (ja) {
+					session_uid = lws_jwt_auth_get_uid(ja);
+					lws_jwt_auth_destroy(&ja);
+				} else if (vhd->refresh_token_validity_secs > 0) {
+					char rnote[96];
+					session_uid = auth_resolve_refresh_session(
+							wsi, vhd, rnote,
+							sizeof(rnote));
 				}
 			}
 
-			if (has_session) {
-				uint64_t now = (uint64_t)time(NULL);
-				if (sqlite3_prepare_v2(vhd->db, "SELECT uid, expires FROM auth_sessions WHERE session_id = ?", -1, &stmt, NULL) == SQLITE_OK) {
-					sqlite3_bind_text(stmt, 1, session_id, -1, SQLITE_TRANSIENT);
-					if (sqlite3_step(stmt) == SQLITE_ROW) {
-						session_uid = (uint32_t)sqlite3_column_int(stmt, 0);
-						uint64_t exp = (uint64_t)sqlite3_column_int64(stmt, 1);
-						if (now >= exp)
-							session_uid = 0;
+			if (session_uid) {
+				/*
+				 * If a service_name is requested, the resolved identity must
+				 * hold that grant (or the '*' wildcard) to be authorized for
+				 * this service; otherwise force them to the login screen.
+				 * Query the grants table by uid rather than the auth_session
+				 * JWT, so this works for the refresh-session fallback path
+				 * where there is no valid JWT to inspect.
+				 */
+				lws_get_urlarg_by_name_safe(wsi, "service_name=",
+						service_name, sizeof(service_name));
+				if (service_name[0]) {
+					int has_grant = 0;
+					if (sqlite3_prepare_v2(vhd->db,
+							"SELECT g.grant_level FROM grants g "
+							"JOIN services s ON g.service_id = s.service_id "
+							"WHERE g.uid = ? AND (s.name = ? OR s.name = '*')",
+							-1, &stmt, NULL) == SQLITE_OK) {
+						sqlite3_bind_int(stmt, 1, (int)session_uid);
+						sqlite3_bind_text(stmt, 2, service_name,
+								  -1, SQLITE_TRANSIENT);
+						while (sqlite3_step(stmt) == SQLITE_ROW) {
+							if (sqlite3_column_int(stmt, 0) >= 1)
+								has_grant = 1;
+						}
+						sqlite3_finalize(stmt);
 					}
-					sqlite3_finalize(stmt);
+					if (!has_grant)
+						session_uid = 0;
 				}
 			}
 
 			if (!session_uid) {
-				char loc[1024];
-				/* lws_urlencode is typically available, but if not we assume frontend can parse mostly raw */
-				lws_snprintf(loc, sizeof(loc), "/auth?client_id=%s&redirect_uri=%s&response_type=code&state=%s&code_challenge=%s&code_challenge_method=%s",
-					client_id, redirect_uri, state, code_challenge, code_challenge_method);
+				/*
+				 * Anonymous: bounce to the login UI with the OAuth2
+				 * params preserved in the query, so auth.js can replay
+				 * them to /api/authorize (or /api/login) after the user
+				 * authenticates.  The UI lives at the auth server root
+				 * ("/", the index.html filesystem mount -- the same URL
+				 * lws-login's login_url convention points at); the old
+				 * "/auth?..." target assumed a mount that does not
+				 * exist in the standard layout and 404'd the whole
+				 * login flow.  Values are percent-encoded: they came
+				 * decoded out of the request urlargs and are replayed
+				 * verbatim into the next Location:, so a '&' or '#'
+				 * inside any of them must not be able to reshape the
+				 * query.
+				 */
+				char enc_redirect[768], enc_state[384], enc_cc[384];
+				char enc_ccm[48], enc_sn[384];
+				char loc[2048];
+
+				lws_urlencode(enc_redirect, redirect_uri, (int)sizeof(enc_redirect));
+				lws_urlencode(enc_state, state, (int)sizeof(enc_state));
+				lws_urlencode(enc_cc, code_challenge, (int)sizeof(enc_cc));
+				lws_urlencode(enc_ccm, code_challenge_method, (int)sizeof(enc_ccm));
+				lws_urlencode(enc_sn, service_name, (int)sizeof(enc_sn));
+
+				lws_snprintf(loc, sizeof(loc), "/?client_id=%s&redirect_uri=%s&response_type=code&state=%s&code_challenge=%s&code_challenge_method=%s%s%s",
+					client_id, enc_redirect, enc_state, enc_cc, enc_ccm,
+					service_name[0] ? "&service_name=" : "", enc_sn);
 
 				uint8_t hdr_buf[8192 + LWS_PRE];
 				uint8_t *h_start = hdr_buf + LWS_PRE;
 				uint8_t *h_p = h_start;
 				uint8_t *h_end = hdr_buf + sizeof(hdr_buf) - 1;
-				if (lws_add_http_common_headers(wsi, HTTP_STATUS_FOUND, "text/html", 0, &h_p, h_end)) return lws_http_transaction_completed(wsi);
-				if (lws_add_http_header_by_name(wsi, (unsigned char *)"location:", (unsigned char *)loc, (int)strlen(loc), &h_p, h_end)) return lws_http_transaction_completed(wsi);
-				if (lws_finalize_write_http_header(wsi, h_start, &h_p, h_end)) return lws_http_transaction_completed(wsi);
+				if (lws_add_http_common_headers(wsi, HTTP_STATUS_FOUND, "text/html", 0, &h_p, h_end) ||
+				    lws_add_http_header_by_name(wsi, (unsigned char *)"location:", (unsigned char *)loc, (int)strlen(loc), &h_p, h_end) ||
+				    /* headers-only 302: OR in LWS_WRITE_H2_STREAM_END so
+				     * the h2/h3 HEADERS frame carries END_STREAM and the
+				     * stream completes -- otherwise it hangs open. */
+				    lws_finalize_write_http_header_flags(wsi, h_start, &h_p, h_end,
+					LWS_WRITE_HTTP_HEADERS | LWS_WRITE_H2_STREAM_END)) {
+					lwsl_notice("%s: /authorize -> /auth header build failed\n",
+						    __func__);
+					return 1;
+				}
 				return lws_http_transaction_completed(wsi);
 			}
 
@@ -2382,21 +4935,64 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 
 			char loc[1024];
 			char host[128] = {0};
-			lws_hdr_copy(wsi, host, sizeof(host), WSI_TOKEN_HOST);
+			/*
+			 * iss (RFC 9207) must be the issuer URL of the auth server
+			 * itself, ie https://auth.warmcat.com -- the oauth2-client
+			 * checks it against its remote-auth-url to defeat code mix-up.
+			 * Read the request's host portably: WSI_TOKEN_HOST covers h1
+			 * and is synthesized from h2/h3 :authority, but be defensive
+			 * and fall back to :authority directly, then to the configured
+			 * auth-domain, so iss is never "https://" with an empty host
+			 * (which the client correctly rejects).
+			 */
+			if (lws_hdr_copy(wsi, host, sizeof(host), WSI_TOKEN_HOST) <= 0 ||
+			    !host[0]) {
+#if defined(LWS_ROLE_H2) || defined(LWS_ROLE_H3)
+				host[0] = '\0';
+				if (lws_hdr_copy(wsi, host, sizeof(host),
+				                 WSI_TOKEN_HTTP_COLON_AUTHORITY) <= 0 ||
+				    !host[0])
+#endif
+					lws_strncpy(host, vhd->auth_domain,
+						    sizeof(host));
+			}
+			auth_sanitise_host(host, sizeof(host), vhd->auth_domain);
+
+			/*
+			 * state is replayed verbatim out of the request
+			 * urlargs, which the parser has already decoded: a
+			 * '%26' / '%23' in it arrives as a literal '&' / '#'
+			 * and, interpolated raw, adds attacker-chosen
+			 * parameters to -- or truncates -- the URL the browser
+			 * is redirected to, which is exactly how the iss the
+			 * client checks (RFC 9207) gets cut off.  Percent-
+			 * encode it, like the anonymous branch above already
+			 * does and says why.
+			 */
+			char enc_state[384];
+
+			lws_urlencode(enc_state, state, (int)sizeof(enc_state));
 			const char *delim = strchr(redirect_uri, '?') ? "&" : "?";
-			lws_snprintf(loc, sizeof(loc), "%s%scode=%s&state=%s&iss=https%%3A%%2F%%2F%s", redirect_uri, delim, code, state, host);
+			lws_snprintf(loc, sizeof(loc), "%s%scode=%s&state=%s&iss=https%%3A%%2F%%2F%s", redirect_uri, delim, code, enc_state, host);
 
 			uint8_t hdr_buf[8192 + LWS_PRE];
 			uint8_t *h_start = hdr_buf + LWS_PRE;
-			uint8_t *h_p = h_start;
-			uint8_t *h_end = hdr_buf + sizeof(hdr_buf) - 1;
-			if (lws_add_http_common_headers(wsi, HTTP_STATUS_FOUND, "text/html", 0, &h_p, h_end)) return lws_http_transaction_completed(wsi);
-			if (lws_add_http_header_by_name(wsi, (unsigned char *)"location:", (unsigned char *)loc, (int)strlen(loc), &h_p, h_end)) return lws_http_transaction_completed(wsi);
-			if (lws_finalize_write_http_header(wsi, h_start, &h_p, h_end)) return lws_http_transaction_completed(wsi);
-			return lws_http_transaction_completed(wsi);
-		}
+				uint8_t *h_p = h_start;
+				uint8_t *h_end = hdr_buf + sizeof(hdr_buf) - 1;
+				if (lws_add_http_common_headers(wsi, HTTP_STATUS_FOUND, "text/html", 0, &h_p, h_end) ||
+				    lws_add_http_header_by_name(wsi, (unsigned char *)"location:", (unsigned char *)loc, (int)strlen(loc), &h_p, h_end) ||
+				    /* headers-only 302: needs LWS_WRITE_H2_STREAM_END so the
+				     * h2/h3 HEADERS frame carries END_STREAM. */
+				    lws_finalize_write_http_header_flags(wsi, h_start, &h_p, h_end,
+					LWS_WRITE_HTTP_HEADERS | LWS_WRITE_H2_STREAM_END)) {
+					lwsl_notice("%s: /authorize -> code header build failed\n",
+						    __func__);
+					return 1;
+				}
+				return lws_http_transaction_completed(wsi);
+			}
 
-		if (in && (strstr((const char *)in, "login") || strstr((const char *)in, "register") || strstr((const char *)in, "token") || strstr((const char *)in, "sso_exchange"))) {
+		if (in && ((char *)strstr((const char *)in, "login") || (char *)strstr((const char *)in, "logout") || (char *)strstr((const char *)in, "register") || (char *)strstr((const char *)in, "forgot_password") || (char *)strstr((const char *)in, "reset_password") || (char *)strstr((const char *)in, "token") || (char *)strstr((const char *)in, "sso_exchange") || (char *)strstr((const char *)in, "device_auth") || (char *)strstr((const char *)in, "device_approve") || !strncmp((const char *)in, "/verify", 7))) {
 			lws_strncpy(pss->requesting_url, (const char *)in, sizeof(pss->requesting_url));
 
 			lwsl_info("%s: Processing POST to '%s'\n", __func__, pss->requesting_url);
@@ -2428,6 +5024,8 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 		break;
 
 	case LWS_CALLBACK_HTTP_BODY_COMPLETION:
+		if (!vhd)
+			return -1;
 		lwsl_info("HTTP_BODY_COMPLETION: pss->spa=%p resolving "
 			  "for '%s'\n", pss->spa, pss->requesting_url);
 		if (!pss->spa) {
@@ -2438,14 +5036,28 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 		}
 		lws_spa_finalize(pss->spa);
 
-		if (strstr(pss->requesting_url, "token"))
+		if ((char *)strstr(pss->requesting_url, "logout"))
+			return lws_auth_api_logout(wsi, vhd, pss);
+		else if ((char *)strstr(pss->requesting_url, "device_auth"))
+			return lws_auth_api_device_auth(wsi, vhd, pss);
+		else if ((char *)strstr(pss->requesting_url, "device_token"))
+			return lws_auth_api_device_token(wsi, vhd, pss);
+		else if ((char *)strstr(pss->requesting_url, "device_approve"))
+			return lws_auth_api_device_approve(wsi, vhd, pss);
+		else if ((char *)strstr(pss->requesting_url, "token"))
 			return lws_auth_api_token(wsi, vhd, pss);
-		else if (strstr(pss->requesting_url, "login"))
+		else if ((char *)strstr(pss->requesting_url, "login"))
 			return lws_auth_api_login(wsi, vhd, pss);
-		else if (strstr(pss->requesting_url, "sso_exchange"))
+		else if ((char *)strstr(pss->requesting_url, "sso_exchange"))
 			return lws_auth_api_sso_exchange(wsi, vhd, pss);
-		else if (strstr(pss->requesting_url, "register"))
+		else if ((char *)strstr(pss->requesting_url, "register"))
 			return lws_auth_api_register(wsi, vhd, pss);
+		else if ((char *)strstr(pss->requesting_url, "forgot_password"))
+			return lws_auth_api_forgot_password(wsi, vhd, pss);
+		else if ((char *)strstr(pss->requesting_url, "reset_password"))
+			return lws_auth_api_reset_password(wsi, vhd, pss);
+		else if (!strncmp(pss->requesting_url, "/verify", 7))
+			return lws_auth_api_verify(wsi, vhd, pss);
 
 		lwsl_err("%s: Unknown requesting URL '%s'\n", __func__, pss->requesting_url);
 		break;
@@ -2459,16 +5071,22 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
                 if (bytes <= 0)
                         break;
 
+		/*
+		 * lws_write() either takes the whole buffer (buffering any
+		 * part the socket would not, itself) or fails: a short count
+		 * is not a partial send to resume.  Resuming it by consuming
+		 * only the written part would have left the segment's LWS_PRE
+		 * padding consumed and the next write skipping LWS_PRE bytes
+		 * of payload instead.
+		 */
                 int m = lws_write(wsi, p + LWS_PRE, (unsigned int)(bytes - LWS_PRE), LWS_WRITE_HTTP_FINAL);
-                if (m < 0)
+                if (m != (int)(bytes - LWS_PRE)) {
+			lwsl_wsi_err(wsi, "write %d of %d", m,
+				     (int)(bytes - LWS_PRE));
                         return -1;
+		}
 
-                size_t consume = (size_t)m;
-                if ((size_t)m == bytes - LWS_PRE) {
-                        consume = bytes;
-                }
-
-                lws_buflist_use_segment(&pss->tx_buflist, consume);
+                lws_buflist_use_segment(&pss->tx_buflist, bytes);
 
                 if (lws_buflist_next_segment_len(&pss->tx_buflist, &p)) {
                         lws_callback_on_writable(wsi);
@@ -2479,6 +5097,10 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 
 	case LWS_CALLBACK_SERVER_WRITEABLE:
 	{
+		/* also where auth_admin_ws_recheck_all() lands */
+		if (!vhd || auth_admin_ws_revoked(wsi, vhd, pss))
+			return -1;
+
 		if (!pss->tx_buflist)
 			break;
 
@@ -2501,40 +5123,98 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 
 	case LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION:
 	{
-		struct lws_jwt_auth *ja = lws_jwt_auth_create(wsi, &vhd->jwk, vhd->cookie_name, NULL, NULL);
-		if (!ja || lws_jwt_auth_query_grant(ja, "*") < 1) {
+		struct lws_jwt_auth *ja;
+		int gl;
+
+		if (!vhd)
+			/* not initialized on this vhost, see HTTP above */
+			return 1;
+
+		if (auth_admin_ws_origin_ok(wsi)) {
+			lwsl_wsi_notice(wsi, "admin ws refused: Origin is not "
+					     "this vhost");
+			return 1;
+		}
+
+		ja = auth_session_jwt(wsi, vhd);
+		gl = ja ? lws_jwt_auth_query_grant(ja, "*") : -1;
+
+		lwsl_notice("%s: FILTER_PROTOCOL_CONNECTION: ja=%p, wildcard grant level=%d\n",
+			    __func__, ja, gl);
+
+		if (!ja || gl < 1) {
 			if (ja) lws_jwt_auth_destroy(&ja);
 			lwsl_info("WS connection rejected: missing administrative wildcard grant\n");
 			return 1;
 		}
+
+		/*
+		 * Keep what the ops have to re-check the session against: the
+		 * cookie is not available to them
+		 */
+		pss->ws_uid = lws_jwt_auth_get_uid(ja);
+		pss->ws_sec = lws_jwt_auth_get_sec(ja);
+		pss->ws_exp = lws_jwt_auth_get_exp(ja);
+		lws_strncpy(pss->ws_did, lws_jwt_auth_get_did(ja) ?
+				lws_jwt_auth_get_did(ja) : "",
+			    sizeof(pss->ws_did));
 		lws_jwt_auth_destroy(&ja);
+
+		/* the token's grants claim, and the grants table now */
+		if (!auth_uid_is_admin(vhd, pss->ws_uid)) {
+			lwsl_wsi_notice(wsi, "admin ws refused: uid %u no "
+					"longer holds '*'", pss->ws_uid);
+			return 1;
+		}
+
 		return 0;
 	}
 
 	case LWS_CALLBACK_ESTABLISHED:
+		lws_set_timer_usecs(wsi, AUTH_ADMIN_WS_RECHECK_US);
+		break;
+
+	case LWS_CALLBACK_TIMER:
+		if (!vhd || auth_admin_ws_revoked(wsi, vhd, pss))
+			return -1;
+		lws_set_timer_usecs(wsi, AUTH_ADMIN_WS_RECHECK_US);
 		break;
 
 	case LWS_CALLBACK_RECEIVE:
 	{
 		char op[32] = {0};
 		int req_uid = -1;
-		char new_grants[512] = {0};
+		char new_grants[2048] = {0};
 
 		char *gp;
-		if ((gp = strstr((const char *)in, "\"op\":\""))) {
+
+		if (!vhd)
+			return -1;
+
+		/* the session behind the socket must still be an admin one */
+		if (auth_admin_ws_revoked(wsi, vhd, pss))
+			return -1;
+
+		/*
+		 * The ws role NUL-terminates a non-empty message for us, an
+		 * empty one it does not, and there is nothing to do for it
+		 */
+		if (!len)
+			break;
+		if ((gp = (char *)strstr((const char *)in, "\"op\":\""))) {
 			gp += 6;
 			int i = 0;
 			while (*gp && *gp != '"' && i < 31) op[i++] = *gp++;
 		}
-		if ((gp = strstr((const char *)in, "\"uid\":"))) {
+		if ((gp = (char *)strstr((const char *)in, "\"uid\":"))) {
 			gp += 6;
 			while (*gp == ' ' || *gp == '"') gp++;
 			req_uid = atoi(gp);
 		}
-		if ((gp = strstr((const char *)in, "\"grants\":\""))) {
+		if ((gp = (char *)strstr((const char *)in, "\"grants\":\""))) {
 			gp += 10;
 			int i = 0;
-			while (*gp && *gp != '"' && i < 511)
+			while (*gp && *gp != '"' && i < (int)sizeof(new_grants) - 1)
 				new_grants[i++] = *gp++;
 		}
 
@@ -2542,17 +5222,17 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 		char client_name[64] = {0};
 		char redirect_uris[512] = {0};
 
-		if ((gp = strstr((const char *)in, "\"client_id\":\""))) {
+		if ((gp = (char *)strstr((const char *)in, "\"client_id\":\""))) {
 			gp += 13;
 			int i = 0;
 			while (*gp && *gp != '"' && i < 63) client_id[i++] = *gp++;
 		}
-		if ((gp = strstr((const char *)in, "\"name\":\""))) {
+		if ((gp = (char *)strstr((const char *)in, "\"name\":\""))) {
 			gp += 8;
 			int i = 0;
 			while (*gp && *gp != '"' && i < 63) client_name[i++] = *gp++;
 		}
-		if ((gp = strstr((const char *)in, "\"redirect_uris\":\""))) {
+		if ((gp = (char *)strstr((const char *)in, "\"redirect_uris\":\""))) {
 			gp += 17;
 			int i = 0;
 			while (*gp && *gp != '"' && i < 511) redirect_uris[i++] = *gp++;
@@ -2619,7 +5299,24 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 			break;
 		}
 
-		if (!strcmp(op, "delete") && req_uid > 0) {
+		if (!strcmp(op, "device_revoke") && req_uid > 0 && client_id[0]) {
+			/*
+			 * Revoke one device token without touching the
+			 * account's other sessions: the token's "did" names
+			 * the devices row, which auth_session_jwt() checks on
+			 * every use.  The device id travels in "client_id".
+			 */
+			sqlite3_stmt *s;
+
+			if (sqlite3_prepare_v2(vhd->db, "DELETE FROM devices WHERE device_id=? AND uid=?", -1, &s, NULL) == SQLITE_OK) {
+				sqlite3_bind_text(s, 1, client_id, -1, SQLITE_TRANSIENT);
+				sqlite3_bind_int(s, 2, req_uid);
+				if (sqlite3_step(s) == SQLITE_DONE)
+					lwsl_wsi_notice(wsi, "admin: device %s of uid %d revoked (%d row)",
+							client_id, req_uid, sqlite3_changes(vhd->db));
+				sqlite3_finalize(s);
+			}
+		} else if (!strcmp(op, "delete") && req_uid > 0) {
 			int has_star = 0;
 			sqlite3_stmt *s;
 			if (sqlite3_prepare_v2(vhd->db, "SELECT 1 FROM grants g JOIN services svc ON g.service_id = svc.service_id WHERE g.uid=? AND svc.name='*'", -1, &s, NULL) == SQLITE_OK) {
@@ -2635,18 +5332,41 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 				lws_snprintf(dq, sizeof(dq), "DELETE FROM grants WHERE uid=%d", req_uid); sqlite3_exec(vhd->db, dq, NULL, NULL, NULL);
 				lws_snprintf(dq, sizeof(dq), "DELETE FROM users WHERE uid=%d", req_uid); sqlite3_exec(vhd->db, dq, NULL, NULL, NULL);
 				sqlite3_exec(vhd->db, "COMMIT;", NULL, NULL, NULL);
+				auth_admin_ws_recheck_all(vhd);
 			}
 		} else if (!strcmp(op, "edit") && req_uid > 0) {
 			sqlite3_exec(vhd->db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
 			char eq[256];
 			lws_snprintf(eq, sizeof(eq), "DELETE FROM grants WHERE uid=%d", req_uid);
 			sqlite3_exec(vhd->db, eq, NULL, NULL, NULL);
+			/*
+			 * The account's live tokens carry its old grants in
+			 * their "grants" claim, which /admin, /device and this
+			 * ws gate on, so a demotion would not take effect
+			 * until they expired.  Move its session epoch on so
+			 * they stop being accepted: a refresh session mints a
+			 * new token with the grants as edited.
+			 */
+			lws_snprintf(eq, sizeof(eq), "UPDATE users SET "
+				     "session_epoch = session_epoch + 1 "
+				     "WHERE uid=%d", req_uid);
+			sqlite3_exec(vhd->db, eq, NULL, NULL, NULL);
 
 			char *p2 = new_grants;
 			while (*p2) {
-				char *comma = strchr(p2, ',');
-				if (comma) *comma = '\0';
-				char *colon = strchr(p2, ':');
+				char *comma = (char *)strchr(p2, ',');
+				char *semi = (char *)strchr(p2, ';');
+				char *delim = NULL;
+
+				if (comma && semi)
+					delim = (comma < semi) ? comma : semi;
+				else if (comma)
+					delim = comma;
+				else
+					delim = semi;
+
+				if (delim) *delim = '\0';
+				char *colon = (char *)strchr(p2, ':');
 				if (colon) {
 					*colon = '\0';
 					const char *sn = p2;
@@ -2668,10 +5388,11 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 						}
 					}
 				}
-				if (!comma) break;
-				p2 = comma + 1;
+				if (!delim) break;
+				p2 = delim + 1;
 			}
 			sqlite3_exec(vhd->db, "COMMIT;", NULL, NULL, NULL);
+			auth_admin_ws_recheck_all(vhd);
 		}
 
 		size_t alloc_sz = 65536 + LWS_PRE;
@@ -2721,10 +5442,32 @@ callback_auth_server(struct lws *wsi, enum lws_callback_reasons reason,
 		break;
 	}
 
+	case LWS_CALLBACK_HTTP_DROP_PROTOCOL:
+		/*
+		 * The protocol bind lasts one http transaction, not one
+		 * connection: on an h1 keep-alive,
+		 * lws_http_transaction_completed() rebinds to protocols[0] and
+		 * lws_bind_protocol() then frees the whole pss.  Anything the
+		 * transaction allocated must be released here -- otherwise
+		 * every POST to /api/login etc leaked its ~4KB lws_spa (no
+		 * credentials, CSRF token or valid body needed, since the spa
+		 * is created in LWS_CALLBACK_HTTP before any check runs), and
+		 * CLOSED_HTTP only ever saw the *next* transaction's fresh pss.
+		 */
+		if (pss && pss->spa) {
+			lws_spa_destroy(pss->spa);
+			pss->spa = NULL;
+		}
+		if (pss && pss->tx_buflist)
+			lws_buflist_destroy_all_segments(&pss->tx_buflist);
+		break;
+
 	case LWS_CALLBACK_CLOSED_HTTP:
 		lwsl_info("CLOSED_HTTP wsi=%p\n", wsi);
-		if (pss && pss->spa)
+		if (pss && pss->spa) {
 			lws_spa_destroy(pss->spa);
+			pss->spa = NULL;
+		}
 		if (pss && pss->tx_buflist)
 			lws_buflist_destroy_all_segments(&pss->tx_buflist);
 		break;

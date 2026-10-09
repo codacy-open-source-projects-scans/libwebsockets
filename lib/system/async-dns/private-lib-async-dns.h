@@ -22,6 +22,8 @@
  * IN THE SOFTWARE.
  */
 
+#ifndef __LWS_PRIVATE_LIB_ASYNC_DNS_H__
+#define __LWS_PRIVATE_LIB_ASYNC_DNS_H__
 
 #define DNS_MAX			128	/* Maximum host name		*/
 #define DNS_RECURSION_LIMIT	4
@@ -29,6 +31,22 @@
 #define MAX_CACHE_ENTRIES	10	/* Dont cache more than that	*/
 #define DNS_QUERY_TIMEOUT	30	/* Query timeout, seconds	*/
 #define LWS_ADNS_MAX_PAYLOAD	1500	/* Maximum TCP payload size    */
+/*
+ * The TTL on the wire isn't covered by any signature, so it's the answerer's
+ * choice: cap how long we will keep any answer, as resolvers usually do
+ */
+#define LWS_ADNS_CACHE_MAX_TTL	86400
+
+/*
+ * The overallocated results area behind lws_adns_cache_t is walked with a
+ * per-item stride of struct addrinfo + sockaddr (or lws_adns_rr_t + payload
+ * for non-address RRs).  Since eg sizeof(struct addrinfo) + sockaddr_in6 is
+ * 4 mod 8 on linux x86_64, round each item's footprint up to an 8-byte
+ * boundary so every object placed in the area keeps its natural alignment.
+ * The estimation pass has to use the same arithmetic as the storage pass.
+ */
+#define adns_align_len(n)	(((size_t)(n) + 7) & ~(size_t)7)
+#define adns_align_ptr(p)	((void *)(((uintptr_t)(p) + 7) & ~(uintptr_t)7))
 
 #if defined(LWS_WITH_SYS_ASYNC_DNS)
 
@@ -58,12 +76,27 @@ typedef enum {
  * appended to the allocation
  */
 
+/* deliberately a plain singly-linked payload chain inside cache entries
+ * (the cache entries themselves are dll2-managed): walked once while
+ * parsing or formatting a response, never mutated mid-walk */
 typedef struct lws_adns_rr {
 	struct lws_adns_rr	*next;
 	adns_query_type_t	type;
 	uint16_t		paylen;
 	/* payload follows */
 } lws_adns_rr_t;
+
+/*
+ * The results area behind a cache entry is sized in two independent regions,
+ * the addrinfos first and then the other RR types, so that the addrinfo list
+ * we publish is contiguous and starts at the head of the area.
+ */
+
+typedef struct lws_adns_est {
+	size_t			ai;	/* bytes of addrinfo + sockaddr */
+	size_t			rr;	/* bytes of lws_adns_rr_t + rdata */
+	uint16_t		only_type; /* if nonzero, the only type kept */
+} lws_adns_est_t;
 
 typedef struct lws_adns_cache {
 	lws_sorted_usec_list_t	sul;	/* for cache TTL management */
@@ -74,9 +107,25 @@ typedef struct lws_adns_cache {
 	struct addrinfo		*results;
 	struct lws_adns_rr	*rr_results; /* For DNSKEY, DS, RRSIG, etc. */
 	const char		*name;
+	/*
+	 * One per requester that was handed our results and has not returned
+	 * them with lws_async_dns_freeaddrinfo() yet, plus one for the query
+	 * that owns us while it is in flight.  Any number of requesters may
+	 * piggyback on one query, so this must be wide enough that it cannot
+	 * wrap to 0 and let the entry be trimmed under its holders.
+	 */
+	uint32_t		refcount;
 	uint8_t			flags;	/* b0 = has ipv4, b1 = has ipv6 */
-	char			refcount;
-	char			incomplete;
+	uint8_t			incomplete;
+	uint8_t			nxdomain; /* authoritative: name does not exist */
+#if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
+	/*
+	 * The query that made us validated its results.  A later query that
+	 * has to validate may only be served from an entry that has this set,
+	 * and is then told LWS_ADNS_DNSSEC_VALID like the original requester
+	 */
+	uint8_t			dnssec_valid;
+#endif
 	/* addrinfo, lws_sa46, then name overallocated here */
 } lws_adns_cache_t;
 
@@ -91,6 +140,7 @@ typedef int (*lws_async_dns_find_t)(const char *name, void *opaque,
 typedef struct lws_adns_q {
 	lws_sorted_usec_list_t	sul;	/* per-query write retry timer */
 	lws_sorted_usec_list_t	write_sul;	/* fail if unable to write by this time */
+	lws_sorted_usec_list_t	deadline_sul;	/* hard limit on the whole query */
 	lws_dll2_t		list;
 
 	lws_metrics_caliper_compose(metcal)
@@ -128,11 +178,42 @@ typedef struct lws_adns_q {
 	uint8_t			is_tcp:1;
 	uint8_t			has_tcp_len:1;
 	uint8_t			want_dnssec:1;
+	uint8_t			ipv4_only:1;
+	uint8_t			ipv6_only:1;
+	uint8_t			completing:1; /* in lws_async_dns_complete() */
 #if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
+	/*
+	 * A pending RRSIG validation is a validation context waiting on the
+	 * signer's zone to finish being authenticated.  The query owns the
+	 * context, and destroying the query unhooks it from the zone.
+	 *
+	 * An address lookup is a pair of responses (A and AAAA) that each
+	 * carry their own RRSIG over their own RRset, so there is one
+	 * validation, and one context, per response.
+	 */
+	struct lws_dnssec_val_ctx *dnssec_vctx_waiting[2]; /* our RRSIGs being validated */
+
+	/*
+	 * These three are bitmaps over the responses, using the same bits as
+	 * q->responded (b0 = A, b1 = AAAA)
+	 */
+	uint8_t			dnssec_verify_rrsig; /* validations in flight */
+	uint8_t			dnssec_valid_mask; /* responses that validated */
+	uint8_t			dnssec_need_mask; /* responses that must validate */
+
+	/*
+	 * Unix time the records validated for this query stop being valid:
+	 * the earliest, over every RRset we validated (a CNAME we followed
+	 * too), of its RRSIG's expiration, its Original TTL from when we
+	 * validated it, and the key expiry of the zone that signed it.
+	 * 0 until something validated.
+	 */
+	uint32_t		dnssec_expires;
+
 	uint8_t			dnssec_valid:1;  /* results are verified */
-	uint8_t			dnssec_chk_cname:1; /* currently checking a CNAME */
-	uint8_t			dnssec_verify_rrsig:1; /* waiting on RRSIG verify */
+	uint8_t			dnssec_chk_cname:1; /* validating the CNAME we chase */
 	uint8_t			lacks_dnssec:1; /* per-query DNSSEC override */
+	uint8_t			dnssec_stale:1; /* validated with replaced anchors */
 #endif
 
 	struct lws		*wsi_tcp;
@@ -169,11 +250,17 @@ sul_cb_expire(struct lws_sorted_usec_list *sul);
 void
 lws_adns_cache_destroy(lws_adns_cache_t *c);
 
+#if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
+void
+lws_adns_dnssec_q_destroy(lws_adns_q_t *q);
+#endif
+
 lws_async_dns_retcode_t
 lws_async_dns_complete(lws_adns_q_t *q, lws_adns_cache_t *c);
 
 lws_adns_cache_t *
-lws_adns_get_cache(lws_async_dns_t *dns, const char *name);
+lws_adns_get_cache(lws_async_dns_t *dns, const char *name, uint16_t qtype,
+		   int need_valid);
 
 lws_adns_q_t *
 lws_adns_get_query(lws_async_dns_t *dns, adns_query_type_t qtype,
@@ -202,13 +289,85 @@ void
 __lws_async_dns_server_remove(lws_async_dns_t *dns, const lws_sockaddr46 *sa46);
 
 #if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
+/*
+ * \p resp is the bit in q->responded belonging to the response at \p pkt, so
+ * the validation state can be tracked per-response.  \p stored is how many
+ * records we kept from the response: they must be exactly the RRset that the
+ * RRSIG covers.
+ */
 int
-lws_adns_dnssec_verify(lws_adns_q_t *q, const uint8_t *pkt, size_t len);
+lws_adns_dnssec_verify(lws_adns_q_t *q, const uint8_t *pkt, size_t len,
+		       uint8_t resp, int stored);
+
+/*
+ * The response at \p pkt answers the queried name with a CNAME to \p target:
+ * validate the CNAME, and only if it validates, restart q for the target.
+ * Returns < 0 if q must be failed, else q was restarted, or is waiting on the
+ * CNAME's zone and will be restarted or failed when that settles.
+ */
+int
+lws_adns_dnssec_cname(lws_adns_q_t *q, const uint8_t *pkt, size_t len,
+		      uint8_t resp, const char *target);
+
+/* destroy the authenticated zone store and the trust anchors */
+void
+lws_adns_dnssec_deinit(lws_async_dns_t *dns);
 #endif
 
 int
 lws_adns_iterate(lws_adns_q_t *q, const uint8_t *pkt, int len,
-		 const char *expname, lws_async_dns_find_t cb, void *opaque);
+		 const char *expname, lws_async_dns_find_t cb, void *opaque,
+		 char *cname);
+
+int
+lws_adns_iterate_type(uint16_t qtype, int follow, const uint8_t *pkt, int len,
+		      const char *expname, lws_async_dns_find_t cb,
+		      void *opaque, char *cname);
+
+/* async-dns-direct.c */
+int
+lws_adns_direct_callback(struct lws *wsi, enum lws_callback_reasons reason,
+			 void *in, size_t len);
+void
+lws_adns_direct_deinit(lws_async_dns_t *dns);
+
+int
+lws_adns_q_cname_restart(lws_adns_q_t *q, const char *target);
+
+#if defined(LWS_WITH_SYS_SMD)
+/*
+ * One watcher acquisition pass: pull the platform's current effective DNS
+ * server list via lws_plat_asyncdns_get_server(), and if it differs from the
+ * last list we published, publish the new one on SMD class LWSSMDCL_DNS.
+ *
+ * Threadsafe to call from a non-service thread (platform push watchers like
+ * the macOS dynamic store dispatch callback do exactly that).
+ */
+void
+lws_adns_watch_trigger(struct lws_context *cx);
+#endif
+
+/*
+ * Shared /etc/resolv.conf "nameserver" line parser used by the unix resolv
+ * implementation, and by the apple one as a fallback where the platform has
+ * no native DNS config store api (iOS etc).  Honors the
+ * LWS_ASYNCDNS_RESOLV_CONF env override for the file path (for testing).
+ */
+int
+lws_asyncdns_parse_resolv_conf(struct lws_context *context, int index,
+			       lws_sockaddr46 *sa46);
+
+#if defined(__APPLE__)
+/* native push watch of the dynamic store, macOS only (no-ops elsewhere) */
+int
+lws_plat_asyncdns_watch_start(struct lws_context *cx);
+void
+lws_plat_asyncdns_watch_stop(struct lws_context *cx);
+#endif
+
+int
+lws_async_dns_estimate(const char *name, void *opaque, uint32_t ttl,
+			adns_query_type_t type, uint16_t rrpaylen, const uint8_t *payload);
 
 void
 lws_adns_parse_udp(lws_async_dns_t *dns, const uint8_t *pkt, size_t len,
@@ -225,21 +384,37 @@ lws_adns_dump(lws_async_dns_t *dns);
 #define lws_adns_dump(_d)
 #endif
 
-/*
- * Hardcoded root DS records for Unbound-like trust anchor bootstrapping.
- * These are the current ICANN root zone KSK DS records.
- */
-static const struct {
-	uint16_t keytag;
-	uint8_t algo;
-	uint8_t digest_type;
-	const char *digest_hex;
-} lws_adns_root_ds[] = {
-	/* Key tag 20326 (KSK-2017) */
-	{ 20326, 8, 2, "e06d44b80b8f1d39a95c0b0d7c65d08458e880409bbc683457104237c7f8ec8d" },
-	/* Key tag 38696 (KSK-2024) */
-	{ 38696, 8, 2, "683d2d0acb8c9b712a1948b27f741219298d0a450d612c483af444a4c0fb2afe" }
-};
-
 #endif
 
+#if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
+/*
+ * Does this query's result have to DNSSEC-validate?  Under REQUIRE every
+ * query does; a query that asked with LWS_ADNS_WANT_DNSSEC does whatever the
+ * context mode is (the DHT DNSSEC plugin's trust anchor lookups); a query
+ * marked INDICATE_LACKS_DNSSEC never does.  Only a query that validates and
+ * passes reports LWS_ADNS_DNSSEC_VALID: the bit used to be set for every
+ * non-REQUIRE query without validating anything, so a consumer failing
+ * closed on it was only actually protected under REQUIRE.
+ */
+static inline int
+lws_adns_q_validates(const lws_adns_q_t *q)
+{
+	return (q->dns->dnssec_mode == LWS_ADNS_DNSSEC_REQUIRE ||
+		q->want_dnssec) && !q->lacks_dnssec;
+}
+
+/*
+ * The RR type response \p resp of q asked for: an address lookup is a pair of
+ * queries, response bit 1 is the A half of the pair, bit 2 the AAAA
+ */
+static inline uint16_t
+lws_adns_q_resp_type(const lws_adns_q_t *q, int resp)
+{
+	if (q->qtype == LWS_ADNS_RECORD_A || q->qtype == LWS_ADNS_RECORD_AAAA)
+		return (resp & 2) ? LWS_ADNS_RECORD_AAAA : LWS_ADNS_RECORD_A;
+
+	return q->qtype;
+}
+#endif
+
+#endif /* __LWS_PRIVATE_LIB_ASYNC_DNS_H__ */

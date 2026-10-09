@@ -157,9 +157,12 @@ enum lws_callback_reasons {
 	 * in is the ssl pointer and len is preverify_ok
 	 * Notice that this callback maintains libwebsocket return
 	 * conventions, return 0 to mean the cert is OK or 1 to fail it.
-	 * This also means that if you don't handle this callback then
-	 * the default callback action of returning 0 allows the client
-	 * certificates. */
+	 * Returning 0 does not override a cert the tls backend already
+	 * rejected: if you don't handle this callback, or handle it and
+	 * return 0, the backend's own verification result stands.  To
+	 * accept a cert the backend refused, clear the error yourself
+	 * with X509_STORE_CTX_set_error(x509_ctx, X509_V_OK) and then
+	 * return 0. */
 
 	LWS_CALLBACK_SSL_INFO					= 67,
 	/**< SSL connections only.  An event you registered an
@@ -228,14 +231,33 @@ enum lws_callback_reasons {
 	 * with the http connection, since the rest of the
 	 * activity will come by websockets from the script
 	 * that was delivered by http, so you will want to
-	 * return 1; to close and free up the connection. */
+	 * return 1; to close and free up the connection.
+	 *
+	 * The request headers are only guaranteed up to here, as a ws
+	 * connection's are up to LWS_CALLBACK_ESTABLISHED.  For a request
+	 * with a body they stay through LWS_CALLBACK_HTTP_BODY to
+	 * LWS_CALLBACK_HTTP_BODY_COMPLETION.  After that lws may give the
+	 * header allocation back to its pool (an h2 or h3 stream does, so a
+	 * transfer that runs for minutes does not pin one), and
+	 * lws_hdr_copy(), lws_get_urlarg_by_name_safe(),
+	 * lws_http_cookie_get() and friends answer "not present" from later
+	 * callbacks such as LWS_CALLBACK_HTTP_WRITEABLE.  Copy what you need
+	 * into your pss inside the window.  That includes `in` itself: it
+	 * points into the request headers, so copy it rather than storing
+	 * the pointer. */
 
 	LWS_CALLBACK_HTTP_BODY					= 13,
 	/**< the next len bytes data from the http
-	 * request body HTTP connection is now available in in. */
+	 * request body HTTP connection is now available in in.  A request
+	 * body sent with Transfer-Encoding: chunked is decoded by lws, so
+	 * in only ever holds body payload, never the chunk framing.  The
+	 * request headers are still available here. */
 
 	LWS_CALLBACK_HTTP_BODY_COMPLETION			= 14,
-	/**< the expected amount of http request body has been delivered */
+	/**< the expected amount of http request body has been delivered:
+	 * the Content-Length was reached, or the last-chunk of a chunked
+	 * body arrived.  This is the last callback at which the request
+	 * headers are guaranteed to be available (see LWS_CALLBACK_HTTP). */
 
 	LWS_CALLBACK_HTTP_FILE_COMPLETION			= 15,
 	/**< a file requested to be sent down http link has completed. */
@@ -307,7 +329,9 @@ enum lws_callback_reasons {
 	 * HTML.  `in` points to a `struct lws_process_html_args`
 	 * which describes the buffer containing outgoing HTML.
 	 * The buffer may grow up to `.max_len` (currently +128
-	 * bytes per buffer).
+	 * bytes per buffer).  Setting `.len` to 0 for a buffer that
+	 * is not `.final` sends nothing for it yet, and the next
+	 * buffer of the file follows.
 	 */
 
 	LWS_CALLBACK_HTTP_BIND_PROTOCOL				= 49,
@@ -339,7 +363,10 @@ enum lws_callback_reasons {
 	 * and response code yourself.
 	 *
 	 * There is no need for you to call transaction_completed() as the
-	 * caller will take care of it when it sees you returned >0.
+	 * caller will take care of it when it sees you returned >0.  That
+	 * includes answering with a file, by lws_serve_http_file(): the
+	 * transaction is completed once the file has all gone, as for a file
+	 * served from LWS_CALLBACK_HTTP.
 	 */
 
 	/* ---------------------------------------------------------------------
@@ -446,7 +473,16 @@ enum lws_callback_reasons {
 	 * headers using the header enums lws_token_indexes from
 	 * libwebsockets.h to check for and read the supported header
 	 * presence and content before deciding to allow the handshake
-	 * to proceed or to kill the connection. */
+	 * to proceed or to kill the connection.
+	 *
+	 * For a WebTransport session, this is issued on the h3 CONNECT
+	 * stream after the protocol has been selected and bound, but before
+	 * the 200 is sent.  in is the name of the negotiated wt protocol, or
+	 * NULL if none was found.  The request headers are still available,
+	 * so eg, lws_hdr_copy() of WSI_TOKEN_HTTP_COLON_PATH or
+	 * lws_get_urlarg_by_name() can be used to inspect the path and
+	 * urlargs.  Returning nonzero answers the CONNECT with 403 instead
+	 * of upgrading the stream. */
 
 	LWS_CALLBACK_CONFIRM_EXTENSION_OKAY			= 25,
 	/**< When the server handshake code
@@ -865,9 +901,9 @@ enum lws_callback_reasons {
 	LWS_CALLBACK_MQTT_CLIENT_CLOSED				= 208,
 	LWS_CALLBACK_MQTT_ACK					= 209,
 	/**< When a message is fully sent, if QoS0 this callback is generated
-	 * to locally "acknowledge" it.  For QoS1, this callback is only
-	 * generated when the matching PUBACK is received.  Return nonzero to
-	 * close the wsi.
+	 * to locally "acknowledge" it, from the event loop after the send
+	 * call returned.  For QoS1, this callback is only generated when the
+	 * matching PUBACK is received.  Return nonzero to close the wsi.
 	 */
 	LWS_CALLBACK_MQTT_RESEND				= 210,
 	/**< In QoS1 or QoS2, this callback is generated instead of the _ACK one
@@ -885,7 +921,13 @@ enum lws_callback_reasons {
 	 * Return nonzero to close the wsi.
 	 */
 
-	LWS_CALLBACK_HTTP_INTERCEPTOR_CHECK				= 213,
+	LWS_CALLBACK_MQTT_QOS2_RX_COMPLETE			= 213,
+	/**< When a QoS2 message has fully completed the transaction (PUBREL
+	 * received, PUBCOMP sent), this callback is generated.
+	 * `in` will point to the `uint16_t` packet ID that completed.
+	 */
+
+	LWS_CALLBACK_HTTP_INTERCEPTOR_CHECK			= 214,
 	/**< A mount has a interceptor_path enabled, this callback asks the
 	 * protocol bound to that mount if it is OK for this request to
 	 * proceed.  If returning 0, the request proceeds to the original
@@ -893,17 +935,57 @@ enum lws_callback_reasons {
 	 * mount.
 	 */
 
-	LWS_CALLBACK_GET_PSS_SIZE					= 214,
+	LWS_CALLBACK_GET_PSS_SIZE					= 215,
 	/**< Called when a protocol wants to specify its PSS size at runtime.
 	 *   If the protocol structure has per_session_data_size == 0, lws will
 	 *   call this to get the size to allocate for the session. */
 
-	LWS_CALLBACK_DHT_VERB_DISPATCH					= 215,
+	LWS_CALLBACK_DHT_VERB_DISPATCH					= 216,
 	/**< Sent to the user protocol handler callback when a DHT message
 	 * carrying a registered verb has been matched by lws-dht.
 	 * `in` is a pointer to `struct lws_dht_verb_dispatch_args` containing
 	 * the context, message, and peer sockaddr information.
 	 */
+
+	LWS_CALLBACK_QT_SERVER_RECEIVE					= 217,
+	/**< QUIC transport payload received on server side */
+	LWS_CALLBACK_QT_CLIENT_RECEIVE					= 218,
+	/**< QUIC transport payload received on client side */
+
+	LWS_CALLBACK_CLIENT_ESTABLISHED_EARLY				= 219,
+	/**< 0-RTT/Early data callback. If the client stream opts into 0-RTT,
+	 * it can return 1 from this callback to enable early WRITEABLE callbacks
+	 * before the handshake completes. Return 0 to ignore 0-RTT. */
+
+	LWS_CALLBACK_WT_BIND_PROTOCOL					= 220,
+	/**< By default, all WebTransport handling is done in the protocol the
+	 * CONNECT mount selected.  This callback occurs in the protocol when a
+	 * WebTransport session wsi, or one of the QUIC stream wsi belonging to
+	 * a session, is bound to that protocol.  Any protocol allocation
+	 * related to the wsi (typically in its pss) should be created then.
+	 *
+	 * These specific reasons are necessary because a WebTransport session
+	 * carries an indefinite number of streams, each with its own wsi and
+	 * pss, whose protocol bind lifetime is just that stream and not the
+	 * session or the QUIC connection.
+	 *
+	 * This is only about the logical binding of the wsi to the protocol,
+	 * it says nothing about the state of the underlying connection or
+	 * stream and must not be confused with LWS_CALLBACK_ESTABLISHED.  A
+	 * stream that was bound and then transitioned into the wt role from
+	 * h3 saw LWS_CALLBACK_HTTP_BIND_PROTOCOL for its original bind. */
+
+	LWS_CALLBACK_WT_DROP_PROTOCOL					= 221,
+	/**< This is called when a WebTransport session or stream wsi is
+	 * unbound from a protocol, either because the wsi is closing or
+	 * because it is being rebound (which frees and reallocates the pss).
+	 * Any protocol allocation related to the wsi should be destroyed, and
+	 * anything pointing into the pss (eg, a list node that lives inside
+	 * it) must be removed, since the pss may be freed immediately after.
+	 *
+	 * Like the bind reason, this is only about the protocol binding and is
+	 * independent of connection state, it must not be confused with
+	 * LWS_CALLBACK_CLOSED. */
 
 	/****** add new things just above ---^ ******/
 

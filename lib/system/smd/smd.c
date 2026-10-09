@@ -91,7 +91,7 @@ _lws_smd_dump(lws_smd_t *smd)
 	int n = 1;
 
 	lws_start_foreach_dll_safe(struct lws_dll2 *, p, p1,
-				   smd->owner_messages.head) {
+				   lws_dll2_get_head(&smd->owner_messages)) {
 		lws_smd_msg_t *msg = lws_container_of(p, lws_smd_msg_t, list);
 
 		lwsl_info(" msg %d: %p: ref %d, lat %dms, cls: 0x%x, len %u: '%s'\n",
@@ -103,7 +103,7 @@ _lws_smd_dump(lws_smd_t *smd)
 	} lws_end_foreach_dll_safe(p, p1);
 
 	n = 1;
-	lws_start_foreach_dll(struct lws_dll2 *, p, smd->owner_peers.head) {
+	lws_start_foreach_dll(struct lws_dll2 *, p, lws_dll2_get_head(&smd->owner_peers)) {
 		lws_smd_peer_t *pr = lws_container_of(p, lws_smd_peer_t, list);
 
 		lwsl_info(" peer %d: %p: tail: %p, filt 0x%x\n",
@@ -112,10 +112,30 @@ _lws_smd_dump(lws_smd_t *smd)
 }
 #endif
 
+static lws_smd_msg_t *
+_lws_smd_msg_next_matching_filter(lws_smd_peer_t *pr);
+
+/*
+ * THE REFCOUNT INVARIANT
+ *
+ * A peer "owes" exactly one reference on a message if, and only if, this
+ * returns nonzero for the pair: he wants that class, and he is not the peer
+ * that injected the message (msg->exc, set for messages forwarded in from
+ * another participant, which must not be echoed back to him).
+ *
+ * Every site that *takes* a reference (send-time assessment, late peer
+ * registration) and every site that *gives one back* (delivery, peer destroy)
+ * must use this same predicate.  If they disagree, a peer can release a
+ * reference it never took, driving the refcount to zero and freeing a message
+ * that another peer still points to as his tail.
+ *
+ * msg->exc must therefore be set on the message before the initial assessment.
+ */
+
 static int
-_lws_smd_msg_peer_interested_in_msg(lws_smd_peer_t *pr, lws_smd_msg_t *msg)
+_lws_smd_msg_peer_owes_refcount(lws_smd_peer_t *pr, lws_smd_msg_t *msg)
 {
-    return !!(msg->_class & pr->_class_filter);
+	return msg->exc != pr && !!(msg->_class & pr->_class_filter);
 }
 
 /*
@@ -125,16 +145,15 @@ _lws_smd_msg_peer_interested_in_msg(lws_smd_peer_t *pr, lws_smd_msg_t *msg)
  */
 
 static int
-_lws_smd_msg_assess_peers_interested(lws_smd_t *smd, lws_smd_msg_t *msg,
-				     struct lws_smd_peer *exc)
+_lws_smd_msg_assess_peers_interested(lws_smd_t *smd, lws_smd_msg_t *msg)
 {
 	struct lws_context *ctx = lws_container_of(smd, struct lws_context, smd);
 	int interested = 0;
 
-	lws_start_foreach_dll(struct lws_dll2 *, p, ctx->smd.owner_peers.head) {
+	lws_start_foreach_dll(struct lws_dll2 *, p, lws_dll2_get_head(&ctx->smd.owner_peers)) {
 		lws_smd_peer_t *pr = lws_container_of(p, lws_smd_peer_t, list);
 
-		if (pr != exc && _lws_smd_msg_peer_interested_in_msg(pr, msg))
+		if (_lws_smd_msg_peer_owes_refcount(pr, msg))
 			/*
 			 * This peer wants to consume it
 			 */
@@ -151,7 +170,7 @@ _lws_smd_class_mask_union(lws_smd_t *smd)
 	uint32_t mask = 0;
 
 	lws_start_foreach_dll_safe(struct lws_dll2 *, p, p1,
-				   smd->owner_peers.head) {
+				   lws_dll2_get_head(&smd->owner_peers)) {
 		lws_smd_peer_t *pr = lws_container_of(p, lws_smd_peer_t, list);
 
 		mask |= pr->_class_filter;
@@ -170,19 +189,21 @@ _lws_smd_msg_destroy(struct lws_context *cx, lws_smd_t *smd, lws_smd_msg_t *msg)
 {
 	/*
 	 * We think we gave the message to everyone and can destroy it.
-	 * Sanity check that no peer holds a pointer to this guy
+	 * Sanity check that no peer holds a pointer to this guy... if one
+	 * does, the refcount accounting went wrong somewhere upstream.  Move
+	 * him off it rather than leave him a dangling tail: an assert here is
+	 * compiled out under NDEBUG and skipped on FREERTOS anyway, so it
+	 * cannot be what stops the use-after-free.
 	 */
 
 	lws_start_foreach_dll_safe(struct lws_dll2 *, p, p1,
-				   smd->owner_peers.head) {
+				   lws_dll2_get_head(&smd->owner_peers)) {
 		lws_smd_peer_t *xpr = lws_container_of(p, lws_smd_peer_t, list);
 
 		if (xpr->tail == msg) {
 			lwsl_cx_err(cx, "peer %p has msg %p "
 				 "we are about to destroy as tail", xpr, msg);
-#if !defined(LWS_PLAT_FREERTOS)
-			assert(0);
-#endif
+			xpr->tail = _lws_smd_msg_next_matching_filter(xpr);
 		}
 
 	} lws_end_foreach_dll_safe(p, p1);
@@ -207,7 +228,7 @@ _lws_smd_msg_send(struct lws_context *ctx, void *pay, struct lws_smd_peer *exc)
 				LWS_SMD_SS_RX_HEADER_LEN_EFF - sizeof(*msg));
 	int locked_peers = 0;
 
-	if (ctx->smd.owner_messages.count >= ctx->smd_queue_depth) {
+	if (lws_dll2_count(&ctx->smd.owner_messages) >= ctx->smd_queue_depth) {
 		// lwsl_cx_debug(ctx, "rejecting message on queue depth %d",
 		//		  (int)ctx->smd.owner_messages.count);
 		/* reject the message due to max queue depth reached */
@@ -230,8 +251,15 @@ _lws_smd_msg_send(struct lws_context *ctx, void *pay, struct lws_smd_peer *exc)
 	if (lws_mutex_lock(ctx->smd.lock_messages)) /* +++++++++++++++++ messages */
 		goto bail;
 
+	/*
+	 * The refcount invariant needs msg->exc valid before we assess who
+	 * owes us a reference
+	 */
+
+	msg->exc = exc;
+
 	msg->refcount = (uint16_t)_lws_smd_msg_assess_peers_interested(
-							&ctx->smd, msg, exc);
+								&ctx->smd, msg);
 	if (!msg->refcount) {
 		/* possible, condsidering exc and no other participants */
 		lws_mutex_unlock(ctx->smd.lock_messages); /* --------------- messages */
@@ -243,8 +271,6 @@ _lws_smd_msg_send(struct lws_context *ctx, void *pay, struct lws_smd_peer *exc)
 		return 0;
 	}
 
-	msg->exc = exc;
-
 	/* let's add him on the queue... */
 
 	lws_dll2_add_tail(&msg->list, &ctx->smd.owner_messages);
@@ -254,11 +280,10 @@ _lws_smd_msg_send(struct lws_context *ctx, void *pay, struct lws_smd_peer *exc)
 	 * should become his tail
 	 */
 
-	lws_start_foreach_dll(struct lws_dll2 *, p, ctx->smd.owner_peers.head) {
+	lws_start_foreach_dll(struct lws_dll2 *, p, lws_dll2_get_head(&ctx->smd.owner_peers)) {
 		lws_smd_peer_t *pr = lws_container_of(p, lws_smd_peer_t, list);
 
-		if (pr != exc &&
-                   !pr->tail && _lws_smd_msg_peer_interested_in_msg(pr, msg)) {
+		if (!pr->tail && _lws_smd_msg_peer_owes_refcount(pr, msg)) {
 			pr->tail = msg;
 			/* tail message has to actually be of interest to the peer */
 			assert(!pr->tail || (pr->tail->_class & pr->_class_filter));
@@ -268,7 +293,7 @@ _lws_smd_msg_send(struct lws_context *ctx, void *pay, struct lws_smd_peer *exc)
 
 #if defined(LWS_SMD_DEBUG)
 	lwsl_smd("%s: added %p (refc %u) depth now %d\n", __func__,
-		 msg, msg->refcount, ctx->smd.owner_messages.count);
+		 msg, msg->refcount, lws_dll2_count(&ctx->smd.owner_messages));
 	_lws_smd_dump(&ctx->smd);
 #endif
 
@@ -317,18 +342,25 @@ lws_smd_msg_printf(struct lws_context *ctx, lws_smd_class_t _class,
 	va_start(ap, format);
 	n = vsnprintf(NULL, 0, format, ap);
 	va_end(ap);
-	if (n > LWS_SMD_MAX_PAYLOAD)
+
+	/*
+	 * n < 0 is a vsnprintf() failure; we must not cast that to size_t.
+	 * The allocation is n + 1 for the NUL vsnprintf() insists on writing,
+	 * so it's n + 1 that has to fit inside LWS_SMD_MAX_PAYLOAD.
+	 */
+
+	if (n < 0 || (size_t)n + 1 > LWS_SMD_MAX_PAYLOAD)
 		/* too large to send */
 		return 1;
 
-	p = lws_smd_msg_alloc(ctx, _class, (size_t)n + 2);
+	p = lws_smd_msg_alloc(ctx, _class, (size_t)n + 1);
 	if (!p)
 		return 1;
 	msg = (lws_smd_msg_t *)(((uint8_t *)p) - LWS_SMD_SS_RX_HEADER_LEN_EFF -
 								sizeof(*msg));
 	msg->length = (uint16_t)n;
 	va_start(ap, format);
-	vsnprintf((char *)p, (unsigned int)n + 2, format, ap);
+	vsnprintf((char *)p, (size_t)n + 1, format, ap);
 	va_end(ap);
 
 	/*
@@ -412,13 +444,19 @@ _lws_smd_ss_rx_forward(struct lws_context *ctx, const char *tag,
 		 */
 		return 0;
 
-	p = lws_smd_msg_alloc(ctx, _class, len);
+	/*
+	 * len includes the class + timestamp header, the payload is what's
+	 * left after that... allocating len would both waste the header size
+	 * and, for payloads just under the limit, blow the
+	 * LWS_SMD_MAX_PAYLOAD assert in lws_smd_msg_alloc()
+	 */
+
+	p = lws_smd_msg_alloc(ctx, _class, len - LWS_SMD_SS_RX_HEADER_LEN_EFF);
 	if (!p)
 		return 1;
 
 	msg = (lws_smd_msg_t *)(((uint8_t *)p) - LWS_SMD_SS_RX_HEADER_LEN_EFF -
 								sizeof(*msg));
-	msg->length = (uint16_t)(len - LWS_SMD_SS_RX_HEADER_LEN_EFF);
 	/* adopt the original source timestamp, not time we forwarded it */
 	msg->timestamp = (lws_usec_t)lws_ser_ru64be(buf + 8);
 
@@ -475,7 +513,7 @@ lws_smd_sspc_rx_forward(void *ss_user, const uint8_t *buf, size_t len)
 static void
 _lws_smd_peer_destroy(lws_smd_peer_t *pr)
 {
-	lws_smd_t *smd = lws_container_of(pr->list.owner, lws_smd_t,
+	lws_smd_t *smd = lws_dll2_owner_container(&pr->list, lws_smd_t,
 					  owner_peers);
 
 	if (lws_mutex_lock(smd->lock_messages)) /* +++++++++ messages */
@@ -490,10 +528,10 @@ _lws_smd_peer_destroy(lws_smd_peer_t *pr)
 
 	while (pr->tail) {
 
-		lws_smd_msg_t *m1 = lws_container_of(pr->tail->list.next,
+		lws_smd_msg_t *m1 = lws_container_of(lws_dll2_get_next(&pr->tail->list),
 							lws_smd_msg_t, list);
 
-		if (_lws_smd_msg_peer_interested_in_msg(pr, pr->tail)) {
+		if (_lws_smd_msg_peer_owes_refcount(pr, pr->tail)) {
 			if (!--pr->tail->refcount)
 				_lws_smd_msg_destroy(pr->ctx, smd, pr->tail);
 		}
@@ -513,13 +551,12 @@ _lws_smd_msg_next_matching_filter(lws_smd_peer_t *pr)
 	lws_smd_msg_t *msg;
 
 	do {
-		tail = tail->next;
+		tail = lws_dll2_get_next(tail);
 		if (!tail)
 			return NULL;
 
 		msg = lws_container_of(tail, lws_smd_msg_t, list);
-		if (msg->exc != pr &&
-		    _lws_smd_msg_peer_interested_in_msg(pr, msg))
+		if (_lws_smd_msg_peer_owes_refcount(pr, msg))
 			return msg;
 	} while (1);
 
@@ -545,7 +582,7 @@ _lws_smd_msg_deliver_peer(struct lws_context *ctx, lws_smd_peer_t *pr)
 {
 	lws_smd_msg_t *msg;
 
-	if (!pr->tail)
+	if (pr->dead || !pr->tail)
 		return 0;
 
 	msg = lws_container_of(pr->tail, lws_smd_msg_t, list);
@@ -605,7 +642,7 @@ lws_smd_msg_distribute(struct lws_context *ctx)
 
 	/* commonly, no messages and nothing to do... */
 
-	if (!ctx->smd.owner_messages.count)
+	if (!lws_dll2_count(&ctx->smd.owner_messages))
 		return 0;
 
 
@@ -615,10 +652,29 @@ lws_smd_msg_distribute(struct lws_context *ctx)
 			return 1; /* For Coverity */
 
 		lws_start_foreach_dll_safe(struct lws_dll2 *, p, p1,
-					   ctx->smd.owner_peers.head) {
+					   lws_dll2_get_head(&ctx->smd.owner_peers)) {
 			lws_smd_peer_t *pr = lws_container_of(p, lws_smd_peer_t, list);
 
 			more = (char)(more | !!_lws_smd_msg_deliver_peer(ctx, pr));
+
+		} lws_end_foreach_dll_safe(p, p1);
+
+		/*
+		 * Reap any peers that unregistered from inside their own
+		 * delivery callback... the delivery loop above (and the
+		 * latched p1) held references to them, so lws_smd_unregister()
+		 * only marked them dead.  Now the loop has unwound, it's safe
+		 * to unlink them and give their refcounts back.
+		 */
+
+		lws_start_foreach_dll_safe(struct lws_dll2 *, p, p1,
+					   lws_dll2_get_head(&ctx->smd.owner_peers)) {
+			lws_smd_peer_t *pr = lws_container_of(p, lws_smd_peer_t, list);
+
+			if (pr->dead) {
+				lwsl_cx_notice(ctx, "reaping peer %p", pr);
+				_lws_smd_peer_destroy(pr);
+			}
 
 		} lws_end_foreach_dll_safe(p, p1);
 
@@ -675,10 +731,10 @@ lws_smd_register(struct lws_context *ctx, void *opaque, int flags,
 	 */
 
 	lws_start_foreach_dll_safe(struct lws_dll2 *, p, p1,
-				   ctx->smd.owner_messages.head) {
+				   lws_dll2_get_head(&ctx->smd.owner_messages)) {
 		lws_smd_msg_t *msg = lws_container_of(p, lws_smd_msg_t, list);
 
-		if (_lws_smd_msg_peer_interested_in_msg(pr, msg))
+		if (_lws_smd_msg_peer_owes_refcount(pr, msg))
 			msg->refcount++;
 
 	} lws_end_foreach_dll_safe(p, p1);
@@ -688,7 +744,7 @@ lws_smd_register(struct lws_context *ctx, void *opaque, int flags,
 	lws_mutex_unlock(ctx->smd.lock_messages); /* messages ------- */
 
 	lwsl_cx_info(ctx, "peer %p (count %u) registered", pr,
-			(unsigned int)ctx->smd.owner_peers.count);
+			(unsigned int)lws_dll2_count(&ctx->smd.owner_peers));
 
 bail1:
 	if (locked_peers)
@@ -700,19 +756,34 @@ bail1:
 void
 lws_smd_unregister(struct lws_smd_peer *pr)
 {
-	lws_smd_t *smd = lws_container_of(pr->list.owner, lws_smd_t, owner_peers);
-	int locked_peers = 0;
+	lws_smd_t *smd = lws_dll2_owner_container(&pr->list, lws_smd_t, owner_peers);
 
-	if (!smd->delivering || !lws_thread_is(smd->tid_holding)) {
-		if (lws_mutex_lock(smd->lock_peers)) /* +++++++++++++++++++ peers */
-			return; /* For Coverity */
-		locked_peers = 1;
+	if (smd->delivering && lws_thread_is(smd->tid_holding)) {
+
+		/*
+		 * We're being called from inside a delivery callback (that is
+		 * what delivering + our own tid means), directly or via
+		 * lws_ss_destroy().  _lws_smd_msg_deliver_peer() is going to
+		 * carry on using this peer when we return, and
+		 * lws_smd_msg_distribute() latched the next peer before the
+		 * callback... so we can't free him here.  Mark him dead so no
+		 * further delivery happens, and let lws_smd_msg_distribute()
+		 * reap him after the delivery loop has unwound.
+		 */
+
+		lwsl_cx_notice(pr->ctx, "deferring destroy of peer %p", pr);
+		pr->dead = 1;
+
+		return;
 	}
+
+	if (lws_mutex_lock(smd->lock_peers)) /* +++++++++++++++++++++++ peers */
+		return; /* For Coverity */
+
 	lwsl_cx_notice(pr->ctx, "destroying peer %p", pr);
 	_lws_smd_peer_destroy(pr);
 
-	if (locked_peers)
-		lws_mutex_unlock(smd->lock_peers); /* ----------------- peers */
+	lws_mutex_unlock(smd->lock_peers); /* ------------------------- peers */
 }
 
 int
@@ -725,7 +796,7 @@ lws_smd_message_pending(struct lws_context *ctx)
 	 * definitely nothing for this tsi or anything else
 	 */
 
-	if (!ctx->smd.owner_messages.count)
+	if (!lws_dll2_count(&ctx->smd.owner_messages))
 		return 0;
 
 	/*
@@ -742,7 +813,7 @@ lws_smd_message_pending(struct lws_context *ctx)
 		goto bail; /* For Coverity */
 
 	lws_start_foreach_dll_safe(struct lws_dll2 *, p, p1,
-				   ctx->smd.owner_messages.head) {
+				   lws_dll2_get_head(&ctx->smd.owner_messages)) {
 		lws_smd_msg_t *msg = lws_container_of(p, lws_smd_msg_t, list);
 
 		if ((lws_now_usecs() - msg->timestamp) > ctx->smd_ttl_us) {
@@ -758,7 +829,7 @@ lws_smd_message_pending(struct lws_context *ctx)
 			 */
 
 			lws_start_foreach_dll_safe(struct lws_dll2 *, pp, pp1,
-						   ctx->smd.owner_peers.head) {
+						   lws_dll2_get_head(&ctx->smd.owner_peers)) {
 				lws_smd_peer_t *pr = lws_container_of(pp,
 							lws_smd_peer_t, list);
 
@@ -782,7 +853,7 @@ lws_smd_message_pending(struct lws_context *ctx)
 	 * Walk the peer list
 	 */
 
-	lws_start_foreach_dll(struct lws_dll2 *, p, ctx->smd.owner_peers.head) {
+	lws_start_foreach_dll(struct lws_dll2 *, p, lws_dll2_get_head(&ctx->smd.owner_peers)) {
 		lws_smd_peer_t *pr = lws_container_of(p, lws_smd_peer_t, list);
 
 		if (pr->tail)
@@ -815,7 +886,7 @@ _lws_smd_destroy(struct lws_context *ctx)
 	 */
 
 	lws_start_foreach_dll_safe(struct lws_dll2 *, p, p1,
-				   ctx->smd.owner_messages.head) {
+				   lws_dll2_get_head(&ctx->smd.owner_messages)) {
 		lws_smd_msg_t *msg = lws_container_of(p, lws_smd_msg_t, list);
 
 		lws_dll2_remove(&msg->list);
@@ -828,7 +899,7 @@ _lws_smd_destroy(struct lws_context *ctx)
 	 */
 
 	lws_start_foreach_dll_safe(struct lws_dll2 *, p, p1,
-				   ctx->smd.owner_peers.head) {
+				   lws_dll2_get_head(&ctx->smd.owner_peers)) {
 		lws_smd_peer_t *pr = lws_container_of(p, lws_smd_peer_t, list);
 
 		pr->tail = NULL; /* we just nuked all the messages, ignore */

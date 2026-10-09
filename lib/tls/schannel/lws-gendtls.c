@@ -68,8 +68,17 @@ lws_gendtls_create(struct lws_gendtls_ctx *ctx,
                  "lws_dtls_%p_%u", ctx, (unsigned int)lws_now_secs());
 
     ctx->schannel_cred.dwVersion = SCHANNEL_CRED_VERSION;
-    ctx->schannel_cred.grbitEnabledProtocols = SP_PROT_DTLS1_0_CLIENT | SP_PROT_DTLS1_0_SERVER |
-                                               SP_PROT_DTLS1_2_CLIENT | SP_PROT_DTLS1_2_SERVER;
+
+    /*
+     * RFC 8827 6: DTLS 1.2 or later only.  DTLS 1.0 drags in the TLS 1.0-era
+     * CBC / SHA1 record layer and is a downgrade target; the openssl gendtls
+     * ctx has had a DTLS 1.2 floor since C-298.  There is no info member to
+     * override this with, and there should not be: a gendtls ctx is only ever
+     * used for WebRTC, where the RFC is not negotiable.
+     */
+
+    ctx->schannel_cred.grbitEnabledProtocols = SP_PROT_DTLS1_2_CLIENT |
+                                               SP_PROT_DTLS1_2_SERVER;
 
     ctx->schannel_cred.dwFlags = SCH_CRED_NO_DEFAULT_CREDS | SCH_CRED_MANUAL_CRED_VALIDATION;
 
@@ -176,12 +185,15 @@ lws_gendtls_schannel_update_creds(struct lws_gendtls_ctx *ctx)
                        SCH_CRED_MANUAL_CRED_VALIDATION |
                        SCH_CRED_IGNORE_NO_REVOCATION_CHECK |
                        SCH_CRED_IGNORE_REVOCATION_OFFLINE;
-/*
- * We use 0 (all enabled) to allow SChannel to negotiate.
- */
 
-    /* Let OS handle protocol enablement for DTLS */
-    sch_cred.grbitEnabledProtocols = 0;
+    /*
+     * NOT 0 ("let the OS pick"): the OS default DTLS set still includes DTLS
+     * 1.0 on every Windows that has it, and RFC 8827 6 requires DTLS 1.2 or
+     * later.  Same floor as the credential built in lws_gendtls_create().
+     */
+
+    sch_cred.grbitEnabledProtocols = SP_PROT_DTLS1_2_CLIENT |
+                                     SP_PROT_DTLS1_2_SERVER;
 
     status = AcquireCredentialsHandleA(NULL, UNISP_NAME_A,
                                       ctx->mode == LWS_GENDTLS_MODE_SERVER ? SECPKG_CRED_INBOUND : SECPKG_CRED_OUTBOUND,
@@ -252,13 +264,21 @@ lws_gendtls_get_rx(struct lws_gendtls_ctx *ctx, uint8_t *out, size_t max_len)
 	size_t avail;
 	int ret;
 
+	/*
+	 * The DTLS server has to ask for the peer's certificate
+	 * (ASC_REQ_MUTUAL_AUTH), the same as the other backends do since
+	 * C-298: without it no CertificateRequest is sent and the WebRTC peer
+	 * never has to present the certificate whose fingerprint its SDP
+	 * advertised, so there is nothing for the fingerprint check to check.
+	 */
+
 	if (ctx->mode == LWS_GENDTLS_MODE_SERVER)
 		req_flags = ASC_REQ_SEQUENCE_DETECT | ASC_REQ_REPLAY_DETECT |
 			    ASC_REQ_CONFIDENTIALITY | ASC_REQ_ALLOCATE_MEMORY |
-			    ASC_REQ_DATAGRAM;
+			    ASC_REQ_DATAGRAM | ASC_REQ_MUTUAL_AUTH;
 
-	int getting_fragments = 0;
-	while (!ctx->handshake_done) {
+	int getting_fragments = 0, budget = 64;
+	while (!ctx->handshake_done && budget--) {
 		uint8_t *flat_buf = NULL;
 
 		avail = lws_buflist_total_len(&ctx->rx_head);
@@ -340,14 +360,37 @@ lws_gendtls_get_rx(struct lws_gendtls_ctx *ctx, uint8_t *out, size_t max_len)
 		    status == SEC_I_CONTINUE_NEEDED ||
 		    status == SEC_I_MESSAGE_FRAGMENT) {
 
-			/* Consume used input */
+			/*
+			 * Consume used input.  A handshake flight routinely
+			 * spans more than one datagram, ie, more than one
+			 * buflist segment, and lws_buflist_use_segment()
+			 * only ever operates on the head segment: charging
+			 * the whole amount to it asserted in a debug build
+			 * and silently destroyed the next datagram in a
+			 * release one.  Walk the segments like the decrypt
+			 * path below does.
+			 */
 			if (pass_avail) {
 				size_t consumed = pass_avail;
-				if (in_bufs[1].BufferType == SECBUFFER_EXTRA) {
-					consumed = pass_avail - in_bufs[1].cbBuffer;
+
+				if (in_bufs[1].BufferType == SECBUFFER_EXTRA &&
+				    in_bufs[1].cbBuffer <= pass_avail)
+					consumed = pass_avail -
+						   in_bufs[1].cbBuffer;
+
+				while (consumed) {
+					size_t seg = lws_buflist_next_segment_len(
+							&ctx->rx_head, NULL);
+					size_t chunk;
+
+					if (!seg)
+						break;
+
+					chunk = consumed > seg ? seg : consumed;
+					lws_buflist_use_segment(&ctx->rx_head,
+								chunk);
+					consumed -= chunk;
 				}
-				if (consumed)
-					lws_buflist_use_segment(&ctx->rx_head, consumed);
 			}
 
 			if (flat_buf) lws_free(flat_buf);
@@ -376,8 +419,15 @@ lws_gendtls_get_rx(struct lws_gendtls_ctx *ctx, uint8_t *out, size_t max_len)
 				return 0;
 			}
 
-			/* Loop to consume the next record if we have an extra buffer remaining */
-			if (in_bufs[1].BufferType == SECBUFFER_EXTRA && in_bufs[1].cbBuffer > 0) {
+			/*
+			 * Loop to consume the next record if we have an extra
+			 * buffer remaining... but only if this pass actually
+			 * consumed something, else we re-enter with identical
+			 * input and spin
+			 */
+			if (in_bufs[1].BufferType == SECBUFFER_EXTRA &&
+			    in_bufs[1].cbBuffer > 0 &&
+			    in_bufs[1].cbBuffer < pass_avail) {
 				continue;
 			}
 
@@ -431,7 +481,7 @@ lws_gendtls_get_rx(struct lws_gendtls_ctx *ctx, uint8_t *out, size_t max_len)
 		return 0; /* Wait for more */
 	}
 
-	if (status != SEC_E_OK) {
+       if (status != SEC_E_OK && status != SEC_I_CONTEXT_EXPIRED && status != SEC_E_CONTEXT_EXPIRED) {
 		lwsl_err("%s: %s DecryptMessage failed: 0x%x\n", __func__,
             ctx->mode == LWS_GENDTLS_MODE_SERVER ? "Server" : "Client", (unsigned int)status);
 		lws_free(buf);

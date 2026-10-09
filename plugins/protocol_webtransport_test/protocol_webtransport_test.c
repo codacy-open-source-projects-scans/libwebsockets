@@ -1,0 +1,343 @@
+/*
+ * WebTransport test protocol plugin
+ *
+ * Written in 2010-2026 by Andy Green <andy@warmcat.com>
+ *
+ * This file is made available under the Creative Commons CC0 1.0
+ * Universal Public Domain Dedication.
+ */
+
+#if !defined (LWS_PLUGIN_STATIC)
+#if !defined(LWS_DLL)
+#define LWS_DLL
+#endif
+#if !defined(LWS_INTERNAL)
+#define LWS_INTERNAL
+#endif
+#include <libwebsockets.h>
+#endif
+#include <libwebsockets/lws-webtransport.h>
+
+#include <string.h>
+#include <stdlib.h>
+
+#define BLOB_SIZE		(4 * 1024 * 1024)
+#define HASH_SIZE		32
+#define TOTAL_SEND_SIZE		(BLOB_SIZE + HASH_SIZE)
+#define TEST_ITERATIONS		10
+
+struct vhd__wt_test {
+	uint8_t *blob;
+	uint8_t hash[HASH_SIZE];
+};
+
+struct pss__wt_test {
+	int send_count;
+	size_t send_pos;
+
+	int recv_count;
+	size_t recv_pos;
+	struct lws_genhash_ctx hash_ctx_rx;
+	uint8_t hash_rx_expected[HASH_SIZE];
+
+	int established;
+	int rx_hash_live;
+};
+
+/*
+ * Start (or restart) the rx hash context.
+ *
+ * lws_genhash_destroy() is what both finalizes and frees the underlying
+ * context, so we have to track whether we are holding a live one: updating a
+ * destroyed context is a NULL deref on the openssl backend, and initializing
+ * over a live one leaks it.
+ */
+
+static int
+wt_test_hash_rx_start(struct pss__wt_test *pss)
+{
+	uint8_t discard[HASH_SIZE];
+
+	if (pss->rx_hash_live) {
+		lws_genhash_destroy(&pss->hash_ctx_rx, discard);
+		pss->rx_hash_live = 0;
+	}
+
+	if (lws_genhash_init(&pss->hash_ctx_rx, LWS_GENHASH_TYPE_SHA256))
+		return 1;
+
+	pss->rx_hash_live = 1;
+
+	return 0;
+}
+
+static int
+callback_wt_test(struct lws *wsi, enum lws_callback_reasons reason,
+		 void *user, void *in, size_t len)
+{
+	struct pss__wt_test *pss = (struct pss__wt_test *)user;
+	struct vhd__wt_test *vhd =
+			(struct vhd__wt_test *)
+			lws_protocol_vh_priv_get(lws_get_vhost(wsi),
+					lws_get_protocol(wsi));
+	uint8_t *p;
+	size_t chunk, to_send;
+	int m;
+
+	switch (reason) {
+	case LWS_CALLBACK_PROTOCOL_INIT:
+		/*
+		 * We take no pvo options, but we must still create the vhost
+		 * priv here, since this is the only chance we get and every
+		 * connection needs the blob and its hash
+		 */
+
+		vhd = lws_protocol_vh_priv_zalloc(lws_get_vhost(wsi),
+				lws_get_protocol(wsi),
+				sizeof(struct vhd__wt_test));
+		if (!vhd)
+			return -1;
+
+		vhd->blob = malloc(BLOB_SIZE);
+		if (!vhd->blob)
+			return -1;
+
+		{
+			struct lws_xos xos;
+			struct lws_genhash_ctx hctx;
+			size_t i;
+			
+			lws_xos_init(&xos, 0x12345678);
+			for (i = 0; i < BLOB_SIZE; i++)
+				vhd->blob[i] = (uint8_t)lws_xos(&xos);
+
+			if (lws_genhash_init(&hctx, LWS_GENHASH_TYPE_SHA256)) {
+				lwsl_err("genhash init failed\n");
+				return -1;
+			}
+			if (lws_genhash_update(&hctx, vhd->blob, BLOB_SIZE)) {
+				lwsl_err("genhash update failed\n");
+				return -1;
+			}
+			lws_genhash_destroy(&hctx, vhd->hash);
+		}
+		break;
+
+	case LWS_CALLBACK_PROTOCOL_DESTROY:
+		if (vhd && vhd->blob) {
+			free(vhd->blob);
+			vhd->blob = NULL;
+		}
+		break;
+	case LWS_CALLBACK_SERVER_NEW_CLIENT_INSTANTIATED:
+	case LWS_CALLBACK_ESTABLISHED:
+		/* We only care about WebTransport child streams for data transfer */
+		if (lws_wt_is_session(wsi)) {
+			lwsl_user("Session established\n");
+			break;
+		}
+
+		/*
+		 * The stream may be told it was adopted more than once, eg, if
+		 * it gets rebound when its WebTransport session is resolved.
+		 * Only the first one starts the test.
+		 */
+
+		if (pss->established)
+			break;
+
+		lwsl_user("Stream established\n");
+		pss->send_count = 0;
+		pss->send_pos = 0;
+		pss->recv_count = 0;
+		pss->recv_pos = 0;
+
+		if (wt_test_hash_rx_start(pss))
+			return -1;
+
+		pss->established = 1;
+		lws_callback_on_writable(wsi);
+		break;
+
+	case LWS_CALLBACK_SERVER_WRITEABLE:
+		if (!pss->established || pss->send_count >= TEST_ITERATIONS)
+			break;
+
+		if (!vhd || !vhd->blob) {
+			lwsl_wsi_warn(wsi, "protocol not initialized on vhost");
+			return -1;
+		}
+
+		to_send = TOTAL_SEND_SIZE - pss->send_pos;
+		{
+			int tx_cr = lws_wsi_tx_credit(wsi, LWSTXCR_US_TO_PEER, 0);
+			if (tx_cr <= 0)
+				break;
+			if (to_send > (size_t)tx_cr)
+				to_send = (size_t)tx_cr;
+		}
+		if (to_send > 65536)
+			to_send = 65536; /* write in chunks */
+
+		{
+			uint8_t buf[LWS_PRE + 65536];
+			p = &buf[LWS_PRE];
+			
+			if (pss->send_pos < BLOB_SIZE) {
+				chunk = BLOB_SIZE - pss->send_pos;
+				if (chunk > to_send) chunk = to_send;
+				memcpy(p, vhd->blob + pss->send_pos, chunk);
+				
+				if (chunk < to_send) {
+					/* Append hash */
+					memcpy(p + chunk, vhd->hash, to_send - chunk);
+				}
+			} else {
+				memcpy(p, vhd->hash + (pss->send_pos - BLOB_SIZE), to_send);
+			}
+
+			m = lws_write(wsi, p, (unsigned int)to_send, LWS_WRITE_BINARY);
+			lwsl_info("WT WRITEABLE: send_pos %zu, to_send %zu, write_ret %d\n", pss->send_pos, to_send, m);
+			if (m < 0) {
+				lwsl_err("write error\n");
+				return -1;
+			}
+
+			pss->send_pos += (size_t)m;
+			if (pss->send_pos == TOTAL_SEND_SIZE) {
+				pss->send_pos = 0;
+				pss->send_count++;
+				lwsl_user("Sent blob %d/%d\n", pss->send_count, TEST_ITERATIONS);
+			}
+			
+			if (pss->send_count < TEST_ITERATIONS)
+				lws_callback_on_writable(wsi);
+		}
+		break;
+
+	case LWS_CALLBACK_RECEIVE:
+		if (!pss->established || pss->recv_count >= TEST_ITERATIONS)
+			break;
+
+		p = (uint8_t *)in;
+		while (len > 0) {
+			/*
+			 * The peer picks the STREAM frame boundaries, so the
+			 * chunk that completes the last blob can carry more
+			 * after it... the test is over at that point and the
+			 * hash context is gone, so discard the remainder
+			 * rather than feed it to a destroyed context
+			 */
+
+			if (pss->recv_count >= TEST_ITERATIONS)
+				break;
+
+			if (pss->recv_pos < BLOB_SIZE) {
+				chunk = BLOB_SIZE - pss->recv_pos;
+				if (chunk > len) chunk = len;
+				
+				if (lws_genhash_update(&pss->hash_ctx_rx, p, chunk))
+					return -1;
+				
+				pss->recv_pos += chunk;
+				p += chunk;
+				len -= chunk;
+			} else {
+				chunk = TOTAL_SEND_SIZE - pss->recv_pos;
+				if (chunk > len) chunk = len;
+				
+				memcpy(pss->hash_rx_expected + (pss->recv_pos - BLOB_SIZE), p, chunk);
+				
+				pss->recv_pos += chunk;
+				p += chunk;
+				len -= chunk;
+				
+				if (pss->recv_pos == TOTAL_SEND_SIZE) {
+					uint8_t computed[HASH_SIZE];
+
+					lws_genhash_destroy(&pss->hash_ctx_rx, computed);
+					pss->rx_hash_live = 0;
+
+					if (memcmp(computed, pss->hash_rx_expected, HASH_SIZE) == 0) {
+						pss->recv_count++;
+						lwsl_user("Received and verified blob %d/%d\n", 
+							  pss->recv_count, TEST_ITERATIONS);
+					} else {
+						lwsl_err("Hash mismatch on blob %d\n", pss->recv_count + 1);
+						return -1;
+					}
+					
+					/* Prepare for next blob */
+					pss->recv_pos = 0;
+					if (pss->recv_count < TEST_ITERATIONS &&
+					    wt_test_hash_rx_start(pss))
+						return -1;
+				}
+			}
+		}
+		break;
+
+	/*
+	 * A stream we initialized may be closed, or have its pss freed and
+	 * replaced under it, by any of these depending on the role it ended up
+	 * in... a QUIC stream that never became a WebTransport one closes as
+	 * h3, and lws_bind_protocol() frees the pss on the unbind reasons even
+	 * when the protocol is unchanged.  We have to release the hash context
+	 * the pss owns on all of them.
+	 */
+
+	case LWS_CALLBACK_CLOSED:
+	case LWS_CALLBACK_CLOSED_HTTP:
+	case LWS_CALLBACK_HTTP_DROP_PROTOCOL:
+	case LWS_CALLBACK_CLIENT_HTTP_DROP_PROTOCOL:
+	case LWS_CALLBACK_WT_DROP_PROTOCOL:
+		if (!pss)
+			break;
+
+		/* if we are still holding a hash context, destroy it */
+
+		if (pss->rx_hash_live) {
+			uint8_t computed[HASH_SIZE];
+
+			lws_genhash_destroy(&pss->hash_ctx_rx, computed);
+			pss->rx_hash_live = 0;
+		}
+		break;
+
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+#define LWS_PLUGIN_PROTOCOL_WT_TEST \
+	{ \
+		"webtransport-test", \
+		callback_wt_test, \
+		sizeof(struct pss__wt_test), \
+		65536, \
+		0, NULL, 0 \
+	}
+
+#if !defined (LWS_PLUGIN_STATIC)
+
+LWS_VISIBLE const struct lws_protocols wt_test_protocols[] = {
+	LWS_PLUGIN_PROTOCOL_WT_TEST
+};
+
+LWS_VISIBLE const lws_plugin_protocol_t webtransport_test = {
+	.hdr = {
+		.name = "webtransport test",
+		._class = "lws_protocol_plugin",
+		.lws_build_hash = LWS_BUILD_HASH,
+		.api_magic = LWS_PLUGIN_API_MAGIC
+	},
+
+	.protocols = wt_test_protocols,
+	.count_protocols = LWS_ARRAY_SIZE(wt_test_protocols),
+	.extensions = NULL,
+	.count_extensions = 0,
+};
+
+#endif

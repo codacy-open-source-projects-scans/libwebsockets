@@ -1,0 +1,159 @@
+/*
+ * lws-minimal-webtransport-server
+ *
+ * Written in 2010-2026 by Andy Green <andy@warmcat.com>
+ *
+ * This file is made available under the Creative Commons CC0 1.0
+ * Universal Public Domain Dedication.
+ *
+ * This demonstrates a minimal WebTransport server.
+ */
+
+#include <libwebsockets.h>
+#include <libwebsockets/lws-webtransport.h>
+#include <string.h>
+#include <signal.h>
+#include <stdio.h>
+
+static struct lws_context *context;
+
+static int
+callback_webtransport(struct lws *wsi, enum lws_callback_reasons reason,
+		      void *user, void *in, size_t len)
+{
+	switch (reason) {
+
+	/*
+	 * Issued on the h3 CONNECT stream after the wt protocol was bound but
+	 * before the 200 is sent, so the request headers are still available.
+	 * Return nonzero to refuse the session with a 403, eg, based on the
+	 * :path or a urlarg like /wt?code=...
+	 */
+	case LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION: {
+		char path[128], code[64];
+		int n;
+
+		n = lws_hdr_copy(wsi, path, sizeof(path), WSI_TOKEN_HTTP_COLON_PATH);
+		lwsl_user("LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION (wsi: %p, "
+			  "protocol: %s, path: %s)\n", wsi, in ? (const char *)in :
+			  "(none)", n > 0 ? path : "?");
+
+		if (lws_get_urlarg_by_name_safe(wsi, "code", code,
+						sizeof(code)) >= 0)
+			lwsl_user("  urlarg code=%s\n", code);
+
+		break;
+	}
+
+	case LWS_CALLBACK_SERVER_NEW_CLIENT_INSTANTIATED:
+		lwsl_user("LWS_CALLBACK_SERVER_NEW_CLIENT_INSTANTIATED "
+			  "(wsi: %p)\n", wsi);
+		/* If it's a session WSI, we can create streams */
+		if (lws_wt_is_session(wsi)) {
+			lwsl_user("  WebTransport Session Established\n");
+			/* Example: create a bidi stream */
+			struct lws *cwsi = lws_wt_create_stream(wsi, 0);
+			if (cwsi) {
+				lwsl_user("  Created Bidi Stream: %p\n", cwsi);
+			}
+		} else {
+			lwsl_user("  WebTransport Stream Established\n");
+		}
+		break;
+
+	/*
+	 * These two are about the logical binding of the session or stream wsi
+	 * to this protocol, they say nothing about the state of the connection
+	 * or the stream.  A stream we created ourselves is announced by the
+	 * bind, since nobody adopted it.  Anything the protocol allocated for
+	 * the wsi must be destroyed at the drop, the pss may be freed
+	 * immediately afterwards.
+	 */
+
+	case LWS_CALLBACK_WT_BIND_PROTOCOL:
+		lwsl_user("LWS_CALLBACK_WT_BIND_PROTOCOL (wsi: %p, %s)\n", wsi,
+			  lws_wt_is_session(wsi) ? "session" : "stream");
+		break;
+
+	case LWS_CALLBACK_WT_DROP_PROTOCOL:
+		lwsl_user("LWS_CALLBACK_WT_DROP_PROTOCOL (wsi: %p, %s)\n", wsi,
+			  lws_wt_is_session(wsi) ? "session" : "stream");
+		break;
+
+	case LWS_CALLBACK_RECEIVE:
+		lwsl_user("LWS_CALLBACK_RECEIVE (wsi: %p, len: %zu)\n", wsi, len);
+		lwsl_hexdump_notice(in, len);
+		/* We can bounce it back if we want, or just print it */
+		break;
+
+	case LWS_CALLBACK_CLOSED:
+		lwsl_user("LWS_CALLBACK_CLOSED (wsi: %p)\n", wsi);
+		break;
+
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+static struct lws_protocols protocols[] = {
+	{ "webtransport", callback_webtransport, 0, 1024, 0, NULL, 0 },
+	{ NULL, NULL, 0, 0, 0, NULL, 0 } /* terminator */
+};
+
+/*
+ * A protocol is only given WebTransport sessions if its pvo on the vhost has
+ * a "webtransport" option.  With no mount and no protocol offered by the
+ * client, the vhost's default protocol (the first) takes the session.
+ */
+
+static const struct lws_protocol_vhost_options pvo_wt_opt = {
+	NULL, NULL, "webtransport", ""
+};
+
+static const struct lws_protocol_vhost_options pvo = {
+	NULL, &pvo_wt_opt, "webtransport", ""
+};
+
+static void
+sigint_handler(int sig)
+{
+	lws_default_loop_exit(context);
+}
+
+int main(int argc, const char **argv)
+{
+	struct lws_context_creation_info info;
+	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+
+	signal(SIGINT, sigint_handler);
+
+	lws_set_log_level(logs, NULL);
+	lwsl_user("LWS minimal WebTransport server\n");
+
+	memset(&info, 0, sizeof info);
+	info.port = 7681;
+	info.protocols = protocols;
+	info.pvo = &pvo;
+	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT |
+		       LWS_SERVER_OPTION_ALLOW_NON_SSL_ON_SSL_PORT;
+
+	info.ssl_cert_filepath = "localhost-100y.cert";
+	info.ssl_private_key_filepath = "localhost-100y.key";
+	info.alpn = "h3"; /* We only support HTTP/3 for WebTransport */
+
+	/* generate localhost-100y.cert and key if missing using lws provided script */
+	
+	context = lws_create_context(&info);
+	if (!context) {
+		lwsl_err("lws init failed\n");
+		return 1;
+	}
+
+	while (n >= 0)
+		n = lws_service(context, 0);
+
+	lws_context_destroy(context);
+	return 0;
+}

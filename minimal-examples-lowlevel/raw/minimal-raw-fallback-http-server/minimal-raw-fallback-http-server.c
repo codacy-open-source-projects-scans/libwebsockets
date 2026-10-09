@@ -42,7 +42,7 @@ struct pss__raw_echo {
 	int len;
 };
 
-static int interrupted;
+static struct lws_context *context;
 
 static const struct lws_http_mount mount = {
 	.mountpoint		= "/",			/* mountpoint URL */
@@ -78,7 +78,7 @@ callback_raw_echo(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 
 	case LWS_CALLBACK_RAW_WRITEABLE:
 		lwsl_notice("LWS_CALLBACK_RAW_WRITEABLE\n");
-		lws_write(wsi, pss->buf, (unsigned int)pss->len, LWS_WRITE_HTTP);
+		lws_write(wsi, pss->buf, (unsigned int)pss->len, LWS_WRITE_RAW);
 		break;
 	default:
 		break;
@@ -94,15 +94,13 @@ static const struct lws_protocols protocols[] = {
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	struct lws_context *context;
-	const char *p;
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	int n = 0;
 	(void)switches;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
@@ -113,14 +111,14 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal raw fallback http server | "
 		  "visit http://localhost:7681\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	/* a server: size the fds tables to the process limit */
+	info.fd_limit_per_thread = 0;
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.port = 7681;
 	info.protocols = protocols;
 	info.mounts = &mount;
@@ -152,7 +150,7 @@ int main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

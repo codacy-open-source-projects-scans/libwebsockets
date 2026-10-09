@@ -63,7 +63,7 @@ struct lws_dbus_ctx_wsproxy_client {
 
 static struct lws_dbus_ctx_wsproxy_client *dbus_ctx;
 static struct lws_context *context;
-static int interrupted, autoexit_budget = -1, count_rx, count_tx;
+static int autoexit_budget = -1, count_rx, count_tx;
 
 #define THIS_INTERFACE	 "org.libwebsockets.wsclientproxy"
 #define THIS_OBJECT	 "/org/libwebsockets/wsclientproxy"
@@ -158,7 +158,7 @@ cb_closing(struct lws_dbus_ctx *ctx)
 
 	destroy_dbus_client_conn(&dcwc);
 
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 static struct lws_dbus_ctx_wsproxy_client *
@@ -234,7 +234,7 @@ fail:
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 /*
@@ -338,7 +338,7 @@ sul_timer(struct lws_sorted_usec_list *sul)
 	if (autoexit_budget > 0) {
 		if (!--autoexit_budget) {
 			lwsl_notice("reached autoexit budget\n");
-			interrupted = 1;
+			lws_default_loop_exit(context);
 			return;
 		}
 	}
@@ -383,13 +383,7 @@ int main(int argc, const char **argv)
 	struct lws_vhost *vh;
 	struct lws_context_creation_info info;
 	const char *p;
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE
-			/* for LLL_ verbosity above NOTICE to be built into lws,
-			 * lws must have been configured and built with
-			 * -DCMAKE_BUILD_TYPE=DEBUG instead of =RELEASE */
-			/* | LLL_INFO */ /* | LLL_PARSER */ /* | LLL_HEADER */
-			/* | LLL_EXT */ /* | LLL_CLIENT */ /* | LLL_LATENCY */
-			/* | LLL_DEBUG */ /* | LLL_THREAD */;
+	int n = 0;
 	(void)switches;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
@@ -400,16 +394,14 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_X].sw)))
 		autoexit_budget = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal DBUS ws proxy testclient\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.options = LWS_SERVER_OPTION_EXPLICIT_VHOSTS;
 	context = lws_create_context(&info);
 	if (!context) {
@@ -436,7 +428,7 @@ int main(int argc, const char **argv)
 
 	/* lws event loop (default poll one) */
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 bail2:

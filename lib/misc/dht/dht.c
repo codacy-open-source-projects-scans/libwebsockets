@@ -31,6 +31,126 @@ static const uint8_t v4prefix[16] = {
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0, 0, 0, 0
 };
 
+/*
+ * BEP42 (DHT security extension): the first 21 bits of a node id are the
+ * CRC32C of the node's masked public IP with three bits of a random byte r
+ * folded in, and the last byte of the id is r.
+ */
+
+static uint32_t
+dht_crc32c(const uint8_t *p, size_t len)
+{
+	uint32_t crc = 0xffffffffu;
+	int n;
+
+	while (len--) {
+		crc ^= *p++;
+		for (n = 0; n < 8; n++)
+			crc = (crc >> 1) ^ (0x82f63b78u & (0u - (crc & 1u)));
+	}
+
+	return ~crc;
+}
+
+/* the BEP42 21-bit prefix for sa and r, into pre[0..2] (pre[2] bits 7..3) */
+static int
+dht_bep42_prefix(const struct sockaddr *sa, uint8_t r, uint8_t *pre)
+{
+	static const uint8_t m4[4] = { 0x03, 0x0f, 0x3f, 0xff },
+			     m6[8] = { 0x01, 0x03, 0x07, 0x0f,
+				       0x1f, 0x3f, 0x7f, 0xff };
+	uint8_t ip[8];
+	uint32_t crc;
+	size_t n, len;
+
+	switch (sa->sa_family) {
+	case AF_INET:
+		memcpy(ip, &((const struct sockaddr_in *)sa)->sin_addr, 4);
+		for (n = 0; n < 4; n++)
+			ip[n] &= m4[n];
+		len = 4;
+		break;
+	case AF_INET6:
+		memcpy(ip, &((const struct sockaddr_in6 *)sa)->sin6_addr, 8);
+		for (n = 0; n < 8; n++)
+			ip[n] &= m6[n];
+		len = 8;
+		break;
+	default:
+		return 1;
+	}
+
+	ip[0] |= (uint8_t)((r & 7) << 5);
+	crc = dht_crc32c(ip, len);
+	pre[0] = (uint8_t)(crc >> 24);
+	pre[1] = (uint8_t)(crc >> 16);
+	pre[2] = (uint8_t)((crc >> 8) & 0xf8);
+
+	return 0;
+}
+
+lws_dht_hash_t *
+lws_dht_bep42_id(struct lws_context *cx, const struct sockaddr *sa,
+		 uint8_t rand, int type, int len)
+{
+	uint8_t id[64], pre[3];
+	lws_dht_hash_t *h;
+
+	if (len < 4 || len > (int)sizeof(id) || dht_bep42_prefix(sa, rand, pre))
+		return NULL;
+
+	lws_get_random(cx, id, (size_t)len);
+	id[0] = pre[0];
+	id[1] = pre[1];
+	id[2] = (uint8_t)(pre[2] | (id[2] & 7));
+	id[len - 1] = rand;
+
+	h = lws_dht_hash_create(type, len, id);
+	lws_explicit_bzero(id, sizeof(id));
+
+	return h;
+}
+
+int
+lws_dht_bep42_check(const lws_dht_hash_t *id, const struct sockaddr *sa)
+{
+	uint8_t pre[3];
+
+	if (!id || id->len < 4 || dht_bep42_prefix(sa, id->id[id->len - 1], pre))
+		return 0;
+
+	return id->id[0] == pre[0] && id->id[1] == pre[1] &&
+	       (id->id[2] & 0xf8) == pre[2];
+}
+
+/*
+ * Our external address has just been agreed by a quorum of peers: an id we
+ * made up at random is replaced by one bound to that address, so peers that
+ * check BEP42 keep us.  An id the application gave us is its own business.
+ * The routing table stays as it is; it is valid for any id, and peers learn
+ * the new one from our next message to them.
+ */
+void
+lws_dht_bep42_own_id(struct lws_dht_ctx *ctx, const struct sockaddr *sa)
+{
+	lws_dht_hash_t *h;
+	uint8_t r;
+
+	if (!ctx->id_random || !ctx->myid || lws_dht_bep42_check(ctx->myid, sa))
+		return;
+
+	lws_get_random(ctx->vhost->context, &r, 1);
+	h = lws_dht_bep42_id(ctx->vhost->context, sa, r, ctx->myid->type,
+			     ctx->myid->len);
+	if (!h)
+		return;
+
+	lwsl_notice("%s: own id now bound to external address (BEP42)\n",
+		    __func__);
+	lws_dht_hash_destroy(&ctx->myid);
+	ctx->myid = h;
+}
+
 void
 lws_dht_capture_announce(struct lws_dht_ctx *ctx, lws_dht_hash_t *hash,
 			 const struct sockaddr *fromaddr, unsigned short prt)
@@ -39,9 +159,45 @@ lws_dht_capture_announce(struct lws_dht_ctx *ctx, lws_dht_hash_t *hash,
 		ctx->capture_announce_cb(ctx, hash, fromaddr, prt);
 }
 
+/*
+ * An address that is not on the public internet: loopback, RFC 1918 and
+ * RFC 6598 private ranges, link-local and IPv6 ULA.  Such a peer is refused
+ * unless the dht was created with allow_private_ads, and is exempt from the
+ * BEP42 id check (BEP42 only binds public addresses).
+ */
 int
-is_martian(const struct sockaddr *sa)
+lws_dht_ads_is_private(const struct sockaddr *sa)
 {
+	switch (sa->sa_family) {
+	case AF_INET: {
+		const uint8_t *a = (const uint8_t *)
+				&((const struct sockaddr_in *)sa)->sin_addr;
+
+		return a[0] == 127 || a[0] == 10 ||
+		       (a[0] == 172 && (a[1] & 0xf0) == 16) ||
+		       (a[0] == 192 && a[1] == 168) ||
+		       (a[0] == 169 && a[1] == 254) ||
+		       (a[0] == 100 && (a[1] & 0xc0) == 64);
+	}
+	case AF_INET6: {
+		const uint8_t *a = (const uint8_t *)
+				&((const struct sockaddr_in6 *)sa)->sin6_addr;
+
+		return (a[0] & 0xfe) == 0xfc ||
+		       (a[0] == 0xfe && (a[1] & 0xc0) == 0x80) ||
+		       (!memcmp(a, zeroes, 15) && a[15] == 1);
+	}
+	default:
+		return 0;
+	}
+}
+
+int
+is_martian(const struct lws_dht_ctx *ctx, const struct sockaddr *sa)
+{
+	if (lws_dht_ads_is_private(sa) && !ctx->allow_private_ads)
+		return 1;
+
 	switch(sa->sa_family) {
 		case AF_INET: {
 			struct sockaddr_in *sin = (struct sockaddr_in*)sa;
@@ -49,7 +205,6 @@ is_martian(const struct sockaddr *sa)
 
 			return sin->sin_port == 0 ||
 				(address[0] == 0) ||
-				/* (address[0] == 127) || local loopback is okay for testing */
 				((address[0] & 0xE0) == 0xE0);
 			}
 		case AF_INET6: {
@@ -72,6 +227,160 @@ is_martian(const struct sockaddr *sa)
 }
 
 
+/*
+ * Take a token from a bucket, refilling it first if it is empty.
+ *
+ * ->now is wall clock, so a backwards step (NTP, snapshot restore) can make
+ * the elapsed time negative.  Test <= 0 and clamp the refill at 0: with an
+ * "== 0" test a single negative refill left the counter negative forever,
+ * so the limiter silently never fired again for the life of the context.
+ */
+
+static int
+dht_tb_take(struct lws_dht_ctx *ctx, lws_dht_tb_t *tb, int rate, int burst)
+{
+	if (tb->tokens <= 0) {
+		long elapsed = (long)(ctx->now - tb->time);
+
+		if (elapsed < 0)
+			elapsed = 0;
+
+		tb->tokens = (int)MIN((long)burst, (long)rate * elapsed);
+		tb->time = ctx->now;
+	}
+
+	if (tb->tokens <= 0)
+		return 0;
+
+	tb->tokens--;
+
+	return 1;
+}
+
+/*
+ * What a per-source share is accounted to: the IPv4 address, or the IPv6
+ * /64, so one host is one source however many ports, or addresses in its
+ * prefix, it uses.  Fills a 16-byte key; -1 for a family we don't handle.
+ */
+
+int
+dht_source_key(const struct sockaddr *sa, uint8_t key[16])
+{
+	const lws_sockaddr46 *sa46 = (const lws_sockaddr46 *)sa;
+
+	memset(key, 0, 16);
+
+	switch (sa->sa_family) {
+	case AF_INET:
+		memcpy(key, &sa46->sa4.sin_addr, 4);
+		return 0;
+#if defined(LWS_WITH_IPV6)
+	case AF_INET6:
+		memcpy(key, &sa46->sa6.sin6_addr, 8);
+		return 0;
+#endif
+	default:
+		return -1;
+	}
+}
+
+/*
+ * Every request costs us a reply, so requests are rate limited (C-071).  A
+ * single bucket for all of them let one source, sending ~100 pings/s, take
+ * every token, and we then dropped every other peer's requests, including
+ * those of the nodes we actually work with.  So a request is admitted in
+ * two stages:
+ *
+ *  - its source (dht_source_key()) has a small bucket of its own, in a
+ *    fixed table recycled in LRU order, and no source gets more than that
+ *    share of what follows;
+ *
+ *  - it then draws from one of two pools: requests from a good node of our
+ *    routing table, from the endpoint we hold for it (which C-594 stops
+ *    anyone else moving), use their own pool; everything else, including
+ *    anything from spoofed sources, uses the general pool.  A flood can
+ *    exhaust the general pool, but the nodes we already know keep being
+ *    answered.
+ *
+ * Losing a table slot only ever gives a source a full bucket again, so
+ * churning the table cannot starve anyone; the pools stay the hard cap on
+ * the total.
+ */
+
+/*
+ * Is `from` a good node of our routing table, at the endpoint we hold for
+ * it?  Since C-594 nobody else can move that endpoint while the node is
+ * alive, so this is as close as an unauthenticated DHT gets to knowing the
+ * source address is genuine.
+ */
+
+int
+lws_dht_peer_known(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id,
+		   const struct sockaddr *from)
+{
+#if defined(LWS_WITH_DHT_BACKEND)
+	struct node *n;
+
+	if (!id)
+		return 0;
+
+	n = find_node(ctx, id, from->sa_family);
+
+	return n && node_good(ctx, n) &&
+	       dht_sa_same_peer((const struct sockaddr *)&n->ss, from);
+#else
+	(void)ctx;
+	(void)id;
+	(void)from;
+
+	return 0;
+#endif
+}
+
+int
+lws_dht_admit_request(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id,
+		      const struct sockaddr *from)
+{
+	lws_dht_tb_t *pool = &ctx->rl_general;
+	uint8_t key[16];
+	int n, victim = 0;
+
+	if (dht_source_key(from, key))
+		return 0;
+
+	for (n = 0; n < (int)LWS_ARRAY_SIZE(ctx->rl_src); n++) {
+		if (ctx->rl_src[n].af == from->sa_family &&
+		    !memcmp(ctx->rl_src[n].key, key, sizeof(key)))
+			break;
+		/* remember a free slot, else the least recently used */
+		if (ctx->rl_src[victim].af &&
+		    (!ctx->rl_src[n].af ||
+		     ctx->rl_src[n].last < ctx->rl_src[victim].last))
+			victim = n;
+	}
+
+	if (n == (int)LWS_ARRAY_SIZE(ctx->rl_src)) {
+		n = victim;
+		memcpy(ctx->rl_src[n].key, key, sizeof(key));
+		ctx->rl_src[n].af		= (uint8_t)from->sa_family;
+		ctx->rl_src[n].tb.tokens	= LWS_DHT_RL_SRC_BURST;
+		ctx->rl_src[n].tb.time		= ctx->now;
+	}
+
+	ctx->rl_src[n].last = ctx->now;
+
+	if (!dht_tb_take(ctx, &ctx->rl_src[n].tb, LWS_DHT_RL_SRC_RATE,
+			 LWS_DHT_RL_SRC_BURST))
+		return 0;
+
+	if (lws_dht_peer_known(ctx, id, from))
+		pool = &ctx->rl_known;
+
+	return dht_tb_take(ctx, pool, LWS_DHT_RL_POOL_RATE,
+			   LWS_DHT_RL_POOL_BURST);
+}
+
+/* args: data, id, len, offset (alphabetical) */
 
 int
 dht_tx_chunk(struct lws_transport_sequencer *ts, uint64_t offset,
@@ -79,49 +388,26 @@ dht_tx_chunk(struct lws_transport_sequencer *ts, uint64_t offset,
 {
 	lws_dht_ts_t *dts = (lws_dht_ts_t *)lws_transport_sequencer_get_info(ts)->user_data;
 	char pkt[2048];
-	size_t i = 0;
-	int rc;
+	dht_txbuf_t t = { .buf = pkt, .size = sizeof(pkt) };
 
-	/* d1:ad4:data%d:<payload>6:offseti%llue3:leni%llue2:id%d:<id>e1:q4:data1:t2:da1:y1:qe */
+	if (dht_tx_lit(&t, "d1:ad4:data") ||
+	    dht_tx_str(&t, buf, len) ||
+	    dht_tx_lit(&t, "2:id") ||
+	    dht_tx_id(dts->ctx, &t, dts->ctx->myid) ||
+	    dht_tx_lit(&t, "3:len") ||
+	    dht_tx_int(&t, len) ||
+	    dht_tx_lit(&t, "6:offset") ||
+	    dht_tx_int(&t, offset) ||
+	    dht_tx_lit(&t, "e1:q4:data1:t4:sqnc1:y1:qe"))
+		goto fail;
 
-	rc = lws_snprintf(pkt + i, sizeof(pkt) - i, "d1:ad4:data%d:", (int)len);
-	if (dht_tx_skip(&i, sizeof(pkt), (size_t)(rc))) goto fail;
-	if (dht_tx_copy__advance_offset(pkt, &i, sizeof(pkt), buf, len)) goto fail;
-
-	/* Correct alphabetical order: data (done), id, len, offset */
-	rc = lws_snprintf(pkt + i, sizeof(pkt) - i, "2:id%d:", dht_tx_id_len(dts->ctx, dts->ctx->myid));
-	if (dht_tx_skip(&i, sizeof(pkt), (size_t)(rc))) goto fail;
-
-	if (dts->ctx->legacy) {
-		if (dts->ctx->myid->len >= 20) {
-			if (dht_tx_copy__advance_offset(pkt, &i, sizeof(pkt), dts->ctx->myid->id, 20)) goto fail;
-		} else {
-			if (dht_tx_check(sizeof(pkt), i, 20)) goto fail;
-			memset(pkt + i, 0, 20);
-			memcpy(pkt + i, dts->ctx->myid->id, dts->ctx->myid->len);
-			i += 20;
-		}
-	} else {
-		if (dht_tx_check(sizeof(pkt), i, (size_t)(2 + dts->ctx->myid->len))) goto fail;
-		pkt[i++] = (char)dts->ctx->myid->type;
-		pkt[i++] = (char)dts->ctx->myid->len;
-		memcpy(pkt + i, dts->ctx->myid->id, dts->ctx->myid->len);
-		i += dts->ctx->myid->len;
-	}
-
-	if (dht_tx_check(sizeof(pkt), i, 1)) goto fail;
-	rc = lws_snprintf(pkt + i, sizeof(pkt) - i, "3:leni%llue6:offseti%llue",
-			 (unsigned long long)len, (unsigned long long)offset);
-	if (dht_tx_skip(&i, sizeof(pkt), (size_t)(rc))) goto fail;
-
-	rc = lws_snprintf(pkt + i, sizeof(pkt) - i, "e1:q4:data1:t4:sqnc1:y1:qe");
-	if (dht_tx_skip(&i, sizeof(pkt), (size_t)(rc))) goto fail;
-
-	return dht_send(dts->ctx, pkt, i, (struct sockaddr *)&dts->sa, dts->salen);
+	return dht_send(dts->ctx, pkt, t.len, (struct sockaddr *)&dts->sa, dts->salen);
 
 fail:
 	return -1;
 }
+
+/* reply: id, len, offset, sack (alphabetical) */
 
 int
 dht_tx_ack(struct lws_transport_sequencer *ts, uint64_t offset, size_t len)
@@ -129,20 +415,15 @@ dht_tx_ack(struct lws_transport_sequencer *ts, uint64_t offset, size_t len)
 	lws_dht_ts_t *dts = (lws_dht_ts_t *)lws_transport_sequencer_get_info(ts)->user_data;
 	const lws_transport_sequencer_stats_t *stats = lws_transport_sequencer_get_stats(ts);
 	char pkt[512];
-	size_t i = 0;
-	int rc;
+	dht_txbuf_t t = { .buf = pkt, .size = sizeof(pkt) };
 
-	/* d1:rd2:id%d:<id>3:leni%llue6:offseti%lluee1:t4:sqnc1:y1:re */
-
-	rc = lws_snprintf(pkt + i, sizeof(pkt) - i, "d1:rd2:id%d:", dht_tx_id_len(dts->ctx, dts->ctx->myid));
-	if (dht_tx_skip(&i, sizeof(pkt), (size_t)(rc))) goto fail;
-
-	if (dht_put_id__advance_offset(dts->ctx, pkt, &i, sizeof(pkt), dts->ctx->myid)) goto fail;
-
-	/* Correct alphabetical order: id, len, offset, sack.  Need an extra 'e' to close rd dict. */
-	rc = lws_snprintf(pkt + i, sizeof(pkt) - i, "3:leni0e6:offseti%llue",
-			 (unsigned long long)stats->ack_offset);
-	if (dht_tx_skip(&i, sizeof(pkt), (size_t)(rc))) goto fail;
+	if (dht_tx_lit(&t, "d1:rd2:id") ||
+	    dht_tx_id(dts->ctx, &t, dts->ctx->myid) ||
+	    dht_tx_lit(&t, "3:len") ||
+	    dht_tx_int(&t, 0) ||
+	    dht_tx_lit(&t, "6:offset") ||
+	    dht_tx_int(&t, stats->ack_offset))
+		goto fail;
 
 	{
 		lws_transport_sequencer_sack_block_t blocks[4];
@@ -150,24 +431,26 @@ dht_tx_ack(struct lws_transport_sequencer *ts, uint64_t offset, size_t len)
 
 		num_blocks = lws_transport_sequencer_get_sack_blocks(ts, blocks, 4);
 		if (num_blocks) {
-			rc = lws_snprintf(pkt + i, sizeof(pkt) - i, "4:sackl");
-			if (dht_tx_skip(&i, sizeof(pkt), (size_t)(rc))) goto fail;
+			if (dht_tx_lit(&t, "4:sackl"))
+				goto fail;
 			for (j = 0; j < num_blocks; j++) {
-				/* d1:li...e1:oi...ee */
-				rc = lws_snprintf(pkt + i, sizeof(pkt) - i, "d1:li%llue1:oi%lluee",
-						  (unsigned long long)blocks[j].len,
-						  (unsigned long long)blocks[j].start);
-				if (dht_tx_skip(&i, sizeof(pkt), (size_t)(rc))) goto fail;
+				/* d1:li<len>e1:o<start>ee */
+				if (dht_tx_lit(&t, "d1:l") ||
+				    dht_tx_int(&t, blocks[j].len) ||
+				    dht_tx_lit(&t, "1:o") ||
+				    dht_tx_int(&t, blocks[j].start) ||
+				    dht_tx_lit(&t, "ee"))
+					goto fail;
 			}
-			rc = lws_snprintf(pkt + i, sizeof(pkt) - i, "e");
-			if (dht_tx_skip(&i, sizeof(pkt), (size_t)(rc))) goto fail;
+			if (dht_tx_lit(&t, "e"))
+				goto fail;
 		}
 	}
 
-	rc = lws_snprintf(pkt + i, sizeof(pkt) - i, "e1:t4:sqnc1:y1:re");
-	if (dht_tx_skip(&i, sizeof(pkt), (size_t)(rc))) goto fail;
+	if (dht_tx_lit(&t, "e1:t4:sqnc1:y1:re"))
+		goto fail;
 
-	return dht_send(dts->ctx, pkt, i, (struct sockaddr *)&dts->sa, dts->salen);
+	return dht_send(dts->ctx, pkt, t.len, (struct sockaddr *)&dts->sa, dts->salen);
 
 fail:
 	return -1;
@@ -188,21 +471,35 @@ dht_on_rx_data(struct lws_transport_sequencer *ts, uint64_t offset,
 		struct sockaddr_in6 *s = (struct sockaddr_in6 *)&dts->sa;
 		inet_ntop(AF_INET6, &s->sin6_addr, buf_ip, sizeof(buf_ip));
 	}
-	lwsl_user("%s: [DEBUG] Received raw UDP packet from %s on sequencer: offset=%llu len=%zu\n", __func__, buf_ip, (unsigned long long)offset, len);
+	// lwsl_notice("%s: [DEBUG] Received raw UDP packet from %s on sequencer: offset=%llu len=%zu\n", __func__, buf_ip, (unsigned long long)offset, len);
 
 	int parse_ret = lws_dht_msg_parse((const char *)buf, len, &msg);
 	if (!parse_ret) {
 		if (!strcmp(msg.verb, "CAP_REQ")) {
 			char ack[512], json[384];
-			int n = lws_snprintf(json, sizeof(json), "{\"protocols\":[");
-			int first = 1;
+			int n, first = 1;
 			const char *last_proto = NULL;
+
+			/*
+			 * Anyone can send this, from any source address, and
+			 * the answer is bigger than the question: it is a
+			 * request like any other, and costs a token.  (If the
+			 * source never acknowledges the answer, the sequencer
+			 * does not repeat it: see dht_ts_create().)
+			 */
+			if (!lws_dht_admit_request(dts->ctx, NULL,
+					(const struct sockaddr *)&dts->sa)) {
+				dts->ctx->stats_current.rx_drops++;
+				return 0;
+			}
+
+			n = lws_snprintf(json, sizeof(json), "{\"protocols\":[");
 
 			/* Gather protocols (dumb uniqueness since they are added consecutively by register_verbs) */
 			lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&dts->ctx->verb_owner)) {
 				struct lws_dht_verb_list *vl = lws_container_of(d, struct lws_dht_verb_list, list);
 
-				lwsl_user("CAP_REQ Generator Iteration: verb=%s, protocol=%s\n",
+				lwsl_notice("CAP_REQ Generator Iteration: verb=%s, protocol=%s\n",
 					vl->v.name ? vl->v.name : "null",
 					(vl->v.protocol && vl->v.protocol->name) ? vl->v.protocol->name : "null");
 
@@ -239,8 +536,10 @@ dht_on_rx_data(struct lws_transport_sequencer *ts, uint64_t offset,
 
 			if (!strcmp(vl->v.name, msg.verb)) {
 				struct lws_dht_verb_dispatch_args args;
-				struct lws_a a;
+				struct lws_context *cx = dts->ctx->vhost->context;
 				int n;
+				lws_fakewsi_def_plwsa(&cx->pt[dts->ctx->wsi_v4 ?
+						dts->ctx->wsi_v4->tsi : 0]);
 
 				if (!strcmp(msg.verb, "PUT"))
 					dts->ctx->stats_current.rx_put++;
@@ -252,17 +551,23 @@ dht_on_rx_data(struct lws_transport_sequencer *ts, uint64_t offset,
 				args.from = (const struct sockaddr *)&dts->sa;
 				args.fromlen = dts->salen;
 
-				/* prepare a temporary minimal wsi to associate the callback with this vhost and protocol */
-				memset(&a, 0, sizeof(a));
-				a.context = dts->ctx->vhost->context;
-				a.vhost = dts->ctx->vhost;
-				a.protocol = vl->v.protocol;
+				/*
+				 * There is no connection for this callback: it
+				 * gets the pt's fake wsi, prepared for this
+				 * vhost and protocol, which is a whole struct
+				 * lws (except on freertos), so a handler that
+				 * looks past the lws_a part is not reading off
+				 * the end of a stack object
+				 */
+				lws_fakewsi_prep_plwsa_ctx(cx);
+				plwsa->vhost = dts->ctx->vhost;
+				plwsa->protocol = vl->v.protocol;
 
 				args.out_precedence = LWS_DHT_VERB_RESULT_PROCEED;
 
-				lwsl_user("DISPATCHING %s to protocol %s\n", msg.verb, vl->v.protocol->name);
+				// lwsl_notice("DISPATCHING %s to protocol %s\n", msg.verb, vl->v.protocol->name);
 
-				n = vl->v.protocol->callback((struct lws *)&a, LWS_CALLBACK_DHT_VERB_DISPATCH,
+				n = vl->v.protocol->callback((struct lws *)plwsa, LWS_CALLBACK_DHT_VERB_DISPATCH,
 							lws_protocol_vh_priv_get(dts->ctx->vhost, vl->v.protocol),
 							&args, 0);
 
@@ -300,6 +605,21 @@ pass:
 	return 0;
 }
 
+static void
+lws_dht_ts_destroy(lws_dht_ts_t *dts)
+{
+	lws_sul_cancel(&dts->sul_idle);
+	lws_transport_sequencer_destroy(&dts->ts);
+	lws_dll2_remove(&dts->list);
+	lws_free(dts);
+}
+
+static void
+lws_dht_ts_idle_cb(lws_sorted_usec_list_t *sul)
+{
+	lws_dht_ts_destroy(lws_container_of(sul, lws_dht_ts_t, sul_idle));
+}
+
 void
 dht_on_state_change(struct lws_transport_sequencer *ts, int state, int status)
 {
@@ -312,8 +632,8 @@ dht_on_state_change(struct lws_transport_sequencer *ts, int state, int status)
 			     NULL, (void *)(intptr_t)status, 0,
 			     (struct sockaddr *)&dts->sa, dts->salen);
 
-	lws_dll2_remove(&dts->list);
-	lws_free(dts);
+	if (state != 0)
+		lws_dht_ts_destroy(dts);
 }
 
 static const lws_transport_sequencer_ops_t dht_seq_ops = {
@@ -330,46 +650,25 @@ static const lws_retry_bo_t dht_retry_policy = {
 	.conceal_count		= 10, /* Increased from 5 to 10 */
 };
 
-LWS_VISIBLE struct lws_transport_sequencer *
-lws_dht_get_ts(struct lws_dht_ctx *ctx, const struct sockaddr *dest, size_t salen, int create)
+/*
+ * A sequencer costs ~160KB of dsh up front, and a single unsolicited (and
+ * trivially spoofable) inbound 'data' datagram is enough to make one for a
+ * source address we have never spoken to.  Bound how many can exist at once,
+ * recycling the least-recently-used, so that a flood churns a fixed-size
+ * table instead of growing the heap without limit; it also bounds the cost
+ * of the linear lookup in lws_dht_get_ts().
+ *
+ * `unproven` is set when the peer spoke first and is not a node we know at
+ * that endpoint: then the sequencer sends it each chunk once and repeats
+ * nothing until it has acknowledged something, so a forged source address
+ * cannot turn a small request into a stream of retransmitted replies.
+ */
+
+static struct lws_transport_sequencer *
+dht_ts_create(struct lws_dht_ctx *ctx, const struct sockaddr *dest,
+	      size_t salen, int unproven)
 {
-	lws_dll2_t *d = lws_dll2_get_head(&ctx->ts_owner);
-
-	while (d) {
-		lws_dht_ts_t *dts = lws_container_of(d, lws_dht_ts_t, list);
-		int match = 0;
-
-		if (dts->sa.ss_family == dest->sa_family) {
-			switch (dest->sa_family) {
-			case AF_INET: {
-				struct sockaddr_in *sin1 = (struct sockaddr_in *)&dts->sa;
-				struct sockaddr_in *sin2 = (struct sockaddr_in *)dest;
-
-				if (sin1->sin_addr.s_addr == sin2->sin_addr.s_addr &&
-				    sin1->sin_port == sin2->sin_port)
-					match = 1;
-				break;
-			}
-			case AF_INET6: {
-				struct sockaddr_in6 *sin1 = (struct sockaddr_in6 *)&dts->sa;
-				struct sockaddr_in6 *sin2 = (struct sockaddr_in6 *)dest;
-
-				if (!memcmp(&sin1->sin6_addr, &sin2->sin6_addr, 16) &&
-				    sin1->sin6_port == sin2->sin6_port)
-					match = 1;
-				break;
-			}
-			}
-		}
-
-		if (match)
-			return dts->ts;
-
-		d = d->next;
-	}
-
-	if (!create)
-		return NULL;
+	lws_dht_ts_t *dts;
 
 	if (dest->sa_family != AF_INET && dest->sa_family != AF_INET6)
 		return NULL;
@@ -378,7 +677,18 @@ lws_dht_get_ts(struct lws_dht_ctx *ctx, const struct sockaddr *dest, size_t sale
 	    (dest->sa_family == AF_INET6 && salen < sizeof(struct sockaddr_in6)))
 		return NULL;
 
-	lws_dht_ts_t *dts = lws_zalloc(sizeof(*dts), "dht ts");
+	while (lws_dll2_count(&ctx->ts_owner) >= LWS_DHT_MAX_TS) {
+		lws_dll2_t *lru = lws_dll2_get_head(&ctx->ts_owner);
+
+		if (!lru)
+			break;
+
+		lwsl_dht_warn("%s: sequencer table full, evicting LRU\n",
+			      __func__);
+		lws_dht_ts_destroy(lws_container_of(lru, lws_dht_ts_t, list));
+	}
+
+	dts = lws_zalloc(sizeof(*dts), "dht ts");
 	if (!dts)
 		return NULL;
 
@@ -388,6 +698,7 @@ lws_dht_get_ts(struct lws_dht_ctx *ctx, const struct sockaddr *dest, size_t sale
 		.retry_policy	= &dht_retry_policy,
 		.user_data	= dts,
 		.window_size	= 65536, /* 64KB - safe for broadside uploader */
+		.unproven_peer	= !!unproven,
 	};
 
 	dts->ctx = ctx;
@@ -401,8 +712,67 @@ lws_dht_get_ts(struct lws_dht_ctx *ctx, const struct sockaddr *dest, size_t sale
 	}
 
 	lws_dll2_add_tail(&dts->list, &ctx->ts_owner);
+	lws_sul_schedule(ctx->vhost->context, 0, &dts->sul_idle, lws_dht_ts_idle_cb, 30 * LWS_US_PER_SEC);
 
 	return dts->ts;
+}
+
+LWS_VISIBLE struct lws_transport_sequencer *
+lws_dht_get_ts(struct lws_dht_ctx *ctx, const struct sockaddr *dest, size_t salen, int create)
+{
+	lws_dll2_t *d = lws_dll2_get_head(&ctx->ts_owner);
+
+	while (d) {
+		lws_dht_ts_t *dts = lws_container_of(d, lws_dht_ts_t, list);
+
+		if (dht_sa_same_peer((const struct sockaddr *)&dts->sa, dest)) {
+			/*
+			 * ->ts_owner is kept in least-recently-used order with
+			 * the stalest at the head, so that the cap below evicts
+			 * the least interesting sequencer.  Move this one to
+			 * the tail now that it has seen traffic.
+			 */
+			lws_dll2_remove(&dts->list);
+			lws_dll2_add_tail(&dts->list, &ctx->ts_owner);
+			lws_sul_schedule(ctx->vhost->context, 0, &dts->sul_idle, lws_dht_ts_idle_cb, 30 * LWS_US_PER_SEC);
+			return dts->ts;
+		}
+
+		d = lws_dll2_get_next(d);
+	}
+
+	if (!create)
+		return NULL;
+
+	/* we are sending to an address the caller chose */
+
+	return dht_ts_create(ctx, dest, salen, 0);
+}
+
+/*
+ * The sequencer an inbound data chunk from `from` belongs to.  Chunks for a
+ * transfer already in progress stay outside the limiter, but making a
+ * sequencer for a source we have no sequencer for is a request like any
+ * other (C-497), in every build.
+ */
+
+struct lws_transport_sequencer *
+lws_dht_ts_rx(struct lws_dht_ctx *ctx, const struct sockaddr *from,
+	      size_t fromlen, const lws_dht_hash_t *id)
+{
+	struct lws_transport_sequencer *ts = lws_dht_get_ts(ctx, from,
+							    fromlen, 0);
+
+	if (ts)
+		return ts;
+
+	if (!lws_dht_admit_request(ctx, id, from)) {
+		ctx->stats_current.rx_drops++;
+		return NULL;
+	}
+
+	return dht_ts_create(ctx, from, fromlen,
+			     !lws_dht_peer_known(ctx, id, from));
 }
 
 int
@@ -421,8 +791,8 @@ lws_callback_dht(struct lws *wsi, enum lws_callback_reasons reason,
 			break;
 
 		lws_dht_process_packet(ctx, in, len,
-				       sa46_sockaddr(&wsi->udp->sa46),
-				       sa46_socklen(&wsi->udp->sa46));
+				       sa46_sockaddr(&wsi->io->udp->sa46),
+				       sa46_socklen(&wsi->io->udp->sa46));
 		break;
 
 	case LWS_CALLBACK_RAW_CLOSE:
@@ -457,30 +827,27 @@ lws_dht_stats_periodic(lws_sorted_usec_list_t *sul)
 	uint32_t active_peers = 0;
 
 #if defined(LWS_WITH_DHT_BACKEND)
-	struct bucket *b;
-	struct node *n;
+	lws_start_foreach_dll(struct lws_dll2 *, db, lws_dll2_get_head(&ctx->buckets)) {
+		struct bucket *b = lws_container_of(db, struct bucket, list);
 
-	b = ctx->buckets;
-	while (b) {
-		n = b->nodes;
-		while (n) {
+		lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&b->nodes)) {
+			struct node *n = lws_container_of(d, struct node, list);
+
 			if (node_good(ctx, n))
 				active_peers++;
-			n = n->next;
-		}
-		b = b->next;
-	}
+		} lws_end_foreach_dll(d);
+	} lws_end_foreach_dll(db);
 
-	b = ctx->buckets6;
-	while (b) {
-		n = b->nodes;
-		while (n) {
+	lws_start_foreach_dll(struct lws_dll2 *, db6, lws_dll2_get_head(&ctx->buckets6)) {
+		struct bucket *b = lws_container_of(db6, struct bucket, list);
+
+		lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&b->nodes)) {
+			struct node *n = lws_container_of(d, struct node, list);
+
 			if (node_good(ctx, n))
 				active_peers++;
-			n = n->next;
-		}
-		b = b->next;
-	}
+		} lws_end_foreach_dll(d);
+	} lws_end_foreach_dll(db6);
 #endif
 
 	ctx->stats_current.peer_count = active_peers;
@@ -501,46 +868,73 @@ lws_dht_stats_periodic(lws_sorted_usec_list_t *sul)
 }
 
 #if defined(LWS_WITH_DHT_BACKEND)
+/*
+ * Ask one node what our address looks like from where it is.  Each probe
+ * gets its own random nonce, recorded with the node it went to: a nonce
+ * shared by the round would be learnt by every probed node from its own
+ * probe, and let it answer in the name of all the others.
+ */
+
+static void
+lws_dht_ip_probe(struct lws_dht_ctx *ctx, const struct node *n)
+{
+	uint8_t tid[LWS_DHT_IP_PROBE_TID_LEN];
+	int j = ctx->ip_probe_count;
+
+	if (j >= (int)LWS_ARRAY_SIZE(ctx->ip_probes))
+		return;
+
+	ctx->ip_probes[j].ss		= n->ss;
+	ctx->ip_probes[j].sslen		= n->sslen;
+	ctx->ip_probes[j].answered	= 0;
+	lws_get_random(ctx->vhost->context, ctx->ip_probes[j].nonce,
+		       sizeof(ctx->ip_probes[j].nonce));
+
+	tid[0] = 'i';
+	tid[1] = 'p';
+	memcpy(tid + 2, ctx->ip_probes[j].nonce, LWS_DHT_IP_PROBE_NONCE_LEN);
+
+	ctx->ip_probe_count++;
+
+	send_ping(ctx, (const struct sockaddr *)&n->ss, n->sslen, tid,
+		  sizeof(tid));
+}
+
+static void
+lws_dht_ip_probe_family(struct lws_dht_ctx *ctx, lws_dll2_owner_t *buckets)
+{
+	int sent = 0;
+
+	lws_start_foreach_dll(struct lws_dll2 *, db, lws_dll2_get_head(buckets)) {
+		struct bucket *b = lws_container_of(db, struct bucket, list);
+
+		lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&b->nodes)) {
+			struct node *n = lws_container_of(d, struct node, list);
+
+			if (sent >= 8)
+				return;
+
+			if (node_good(ctx, n)) {
+				lws_dht_ip_probe(ctx, n);
+				sent++;
+			}
+		} lws_end_foreach_dll(d);
+	} lws_end_foreach_dll(db);
+}
+
 static void
 lws_dht_sul_ip_monitor_cb(lws_sorted_usec_list_t *sul)
 {
 	struct lws_dht_ctx *ctx = lws_container_of(sul, struct lws_dht_ctx, sul_ip_monitor);
-	struct bucket *b;
-	struct node *n;
-	int sent = 0;
-	uint8_t tid[4];
 
-	ctx->ip_monitor_seqno++;
-	tid[0] = 'i';
-	tid[1] = 'p';
-	memcpy(tid + 2, &ctx->ip_monitor_seqno, 2);
+	/*
+	 * A new round forgets who we asked last time: replies to the old
+	 * probes no longer match anything.
+	 */
+	ctx->ip_probe_count = 0;
 
-	b = ctx->buckets;
-	while (b && sent < 8) {
-		n = b->nodes;
-		while (n && sent < 8) {
-			if (node_good(ctx, n)) {
-				send_ping(ctx, (struct sockaddr *)&n->ss, n->sslen, tid, 4);
-				sent++;
-			}
-			n = n->next;
-		}
-		b = b->next;
-	}
-
-	sent = 0;
-	b = ctx->buckets6;
-	while (b && sent < 8) {
-		n = b->nodes;
-		while (n && sent < 8) {
-			if (node_good(ctx, n)) {
-				send_ping(ctx, (struct sockaddr *)&n->ss, n->sslen, tid, 4);
-				sent++;
-			}
-			n = n->next;
-		}
-		b = b->next;
-	}
+	lws_dht_ip_probe_family(ctx, &ctx->buckets);
+	lws_dht_ip_probe_family(ctx, &ctx->buckets6);
 
 	lws_sul_schedule(ctx->vhost->context, 0, &ctx->sul_ip_monitor,
 			 lws_dht_sul_ip_monitor_cb, 600 * LWS_US_PER_SEC);
@@ -560,10 +954,10 @@ lws_dht_get_stats(struct lws_vhost *vh, struct lws_dht_stats *current,
 {
 	struct lws_dht_ctx *ctx;
 
-	if (!vh || !vh->dht_owner.head)
+	if (!vh || !lws_dll2_get_head(&vh->dht_owner))
 		return 1;
 
-	ctx = lws_container_of(vh->dht_owner.head, struct lws_dht_ctx, list);
+	ctx = lws_container_of(lws_dll2_get_head(&vh->dht_owner), struct lws_dht_ctx, list);
 
 	if (current)
 		*current = ctx->stats_current;
@@ -585,7 +979,13 @@ lws_dht_get_external_addr(struct lws_dht_ctx *ctx, struct sockaddr_storage *ss,
 		return -1;
 
 	for (j = 0; j < ctx->num_reported_ads; j++) {
-		if (ctx->reported_ads[j].count >= 3) {
+		/*
+		 * The quorum decision lives where the reports are tallied, and
+		 * it is not a fixed count of three: in a small network it is
+		 * however many nodes there were to ask.  Report what that
+		 * decided rather than re-deriving it wrongly here.
+		 */
+		if (ctx->reported_ads[j].confirmed) {
 			*ss = ctx->reported_ads[j].ss;
 			*sslen = ctx->reported_ads[j].sslen;
 
@@ -600,14 +1000,14 @@ struct lws_dht_ctx *
 lws_dht_create(const lws_dht_info_t *info)
 {
 	struct lws_dht_ctx *ctx;
-	int rc;
+	uint32_t r;
 
-	if (info->vhost && info->vhost->dht_owner.head) {
-		return lws_container_of(info->vhost->dht_owner.head, struct lws_dht_ctx, list);
+	if (info->vhost && lws_dll2_get_head(&info->vhost->dht_owner)) {
+		return lws_container_of(lws_dll2_get_head(&info->vhost->dht_owner), struct lws_dht_ctx, list);
 	}
 
 	ctx = lws_zalloc(sizeof(*ctx), "dht ctx");
-	(void)rc;
+	(void)r;
 
 	if (!ctx) {
 		lwsl_err("lws_zalloc failed\n");
@@ -634,6 +1034,14 @@ lws_dht_create(const lws_dht_info_t *info)
 	}
 	ctx->hash_cb			= info->hash_cb;
 	ctx->capture_announce_cb	= info->capture_announce_cb;
+	/*
+	 * The legacy 20-byte id wire encoding is only for a DHT that asks
+	 * for it: lwsws's default for a "dht" block is off (lejp-conf.c),
+	 * so existing deployments keep the multihash encoding they have
+	 * always used
+	 */
+	ctx->legacy = info->legacy;
+	ctx->allow_private_ads = info->allow_private_ads;
 	lws_dll2_owner_clear(&ctx->ts_owner);
 	lws_dll2_owner_clear(&ctx->verb_owner);
 
@@ -643,13 +1051,13 @@ lws_dht_create(const lws_dht_info_t *info)
 		uint8_t temp_id[20];
 		lws_get_random(ctx->vhost->context, temp_id, 20);
 		ctx->myid = lws_dht_hash_create(LWS_DHT_HASH_TYPE_SHA1, 20, temp_id);
+		/* replaced by a BEP42 id once our external address is known */
+		ctx->id_random = 1;
 	}
 
 	if (!ctx->myid) {
 		lwsl_err("ctx->myid creation failed\n");
-		lws_free(ctx);
-
-		return NULL;
+		goto fail;
 	}
 
 	if (info->v) {
@@ -658,30 +1066,34 @@ lws_dht_create(const lws_dht_info_t *info)
 		ctx->have_v = 1;
 	}
 
-	ctx->now.tv_sec			= (time_t)lws_now_secs();
+	ctx->now			= (time_t)lws_now_secs();
 
 #if defined(LWS_WITH_DHT_BACKEND)
-	ctx->mybucket_grow_time		= ctx->now.tv_sec;
-	ctx->mybucket6_grow_time	= ctx->now.tv_sec;
-	ctx->confirm_nodes_time		= ctx->now.tv_sec + ((lws_get_random(ctx->vhost->context, &rc, sizeof(rc)), rc) % 3);
+	ctx->mybucket_grow_time		= ctx->now;
+	ctx->mybucket6_grow_time	= ctx->now;
+	/*
+	 * Jitter must be drawn into an unsigned type: C99 % on a negative
+	 * signed random gives a negative remainder, which would schedule the
+	 * first maintenance pass in the past.
+	 */
+	ctx->confirm_nodes_time		= ctx->now + (time_t)((lws_get_random(ctx->vhost->context, &r, sizeof(r)), r) % 3);
 
-	ctx->search_id			= (unsigned short)((lws_get_random(ctx->vhost->context, &rc, sizeof(rc)), rc) & 0xFFFF);
+	ctx->search_id			= (unsigned short)((lws_get_random(ctx->vhost->context, &r, sizeof(r)), r) & 0xFFFF);
 	ctx->search_time		= 0;
 #endif
 
 	ctx->next_blacklisted		= 0;
 
-#if defined(LWS_WITH_DHT_BACKEND)
-	ctx->token_bucket_time		= ctx->now.tv_sec;
-	ctx->token_bucket_tokens	= MAX_TOKEN_BUCKET_TOKENS;
-#endif
+	ctx->rl_known.time		= ctx->now;
+	ctx->rl_known.tokens		= LWS_DHT_RL_POOL_BURST;
+	ctx->rl_general.time		= ctx->now;
+	ctx->rl_general.tokens		= LWS_DHT_RL_POOL_BURST;
 
 	ctx->iface = info->iface;
 
 #if defined(LWS_WITH_DHT_BACKEND)
 	memset(ctx->secret, 0, sizeof(ctx->secret));
-	rc = rotate_secrets(ctx);
-	if (rc < 0) {
+	if (rotate_secrets(ctx) < 0) {
 		lwsl_err("rotate_secrets failed\n");
 		goto fail;
 	}
@@ -706,35 +1118,41 @@ lws_dht_create(const lws_dht_info_t *info)
 	}
 
 #if defined(LWS_WITH_DHT_BACKEND)
-	ctx->buckets = lws_zalloc(sizeof(struct bucket), __func__);
-	if (ctx->buckets) {
-		ctx->buckets->af = AF_INET;
-		ctx->buckets->first = lws_dht_hash_create(LWS_DHT_HASH_TYPE_SHA1, 20, zeroes);
-		if (!ctx->buckets->first) {
-			lwsl_err("ctx->buckets->first failed\n");
+	{
+		struct bucket *b = lws_zalloc(sizeof(*b), __func__);
+
+		if (!b) {
+			lwsl_err("lws_zalloc for buckets failed\n");
 			goto fail;
 		}
-	} else {
-		lwsl_err("lws_zalloc for buckets failed\n");
-		goto fail;
-	}
-
-	if (info->ipv6) {
-		ctx->buckets6 = lws_zalloc(sizeof(struct bucket), __func__);
-		if (ctx->buckets6) {
-			ctx->buckets6->af = AF_INET6;
-			ctx->buckets6->first = lws_dht_hash_create(LWS_DHT_HASH_TYPE_SHA1, 20, zeroes);
-			if (!ctx->buckets6->first)
-				goto fail;
-		} else
+		b->af = AF_INET;
+		b->first = lws_dht_hash_create(LWS_DHT_HASH_TYPE_SHA1, 20, zeroes);
+		if (!b->first) {
+			lwsl_err("ctx->buckets->first failed\n");
+			lws_free(b);
 			goto fail;
+		}
+		lws_dll2_add_tail(&b->list, &ctx->buckets);
+
+		if (info->ipv6) {
+			b = lws_zalloc(sizeof(*b), __func__);
+			if (!b)
+				goto fail;
+			b->af = AF_INET6;
+			b->first = lws_dht_hash_create(LWS_DHT_HASH_TYPE_SHA1, 20, zeroes);
+			if (!b->first) {
+				lws_free(b);
+				goto fail;
+			}
+			lws_dll2_add_tail(&b->list, &ctx->buckets6);
+		}
 	}
 
 	lws_sul_schedule(ctx->vhost->context, 0, &ctx->sul,
 			 lws_dht_periodic_cb, 100 * LWS_US_PER_MS);
 
-	expire_buckets(ctx, ctx->buckets);
-	expire_buckets(ctx, ctx->buckets6);
+	expire_buckets(ctx, &ctx->buckets);
+	expire_buckets(ctx, &ctx->buckets6);
 
 	lws_sul_schedule(ctx->vhost->context, 0, &ctx->sul_ip_monitor,
 			 lws_dht_sul_ip_monitor_cb, 5 * LWS_US_PER_SEC);
@@ -797,47 +1215,50 @@ lws_dht_destroy(struct lws_dht_ctx **pctx)
 	lws_dht_hash_destroy(&ctx->myid);
 
 #if defined(LWS_WITH_DHT_BACKEND)
-	while (ctx->buckets) {
-		struct bucket *b = ctx->buckets;
+	while (lws_dll2_get_head(&ctx->buckets) ||
+	       lws_dll2_get_head(&ctx->buckets6)) {
+		lws_dll2_owner_t *bo = lws_dll2_get_head(&ctx->buckets) ?
+				&ctx->buckets : &ctx->buckets6;
+		struct bucket *b = lws_container_of(lws_dll2_get_head(bo),
+						    struct bucket, list);
 
-		ctx->buckets = b->next;
-		while (b->nodes) {
-			struct node *n = b->nodes;
-			b->nodes = n->next;
+		while(!lws_dll2_is_empty(&b->nodes)) {
+			struct node *n = lws_container_of(lws_dll2_get_head(&b->nodes),
+							  struct node, list);
+
+			lws_dll2_remove(&n->list);
 			lws_dht_hash_destroy(&n->id);
 			lws_free(n);
 		}
+		lws_dll2_remove(&b->list);
 		lws_dht_hash_destroy(&b->first);
 		lws_free(b);
 	}
 
-	while (ctx->buckets6) {
-		struct bucket *b = ctx->buckets6;
+	while(!lws_dll2_is_empty(&ctx->storage)) {
+		struct storage *st = lws_container_of(lws_dll2_get_head(&ctx->storage),
+						      struct storage, list);
 
-		ctx->buckets6 = b->next;
-		while (b->nodes) {
-			struct node *n = b->nodes;
-			b->nodes = n->next;
-			lws_dht_hash_destroy(&n->id);
-			lws_free(n);
+		while(!lws_dll2_is_empty(&st->subscribers)) {
+			struct subscriber *sub = lws_container_of(
+					lws_dll2_get_head(&st->subscribers),
+					struct subscriber, list);
+
+			lws_dll2_remove(&sub->list);
+			lws_free(sub);
 		}
-		lws_dht_hash_destroy(&b->first);
-		lws_free(b);
-	}
 
-	while (ctx->storage) {
-		struct storage *st = ctx->storage;
-
-		ctx->storage = ctx->storage->next;
+		lws_dll2_remove(&st->list);
 		lws_free(st->peers);
 		lws_dht_hash_destroy(&st->id);
 		lws_free(st);
 	}
 
-	while (ctx->searches) {
-		struct search *sr = ctx->searches;
+	while(!lws_dll2_is_empty(&ctx->searches)) {
+		struct search *sr = lws_container_of(lws_dll2_get_head(&ctx->searches),
+						     struct search, list);
 
-		ctx->searches = ctx->searches->next;
+		lws_dll2_remove(&sr->list);
 		lws_dht_hash_destroy(&sr->id);
 		for (int i = 0; i < sr->numnodes; i++)
 			lws_dht_hash_destroy(&sr->nodes[i].id);
@@ -847,9 +1268,10 @@ lws_dht_destroy(struct lws_dht_ctx **pctx)
 
 	lws_dll2_t *d = lws_dll2_get_head(&ctx->ts_owner);
 	while (d) {
-		lws_dll2_t *d1 = d->next;
+		lws_dll2_t *d1 = lws_dll2_get_next(d);
 		lws_dht_ts_t *dts = lws_container_of(d, lws_dht_ts_t, list);
 
+		lws_sul_cancel(&dts->sul_idle);
 		lws_transport_sequencer_destroy(&dts->ts);
 		lws_dll2_remove(&dts->list);
 		lws_free(dts);
@@ -952,74 +1374,194 @@ lws_dht_msg_gen(char *out, size_t len, const char *verb, const char *hash, unsig
 }
 
 int
+lws_dht_valid_domain_name(const char *domain)
+{
+	size_t i, len, label = 0;
+
+	if (!domain)
+		return 0;
+
+	len = strlen(domain);
+	if (!len || len > 253)
+		return 0;
+
+	for (i = 0; i < len; i++) {
+		char c = domain[i];
+
+		if (c == '.') {
+			/* empty label (".." or leading dot) or overlong */
+			if (!label || label > 63)
+				return 0;
+			label = 0;
+			continue;
+		}
+
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		      (c >= '0' && c <= '9') || c == '-' || c == '_'))
+			return 0;
+		label++;
+	}
+
+	/*
+	 * The residual label never met the c == '.' test above, so apply the
+	 * same length rule to it here: an over-63 label cannot be encoded in
+	 * DNS wire format at all (the length byte would alias the 0xc0
+	 * compression-pointer bits), and callers rely on us for that.
+	 */
+	if (label > 63)
+		return 0;
+
+	/* final label may be empty only for a single trailing root dot */
+	return label || domain[len - 1] == '.';
+}
+
+/*
+ * The RPC-over-data wire format is four fields separated by exactly one
+ * space each, optionally followed by one more space and the payload:
+ *
+ *   <verb> <hash> <offset> <len>[ <payload>]
+ *
+ * `in` points into the received datagram and is not NUL-terminated, so
+ * everything here is bounded by `len` alone; lws_tokenize() is given the
+ * explicit length of the four fields and never reads past it.  It must not
+ * see the payload: after a token's terminating whitespace it reads on for
+ * a following '=', UTF-8 checking the byte it finds, and a binary payload
+ * starting with '=' or a byte that can't lead UTF-8 then failed the whole
+ * message.  It extracts the fields with
+ * its own integer validation, while the gap checks below insist the
+ * fields were separated by exactly one space, the only shape the
+ * generator emits: without them a datagram with a missing or empty field
+ * would have its remaining fields silently shift left rather than be
+ * rejected.
+ */
+
+int
 lws_dht_msg_parse(const char *in, size_t len, struct lws_dht_msg *out)
 {
-	int step = 0;
+	char tmp[32];
+	lws_tokenize_t ts;
+	const char *cur = in, *end = in + len;
+	size_t i, hl;
+	int sp = 0;
 
 	if (!in || !out || len < 10)
 		return -1;
 
 	memset(out, 0, sizeof(*out));
 
-	/* Print the top level header for debug */
-	if (len > 32) {
-		char dbg[128];
-		lws_strncpy(dbg, in, sizeof(dbg));
-		lwsl_user("lws_dht_msg_parse: len=%zu header='%s'\n", len, dbg);
-	}
+	/* the fields end at the fourth space, if any */
 
-	const char *p = in;
-	const char *end = in + len;
+	for (hl = 0; hl < len; hl++)
+		if (in[hl] == ' ' && ++sp == 4)
+			break;
 
-	/* Parse 4 space-delimited tokens */
-	while (p < end && step < 4) {
-		const char *token_start = p;
-		while (p < end && *p != ' ') p++;
-		size_t tlen = (size_t)(p - token_start);
+	lws_tokenize_init(&ts, in, 0);
+	ts.len = hl;
 
-		if (step == 0) {
-			if (tlen >= sizeof(out->verb)) tlen = sizeof(out->verb) - 1;
-			lws_strncpy(out->verb, token_start, tlen + 1);
-		} else if (step == 1) {
-			if (tlen >= sizeof(out->hash)) tlen = sizeof(out->hash) - 1;
-			lws_strncpy(out->hash, token_start, tlen + 1);
-		} else if (step == 2) {
-			char tmp[32];
-			if (tlen >= sizeof(tmp)) tlen = sizeof(tmp) - 1;
-			lws_strncpy(tmp, token_start, tlen + 1);
+	for (i = 0; i < 4; i++) {
+		size_t tl;
+		lws_tokenize_elem e = lws_tokenize(&ts);
+
+		/*
+		 * The token content lives in the tokenizer's collect buffer;
+		 * anchor it to the expected position in the datagram so a
+		 * leading space, a double space or a non-space delimiter in
+		 * place of the single separating space cannot pass.
+		 */
+
+		if ((i < 2 ? (e != LWS_TOKZE_TOKEN && e != LWS_TOKZE_INTEGER)
+			   : e != LWS_TOKZE_INTEGER) ||
+		    ts.token_len > (size_t)(end - cur) ||
+		    memcmp(cur, ts.token, ts.token_len))
+			return -1;
+
+		tl = ts.token_len;
+
+		switch (i) {
+		case 0:
+			if (tl >= sizeof(out->verb))
+				return -1;
+			memcpy(out->verb, cur, tl);
+			out->verb[tl] = '\0';
+			break;
+
+		case 1: {
+			size_t j;
+
+			/*
+			 * F-051: the hash token is composed into
+			 * filesystem paths by the object-store and dnssec
+			 * plugins, so it must be exactly lowercase hex
+			 * (the only shape the protocol generates) and not
+			 * something like "../x" or an absolute path.
+			 * Reject the whole datagram otherwise.
+			 */
+			if (tl < 2 || tl >= sizeof(out->hash))
+				return -1;
+
+			for (j = 0; j < tl; j++) {
+				char c = cur[j];
+				if (!((c >= '0' && c <= '9') ||
+				      (c >= 'a' && c <= 'f')))
+					return -1;
+			}
+
+			memcpy(out->hash, cur, tl);
+			out->hash[tl] = '\0';
+			break;
+		}
+
+		case 2:
+			if (tl >= sizeof(tmp))
+				return -1;
+			memcpy(tmp, cur, tl);
+			tmp[tl] = '\0';
 			out->offset = (unsigned long long)strtoull(tmp, NULL, 10);
-		} else if (step == 3) {
-			char tmp[32];
-			if (tlen >= sizeof(tmp)) tlen = sizeof(tmp) - 1;
-			lws_strncpy(tmp, token_start, tlen + 1);
+			break;
+
+		default:
+			if (tl >= sizeof(tmp))
+				return -1;
+			memcpy(tmp, cur, tl);
+			tmp[tl] = '\0';
 			out->len = (unsigned long long)strtoull(tmp, NULL, 10);
+			break;
 		}
 
-		/* skip space */
-		if (p < end && *p == ' ') p++;
-		step++;
-	}
+		cur += tl;
 
-	if (step == 4) {
-		if (p < end) {
-			out->payload = p;
-			out->payload_len = (size_t)(end - p);
-		} else {
-			out->payload = NULL;
-			out->payload_len = 0;
+		/* the next field (or the payload) follows exactly one ' ' */
+
+		if (i < 3) {
+			if (cur >= end || *cur != ' ')
+				return -1;
+			cur++;
 		}
-		return 0;
 	}
 
-	return -1;
+	/*
+	 * Anything after exactly one further space is the payload; it is not
+	 * validated at all here.
+	 */
+
+	if (cur < end) {
+		if (*cur != ' ')
+			return -1;
+
+		if (cur + 1 < end) {
+			out->payload = cur + 1;
+			out->payload_len = (size_t)(end - (cur + 1));
+		}
+	}
+
+	return 0;
 }
 
 int
-lws_dht_notify_subscribers(struct lws_dht_ctx *ctx, const lws_dht_hash_t *hash, const uint8_t *sha256)
+lws_dht_notify_subscribers(struct lws_dht_ctx *ctx, const lws_dht_hash_t *hash, const uint8_t *sha256, const uint8_t *payload, size_t payload_len)
 {
 #if defined(LWS_WITH_DHT_BACKEND)
 	struct storage *st;
-	struct subscriber *sub;
 	int count = 0;
 
 	if (!ctx || !hash || !sha256)
@@ -1029,25 +1571,25 @@ lws_dht_notify_subscribers(struct lws_dht_ctx *ctx, const lws_dht_hash_t *hash, 
 	if (!st)
 		return 0; /* no subscribers */
 
-	sub = st->subscribers;
-	while (sub) {
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&st->subscribers)) {
+		struct subscriber *sub = lws_container_of(d, struct subscriber, list);
+
 		/* Don't notify if the TTL expired */
-		if (ctx->now.tv_sec <= sub->expire) {
+		if (ctx->now <= sub->expire) {
 			/* Only notify if the content actually changed from what they have */
 			if (memcmp(sub->current_sha256, sha256, 32)) {
-				lws_dht_send_notify(ctx, (struct sockaddr *)&sub->ss, sub->sslen, sub->tid, sub->tid_len, hash, sha256, NULL, 0);
+				lws_dht_send_notify(ctx, (struct sockaddr *)&sub->ss, sub->sslen, sub->tid, sub->tid_len, hash, sha256, payload, payload_len);
 
 				/* Queue up reliable delivery retry state */
 				sub->pending_notify = 1;
 				sub->notify_retries = 0;
-				sub->last_notify = ctx->now.tv_sec;
+				sub->last_notify = ctx->now;
 				memcpy(sub->pending_sha256, sha256, 32);
 
 				count++;
 			}
 		}
-		sub = sub->next;
-	}
+	} lws_end_foreach_dll(d);
 
 	return count;
 #else
@@ -1055,22 +1597,32 @@ lws_dht_notify_subscribers(struct lws_dht_ctx *ctx, const lws_dht_hash_t *hash, 
 #endif
 }
 
+/*
+ * A notify ack clears the pending notification it answers: the one sent
+ * under that tid, to the endpoint the ack comes from.  The tid is the
+ * subscriber's choice, not a secret, so it alone would let anyone who
+ * learned it acknowledge (and so suppress) a notification it never got.
+ */
+
 void
-lws_dht_clear_pending_notify(struct lws_dht_ctx *ctx, const uint8_t *tid, size_t tid_len)
+lws_dht_clear_pending_notify(struct lws_dht_ctx *ctx, const uint8_t *tid,
+			     size_t tid_len, const struct sockaddr *from)
 {
 #if defined(LWS_WITH_DHT_BACKEND)
-	struct storage *st;
 
-	if (!ctx || !tid || tid_len != 16)
+	if (!ctx || !tid || tid_len != 16 || !from)
 		return;
 
-	st = ctx->storage;
+	lws_start_foreach_dll(struct lws_dll2 *, dt, lws_dll2_get_head(&ctx->storage)) {
+		struct storage *st = lws_container_of(dt, struct storage, list);
 
-	while (st) {
-		struct subscriber *sub = st->subscribers;
-		while (sub) {
+		lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&st->subscribers)) {
+			struct subscriber *sub = lws_container_of(d, struct subscriber, list);
+
 			if (sub->pending_notify && sub->tid_len == tid_len &&
-			    !memcmp(sub->tid, tid, tid_len)) {
+			    !memcmp(sub->tid, tid, tid_len) &&
+			    dht_sa_same_peer((const struct sockaddr *)&sub->ss,
+					     from)) {
 				/* ACK received! */
 				sub->pending_notify = 0;
 				sub->notify_retries = 0;
@@ -1078,10 +1630,8 @@ lws_dht_clear_pending_notify(struct lws_dht_ctx *ctx, const uint8_t *tid, size_t
 				memcpy(sub->current_sha256, sub->pending_sha256, 32);
 				return;
 			}
-			sub = sub->next;
-		}
-		st = st->next;
-	}
+		} lws_end_foreach_dll(d);
+	} lws_end_foreach_dll(dt);
 #endif
 }
 
@@ -1107,7 +1657,7 @@ lws_dht_register_verbs(struct lws_dht_ctx *ctx, const char **verbs, int count, c
 struct lws_dht_ctx *
 lws_dht_get_by_name(struct lws_vhost *vhost, const char *name)
 {
-	lws_start_foreach_dll(struct lws_dll2 *, d, vhost->dht_owner.head) {
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&vhost->dht_owner)) {
 		struct lws_dht_ctx *ctx = lws_container_of(d, struct lws_dht_ctx, list);
 
 		if (ctx->name && !strcmp(ctx->name, name))
@@ -1120,8 +1670,8 @@ lws_dht_get_by_name(struct lws_vhost *vhost, const char *name)
 void
 lws_dht_destroy_all_on_vhost(struct lws_vhost *vh)
 {
-	while (vh->dht_owner.head) {
-		struct lws_dht_ctx *ctx = lws_container_of(vh->dht_owner.head,
+	while(!lws_dll2_is_empty(&vh->dht_owner)) {
+		struct lws_dht_ctx *ctx = lws_container_of(lws_dll2_get_head(&vh->dht_owner),
 							   struct lws_dht_ctx,
 							   list);
 
@@ -1145,14 +1695,14 @@ lws_dht_get_fallback_node(struct lws_context *cx, const char *custom_path, char 
 		return 1;
 	}
 
-	if (!policy->seeds.count) {
+	if (!lws_dll2_count(&policy->seeds)) {
 		lwsl_err("%s: No seeds in policy\n", __func__);
 		lws_system_policy_free(policy);
 		return 1;
 	}
 
 	lws_get_random(cx, &random_val, sizeof(random_val));
-	target_idx = (int)(random_val % policy->seeds.count);
+	target_idx = (int)(random_val % lws_dll2_count(&policy->seeds));
 
 	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&policy->seeds)) {
 		if (current_idx++ == target_idx) {

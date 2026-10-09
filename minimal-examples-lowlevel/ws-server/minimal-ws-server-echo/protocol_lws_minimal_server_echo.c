@@ -43,7 +43,7 @@ struct vhd_minimal_server_echo {
 	struct lws_context *context;
 	struct lws_vhost *vhost;
 
-	int *interrupted;
+	int *result;
 	int *options;
 };
 
@@ -83,11 +83,19 @@ callback_minimal_server_echo(struct lws *wsi, enum lws_callback_reasons reason,
 		vhd->context = lws_get_context(wsi);
 		vhd->vhost = lws_get_vhost(wsi);
 
+		/*
+		 * We are also instantiated on vhosts that have no pvo for
+		 * us (eg, Secure Streams' internal vhosts)... only our own
+		 * vhost passes the pvo chain in
+		 */
+		if (!in)
+			break;
+
 		/* get the pointers we were passed in pvo */
 
-		vhd->interrupted = (int *)lws_pvo_search(
+		vhd->result = (int *)lws_pvo_search(
 			(const struct lws_protocol_vhost_options *)in,
-			"interrupted")->value;
+			"result")->value;
 		vhd->options = (int *)lws_pvo_search(
 			(const struct lws_protocol_vhost_options *)in,
 			"options")->value;
@@ -210,9 +218,9 @@ callback_minimal_server_echo(struct lws *wsi, enum lws_callback_reasons reason,
 		lws_ring_destroy(pss->ring);
 
 		if (*vhd->options & 1) {
-			if (!*vhd->interrupted)
-				*vhd->interrupted = 1 + pss->completed;
-			lws_cancel_service(lws_get_context(wsi));
+			if (!*vhd->result)
+				*vhd->result = 1 + pss->completed;
+			lws_default_loop_exit(lws_get_context(wsi));
 		}
 		break;
 

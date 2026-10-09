@@ -129,6 +129,28 @@ creation info Fault Injection Context.  By default the lws helper
 be overridden using `--fault-seed <decimal>`, and the effective PRNG seed is
 logged when the commandline options are initially parsed.
 
+## Replacing the random source with a seeded PRNG
+
+`lws_get_random()` normally returns the platform's random.  For a
+reproducible test, fault injection can replace it, per context, with its own
+xoshiro256 stream, so a run making the same calls in the same order draws
+the same bytes (ws masks and keys, quic connection ids, multipart
+boundaries...).  Either:
+
+ - add the fault `random_prng` to the context creation info's fic, eg
+   `--fault-injection random_prng`: the stream is seeded from the fic's PRNG
+   at context creation, ie, from `--fault-seed`, and covers everything the
+   context draws from its creation onwards; or
+
+ - call `lws_fi_random_seed(context, seed)` to seed it directly (again, to
+   reseed), before other threads service the context.
+
+The stream is separate from the one the fault decisions use, so turning
+other faults on or off does not change the random bytes.  The bytes are
+predictable, and key generation draws from `lws_get_random()` too, so a
+warning is logged when it is set and it must never be used outside a test.
+The tls library's own random, used inside its handshakes, is unaffected.
+
 ## Addings Fault Injection Rules to `lws_fi_ctx_t`
 
 Typically the lws_context is used as the central, toplevel place to define
@@ -256,6 +278,7 @@ thing by giving, eg, `"myfault(10%),myfault_delay(123..456)"`
 
 |Scope|Namespc|Name|Fault effect|
 |---|---|---|---|
+|context||`random_prng`|Not a failure: `lws_get_random()` is a PRNG seeded from `--fault-seed` (see above)|
 |context||`ctx_createfail1`|Fail context creation immediately at entry|
 |context||`ctx_createfail_plugin_init`|Fail context creation as if a plugin init failed (if plugins enabled)|
 |context||`ctx_createfail_evlib_plugin`|Fail context creation due to event lib plugin failed init (if evlib plugins enabled)|
@@ -275,6 +298,7 @@ thing by giving, eg, `"myfault(10%),myfault_delay(123..456)"`
 |context||`ctx_createfail_ss_pol3`|Fail context creation due to ss policy set failed (if policy enabled)|
 |context||`cache_createfail`|Fail `lws_cache` creation due to OOM|
 |context||`cache_lookup_oom`|Fail `lws_cache` lookup due to OOM|
+|context||`async_queue_full`|The async worker queue seems saturated, so tls accepts and file reads are done inline on the service thread (LWS_WITH_ASYNC_QUEUE)|
 |vhost|`vh`|`vh_create_oom`|Fail vh creation on vh object alloc OOM|
 |vhost|`vh`|`vh_create_oom`|Fail vh creation on vh object alloc OOM|
 |vhost|`vh`|`vh_create_pcols_oom`|Fail vh creation at protocols alloc OOM|
@@ -283,6 +307,7 @@ thing by giving, eg, `"myfault(10%),myfault_delay(123..456)"`
 |vhost|`vh`|`vh_create_ssl_cli`|Fail client ssl_ctx init|
 |vhost|`vh`|`vh_create_srv_init`|Fail server init|
 |vhost|`vh`|`vh_create_protocol_init`|Fail late protocol init (for late vhost creation)|
+|srv vhost|`vh`|`h3_settings_no_wt`|h3 server SETTINGS do not enable WebTransport or HTTP Datagrams (LWS_ROLE_WT)|
 |srv vhost|`vh=xxx/wsi`|`listenskt`|Causes `socket()` allocation for vhost listen socket to fail|
 |cli wsi|`wsi`|`dnsfail`|Sync: `getaddrinfo()` is not called and a EAI_FAIL return synthesized, Async: request not started and immediate fail synthesized|
 |cli wsi|`wsi`|`sendfail`|Attempts to send data on the wsi socket fail|

@@ -41,10 +41,44 @@
 
 #include <libwebsockets/lws-rtp.h>
 #include <libwebsockets/lws-srtp.h>
+
 #include <libwebsockets/lws-stun.h>
 
 #include "protocol_lws_webrtc.h"
+
+#if defined(LWS_WITH_MBEDTLS)
+#include <mbedtls/ssl.h>
+#include <mbedtls/x509_crt.h>
+#include <mbedtls/md.h>
+#elif defined(LWS_WITH_GNUTLS)
+#include <gnutls/gnutls.h>
+#elif !defined(LWS_WITH_SCHANNEL) && !defined(LWS_WITH_OPENHITLS)
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+#endif
 #include <stdarg.h>
+
+/*
+ * Q-25: atoi silently returns 0 on non-numeric input and truncates on
+ * overflow with no signal.  This helper parses a (peer-SDP-supplied) token
+ * to a non-negative int in [0, max], returning -1 on any parse error.
+ */
+static int
+webrtc_sdtoi(const char *s, size_t len, int max)
+{
+	char tmp[16];
+	char *endp = NULL;
+	long v;
+	size_t copy = len < sizeof(tmp) - 1 ? len : sizeof(tmp) - 1;
+	if (!copy)
+		return -1;
+	memcpy(tmp, s, copy);
+	tmp[copy] = '\0';
+	v = strtol(tmp, &endp, 10);
+	if (endp == tmp || *endp != '\0' || v < 0 || v > max)
+		return -1;
+	return (int)v;
+}
 
 static void
 webrtc_pss_log(struct pss_webrtc *pss, const char *fmt, ...)
@@ -112,6 +146,12 @@ lws_webrtc_set_user_data(struct pss_webrtc *pss, void *data)
 
 static int
 lws_webrtc_send_pli(struct pss_webrtc *pss);
+
+static int
+webrtc_dtls_service(struct pss_webrtc *pss);
+
+static void
+webrtc_dtls_fail(struct pss_webrtc *pss, const char *reason);
 
 static struct lws_vhost *
 lws_webrtc_get_vhost(struct vhd_webrtc *vhd)
@@ -208,17 +248,37 @@ rtp_packet_tx_cb(void *priv, const uint8_t *pkt, size_t len, int marker)
 	if (!media || !media->wsi_udp || !media->has_peer_sa46)
 		return;
 
+	/*
+	 * The video packetizers cap themselves at the RTP MTU, but the audio
+	 * path and any out-of-tree media source reaching us via lws_webrtc_ops
+	 * do not: refuse anything that would not fit, rather than smashing the
+	 * stack.  lws_srtp_protect() also appends its tag in here, so it gets
+	 * the real buffer size instead of a hardcoded 2048.
+	 */
+	if (len > sizeof(protected_pkt) - LWS_PRE) {
+		lwsl_err("%s: oversize RTP packet %zu\n", __func__, len);
+		return;
+	}
+
 	memcpy(p, pkt, len);
 	if (marker) p[1] |= 0x80;
 
-	if (lws_srtp_protect(&media->srtp_ctx_tx, p, &protected_len, 2048)) {
+	if (lws_srtp_protect(&media->srtp_ctx_tx, p, &protected_len,
+			     sizeof(protected_pkt) - LWS_PRE)) {
 		lwsl_err("%s: SRTP protect failed\n", __func__);
 		return;
 	}
 
 #if defined(LWS_HAVE_PTHREAD_H)
 	if (media->txpacer) {
-		uint8_t *heap_buf = malloc(protected_len);
+		/*
+		 * lws_txp_append() takes ownership and releases this with
+		 * lws_free(), which is not free() under
+		 * LWS_WITH_ALLOC_METADATA_LWS or a lws_set_allocator() build.
+		 * lws_malloc() is a private macro, so use the exported
+		 * lws_realloc() it expands to.
+		 */
+		uint8_t *heap_buf = lws_realloc(NULL, protected_len, __func__);
 		if (heap_buf) {
 			memcpy(heap_buf, p, protected_len);
 			if (lws_txp_append(media->txpacer, heap_buf, protected_len) < 0) {
@@ -346,7 +406,12 @@ lws_webrtc_send_video(struct lws_webrtc_peer_media *media, const uint8_t *buf, s
 				uint32_t s = 0; int shift = 0;
 				while (tr > 0) {
 					uint8_t b = *ts++; tr--;
-					s |= (uint32_t)(b & 0x7f) << shift;
+					/* only the first 5 bytes can affect a
+					 * uint32_t; shifting by >= its width is
+					 * UB, and pl is clamped to what is
+					 * left in the buffer anyway */
+					if (shift < 32)
+						s |= (uint32_t)(b & 0x7f) << shift;
 					if (!(b & 0x80)) break;
 					shift += 7;
 				}
@@ -388,7 +453,12 @@ lws_webrtc_send_video(struct lws_webrtc_peer_media *media, const uint8_t *buf, s
 				int shift = 0;
 				while (tr > 0) {
 					uint8_t b = *ts++; tr--;
-					s |= (uint32_t)(b & 0x7f) << shift;
+					/* only the first 5 bytes can affect a
+					 * uint32_t; shifting by >= its width is
+					 * UB, and pl is clamped to what is
+					 * left in the buffer anyway */
+					if (shift < 32)
+						s |= (uint32_t)(b & 0x7f) << shift;
 					if (!(b & 0x80)) break;
 					shift += 7;
 				}
@@ -402,8 +472,16 @@ lws_webrtc_send_video(struct lws_webrtc_peer_media *media, const uint8_t *buf, s
 
 			ps = src;
 			uint8_t stack_obu[4096], *tmp_obu = NULL;
-			uint8_t oh_no_size = (uint8_t)(oh & 0xfd);
-			size_t tl = 1 + (oh & 0x04 ? 1 : 0);
+			/*
+			 * Only claim the extension header byte if it actually
+			 * arrived: on a truncated OBU whose header is the last
+			 * byte of buf, obu_start[1] is out of bounds.  Drop the
+			 * ext flag from the rebuilt header in that case, so we
+			 * never emit a header promising an extension byte that
+			 * is not there.
+			 */
+			size_t tl = 1u + (((oh & 0x04) && obu_start + 1 < end) ? 1u : 0u);
+			uint8_t oh_no_size = (uint8_t)(oh & (tl > 1 ? 0xfd : 0xf9));
 
 			if (tl + pl <= sizeof(stack_obu)) {
 				tmp_obu = stack_obu;
@@ -413,7 +491,7 @@ lws_webrtc_send_video(struct lws_webrtc_peer_media *media, const uint8_t *buf, s
 
 			if (tmp_obu) {
 				tmp_obu[0] = oh_no_size;
-				if (oh & 0x04) tmp_obu[1] = obu_start[1];
+				if (tl > 1) tmp_obu[1] = obu_start[1];
 
 				uint8_t type = (tmp_obu[0] >> 3) & 0x0f;
 				if (type == 2 || type == 5 || type == 15) {
@@ -522,6 +600,16 @@ lws_webrtc_send_audio(struct lws_webrtc_peer_media *media, const uint8_t *buf, s
 	if (!media || !media->handshake_done)
 		return 0;
 
+	/*
+	 * len is the caller's, and lws_webrtc_ops::send_audio is a public
+	 * contract for out-of-tree media sources: bound it against the packet
+	 * buffer before the memcpy below rather than trusting it.
+	 */
+	if (len > sizeof(pkt) - LWS_PRE - LWS_RTP_HEADER_LEN) {
+		lwsl_err("%s: oversize audio frame %zu\n", __func__, len);
+		return -1;
+	}
+
 	pthread_mutex_lock(&media->lock_tx);
 
 	if (timestamp != 0) {
@@ -607,16 +695,16 @@ lws_webrtc_create_offer(struct pss_webrtc *pss)
 	char audio_m[2048], video_m[2048], candidates[1024] = "";
 	size_t n_sdp;
 
-	pss->is_client = 1;
+	pss->is_client = 0;
 
 	if (!vhd) return -1;
 
-	/* Initialize Client DTLS */
+	/* Initialize Server DTLS */
 	if (!pss->handshake_started) {
 		struct lws_gendtls_creation_info ci;
 		memset(&ci, 0, sizeof(ci));
 		ci.context = vhd->context;
-		ci.mode = LWS_GENDTLS_MODE_CLIENT;
+		ci.mode = LWS_GENDTLS_MODE_SERVER;
 		ci.mtu = 1100;
 		ci.use_srtp = "SRTP_AES128_CM_SHA1_80";
 		if (lws_gendtls_create(&pss->dtls_ctx, &ci)) return -1;
@@ -624,12 +712,14 @@ lws_webrtc_create_offer(struct pss_webrtc *pss)
 		lws_gendtls_set_key_mem(&pss->dtls_ctx, vhd->key_mem, vhd->key_len);
 		pss->media->wsi_udp = vhd->wsi_udp;
 		pss->handshake_started = 1;
+		/* poll the handshake, see LWS_CALLBACK_TIMER */
+		lws_set_timer_usecs(pss->wsi_ws, LWS_WEBRTC_DTLS_POLL_US);
 	}
 
 	/* Default PTs for Offer */
 	pss->media->pt_audio = 111;
 	pss->media->pt_video_h264 = 102;
-	pss->media->pt_video_av1 = 104;
+	pss->media->pt_video_av1 = 0;
 	pss->media->pt_video = pss->media->pt_video_h264; /* Default to H264 */
 
 	pss->media->rtp_ctx_video.ts = (uint32_t)(lws_now_usecs() * 9 / 100);
@@ -651,34 +741,28 @@ lws_webrtc_create_offer(struct pss_webrtc *pss)
 
 	/* Video Section */
 	lws_snprintf(video_m, sizeof(video_m),
-			"m=video %u UDP/TLS/RTP/SAVPF %u %u\\r\\n"
+			"m=video %u UDP/TLS/RTP/SAVPF %u\\r\\n"
 			"c=IN IP4 0.0.0.0\\r\\n"
 			"a=rtcp-mux\\r\\n"
 			"a=ice-ufrag:%s\\r\\n"
 			"a=ice-pwd:%s\\r\\n"
 			"a=fingerprint:sha-256 %s\\r\\n"
-			"a=setup:actpass\\r\\n"
+			"a=setup:passive\\r\\n"
 			"a=mid:1\\r\\n"
 			"a=sendonly\\r\\n"
 			"a=msid:lws-stream lws-track-video\\r\\n"
 			"a=rtpmap:%u H264/90000\\r\\n"
 			"a=fmtp:%u level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e02a\\r\\n"
-			"a=rtpmap:%u AV1/90000\\r\\n"
-			"a=fmtp:%u profile=0;level-idx=5;tier=0\\r\\n"
-			"a=rtcp-fb:%u nack\\r\\n"
-			"a=rtcp-fb:%u nack pli\\r\\n"
 			"a=rtcp-fb:%u nack\\r\\n"
 			"a=rtcp-fb:%u nack pli\\r\\n"
 			"a=ssrc:%u cname:lws-video\\r\\n"
 			"a=ssrc:%u msid:lws-stream lws-track-video\\r\\n"
 			"%s"
 			"a=end-of-candidates\\r\\n",
-		vhd->udp_port, pss->media->pt_video_h264, pss->media->pt_video_av1,
+		vhd->udp_port, pss->media->pt_video_h264,
 		pss->ice_ufrag, pss->ice_pwd, vhd->fingerprint,
 		pss->media->pt_video_h264, pss->media->pt_video_h264,
-		pss->media->pt_video_av1, pss->media->pt_video_av1,
 		pss->media->pt_video_h264, pss->media->pt_video_h264,
-		pss->media->pt_video_av1, pss->media->pt_video_av1,
 		pss->media->ssrc_video, pss->media->ssrc_video, candidates);
 
 	/* Audio Section */
@@ -689,7 +773,7 @@ lws_webrtc_create_offer(struct pss_webrtc *pss)
 			"a=ice-ufrag:%s\\r\\n"
 			"a=ice-pwd:%s\\r\\n"
 			"a=fingerprint:sha-256 %s\\r\\n"
-			"a=setup:actpass\\r\\n"
+			"a=setup:passive\\r\\n"
 			"a=mid:0\\r\\n"
 			"a=sendonly\\r\\n"
 			"a=msid:lws-stream lws-track-audio\\r\\n"
@@ -708,10 +792,14 @@ lws_webrtc_create_offer(struct pss_webrtc *pss)
 			"{\"type\":\"offer\",\"sdp\":\"v=0\\r\\no=- 123456 2 IN IP4 %s\\r\\ns=-\\r\\nt=0 0\\r\\na=msid-semantic: WMS lws-stream\\r\\na=ice-lite\\r\\na=group:BUNDLE 0 1\\r\\n%s%s\"}",
 			vhd->external_ip[0] ? vhd->external_ip : "127.0.0.1", audio_m, video_m);
 
+	/* sizeof - 1, not a hand-counted length: the END one was one over */
+	static const char sdp_o_s[] = "\n--- START SDP OFFER ---\n",
+			  sdp_o_e[] = "\n--- END SDP OFFER ---\n\n";
+
 	webrtc_pss_log(pss, "Generated SDP OFFER (%zu bytes)\n%s\n", n_sdp, p);
-	if (write(2, "\n--- START SDP OFFER ---\n", 25) < 0 ||
+	if (write(2, sdp_o_s, sizeof(sdp_o_s) - 1) < 0 ||
 	    write(2, p, n_sdp) < 0 ||
-	    write(2, "\n--- END SDP OFFER ---\n\n", 25) < 0) {
+	    write(2, sdp_o_e, sizeof(sdp_o_e) - 1) < 0) {
 		webrtc_pss_err(pss, "Failed writing SDP offer to stderr\n");
 		return -1;
 	}
@@ -723,7 +811,7 @@ lws_webrtc_create_offer(struct pss_webrtc *pss)
 	return 0;
 }
 
-/* STUN Binding Request generator */
+/* STUN Binding Request generator for hole punching */
 static int
 lws_webrtc_stun_req_pack(struct pss_webrtc *pss, uint8_t *buf, size_t len, uint8_t *tid)
 {
@@ -761,13 +849,13 @@ lws_webrtc_stun_req_pack(struct pss_webrtc *pss, uint8_t *buf, size_t len, uint8
 	lws_ser_wu32be(p + 4, 1845494271); /* Type preference 110, Local pref 65535, Component 255 */
 	p += 8;
 
-	/* 3. ICE-CONTROLLING (0x802A) */
-	lws_ser_wu16be(p, 0x802A);
-	lws_ser_wu16be(p + 2, 8);
-	lws_get_random(lws_get_context(pss->wsi_ws), p + 4, 8);
-	p += 12;
+	/*
+	 * CRITICAL: We MUST NOT include ICE-CONTROLLING (0x802A) here!
+	 * Since our server is ice-lite, sending ICE-CONTROLLING is a fatal protocol
+	 * violation and modern Chrome/Firefox will aggressively abort the ICE connection.
+	 */
 
-	/* 4. MESSAGE-INTEGRITY (0x0008) */
+	/* 3. MESSAGE-INTEGRITY (0x0008) */
 	/* Should use remote password */
 	if (pss->ice_pwd_remote[0]) {
 		uint16_t msg_len = (uint16_t)(p - start - 20 + 24); /* Current len + attribute header + HMAC (20) */
@@ -786,7 +874,7 @@ lws_webrtc_stun_req_pack(struct pss_webrtc *pss, uint8_t *buf, size_t len, uint8
 		p += 24;
 	}
 
-	/* 5. FINGERPRINT (0x8028) */
+	/* 4. FINGERPRINT (0x8028) */
 	{
 		uint16_t msg_len = (uint16_t)(p - start - 20 + 8); /* Current len + attribute header + CRC (4) */
 		lws_ser_wu16be(start + 2, msg_len);
@@ -807,6 +895,8 @@ lws_webrtc_stun_req_pack(struct pss_webrtc *pss, uint8_t *buf, size_t len, uint8
 }
 
 
+
+
 	static int
 handle_candidate(struct pss_webrtc *pss, struct vhd_webrtc *vhd, const char *cand)
 {
@@ -825,9 +915,10 @@ handle_candidate(struct pss_webrtc *pss, struct vhd_webrtc *vhd, const char *can
 
 	int state = 0;
 
-	while (lws_tokenize(&ts) != LWS_TOKZE_ENDED) {
-		lwsl_notice("%s: Token: '%.*s' (len %d, type %d), state %d\n", __func__, (int)ts.token_len, ts.token, (int)ts.token_len, ts.e, state);
-		if (state == 0 && ts.token_len == 3 && !strncmp(ts.token, "udp", 3)) {
+	while (lws_tokenize(&ts) > LWS_TOKZE_ENDED) {
+		/* debug: one line per token of every candidate a client sends */
+		lwsl_debug("%s: Token: '%.*s' (len %d, type %d), state %d\n", __func__, (int)ts.token_len, ts.token, (int)ts.token_len, ts.e, state);
+		if (state == 0 && ts.token_len == 3 && !strncasecmp(ts.token, "udp", 3)) {
 			state = 1; /* Found Protocol udp */
 		} else if (state == 1) {
 			/* Priority */
@@ -842,7 +933,7 @@ handle_candidate(struct pss_webrtc *pss, struct vhd_webrtc *vhd, const char *can
 			}
 		} else if (state == 3) {
 			/* Port */
-			port = atoi(ts.token);
+			port = webrtc_sdtoi(ts.token, ts.token_len, 65535);
 			state = 5;
 			break;
 		}
@@ -851,12 +942,64 @@ handle_candidate(struct pss_webrtc *pss, struct vhd_webrtc *vhd, const char *can
 	if (state == 5 && port > 0) {
 		webrtc_pss_log(pss, "Found ICE Candidate: %s:%d\n", ip_str, port);
 
+		if (pss->media && pss->media->peer_stun_received) {
+			webrtc_pss_log(pss, "Skipping candidate parsing as ICE is already resolved via STUN.\n");
+			return 0;
+		}
+
+		/*
+		 * Each accepted candidate costs us an HMAC-SHA1 and a ~200 byte
+		 * STUN datagram sent to an address and port the peer chose, so
+		 * an unlimited SDP would make us a controllable reflector and
+		 * CPU sink.  A real ICE peer offers a handful of candidates.
+		 */
+		if (pss->stun_punches >= LWS_WEBRTC_MAX_PUNCHES) {
+			webrtc_pss_log(pss, "Ignoring ICE candidate: punch limit (%d) reached\n",
+				       LWS_WEBRTC_MAX_PUNCHES);
+			return 0;
+		}
+
 		if (lws_sa46_parse_numeric_address(ip_str, &pss->media->peer_sa46) < 0)
 			return -1;
+
+		if (pss->media->peer_sa46.sa4.sin_family == AF_INET) {
+			uint32_t a4 = ntohl(pss->media->peer_sa46.sa4.sin_addr.s_addr);
+			if (a4 == 0 || (a4 >> 24) == 127 || (a4 >> 28) >= 14 ||
+                            (a4 >> 24) == 10 || /* 10.0.0.0/8 */
+                            (a4 >> 20) == 2753 || /* 172.16.0.0/12 */
+                            (a4 >> 16) == 49320 || /* 192.168.0.0/16 */
+                            (a4 >> 16) == 43518) { /* 169.254.0.0/16 */
+				webrtc_pss_log(pss, "Rejecting invalid ICE candidate IP %s\n", ip_str);
+				return 0;
+			}
+		} else {
+			const uint8_t *a6 = pss->media->peer_sa46.sa6.sin6_addr.s6_addr;
+			static const uint8_t in6addr_any[16] = {0};
+			static const uint8_t in6addr_loopback[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+			
+			int is_mapped = 0;
+			static const uint8_t v4mapped[12] = { 0,0,0,0,0,0,0,0,0,0,0xff,0xff };
+			if (!memcmp(a6, v4mapped, 12)) {
+				uint32_t a4 = ntohl(*(uint32_t *)&a6[12]);
+				if (a4 == 0 || (a4 >> 24) == 127 || (a4 >> 28) >= 14 ||
+				    (a4 >> 24) == 10 || /* 10.0.0.0/8 */
+				    (a4 >> 20) == 2753 || /* 172.16.0.0/12 */
+				    (a4 >> 16) == 49320 || /* 192.168.0.0/16 */
+				    (a4 >> 16) == 43518) { /* 169.254.0.0/16 */
+					is_mapped = 1;
+				}
+			}
+			if (is_mapped || !memcmp(a6, in6addr_any, 16) || !memcmp(a6, in6addr_loopback, 16) || a6[0] == 0xff ||
+			    (a6[0] == 0xfe && (a6[1] & 0xc0) == 0x80) || /* fe80::/10 Link-Local */
+			    (a6[0] & 0xfe) == 0xfc) { /* fc00::/7 Unique-Local */
+				webrtc_pss_log(pss, "Rejecting invalid ICE candidate IPv6 %s\n", ip_str);
+				return 0;
+			}
+		}
 		sa46_sockport(&pss->media->peer_sa46, htons((uint16_t)port));
 		pss->media->has_peer_sa46 = 1;
 
-		/* Send STUN Binding Request to punch hole */
+		/* Send STUN Binding Request to punch hole (spec compliant) */
 		uint8_t stun[2048];
 		uint8_t tid[12];
 
@@ -866,6 +1009,7 @@ handle_candidate(struct pss_webrtc *pss, struct vhd_webrtc *vhd, const char *can
 		}
 
 		lws_get_random(vhd->context, tid, 12);
+		pss->stun_punches++;
 		int n = lws_webrtc_stun_req_pack(pss, stun, sizeof(stun), tid);
 		if (n > 0) {
 			int fd = (int)(lws_intptr_t)lws_get_socket_fd(pss->media->wsi_udp);
@@ -880,22 +1024,6 @@ handle_candidate(struct pss_webrtc *pss, struct vhd_webrtc *vhd, const char *can
 			webrtc_pss_err(pss, "STUN req pack failed: %d\n", n);
 		}
 
-		/* Trigger DTLS Client Hello if we were waiting for peer sin */
-		if (pss->is_client && pss->handshake_started && !pss->media->handshake_done) {
-			uint8_t dummy;
-			lws_gendtls_get_rx(&pss->dtls_ctx, &dummy, 1);
-			uint8_t out[2048];
-			int _tx_len;
-			while ((_tx_len = lws_gendtls_get_tx(&pss->dtls_ctx, out, sizeof(out))) > 0) {
-				int fd = (int)(lws_intptr_t)lws_get_socket_fd(pss->media->wsi_udp);
-				if (fd >= 0) {
-					lwsl_notice("%s: Sending Initial DTLS ClientHello after ICE (%d bytes)\n", __func__, _tx_len);
-					if (sendto((lws_sockfd_type)(lws_intptr_t)fd, (const char *)out, (size_t)_tx_len, 0, (const struct sockaddr *)&pss->media->peer_sa46, pss->media->peer_sa46.sa4.sin_family == AF_INET6 ? (socklen_t)sizeof(pss->media->peer_sa46.sa6) : (socklen_t)sizeof(pss->media->peer_sa46.sa4)) < 0) {
-						webrtc_pss_err(pss, "DTLS ClientHello sendto failed: errno %d\n", errno);
-					}
-				}
-			}
-		}
 
 		return 0;
 	}
@@ -935,7 +1063,7 @@ lws_webrtc_parse_sdp_codecs(struct pss_webrtc *pss, const char *sdp_clean)
 	/* Pass 1: Build H.264 PT Map from rtpmap */
 	char *p_pass1 = (char *)sdp_clean;
 	while (*p_pass1) {
-		char *eol = strchr(p_pass1, '\n');
+		char *eol = (char *)strchr(p_pass1, '\n');
 		size_t line_len = eol ? (size_t)(eol - p_pass1) : strlen(p_pass1);
 		if (line_len > 0 && p_pass1[line_len-1] == '\r') line_len--;
 
@@ -952,9 +1080,9 @@ lws_webrtc_parse_sdp_codecs(struct pss_webrtc *pss, const char *sdp_clean)
 
 				/* Skip "a=rtpmap:" part by finding first integer */
 				int pt = -1;
-				while (lws_tokenize(&ts) != LWS_TOKZE_ENDED) {
+				while (lws_tokenize(&ts) > LWS_TOKZE_ENDED) {
 					if (ts.token_len > 0 && isdigit(ts.token[0])) {
-						pt = atoi(ts.token);
+						pt = webrtc_sdtoi(ts.token, ts.token_len, 127);
 						break; /* Found PT */
 					}
 				}
@@ -976,7 +1104,7 @@ lws_webrtc_parse_sdp_codecs(struct pss_webrtc *pss, const char *sdp_clean)
 
 	/* Pass 2: Main Parsing */
 	while (*p_scan) {
-		char *eol = strchr(p_scan, '\n');
+		char *eol = (char *)strchr(p_scan, '\n');
 		size_t line_len = eol ? (size_t)(eol - p_scan) : strlen(p_scan);
 		if (line_len > 0 && p_scan[line_len-1] == '\r') line_len--;
 
@@ -1005,9 +1133,9 @@ lws_webrtc_parse_sdp_codecs(struct pss_webrtc *pss, const char *sdp_clean)
 
 				/* Skip "a=rtpmap:" part by finding first integer */
 				int pt = -1;
-				while (lws_tokenize(&ts) != LWS_TOKZE_ENDED) {
+				while (lws_tokenize(&ts) > LWS_TOKZE_ENDED) {
 					if (ts.token_len > 0 && isdigit(ts.token[0])) {
-						pt = atoi(ts.token);
+						pt = webrtc_sdtoi(ts.token, ts.token_len, 127);
 						break; /* Found PT */
 					}
 				}
@@ -1017,7 +1145,7 @@ lws_webrtc_parse_sdp_codecs(struct pss_webrtc *pss, const char *sdp_clean)
 					if (lws_tokenize(&ts) == LWS_TOKZE_TOKEN) {
 						if (!strncasecmp(ts.token, "H264/90000", 10)) {
 							/* We found H264. Map already populated in Pass 1. */
-						} else if (!strncasecmp(ts.token, "AV1/90000", 9)) {
+						} else if (0 && !strncasecmp(ts.token, "AV1/90000", 9)) {
 							pss->media->pt_video_av1 = (uint8_t)pt;
 						} else if (!strncasecmp(ts.token, "VP9/90000", 9)) {
 						} else if (!strncasecmp(ts.token, "opus/48000", 10)) {
@@ -1035,9 +1163,9 @@ lws_webrtc_parse_sdp_codecs(struct pss_webrtc *pss, const char *sdp_clean)
 
 				int pt = -1;
 				/* Find PT first */
-				while (lws_tokenize(&ts) != LWS_TOKZE_ENDED) {
+				while (lws_tokenize(&ts) > LWS_TOKZE_ENDED) {
 					if (ts.token_len > 0 && isdigit(ts.token[0])) {
-						pt = atoi(ts.token);
+						pt = webrtc_sdtoi(ts.token, ts.token_len, 127);
 						break;
 					}
 				}
@@ -1046,7 +1174,7 @@ lws_webrtc_parse_sdp_codecs(struct pss_webrtc *pss, const char *sdp_clean)
 					/* Check if this is H264 Mode 1 */
 					if (!pss->media->pt_video_h264) {
 						int is_mode_1 = 0;
-						while (lws_tokenize(&ts) != LWS_TOKZE_ENDED) {
+						while (lws_tokenize(&ts) > LWS_TOKZE_ENDED) {
 							if (ts.token_len == 18 && !strncmp(ts.token, "packetization-mode", 18)) {
 								/* Next token should be = then 1 */
 								if (lws_tokenize(&ts) == LWS_TOKZE_DELIMITER && ts.token[0] == '=') {
@@ -1139,7 +1267,7 @@ handle_answer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, c
 
 	char *p = sdp_clean;
 	while (*p) {
-		char *eol = strchr(p, '\n');
+		char *eol = (char *)strchr(p, '\n');
 		size_t line_len = eol ? (size_t)(eol - p) : strlen(p);
 		if (line_len > 0 && p[line_len-1] == '\r') line_len--;
 
@@ -1178,24 +1306,6 @@ handle_answer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, c
 	lws_webrtc_parse_sdp_codecs(pss, sdp_clean);
 
 	free(sdp_clean);
-
-	/* Trigger DTLS Client Hello */
-	lwsl_notice("%s: Checking DTLS Cond: started %d, done %d, peer %d\n", __func__, pss->handshake_started, pss->media ? pss->media->handshake_done : 0, pss->media ? pss->media->has_peer_sa46 : 0);
-	if (pss->media && pss->media->wsi_udp && pss->handshake_started && !pss->media->handshake_done && pss->media->has_peer_sa46) {
-		int fd = (int)(lws_intptr_t)lws_get_socket_fd(pss->media->wsi_udp);
-		if (fd >= 0) {
-			uint8_t dummy;
-			lws_gendtls_get_rx(&pss->dtls_ctx, &dummy, 1);
-			uint8_t out[2048];
-			int _tx_len;
-			while ((_tx_len = lws_gendtls_get_tx(&pss->dtls_ctx, out, sizeof(out))) > 0) {
-				webrtc_pss_log(pss, "Sending Initial DTLS ClientHello (%d bytes)\n", _tx_len);
-				if (sendto((lws_sockfd_type)(lws_intptr_t)fd, (const char *)out, (size_t)_tx_len, 0, (const struct sockaddr *)&pss->media->peer_sa46, pss->media->peer_sa46.sa4.sin_family == AF_INET6 ? (socklen_t)sizeof(pss->media->peer_sa46.sa6) : (socklen_t)sizeof(pss->media->peer_sa46.sa4)) < 0) {
-					webrtc_pss_err(pss, "Failed to send Initial DTLS ClientHello: errno %d\n", errno);
-				}
-			}
-		}
-	}
 
 	return 0;
 }
@@ -1287,7 +1397,7 @@ handle_offer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, co
 	/* Pass 1: Build H.264 PT Map from rtpmap */
 	char *p_pass1 = sdp_clean;
 	while (*p_pass1) {
-		char *eol = strchr(p_pass1, '\n');
+		char *eol = (char *)strchr(p_pass1, '\n');
 		size_t line_len = eol ? (size_t)(eol - p_pass1) : strlen(p_pass1);
 		if (line_len > 0 && p_pass1[line_len-1] == '\r') line_len--;
 
@@ -1304,9 +1414,9 @@ handle_offer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, co
 
 				/* Skip "a=rtpmap:" part by finding first integer */
 				int pt = -1;
-				while (lws_tokenize(&ts) != LWS_TOKZE_ENDED) {
+				while (lws_tokenize(&ts) > LWS_TOKZE_ENDED) {
 					if (ts.token_len > 0 && isdigit(ts.token[0])) {
-						pt = atoi(ts.token);
+						pt = webrtc_sdtoi(ts.token, ts.token_len, 127);
 						break; /* Found PT */
 					}
 				}
@@ -1328,7 +1438,7 @@ handle_offer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, co
 
 	/* Pass 2: Main Parsing */
 	while (*p_scan) {
-		char *eol = strchr(p_scan, '\n');
+		char *eol = (char *)strchr(p_scan, '\n');
 		size_t line_len = eol ? (size_t)(eol - p_scan) : strlen(p_scan);
 		if (line_len > 0 && p_scan[line_len-1] == '\r') line_len--;
 
@@ -1359,9 +1469,9 @@ handle_offer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, co
 
 				/* Skip "a=rtpmap:" part by finding first integer */
 				int pt = -1;
-				while (lws_tokenize(&ts) != LWS_TOKZE_ENDED) {
+				while (lws_tokenize(&ts) > LWS_TOKZE_ENDED) {
 					if (ts.token_len > 0 && isdigit(ts.token[0])) {
-						pt = atoi(ts.token);
+						pt = webrtc_sdtoi(ts.token, ts.token_len, 127);
 						break; /* Found PT */
 					}
 				}
@@ -1372,7 +1482,7 @@ handle_offer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, co
 						lwsl_warn("  SDP Parsing: PT %d -> Token '%.*s'\n", pt, (int)ts.token_len, ts.token);
 						if (!strncasecmp(ts.token, "H264/90000", 10)) {
 							/* We found H264. Map already populated in Pass 1. */
-						} else if (!strncasecmp(ts.token, "AV1/90000", 9)) {
+						} else if (0 && !strncasecmp(ts.token, "AV1/90000", 9)) {
 							pss->media->pt_video_av1 = (uint8_t)pt;
 							lwsl_info("  Found AV1 PT: %d\n", pt);
 						} else if (!strncasecmp(ts.token, "VP9/90000", 9)) {
@@ -1393,9 +1503,9 @@ handle_offer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, co
 
 				int pt = -1;
 				/* Find PT first */
-				while (lws_tokenize(&ts) != LWS_TOKZE_ENDED) {
+				while (lws_tokenize(&ts) > LWS_TOKZE_ENDED) {
 					if (ts.token_len > 0 && isdigit(ts.token[0])) {
-						pt = atoi(ts.token);
+						pt = webrtc_sdtoi(ts.token, ts.token_len, 127);
 						break;
 					}
 				}
@@ -1404,7 +1514,7 @@ handle_offer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, co
 					/* Check if this is H264 Mode 1 */
 					if (!pss->media->pt_video_h264) {
 						int is_mode_1 = 0;
-						while (lws_tokenize(&ts) != LWS_TOKZE_ENDED) {
+						while (lws_tokenize(&ts) > LWS_TOKZE_ENDED) {
 							if (ts.token_len == 18 && !strncmp(ts.token, "packetization-mode", 18)) {
 								/* Next token should be = then 1 */
 								if (lws_tokenize(&ts) == LWS_TOKZE_DELIMITER && ts.token[0] == '=') {
@@ -1489,7 +1599,7 @@ handle_offer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, co
 		struct lws_gendtls_creation_info ci;
 		memset(&ci, 0, sizeof(ci));
 		ci.context = vhd->context;
-		ci.mode = LWS_GENDTLS_MODE_SERVER;
+		ci.mode = pss->is_client ? LWS_GENDTLS_MODE_CLIENT : LWS_GENDTLS_MODE_SERVER;
 		ci.mtu = 1100;
 		ci.use_srtp = "SRTP_AES128_CM_SHA1_80";
 		if (lws_gendtls_create(&pss->dtls_ctx, &ci)) return -1;
@@ -1497,6 +1607,8 @@ handle_offer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, co
 		lws_gendtls_set_key_mem(&pss->dtls_ctx, vhd->key_mem, vhd->key_len);
 		pss->handshake_started = 1;
 		pss->media->wsi_udp = vhd->wsi_udp;
+		/* poll the handshake, see LWS_CALLBACK_TIMER */
+		lws_set_timer_usecs(pss->wsi_ws, LWS_WEBRTC_DTLS_POLL_US);
 	}
 
 	/* Generate Answer */
@@ -1512,7 +1624,7 @@ handle_offer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, co
 
 		if (rou->src.sa4.sin_family == AF_INET && rou->source_ads) {
 			lws_sa46_write_numeric_address(&rou->src, ads, sizeof(ads));
-			if (strcmp(ads, "127.0.0.1") && !strstr(candidates, ads)) {
+			if (strcmp(ads, "127.0.0.1") && !(char *)strstr(candidates, ads)) {
 				lws_snprintf(candidates + strlen(candidates),
 						sizeof(candidates) - strlen(candidates),
 						"a=candidate:%d 1 udp %u %s %u typ host generation 0\\r\\n",
@@ -1522,7 +1634,7 @@ handle_offer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, co
 	} lws_end_foreach_dll(d);
 #endif
 
-	if (vhd->external_ip[0] && !strstr(candidates, vhd->external_ip)) {
+	if (vhd->external_ip[0] && !(char *)strstr(candidates, vhd->external_ip)) {
 		lws_snprintf(candidates + strlen(candidates),
 				sizeof(candidates) - strlen(candidates),
 				"a=candidate:%d 1 udp %u %s %u typ host generation 0\\r\\n",
@@ -1539,7 +1651,7 @@ handle_offer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, co
 			else if (ss.ss_family == AF_INET6)
 				inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&ss)->sin6_addr, local_ip, sizeof(local_ip));
 		}
-		if (!strstr(candidates, local_ip)) {
+		if (!(char *)strstr(candidates, local_ip)) {
 			lws_snprintf(candidates + strlen(candidates),
 					sizeof(candidates) - strlen(candidates),
 					"a=candidate:%d 1 udp %u %s %u typ host generation 0\\r\\n",
@@ -1596,7 +1708,7 @@ handle_offer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, co
 			"a=ice-ufrag:%s\\r\\n"
 			"a=ice-pwd:%s\\r\\n"
 			"a=fingerprint:sha-256 %s\\r\\n"
-			"a=setup:passive\\r\\n"
+			"a=setup:%s\\r\\n"
 			"a=mid:%s\\r\\n"
 			"a=sendrecv\\r\\n"
 			"a=msid:lws-stream lws-track-video\\r\\n"
@@ -1609,6 +1721,7 @@ handle_offer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, co
 			"a=end-of-candidates\\r\\n",
 		vhd->udp_port, pt_list[0] ? pt_list : "0", vhd->external_ip[0] ? vhd->external_ip : "127.0.0.1",
 		pss->ice_ufrag, pss->ice_pwd, vhd->fingerprint,
+		pss->is_client ? "active" : "passive",
 		mid_video,
 		rtpmap_lines,
 		pss->media->ssrc_video, pss->media->ssrc_video, candidates);
@@ -1628,7 +1741,7 @@ handle_offer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, co
 			"a=ice-ufrag:%s\\r\\n"
 			"a=ice-pwd:%s\\r\\n"
 			"a=fingerprint:sha-256 %s\\r\\n"
-			"a=setup:passive\\r\\n"
+			"a=setup:%s\\r\\n"
 			"a=mid:%s\\r\\n"
 			"a=sendrecv\\r\\n"
 			"a=msid:lws-stream lws-track-audio\\r\\n"
@@ -1639,6 +1752,7 @@ handle_offer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, co
 			"%s"
 			"a=end-of-candidates\\r\\n",
 			vhd->udp_port, pss->media->pt_audio, vhd->external_ip[0] ? vhd->external_ip : "127.0.0.1", pss->ice_ufrag, pss->ice_pwd, vhd->fingerprint,
+			pss->is_client ? "active" : "passive",
 			mid_audio, pss->media->pt_audio,
 			fmtp_audio,
 			pss->media->ssrc_audio, pss->media->ssrc_audio, candidates);
@@ -1666,10 +1780,13 @@ handle_offer(struct lws *wsi, struct pss_webrtc *pss, struct vhd_webrtc *vhd, co
 			audio_first ? mid_audio : mid_video, audio_first ? mid_video : mid_audio,
 			audio_first ? audio_m : video_m, audio_first ? video_m : audio_m);
 
+	static const char sdp_a_s[] = "\n--- START SDP ANSWER ---\n",
+			  sdp_a_e[] = "\n--- END SDP ANSWER ---\n\n";
+
 	webrtc_pss_log(pss, "Generated SDP ANSWER (%zu bytes)\n%s\n", n_sdp, p);
-	if (write(2, "\n--- START SDP ANSWER ---\n", 26) < 0 ||
+	if (write(2, sdp_a_s, sizeof(sdp_a_s) - 1) < 0 ||
 	    write(2, p, n_sdp) < 0 ||
-	    write(2, "\n--- END SDP ANSWER ---\n\n", 25) < 0) {
+	    write(2, sdp_a_e, sizeof(sdp_a_e) - 1) < 0) {
 		webrtc_pss_err(pss, "Failed writing SDP answer to log\n");
 		free(json_out);
 		return -1;
@@ -1708,6 +1825,8 @@ lws_shared_webrtc_callback(struct lws *wsi, enum lws_callback_reasons reason,
 
 	switch (reason) {
 		case LWS_CALLBACK_PROTOCOL_INIT:
+			if (lws_cmdline_option_cx(lws_get_context(wsi), "--lws-stub"))
+				return 0;
 			/* VHD is managed by the application extension now */
 
 			if (!vhd->context) vhd->context = lws_get_context(wsi);
@@ -1761,9 +1880,14 @@ lws_shared_webrtc_callback(struct lws *wsi, enum lws_callback_reasons reason,
 
 			lwsl_notice("%s: Generating self-signed certificate (this may take a few seconds)...\n", __func__);
 			lws_usec_t t1 = lws_now_usecs();
-			if (lws_x509_create_self_signed(vhd->context, &vhd->cert_mem, &vhd->cert_len,
-						&vhd->key_mem, &vhd->key_len,
-						vhd->external_ip, 2048)) {
+			struct lws_x509_cert_gen_info cert_info;
+			memset(&cert_info, 0, sizeof(cert_info));
+			cert_info.san = vhd->external_ip[0] ? vhd->external_ip : "localhost";
+			cert_info.curve_name = "P-256";
+			cert_info.is_server = 1;
+
+			if (lws_x509_create_cert(vhd->context, &vhd->cert_mem, &vhd->cert_len,
+						&vhd->key_mem, &vhd->key_len, &cert_info)) {
 				lwsl_err("%s: Cert generation failed\n", __func__);
 				return -1;
 			}
@@ -1781,8 +1905,7 @@ lws_shared_webrtc_callback(struct lws *wsi, enum lws_callback_reasons reason,
 			}
 
 			vhd->wsi_udp = lws_create_adopt_udp(vhd->vhost,
-					vhd->external_ip[0] ? vhd->external_ip : NULL,
-					vhd->udp_port, LWS_CAUDP_BIND,
+					"0.0.0.0", vhd->udp_port, LWS_CAUDP_BIND,
 					"lws-webrtc-udp", NULL, NULL, NULL, NULL, NULL);
 			if (!vhd->wsi_udp) {
 				lwsl_err("%s: UDP socket creation failed\n", __func__);
@@ -1819,8 +1942,6 @@ lws_shared_webrtc_callback(struct lws *wsi, enum lws_callback_reasons reason,
 #endif
 			}
 			pss->media->wsi_udp = vhd->wsi_udp; /* Critical: Session needs UDP handle */
-			if (reason == LWS_CALLBACK_CLIENT_ESTABLISHED)
-				pss->is_client = 1;
 			lws_dll2_clear(&pss->list);
 			lws_dll2_add_tail(&pss->list, &vhd->sessions);
 			pss->media->ssrc_video = (uint32_t)lws_now_usecs();
@@ -1834,9 +1955,15 @@ lws_shared_webrtc_callback(struct lws *wsi, enum lws_callback_reasons reason,
 				char *pp = pss->ice_pwd;
 				int n;
 
-				lws_get_random(vhd->context, rand, 4);
-				lws_snprintf(pss->ice_ufrag, sizeof(pss->ice_ufrag),
-						"%02X%02X%02X%02X", rand[0], rand[1], rand[2], rand[3]);
+			lws_get_random(vhd->context, rand, 16);
+			/* Q-21: 128 bits of entropy (was 32) per RFC 8445 §5.3 */
+			lws_snprintf(pss->ice_ufrag, sizeof(pss->ice_ufrag),
+				"%02X%02X%02X%02X%02X%02X%02X%02X"
+				"%02X%02X%02X%02X%02X%02X%02X%02X",
+				rand[0], rand[1], rand[2], rand[3],
+				rand[4], rand[5], rand[6], rand[7],
+				rand[8], rand[9], rand[10], rand[11],
+				rand[12], rand[13], rand[14], rand[15]);
 
 				lws_get_random(vhd->context, rand, 16);
 				for (n = 0; n < 16; n++)
@@ -1875,6 +2002,25 @@ lws_shared_webrtc_callback(struct lws *wsi, enum lws_callback_reasons reason,
 
 		case LWS_CALLBACK_HTTP_FILE_COMPLETION:
 			// return -1; /* falling through to close transaction inside dummy cb leads to delays */
+			break;
+
+		case LWS_CALLBACK_TIMER:
+			/*
+			 * DTLS is otherwise only driven by datagrams the peer
+			 * sends us, so poll it until the handshake is settled:
+			 * that is what makes flight retransmission and the
+			 * handshake deadline actually happen.
+			 */
+			if (!pss->handshake_started || !pss->media ||
+			    pss->media->handshake_done)
+				break;
+
+			if (webrtc_dtls_service(pss)) {
+				webrtc_dtls_fail(pss, "handshake timed out or failed");
+				break;
+			}
+
+			lws_set_timer_usecs(wsi, LWS_WEBRTC_DTLS_POLL_US);
 			break;
 
 		case LWS_CALLBACK_CLIENT_WRITEABLE:
@@ -1925,6 +2071,8 @@ lws_shared_webrtc_callback(struct lws *wsi, enum lws_callback_reasons reason,
 				break;
 			}
 
+		/* CLIENT_CLOSED too: CLIENT_ESTABLISHED allocates the same things */
+		case LWS_CALLBACK_CLIENT_CLOSED:
 		case LWS_CALLBACK_CLOSED:
 			lwsl_notice("%s: LWS_CALLBACK_CLOSED\n", __func__);
 			if (pss->connection_log) {
@@ -1938,6 +2086,24 @@ lws_shared_webrtc_callback(struct lws *wsi, enum lws_callback_reasons reason,
 				pss->handshake_started = 0;
 			}
 			lws_buflist_destroy_all_segments(&pss->buflist);
+			/*
+			 * Drop the reference the pss took at ESTABLISHED.  pss
+			 * is about to be freed by lws and was the only owner in
+			 * the common case, so without this every ws connect /
+			 * disconnect cycle leaked the media object, its pacer
+			 * and the pacer's thread (8MB of stack reservation
+			 * each), which any unauthenticated client can cycle.
+			 *
+			 * Clear wsi_udp first: the pacer thread dereferences it
+			 * for each queued segment, and lws_txp_destroy() (via
+			 * lws_webrtc_media_unref()) only joins the thread after
+			 * this point.
+			 */
+			if (pss->media) {
+				pss->media->wsi_udp = NULL;
+				pss->media->has_peer_sa46 = 0;
+				lws_webrtc_media_unref(&pss->media);
+			}
 			break;
 
 		case LWS_CALLBACK_PROTOCOL_DESTROY:
@@ -1953,27 +2119,150 @@ lws_shared_webrtc_callback(struct lws *wsi, enum lws_callback_reasons reason,
 	return lws_callback_http_dummy(wsi, reason, user, in, len);
 }
 
-/* Helper: Find session by peer address */
-	static struct pss_webrtc *
-webrtc_find_session(struct vhd_webrtc *vhd, const struct sockaddr_in *sin)
+/* Helper: network-order port out of either family of an lws_sockaddr46 */
+	static uint16_t
+webrtc_sa46_port(const lws_sockaddr46 *sa46)
 {
-	lws_start_foreach_dll(struct lws_dll2 *, d, vhd->sessions.head) {
+#if defined(LWS_WITH_IPV6)
+	if (sa46->sa4.sin_family == AF_INET6)
+		return sa46->sa6.sin6_port;
+#endif
+	return sa46->sa4.sin_port;
+}
+
+/*
+ * Helper: Find session by peer address
+ *
+ * Compare the whole address, not just its low 32 bits: for a real (not
+ * v4-mapped) v6 peer those bits live in the interface identifier, so anyone
+ * on the victim's /64 could collide with his session and, since the DTLS
+ * path is reached on this match alone, inject records into his handshake.
+ * lws_sa46_compare_ads() normalizes v4 against v4-mapped v6 and also
+ * requires the families to agree.
+ */
+	static struct pss_webrtc *
+webrtc_find_session(struct vhd_webrtc *vhd, const lws_sockaddr46 *sa46)
+{
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&vhd->sessions)) {
 		struct pss_webrtc *s = lws_container_of(d, struct pss_webrtc, list);
-		if (s->media && s->media->has_peer_sa46) {
-			uint32_t stored_a = 0;
-			uint16_t stored_p = 0;
-			if (s->media->peer_sa46.sa4.sin_family == AF_INET) {
-				stored_a = s->media->peer_sa46.sa4.sin_addr.s_addr;
-				stored_p = s->media->peer_sa46.sa4.sin_port;
-			} else {
-				memcpy(&stored_a, &s->media->peer_sa46.sa6.sin6_addr.s6_addr[12], 4);
-				stored_p = s->media->peer_sa46.sa6.sin6_port;
-			}
-			if (stored_a == sin->sin_addr.s_addr && stored_p == sin->sin_port)
-				return s;
-		}
+
+		if (s->media && s->media->has_peer_sa46 &&
+		    webrtc_sa46_port(&s->media->peer_sa46) ==
+						webrtc_sa46_port(sa46) &&
+		    !lws_sa46_compare_ads(&s->media->peer_sa46, sa46))
+			return s;
 	} lws_end_foreach_dll(d);
 	return NULL;
+}
+
+/*
+ * Helper: put whatever the DTLS state machine produced on the wire, to the
+ * peer media address that ICE already validated.
+ *
+ * Returns 0, or -1 if the handshake must be abandoned.
+ */
+	static int
+webrtc_dtls_flush_tx(struct pss_webrtc *pss)
+{
+	uint8_t out[2048];
+	lws_sockfd_type fd;
+	socklen_t slen;
+	int n;
+
+	if (!pss->handshake_started || !pss->media || !pss->media->wsi_udp ||
+	    !pss->media->has_peer_sa46)
+		return 0;
+
+	fd = lws_get_socket_fd(pss->media->wsi_udp);
+	if (fd == LWS_SOCK_INVALID)
+		return 0;
+
+	slen = pss->media->peer_sa46.sa4.sin_family == AF_INET6 ?
+			(socklen_t)sizeof(pss->media->peer_sa46.sa6) :
+			(socklen_t)sizeof(pss->media->peer_sa46.sa4);
+
+	while ((n = lws_gendtls_get_tx(&pss->dtls_ctx, out, sizeof(out))) > 0) {
+		/*
+		 * debug, not notice: the peer chooses how many of these there
+		 * are, so at notice it is remote log volume on demand.
+		 */
+		lwsl_debug("%s: sending DTLS (%d bytes)\n", __func__, n);
+
+		if (sendto(fd, (const char *)out, (size_t)n, 0,
+			   (const struct sockaddr *)&pss->media->peer_sa46,
+			   slen) < 0)
+			webrtc_pss_err(pss, "DTLS sendto failed: errno %d\n",
+				       errno);
+	}
+
+	return n < 0 ? -1 : 0;
+}
+
+/*
+ * Helper: drive the DTLS state machine, ie, consume anything it decrypted
+ * (including the handshake flights) and send anything it wants to send.
+ *
+ * Returns 0, or -1 if the DTLS session is over: before the handshake
+ * completed that is a failed handshake, after it the peer's close_notify or
+ * a fatal error.  Either way the ctx must not be fed any more.
+ */
+	static int
+webrtc_dtls_service(struct pss_webrtc *pss)
+{
+	uint8_t rx[2048];
+	int n;
+
+	if (!pss->handshake_started || !pss->media)
+		return 0;
+
+	while ((n = lws_gendtls_get_rx(&pss->dtls_ctx, rx, sizeof(rx))) > 0)
+		;
+
+	if (n < 0)
+		return -1;
+
+	return webrtc_dtls_flush_tx(pss);
+}
+
+/*
+ * Helper: drop the DTLS ctx and stop the session being reachable at its
+ * media address.  Nothing afterwards accepts DTLS or media for it until a
+ * fresh offer / answer starts a new handshake.
+ */
+	static void
+webrtc_dtls_end(struct pss_webrtc *pss)
+{
+	if (pss->handshake_started) {
+		lws_gendtls_destroy(&pss->dtls_ctx);
+		pss->handshake_started = 0;
+	}
+
+	if (pss->media) {
+		pss->media->handshake_done = 0;
+		pss->media->has_peer_sa46 = 0;
+	}
+
+	if (pss->wsi_ws)
+		lws_set_timer_usecs(pss->wsi_ws, LWS_SET_TIMER_USEC_CANCEL);
+}
+
+/*
+ * Helper: the DTLS handshake cannot complete (fatal error, or the deadline
+ * passed, or the peer certificate did not match the signalled fingerprint).
+ *
+ * Drop the DTLS ctx and take the session down with it: leaving it half-open
+ * pins the ctx and the media object until the ws session happens to close,
+ * and keeps the session reachable at its media address meanwhile.
+ */
+	static void
+webrtc_dtls_fail(struct pss_webrtc *pss, const char *reason)
+{
+	webrtc_pss_err(pss, "DTLS: %s, closing session\n", reason);
+
+	webrtc_dtls_end(pss);
+
+	if (pss->wsi_ws)
+		lws_wsi_close(pss->wsi_ws, LWS_TO_KILL_ASYNC);
 }
 
 /* Helper: Handle STUN packets */
@@ -1983,9 +2272,15 @@ webrtc_handle_stun(struct lws *wsi, struct vhd_webrtc *vhd, struct pss_webrtc **
 {
 	struct pss_webrtc *pss = *ppss;
 	uint8_t *p = (uint8_t *)in;
-	uint16_t type = (uint16_t)((p[0] << 8) | p[1]);
+	uint16_t type;
 	char ads[64];
 	const struct lws_udp *udp_desc = lws_get_udp(wsi);
+
+	/* the demux only checked len > 0; a STUN header is 20 bytes */
+	if (len < 20)
+		return 0;
+
+	type = (uint16_t)((p[0] << 8) | p[1]);
 
 	lws_sa46_write_numeric_address((lws_sockaddr46 *)sin, ads, sizeof(ads));
 
@@ -2000,15 +2295,23 @@ webrtc_handle_stun(struct lws *wsi, struct vhd_webrtc *vhd, struct pss_webrtc **
 	/* If we don't know the PSS yet (NAT), try to find it via USERNAME */
 	int found_username = 0;
 	if (!pss) {
+		/*
+		 * C-089: bound the walk by the declared STUN message length, not
+		 * by whatever the datagram happened to carry after it.
+		 */
+		size_t i = 20, slen = 20 + (size_t)((p[2] << 8) | p[3]);
+
+		if (slen > len)
+			slen = len;
+
 		/* Parse attributes to find USERNAME */
-		size_t i = 20;
-		while (i + 4 <= len) {
+		while (i + 4 <= slen) {
 			uint16_t attr_type = (uint16_t)((p[i] << 8) | p[i + 1]);
 			uint16_t attr_len = (uint16_t)((p[i + 2] << 8) | p[i + 3]);
 
 			if (attr_type == LWS_STUN_ATTR_USERNAME) { /* USERNAME */
 				found_username = 1;
-				if (i + 4 + attr_len > len)
+				if (i + 4 + attr_len > slen)
 					break;
 
 				char username[128];
@@ -2019,27 +2322,32 @@ webrtc_handle_stun(struct lws *wsi, struct vhd_webrtc *vhd, struct pss_webrtc **
 				username[attr_len] = '\0';
 
 				/* Format is DestUfrag:SrcUfrag */
-				char *colon = strchr(username, ':');
+				char *colon = (char *)strchr(username, ':');
 				if (colon) {
 					*colon = '\0';
 					const char *u_dest = username; // Server Ufrag (Ours)
 					const char *u_src = colon + 1; // Client Ufrag (Theirs)
 
-					lws_start_foreach_dll(struct lws_dll2 *, d, vhd->sessions.head) {
+					lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&vhd->sessions)) {
 						struct pss_webrtc *s = lws_container_of(d, struct pss_webrtc, list);
-						// Match first part against our ufrag
+						/*
+						 * Match the first part against our ufrag.
+						 * The ufrag is public (it is in the SDP and in
+						 * cleartext in every check the real peer sends),
+						 * so a match here only selects which credential
+						 * to validate against.  It must NOT move the
+						 * session's peer address: doing that before
+						 * MESSAGE-INTEGRITY passed let any off-path
+						 * sender who knows the ufrag steer the whole
+						 * outbound media flow at a victim.  The address
+						 * is committed below, only once
+						 * lws_stun_validate_and_reply() succeeded.
+						 */
 						if (!strcmp(s->ice_ufrag, u_dest)) {
 							pss = s;
 							webrtc_pss_log(pss, "Mapped ICE identity to Peer IP '%s:%s'\n", u_dest, u_src);
-							if (pss->media) {
-								/* Save original sa46 for outbound sendto */
-								pss->media->peer_sa46 = udp_desc->sa46;
-								pss->media->has_peer_sa46 = 1;
-							}
 							*ppss = s;
 							break;
-						} else {
-							webrtc_pss_log(s, "STUN Mapping Miss: packet ufrag '%s' != our ufrag '%s'\n", u_dest, s->ice_ufrag);
 						}
 					} lws_end_foreach_dll(d);
 				}
@@ -2050,31 +2358,56 @@ webrtc_handle_stun(struct lws *wsi, struct vhd_webrtc *vhd, struct pss_webrtc **
 		}
 
 		if (!pss) {
-			lws_start_foreach_dll(struct lws_dll2 *, d, vhd->sessions.head) {
-				struct pss_webrtc *s = lws_container_of(d, struct pss_webrtc, list);
-				webrtc_pss_log(s, "Received STUN packet that could not be mapped (found_username=%d)\n", found_username);
-			} lws_end_foreach_dll(d);
+			/*
+			 * Unauthenticated senders reach here.  Log it once at
+			 * debug: fanning it out over every live session cost
+			 * O(datagrams * sessions) log lines and 64KB-bounded
+			 * memmoves into each session's log, on attacker demand.
+			 */
+			lwsl_debug("%s: unmappable STUN packet (found_username=%d)\n",
+				   __func__, found_username);
 			return 0;
 		}
 	}
 
 	// lwsl_notice("%s: Incoming STUN Request from %s:%u session %p\n", __func__, ads, ntohs(sin->sin_port), pss);
 	uint8_t out[512];
-	int n_stun = lws_stun_validate_and_reply(wsi, (uint8_t *)in, len, out, sizeof(out), pss->ice_pwd, sin);
+	int n_stun = lws_stun_validate_and_reply(wsi, (uint8_t *)in, len, out, sizeof(out), pss->ice_pwd, pss->ice_ufrag, sin);
 	if (n_stun > 0) {
 		if (udp_desc) {
+			if (pss->media) {
+				pss->media->peer_sa46 = udp_desc->sa46;
+				pss->media->has_peer_sa46 = 1;
+				pss->media->peer_stun_received = 1;
+			}
+
 			int fd = (int)(lws_intptr_t)lws_get_socket_fd(wsi);
 			if (fd >= 0) {
 				socklen_t slen = udp_desc->sa46.sa4.sin_family == AF_INET6 ? (socklen_t)sizeof(udp_desc->sa46.sa6) : (socklen_t)sizeof(udp_desc->sa46.sa4);
-				// webrtc_pss_log(pss, "Sent STUN Response (%d bytes) successfully.\n", n_stun);
+				lwsl_debug(">>> STUN RESPONSE (%d bytes) TO %s:%u <<<\n", n_stun, ads, ntohs(sin->sin_port));
+				lwsl_hexdump_debug(out, (size_t)n_stun);
+				webrtc_pss_log(pss, "Sent STUN Response (%d bytes) successfully.\n", n_stun);
 				ssize_t sent = sendto((lws_sockfd_type)(lws_intptr_t)fd, (const char *)out, (size_t)n_stun, 0, (const struct sockaddr *)&udp_desc->sa46, slen);
 				if (sent < 0) {
 					webrtc_pss_err(pss, "STUN sendto failed: errno %d\n", errno);
 				} else if (sent != n_stun) {
 					webrtc_pss_err(pss, "STUN sendto partial %ld of %d\n", (long)sent, n_stun);
 				}
+
+				/*
+				 * Trigger DTLS Client Hello now that we have proven connectivity
+				 * via a successful STUN Request/Response cycle.
+				 */
+				if (pss->is_client && pss->handshake_started &&
+				    pss->media && !pss->media->handshake_done &&
+				    webrtc_dtls_service(pss)) {
+					webrtc_dtls_fail(pss, "failed to start handshake");
+
+					return 0;
+				}
 			}
 		}
+
 	} else {
 		webrtc_pss_err(pss, "STUN validation failed (bad credentials or format)\n");
 	}
@@ -2084,32 +2417,122 @@ webrtc_handle_stun(struct lws *wsi, struct vhd_webrtc *vhd, struct pss_webrtc **
 
 /* Helper: Handle DTLS packets */
 	static int
-webrtc_handle_dtls(struct lws *wsi, struct pss_webrtc *pss, const struct sockaddr_in *sin,
-		uint8_t *in, size_t len)
+webrtc_handle_dtls(struct pss_webrtc *pss, uint8_t *in, size_t len)
 {
 	if (!pss || !pss->handshake_started || !pss->media)
 		return 0;
 
-	webrtc_pss_log(pss, "Incoming DTLS packet (%zu bytes)\n", len);
+	/*
+	 * debug, not notice: this is every DTLS datagram from a peer who
+	 * chooses how many he sends, ie, remote log volume on demand.
+	 */
+	lwsl_debug("%s: incoming DTLS packet (%zu bytes)\n", __func__, len);
 
 	if (lws_gendtls_put_rx(&pss->dtls_ctx, (uint8_t *)in, len) == 0) {
-		/* Drive state machine by reading */
-		uint8_t rx_dump[2048];
-		while (lws_gendtls_get_rx(&pss->dtls_ctx, rx_dump, sizeof(rx_dump)) > 0);
-		/* Check if we need to send anything */
-		uint8_t out[2048];
-		int _tx_len;
-		int _fd = (int)(lws_intptr_t)lws_get_socket_fd(wsi);
-		while ((_tx_len = lws_gendtls_get_tx(&pss->dtls_ctx, out, sizeof(out))) > 0) {
-			lwsl_notice("%s: Sending DTLS Reply (%d bytes)\n", __func__, _tx_len);
-			if (_fd >= 0) {
-				if (sendto((lws_sockfd_type)(lws_intptr_t)_fd, (const char *)out, (size_t)_tx_len, 0, (const struct sockaddr *)sin, sizeof(*sin)) < 0) {
-					webrtc_pss_err(pss, "DTLS reply sendto failed: errno %d\n", errno);
-				}
+		/* drive the state machine and flush whatever it produced */
+		if (webrtc_dtls_service(pss)) {
+			if (!pss->media->handshake_done) {
+				webrtc_dtls_fail(pss, "handshake failed");
+
+				return -1;
 			}
+
+			/*
+			 * An established session ended, normally by the
+			 * peer's close_notify.  Once that is read the DTLS
+			 * stack consumes nothing more, so keeping the ctx
+			 * would only accumulate whatever still arrives from
+			 * that address; the media is over, drop it.  The ws
+			 * session stays up, a fresh offer / answer on it
+			 * starts a new handshake.
+			 *
+			 * info, not notice: the peer decides when this happens.
+			 */
+			lwsl_info("%s: DTLS session ended by peer or failed\n",
+				  __func__);
+			webrtc_dtls_end(pss);
+
+			return 0;
 		}
 
 		if (!pss->media->handshake_done && lws_gendtls_handshake_done(&pss->dtls_ctx)) {
+			/*
+			 * F-108: verify the peer certificate against the
+			 * a=fingerprint that came in on the signalling
+			 * channel.
+			 *
+			 * The DTLS chain is self-signed and deliberately not
+			 * validated (RFC 8827), so this comparison is the only
+			 * thing authenticating the peer before we export the
+			 * media keys.  Every backend must therefore either
+			 * perform it, or refuse the session.
+			 */
+			uint8_t md[32];
+			unsigned int i;
+			int have_md = 0, verified = 0;
+#if defined(LWS_WITH_MBEDTLS)
+			{
+				const mbedtls_x509_crt *cert =
+					mbedtls_ssl_get_peer_cert(&pss->dtls_ctx.ssl);
+
+				if (cert && !mbedtls_md(mbedtls_md_info_from_type(
+							MBEDTLS_MD_SHA256),
+							cert->raw.p, cert->raw.len, md))
+					have_md = 1;
+			}
+#elif defined(LWS_WITH_GNUTLS)
+			{
+				const gnutls_datum_t *cd;
+				unsigned int nc = 0;
+				size_t ml = sizeof(md);
+
+				cd = gnutls_certificate_get_peers(pss->dtls_ctx.session, &nc);
+				if (cd && nc &&
+				    !gnutls_fingerprint(GNUTLS_DIG_SHA256, &cd[0], md, &ml) &&
+				    ml == sizeof(md))
+					have_md = 1;
+			}
+#elif defined(LWS_WITH_SCHANNEL) || defined(LWS_WITH_OPENHITLS)
+			/*
+			 * No peer-certificate accessor for this backend yet:
+			 * fail closed.  Accepting here would hand the media
+			 * keys to whoever completed the handshake, ie, to
+			 * anybody at all.
+			 */
+			lwsl_err("%s: DTLS fingerprint check not implemented "
+				 "on this tls backend\n", __func__);
+#else /* OpenSSL */
+			{
+				X509 *cert = SSL_get_peer_certificate((SSL *)pss->dtls_ctx.ssl);
+				unsigned int ml = 0;
+
+				if (cert) {
+					if (X509_digest(cert, EVP_sha256(), md, &ml) &&
+					    ml == sizeof(md))
+						have_md = 1;
+					X509_free(cert);
+				}
+			}
+#endif
+			if (have_md) {
+				char computed[(sizeof(md) * 3) + 1];
+
+				for (i = 0; i < sizeof(md); i++)
+					lws_snprintf(computed + (i * 3), 4, "%02X%c",
+						     md[i], i == sizeof(md) - 1 ? '\0' : ':');
+
+				verified = pss->fingerprint_remote[0] != '\0' &&
+					   strlen(pss->fingerprint_remote) == 95 &&
+					   !lws_timingsafe_bcmp(computed,
+						   pss->fingerprint_remote, 95);
+			}
+
+			if (!verified) {
+				webrtc_dtls_fail(pss, "peer fingerprint mismatch");
+
+				return -1;
+			}
+
 			pss->media->handshake_done = 1;
 			webrtc_pss_log(pss, "DTLS Handshake DONE! Cipher: %s\n", lws_gendtls_get_srtp_profile(&pss->dtls_ctx));
 
@@ -2142,7 +2565,13 @@ webrtc_handle_dtls(struct lws *wsi, struct pss_webrtc *pss, const struct sockadd
 			}
 		}
 	} else {
-		lwsl_err("%s: lws_gendtls_put_rx failed\n", __func__);
+		/*
+		 * Dropped, as the network might have: the backend is full or
+		 * the session is over.  debug, not err: the peer chooses how
+		 * many of these there are.
+		 */
+		lwsl_debug("%s: lws_gendtls_put_rx dropped datagram\n",
+			   __func__);
 		pss->media->telemetry.dtls_errors++;
 	}
 
@@ -2158,7 +2587,7 @@ webrtc_handle_rtp_rtcp(struct lws *wsi, struct vhd_webrtc *vhd, struct pss_webrt
 	uint8_t *p = (uint8_t *)in;
 
 	if (!pss || !pss->media || !pss->media->handshake_done) return 0;
-
+	if (len < 2) return 0;
 	uint8_t pt_raw = p[1];
 
 	/*
@@ -2354,6 +2783,12 @@ lws_shared_webrtc_udp_callback(struct lws *wsi, enum lws_callback_reasons reason
 
 		case LWS_CALLBACK_RAW_RX:
 			if (!vhd || !udp_desc) return 0;
+			/*
+			 * debug, not notice: this is every media datagram, and
+			 * anyone can send them.  At notice it is a remote
+			 * log-flood / event-loop stall on demand.
+			 */
+			lwsl_debug("%s: UDP packet received on port %u (len %zu)\n", __func__, vhd->udp_port, len);
 
 			/* Create pure IPv4 mapping for logic checks */
 			struct sockaddr_in pure_sin;
@@ -2371,8 +2806,13 @@ lws_shared_webrtc_udp_callback(struct lws *wsi, enum lws_callback_reasons reason
 
 			const struct sockaddr_in *sin = &pure_sin;
 
-			/* Find session by address */
-			pss = webrtc_find_session(vhd, sin);
+			/*
+			 * Find session by address: on the full sa46, since the
+			 * flattened pure_sin above discards 96 bits of a v6 peer
+			 * (it exists only because the STUN validator's API takes
+			 * a struct sockaddr_in).
+			 */
+			pss = webrtc_find_session(vhd, &udp_desc->sa46);
 
 			if (len > 0) {
 				uint8_t *p = (uint8_t *)in;
@@ -2384,7 +2824,7 @@ lws_shared_webrtc_udp_callback(struct lws *wsi, enum lws_callback_reasons reason
 				}
 				/* DTLS: 20-63 */
 				else if (b0 >= 20 && b0 <= 63) {
-					webrtc_handle_dtls(wsi, pss, sin, (uint8_t *)in, len);
+					webrtc_handle_dtls(pss, (uint8_t *)in, len);
 				}
 				/* RTP/RTCP: 128-191 */
 				else if (b0 >= 128 && b0 <= 191) {
@@ -2407,7 +2847,8 @@ callback_webrtc_udp(struct lws *wsi, enum lws_callback_reasons reason,
 	if (reason == LWS_CALLBACK_PROTOCOL_INIT) {
 		const struct lws_protocols *p;
 
-		// lwsl_vhost_notice(lws_get_vhost(wsi), "plugin 'lws-webrtc-udp' PROTOCOL_INIT\n");
+		if (!in)
+			return 0;
 
 		vhd = lws_protocol_vh_priv_zalloc(lws_get_vhost(wsi), lws_get_protocol(wsi), sizeof(struct vhd_webrtc_udp));
 		if (!vhd)
@@ -2437,7 +2878,7 @@ callback_webrtc(struct lws *wsi, enum lws_callback_reasons reason,
 	if (reason == LWS_CALLBACK_PROTOCOL_INIT) {
 
 		if (!in)
-			return -1;
+			return 0;
 
 		lwsl_vhost_notice(lws_get_vhost(wsi), "plugin 'lws-webrtc' PROTOCOL_INIT\n");
 

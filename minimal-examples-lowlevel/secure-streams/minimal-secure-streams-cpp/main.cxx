@@ -15,6 +15,7 @@
 #include <signal.h>
 
 static int interrupted, bad = 1, concurrent = 1, completed;
+static const char *url_base = "https://warmcat.com";
 
 static int
 lss_completion(lss *lss, lws_ss_constate_t state, void *arg)
@@ -56,13 +57,18 @@ int main(int argc, const char **argv)
 	if ((p = lws_cmdline_option(argc, argv, "-c")))
 		concurrent = atoi(p);
 
+	/* if given, -u overrides the base url we fetch test files from, so
+	 * the same binary can be pointed at a local test server */
+	if ((p = lws_cmdline_option(argc, argv, "-u")))
+		url_base = p;
+
 	if (concurrent > 12)
 		concurrent = 12;
 
 	lwsl_user("LWS secure streams cpp test client "
-			"[-d<verb>] [-c<concurrent>]\n");
+			"[-d<verb>] [-c<concurrent>] [-u<url-base>]\n");
 
-	info.fd_limit_per_thread = 1 + 12 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 12;
 	info.port = CONTEXT_PORT_NO_LISTEN;
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 
@@ -79,12 +85,13 @@ int main(int argc, const char **argv)
 		for (int n = 0; n < concurrent; n++) {
 			std::string url, filepath;
 
-			url = "https://warmcat.com/test-";
-			url += ('a' + n);
+			url = url_base;
+			url += "/test-";
+			url += (char)('a' + n);
 			url += ".bin";
 
-			filepath = "/tmp/test-";
-			filepath += ('a' + n);
+			filepath = "/tmp/test-"; // NOSONAR
+			filepath += (char)('a' + n);
 			filepath += ".bin";
 
 			new lssFile(context, url, filepath, lss_completion, 0);

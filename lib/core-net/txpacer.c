@@ -25,6 +25,7 @@
 #include "private-lib-core.h"
 
 #if defined(LWS_HAVE_PTHREAD_H)
+#if !defined(LWS_PLAT_OPTEE) && !defined(LWS_PLAT_BAREMETAL) && !defined(LWS_PLAT_FREERTOS)
 
 struct lws_txp {
 	lws_txp_info_t		txp_info;
@@ -92,8 +93,11 @@ lws_txpacer_thread(void *d)
 		} else {
 			/* Calculate sleep time */
 			struct timespec ts;
-			lws_usec_t target_us = lws_now_usecs() + txp->txp_info.interval_us;
-			ts.tv_sec = (time_t)(target_us / 1000000);
+			struct timeval tv;
+			gettimeofday(&tv, NULL);
+
+			uint64_t target_us = (uint64_t)tv.tv_usec + txp->txp_info.interval_us;
+			ts.tv_sec = tv.tv_sec + (time_t)(target_us / 1000000);
 			ts.tv_nsec = (long)((target_us % 1000000) * 1000);
 
 			/* Wait for signal (new packet) or timeout (next pacing tick) */
@@ -195,5 +199,5 @@ bail:
 	pthread_mutex_unlock(&txp->lock);
 	return ret;
 }
-
+#endif
 #endif /* LWS_HAVE_PTHREAD_H */

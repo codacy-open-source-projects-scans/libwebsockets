@@ -33,6 +33,7 @@ static const char * const lejp_tokens_policy[] = {
 	"schema-version",
 	"via-socks5",
 	"retry[].*.backoff",
+	"retry[].*.backoff[]",
 	"retry[].*.conceal",
 	"retry[].*.jitterpc",
 	"retry[].*.svalidping",
@@ -143,6 +144,7 @@ typedef enum {
 	LSSPPT_SCHEMA_VERSION,
 	LSSPPT_VIA_SOCKS5,
 	LSSPPT_BACKOFF,
+	LSSPPT_BACKOFF_ELEM,
 	LSSPPT_CONCEAL,
 	LSSPPT_JITTERPC,
 	LSSPPT_VALIDPING_S,
@@ -263,10 +265,23 @@ static uint16_t sizes[] = {
 static const char * const protonames[] = {
 	"h1",		/* LWSSSP_H1 */
 	"h2",		/* LWSSSP_H2 */
+	"h3",		/* LWSSSP_H3 */
 	"ws",		/* LWSSSP_WS */
 	"mqtt",		/* LWSSSP_MQTT */
 	"raw",		/* LWSSSP_RAW */
 };
+
+/*
+ * Policy objects refer to each other by name, and the reference must match
+ * the whole name: a strncmp() on the reference length alone would let "a"
+ * pick "abc", and "" pick whatever is first on the list
+ */
+
+static int
+lws_ss_policy_name_is(const char *name, const char *ref, size_t len)
+{
+	return name && strlen(name) == len && !strncmp(name, ref, len);
+}
 
 static const lws_ss_auth_t *
 lws_ss_policy_find_auth_by_name(struct policy_cb_args *a,
@@ -275,9 +290,7 @@ lws_ss_policy_find_auth_by_name(struct policy_cb_args *a,
 	const lws_ss_auth_t *auth = a->heads[LTY_AUTH].a;
 
 	while (auth) {
-		if (auth->name &&
-		    len == strlen(auth->name) &&
-		    !strncmp(auth->name, name, len))
+		if (lws_ss_policy_name_is(auth->name, name, len))
 			return auth;
 
 		auth = auth->next;
@@ -290,6 +303,19 @@ static int
 lws_ss_policy_alloc_helper(struct policy_cb_args *a, int type)
 {
 	/*
+	 * An overlay may only override streamtypes that already exist (see
+	 * README.md): it parses into the live policy's lwsac, and nothing
+	 * links an object it defines into the live policy or owns its heap
+	 * DER once the parse is finished
+	 */
+	if (a->overlay) {
+		lwsl_err("%s: an overlay may only override existing streamtypes\n",
+			 __func__);
+
+		return 1;
+	}
+
+	/*
 	 * We do the pointers always as .b union member, all of the
 	 * participating structs begin with .next and .name the same
 	 */
@@ -301,6 +327,33 @@ lws_ss_policy_alloc_helper(struct policy_cb_args *a, int type)
 
 	a->curr[type].b->next = a->heads[type].b;
 	a->heads[type].b = a->curr[type].b;
+
+	return 0;
+}
+
+/*
+ * Is any live ss handle bound to this policy object?  Used to refuse overlay
+ * changes that would invalidate what the handle was created with.
+ */
+
+static int
+lws_ss_policy_in_use(struct lws_context *cx, const lws_ss_policy_t *p)
+{
+	int n;
+
+	for (n = 0; n < cx->count_threads; n++) {
+		struct lws_context_per_thread *pt = &cx->pt[n];
+
+		lws_start_foreach_dll(struct lws_dll2 *, d,
+				      lws_dll2_get_head(&pt->ss_owner)) {
+			lws_ss_handle_t *h = lws_container_of(d,
+						lws_ss_handle_t, list);
+
+			if (h->policy == p)
+				return 1;
+
+		} lws_end_foreach_dll(d);
+	}
 
 	return 0;
 }
@@ -434,9 +487,9 @@ lws_ss_policy_parser_cb(struct lejp_ctx *ctx, char reason)
 			p2 = (lws_ss_policy_t *)a->context->pss_policies;
 
 			while (p2) {
-				if (!strncmp(p2->streamtype,
+				if (lws_ss_policy_name_is(p2->streamtype,
 					     ctx->path + ctx->st[ctx->sp].p,
-					     (unsigned int)(ctx->path_match_len -
+					     (size_t)(ctx->path_match_len -
 						          ctx->st[ctx->sp].p))) {
 					lwsl_info("%s: overriding s[] %s\n",
 						  __func__, p2->streamtype);
@@ -445,6 +498,13 @@ lws_ss_policy_parser_cb(struct lejp_ctx *ctx, char reason)
 
 				p2 = p2->next;
 			}
+		}
+
+		/* an overlay may only override: see lws_ss_policy_alloc_helper() */
+		if (a->overlay && !p2) {
+			lwsl_err("%s: an overlay may only override existing "
+				 "streamtypes\n", __func__);
+			goto oom;
 		}
 
 		/*
@@ -460,6 +520,12 @@ lws_ss_policy_parser_cb(struct lejp_ctx *ctx, char reason)
 			goto oom;
 
 		if (n == LTY_X509) {
+			/*
+			 * PAIR_NAME comes once per key in the certs[] object,
+			 * but OBJECT_END only frees one temp buffer... don't
+			 * leak MAX_CERT_TEMP per extra key
+			 */
+			lws_free_set_NULL(a->p);
 			a->p = lws_malloc(MAX_CERT_TEMP, "cert temp");
 			if (!a->p)
 				goto oom;
@@ -500,6 +566,14 @@ lws_ss_policy_parser_cb(struct lejp_ctx *ctx, char reason)
 		goto string2;
 
 	case LSSPPT_BACKOFF:
+	case LSSPPT_BACKOFF_ELEM:
+		/*
+		 * The first array element arrives with the "backoff" pair-name
+		 * match still active, but lejp re-evaluates the path at every
+		 * array comma; the element path "backoff[]" then only matches
+		 * the explicit "[]" pattern, else it falls through to "retry[].*"
+		 * and the rest of the table is silently dropped.
+		 */
 		b = &a->curr[LTY_BACKOFF].b->r;
 		if (b->retry_ms_table_count == 8) {
 			lwsl_err("%s: > 8 backoff levels\n", __func__);
@@ -560,6 +634,16 @@ lws_ss_policy_parser_cb(struct lejp_ctx *ctx, char reason)
 		goto string2;
 
 	case LSSPPT_TRUST_STORES_STACK:
+		/*
+		 * The trust store object is only created when we see the value
+		 * of its "name"... JSON key order is not constrained, so a
+		 * "stack" before the "name" would write through NULL here
+		 */
+		if (!a->curr[LTY_TRUSTSTORE].t) {
+			lwsl_err("%s: trust store stack before name\n",
+				 __func__);
+			goto oom;
+		}
 		if (a->count >= (int)LWS_ARRAY_SIZE(
 					a->curr[LTY_TRUSTSTORE].t->ssx509)) {
 			lwsl_err("%s: trust store too big\n", __func__);
@@ -569,7 +653,8 @@ lws_ss_policy_parser_cb(struct lejp_ctx *ctx, char reason)
 			   ctx->npos, ctx->buf);
 		x = a->heads[LTY_X509].x;
 		while (x) {
-			if (!strncmp(x->vhost_name, ctx->buf, ctx->npos)) {
+			if (lws_ss_policy_name_is(x->vhost_name, ctx->buf,
+						  ctx->npos)) {
 				a->curr[LTY_TRUSTSTORE].t->ssx509[a->count++] = x;
 				a->curr[LTY_TRUSTSTORE].t->count++;
 
@@ -591,20 +676,37 @@ lws_ss_policy_parser_cb(struct lejp_ctx *ctx, char reason)
 		goto string2;
 
 	case LSSPPT_METRICS_US_SCHEDULE:
-		a->curr[LTY_METRICS].m->us_schedule = (uint64_t)atoll(ctx->buf);
-		break;
-
 	case LSSPPT_METRICS_US_HALFLIFE:
-		a->curr[LTY_METRICS].m->us_decay_unit = (uint32_t)atol(ctx->buf);
-		break;
-
 	case LSSPPT_METRICS_MIN_OUTLIER:
-		a->curr[LTY_METRICS].m->min_contributors = (uint8_t)atoi(ctx->buf);
-		break;
-
 	case LSSPPT_METRICS_REPORT:
-		pp = (char **)&a->curr[LTY_METRICS].m->report;
-		goto string2;
+		/*
+		 * Like the trust store, the metrics object only exists once we
+		 * saw the value of its "name" key, and JSON key order is not
+		 * constrained... don't write through NULL
+		 */
+		if (!a->curr[LTY_METRICS].m) {
+			lwsl_err("%s: metrics member before name\n", __func__);
+			goto oom;
+		}
+
+		switch (ctx->path_match - 1) {
+		case LSSPPT_METRICS_US_SCHEDULE:
+			a->curr[LTY_METRICS].m->us_schedule =
+						(uint64_t)atoll(ctx->buf);
+			break;
+		case LSSPPT_METRICS_US_HALFLIFE:
+			a->curr[LTY_METRICS].m->us_decay_unit =
+						(uint32_t)atol(ctx->buf);
+			break;
+		case LSSPPT_METRICS_MIN_OUTLIER:
+			a->curr[LTY_METRICS].m->min_contributors =
+						(uint8_t)atoi(ctx->buf);
+			break;
+		default:
+			pp = (char **)&a->curr[LTY_METRICS].m->report;
+			goto string2;
+		}
+		break;
 #endif
 
 	case LSSPPT_OPTIONS:
@@ -645,8 +747,8 @@ lws_ss_policy_parser_cb(struct lejp_ctx *ctx, char reason)
 		py = &a->heads[LTY_X509].x;
 		x = a->heads[LTY_X509].x;
 		while (x) {
-			if (!strncmp(x->vhost_name, ctx->buf, ctx->npos) &&
-					!x->vhost_name[ctx->npos]) {
+			if (lws_ss_policy_name_is(x->vhost_name, ctx->buf,
+						  ctx->npos)) {
 				if ((ctx->path_match - 1) == LSSPPT_SERVER_CERT)
 					a->curr[LTY_POLICY].p->trust.server.cert = x;
 				else
@@ -754,7 +856,19 @@ lws_ss_policy_parser_cb(struct lejp_ctx *ctx, char reason)
 		break;
 
 	case LSSPPT_AUTH_BLOB:
-		a->curr[LTY_AUTH].a->blob_index = (uint8_t)atoi(ctx->buf);
+		n = atoi(ctx->buf);
+		/*
+		 * This ends up indexing a 4-entry table of blob types in
+		 * sign.c... it comes from the policy, ie, possibly from the
+		 * network, so it must be inside the table
+		 */
+		if (n < 0 || n >= LWS_SS_POLICY_AUTH_BLOB_SLOTS) {
+			lwsl_err("%s: auth blob index %d out of range\n",
+				 __func__, n);
+
+			return -1;
+		}
+		a->curr[LTY_AUTH].a->blob_index = (uint8_t)n;
 		break;
 	case LSSPPT_HTTP_EXPECT:
 		a->curr[LTY_POLICY].p->u.http.resp_expect = (uint16_t)atoi(ctx->buf);
@@ -850,7 +964,8 @@ lws_ss_policy_parser_cb(struct lejp_ctx *ctx, char reason)
 	case LSSPPT_RETRYPTR:
 		bot = a->heads[LTY_BACKOFF].b;
 		while (bot) {
-			if (!strncmp(ctx->buf, bot->name, ctx->npos)) {
+			if (lws_ss_policy_name_is(bot->name, ctx->buf,
+						  ctx->npos)) {
 				a->curr[LTY_POLICY].p->retry_bo = &bot->r;
 
 				return 0;
@@ -864,7 +979,8 @@ lws_ss_policy_parser_cb(struct lejp_ctx *ctx, char reason)
 	case LSSPPT_TRUST:
 		ts = a->heads[LTY_TRUSTSTORE].t;
 		while (ts) {
-			if (!strncmp(ctx->buf, ts->name, ctx->npos)) {
+			if (lws_ss_policy_name_is(ts->name, ctx->buf,
+						  ctx->npos)) {
 				a->curr[LTY_POLICY].p->trust.store = ts;
 				return 0;
 			}
@@ -891,9 +1007,52 @@ lws_ss_policy_parser_cb(struct lejp_ctx *ctx, char reason)
 
 
 	case LSSPPT_METADATA_ITEM:
+		/*
+		 * An overlay writes directly into the live policy object.  A
+		 * handle's metadata slot array is overallocated once, at
+		 * create time, from the metadata_count in force then... so
+		 * growing the count under a live handle makes everything that
+		 * walks h->metadata[] run off the end of the handle.
+		 */
+		if (a->overlay &&
+		    lws_ss_policy_in_use(a->context, a->curr[LTY_POLICY].p)) {
+			lwsl_err("%s: overlay can't add metadata to in-use "
+				 "streamtype %s\n", __func__,
+				 a->curr[LTY_POLICY].p->streamtype);
+
+			return -1;
+		}
+
+		/*
+		 * A long value comes in more than one string chunk... collect
+		 * it, and only make the key's one metadata item once we have
+		 * all of it
+		 */
+		if (a->md_value_len + ctx->npos > sizeof(a->md_value)) {
+			lwsl_err("%s: metadata value too long\n", __func__);
+
+			return -1;
+		}
+		memcpy(a->md_value + a->md_value_len, ctx->buf, ctx->npos);
+		a->md_value_len += ctx->npos;
+		if (reason == LEJPCB_VAL_STR_CHUNK)
+			return 0;
+
+		/*
+		 * metadata_count is a uint8_t, and the handle's metadata array
+		 * is sized from it while the list walks see every item...
+		 * wrapping it would have them index off the end of the handle
+		 */
+		if (a->curr[LTY_POLICY].p->metadata_count == 255) {
+			lwsl_err("%s: too many metadata in streamtype %s\n",
+				 __func__, a->curr[LTY_POLICY].p->streamtype);
+
+			return -1;
+		}
+
 		pmd = a->curr[LTY_POLICY].p->metadata;
 		a->curr[LTY_POLICY].p->metadata = lwsac_use_zero(&a->ac,
-			sizeof(lws_ss_metadata_t) + ctx->npos +
+			sizeof(lws_ss_metadata_t) + a->md_value_len +
 			(unsigned int)(ctx->path_match_len - ctx->st[ctx->sp - 2].p + 1) + 2,
 			POL_AC_GRAIN);
 		if (!a->curr[LTY_POLICY].p->metadata)
@@ -908,7 +1067,7 @@ lws_ss_policy_parser_cb(struct lejp_ctx *ctx, char reason)
 
 		q += ctx->path_match_len - ctx->st[ctx->sp - 2].p;
 		a->curr[LTY_POLICY].p->metadata->value__may_own_heap = q;
-		memcpy(q, ctx->buf, ctx->npos);
+		memcpy(q, a->md_value, a->md_value_len);
 
 #if defined(LWS_ROLE_H1) || defined(LWS_ROLE_H2)
 		/*
@@ -917,13 +1076,16 @@ lws_ss_policy_parser_cb(struct lejp_ctx *ctx, char reason)
 		 * no header string match else it's the well-known header index
 		 */
 		a->curr[LTY_POLICY].p->metadata->value_is_http_token = (uint8_t)
-			lws_http_string_to_known_header(ctx->buf, ctx->npos);
+			lws_http_string_to_known_header(a->md_value,
+							a->md_value_len);
 #endif
 
 		a->curr[LTY_POLICY].p->metadata->length = /* the index in handle->metadata */
 				a->curr[LTY_POLICY].p->metadata_count++;
 
-		a->curr[LTY_POLICY].p->metadata->value_length = ctx->npos;
+		a->curr[LTY_POLICY].p->metadata->value_length =
+						(uint8_t)a->md_value_len;
+		a->md_value_len = 0;
 		break;
 
 #if defined(LWS_ROLE_H1) || defined(LWS_ROLE_H2)
@@ -1148,9 +1310,16 @@ string1:
 	return 0;
 
 oom:
-	lwsl_err("%s: OOM\n", __func__);
+	/*
+	 * Despite the name, most ways here are the policy content being
+	 * rejected, not OOM.  Either way the parse fails and the caller
+	 * abandons it, which owns tearing down the lwsac: the X.509 objects
+	 * whose DER it frees live in there, and for an overlay the lwsac is
+	 * the live policy and must not be freed at all.  So just drop what
+	 * we allocated outside the lwsac.
+	 */
+	lwsl_err("%s: OOM or policy rejected\n", __func__);
 	lws_free_set_NULL(a->p);
-	lwsac_free(&a->ac);
 
 	return -1;
 }
@@ -1161,24 +1330,50 @@ lws_ss_policy_parse_begin(struct lws_context *context, int overlay)
 	struct policy_cb_args *args;
 	char *p;
 
+	/*
+	 * One parse at a time: a second begun here would orphan the first's
+	 * parser and whatever it had built, and a policy fetch is parsed
+	 * across many calls
+	 */
+	if (context->pol_args) {
+		lwsl_err("%s: a policy parse is already in progress\n",
+			 __func__);
+
+		return 1;
+	}
+
 	args = lws_zalloc(sizeof(struct policy_cb_args), __func__);
 	if (!args) {
 		lwsl_err("%s: OOM\n", __func__);
 
 		return 1;
 	}
-	if (overlay)
+	if (overlay) {
 		/* continue to use the existing lwsac */
 		args->ac = context->ac_policy;
-	else
-		/* we don't want to see any old policy */
+		args->overlay = 1;
+	} else {
+		/*
+		 * We don't want to see any old policy while parsing the new
+		 * one (or the streamtype override logic would write into the
+		 * live policy)... but we must be able to put it back if the
+		 * new policy does not parse, or one bad response from the
+		 * policy server permanently disables SS, including the
+		 * fetch_policy stream that would fix it.
+		 */
+		args->prev_pss_policies = context->pss_policies;
 		context->pss_policies = NULL;
+	}
 
+	args->prev_server_der_list = context->server_der_list;
 	context->pol_args = args;
 	args->context = context;
 	p = lwsac_use(&args->ac, 1, POL_AC_INITIAL);
 	if (!p) {
 		lwsl_err("%s: OOM\n", __func__);
+		if (!overlay)
+			/* put back the policy we hid above */
+			context->pss_policies = args->prev_pss_policies;
 		lws_free_set_NULL(context->pol_args);
 
 		return -1;
@@ -1186,6 +1381,14 @@ lws_ss_policy_parse_begin(struct lws_context *context, int overlay)
 	*p = 0;
 	lejp_construct(&args->jctx, lws_ss_policy_parser_cb, args,
 		       lejp_tokens_policy, LWS_ARRAY_SIZE(lejp_tokens_policy));
+	/*
+	 * Policies are operator-authored documents (even when fetched over
+	 * TLS from the operator's own server) and the format has always
+	 * allowed '#' to-end-of-line comments, eg, the warmcat.com
+	 * minimal-proxy policies use them.  Opt in here; every other network
+	 * facing lejp parse stays RFC 8259 strict.
+	 */
+	args->jctx.flags |= LEJP_FLAG_FEAT_COMMENTS;
 
 	return 0;
 }
@@ -1195,7 +1398,16 @@ lws_ss_policy_parse_abandon(struct lws_context *context)
 {
 	struct policy_cb_args *args = (struct policy_cb_args *)context->pol_args;
 	lws_ss_x509_t *x;
-lwsl_notice("%s\n", __func__);
+
+	/*
+	 * A failed parse abandons by itself, and the caller's state machine
+	 * may then abandon again on the stream close... just do nothing
+	 */
+
+	if (!args)
+		return 0;
+
+	lwsl_notice("%s\n", __func__);
 	x = args->heads[LTY_X509].x;
 	while (x) {
 		/*
@@ -1208,19 +1420,43 @@ lwsl_notice("%s\n", __func__);
 		x = x->next;
 	}
 
-	x = context->server_der_list;
-	while (x) {
-		lws_free((void *)x->ca_der);
-		x->ca_der = NULL;
+	if (!args->overlay) {
+		/*
+		 * Only free the DER of the server certs this parse kept, which
+		 * are in front of the ones the policy we are going back to kept
+		 * and still needs to bring its servers up.  (An overlay's are
+		 * in the live lwsac and the live policy may already point to
+		 * them, so they stay listed until the policy goes away.)
+		 */
+		x = context->server_der_list;
+		while (x && x != args->prev_server_der_list) {
+			lws_free((void *)x->ca_der);
+			x->ca_der = NULL;
 
-		x = x->next;
+			x = x->next;
+		}
+		context->server_der_list = args->prev_server_der_list;
 	}
 
+	/* a parse that failed partway through a certs[] entry */
+	lws_free_set_NULL(args->p);
+
 	lejp_destruct(&args->jctx);
+
+	if (args->overlay)
+		/*
+		 * An overlay parses into the live policy lwsac... freeing it
+		 * here would take every live policy, streamtype name and trust
+		 * store down with it.  Leave the arena (and whatever partial
+		 * objects the failed overlay put in it) alone.
+		 */
+		args->ac = NULL;
+	else
+		/* restore whatever policy was in force before we started */
+		context->pss_policies = args->prev_pss_policies;
+
 	lwsac_free(&args->ac);
 	lws_free_set_NULL(context->pol_args);
-
-	context->server_der_list = NULL;
 
 	return 0;
 }
@@ -1268,34 +1504,88 @@ bail:
 }
 #endif
 
+/*
+ * A completed overlay has nothing to install: it wrote into the live policy's
+ * objects and lwsac and was refused anything of its own.  Only the parser is
+ * left to drop, so the next parse can begin.  (A completed new policy keeps
+ * its args until lws_ss_policy_set() installs it, which drops them.)
+ */
+
+static void
+lws_ss_policy_overlay_done(struct lws_context *context)
+{
+	struct policy_cb_args *args = (struct policy_cb_args *)context->pol_args;
+
+	lejp_destruct(&args->jctx);
+	lws_free_set_NULL(args->p);
+	lws_free_set_NULL(context->pol_args);
+}
+
 int
 lws_ss_policy_parse(struct lws_context *context, const uint8_t *buf, size_t len)
 {
 	struct policy_cb_args *args = (struct policy_cb_args *)context->pol_args;
 	int m;
 
+	if (!args)
+		return -1;
+
 #if !defined(LWS_PLAT_FREERTOS) && !defined(LWS_PLAT_OPTEE)
-	if (args->jctx.line < 2 && buf[0] != '{' && !args->parse_data)
-		return lws_ss_policy_parse_file(context, (const char *)buf);
+	/*
+	 * As a convenience for app-provided policy, a buffer that doesn't look
+	 * like JSON is taken to be the path of a file to read the policy from.
+	 *
+	 * That must never apply to policy coming off the network: the buffer is
+	 * a ptr + length and not NUL-terminated, and it would let the policy
+	 * server choose an arbitrary local path for us to open and parse.
+	 */
+	if (!args->untrusted && args->jctx.line < 2 && buf[0] != '{' &&
+	    !args->parse_data) {
+		m = lws_ss_policy_parse_file(context, (const char *)buf);
+		if (m) /* a failed parse has abandoned itself */
+			return m;
+
+		goto completed;
+	}
 #endif
 
 	args->parse_data = 1;
 	m = lejp_parse(&args->jctx, buf, (int)len);
-	if (m == LEJP_CONTINUE || m >= 0)
+	if (m == LEJP_CONTINUE)
 		return m;
+	if (m < 0) {
+		lwsl_err("%s: parse failed line %u: %d: %s\n", __func__,
+			 (unsigned int)args->jctx.line, m,
+			 lejp_error_to_string(m));
+		lws_ss_policy_parse_abandon(context);
 
-	lwsl_err("%s: parse failed line %u: %d: %s\n", __func__,
-		 (unsigned int)args->jctx.line, m, lejp_error_to_string(m));
-	lws_ss_policy_parse_abandon(context);
-	assert(0);
+		return m;
+	}
+
+#if !defined(LWS_PLAT_FREERTOS) && !defined(LWS_PLAT_OPTEE)
+completed:
+#endif
+	if (args->overlay)
+		lws_ss_policy_overlay_done(context);
 
 	return m;
+}
+
+void
+lws_ss_policy_parse_untrusted(struct lws_context *context)
+{
+	struct policy_cb_args *args = (struct policy_cb_args *)context->pol_args;
+
+	if (args)
+		args->untrusted = 1;
 }
 
 int
 lws_ss_policy_overlay(struct lws_context *context, const char *overlay)
 {
-	lws_ss_policy_parse_begin(context, 1);
+	if (lws_ss_policy_parse_begin(context, 1))
+		return -1;
+
 	return lws_ss_policy_parse(context, (const uint8_t *)overlay,
 				   strlen(overlay));
 }

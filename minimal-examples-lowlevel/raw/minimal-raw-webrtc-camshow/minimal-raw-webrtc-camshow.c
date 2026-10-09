@@ -16,12 +16,16 @@
 
 #include "../../../plugins/protocol_lws_rtc_camera/protocol_lws_rtc_camera.h"
 #include "../../../plugins/protocol_lws_webrtc/protocol_lws_webrtc.h"
+#include "../../../include/libwebsockets/lws-auth-device-client.h"
+
+static struct lws_auth_device_client_api *auth_api;
 
 enum {
 	LWS_SW_HEIGHT,
 	LWS_SW_NAME,
 	LWS_SW_URL,
 	LWS_SW_VIDEO_DEVICE,
+	LWS_SW_AUDIO_DEVICE,
 	LWS_SW_WIDTH,
 	LWS_SW_HELP,
 };
@@ -31,13 +35,14 @@ static const struct lws_switches switches[] = {
 	[LWS_SW_NAME]	= { "--name",          "Client peer name to identify in mixer" },
 	[LWS_SW_URL]	= { "--url",           "WebSockets URL to connect to (default wss://127.0.0.1:7681)" },
 	[LWS_SW_VIDEO_DEVICE]	= { "--video-device",  "V4L2 video device path (default /dev/video0)" },
+	[LWS_SW_AUDIO_DEVICE]	= { "--audio-device",  "ALSA audio device path (default default)" },
 	[LWS_SW_WIDTH]	= { "--width",         "Video capture width in pixels (default 1280)" },
 	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
 };
 
 static const char *url = "wss://127.0.0.1:7681";
 static const char *devs_list = "/dev/video0";
-static char *devices_copy = NULL;
+static const char *audio_dev = "default";
 static const char *client_name;
 static uint32_t app_width = 1280;
 static uint32_t app_height = 720;
@@ -75,17 +80,12 @@ app_system_state_nf(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
                         return -1;
                 }
 
-                if (!devices_copy)
-                        devices_copy = strdup(devs_list);
-
-                char *p = devices_copy;
-                char *token;
-
-                while ((token = strsep(&p, ","))) {
-                        lwsl_notice("Attaching %s to WebRTC mixer\n", token);
-                        if (cam_ops->attach(vh, url, token, client_name, app_width, app_height))
-                                lwsl_err("Failed to queue attach for %s\n", token);
+                if (!auth_api || !auth_api->start_auth_flow) {
+                        lwsl_err("auth_api not populated by plugin\n");
+                        return -1;
                 }
+
+                auth_api->start_auth_flow(vh, url, "camshow");
 
                 break;
 	}
@@ -96,11 +96,80 @@ static lws_state_notify_link_t * const app_notifier_list[] = {
 	&nl, NULL
 };
 
-static int interrupted;
-
 void sigint_handler(int signum) {
-    interrupted = 1;
+    lws_default_loop_exit(cx);
 }
+
+static int
+set_clock(lws_usec_t us)
+{
+	struct timeval tv;
+	int n;
+	tv.tv_sec = us / LWS_US_PER_SEC;
+	tv.tv_usec = us % LWS_US_PER_SEC;
+	n = settimeofday(&tv, NULL);
+	if (n) {
+		lwsl_err("%s: settimeofday failed: %d\n", __func__, n);
+		return 1;
+	}
+	lwsl_notice("%s: system time successfully updated via NTP!\n", __func__);
+	return 0;
+}
+
+static void start_app_attach(struct lws_vhost *vh, const char *logical_name, const char *access_token)
+{
+	struct lws_tokenize ts;
+	lws_tokenize_elem e;
+	char token[256];
+
+	lws_tokenize_init(&ts, devs_list, LWS_TOKENIZE_F_COMMA_SEP_LIST |
+					  LWS_TOKENIZE_F_MINUS_NONTERM |
+					  LWS_TOKENIZE_F_SLASH_NONTERM |
+					  LWS_TOKENIZE_F_DOT_NONTERM |
+					  LWS_TOKENIZE_F_NO_INTEGERS |
+					  LWS_TOKENIZE_F_NO_FLOATS);
+
+	do {
+		e = lws_tokenize(&ts);
+		if (e != LWS_TOKZE_TOKEN)
+			continue;
+
+		if (lws_tokenize_cstr(&ts, token, sizeof(token))) {
+			lwsl_err("Token too long\n");
+			continue;
+		}
+
+		lwsl_notice("Attaching %s (audio %s) to WebRTC mixer\n", token, audio_dev);
+		if (cam_ops->attach(vh, url, token, audio_dev, client_name,
+				    app_width, app_height, access_token))
+			lwsl_err("Failed to queue attach for %s\n", token);
+
+	} while (e > 0);
+}
+
+static void pairing_indication(struct lws_vhost *vh, const char *logical_name, int start)
+{
+	lwsl_notice("\n\n*** BLINK BLINK BLINK: Identify triggered by Admin for %s ***\n\n", logical_name);
+}
+
+static void display_code(struct lws_vhost *vh, const char *logical_name, const char *user_code)
+{
+	lwsl_notice("\n\n=======================================\n");
+	lwsl_notice("   PAIRING REQUIRED FOR %s\n", logical_name);
+	lwsl_notice("   User Code: %s\n", user_code);
+	lwsl_notice("=======================================\n\n");
+}
+
+static struct lws_auth_device_client_ops auth_ops = {
+	.abi_version = LWS_AUTH_DEVICE_CLIENT_ABI_VERSION,
+	.auth_success = start_app_attach,
+	.pairing_indication = pairing_indication,
+	.display_code = display_code,
+};
+
+static const lws_system_ops_t system_ops = {
+	.set_clock = set_clock,
+};
 
 int
 main(int argc, const char **argv)
@@ -110,7 +179,7 @@ main(int argc, const char **argv)
 
 	lws_context_info_defaults(&info, NULL);
 	lws_cmdline_option_handle_builtin(argc, argv, &info);
-	lwsl_user("LWS minimal raw webrtc camshow [--url <wss url>] [--video-device <device>] [--name <client name>] [--width <width>] [--height <height>]\n");
+	lwsl_user("LWS minimal raw webrtc camshow [--url <wss url>] [--video-device <device>] [--audio-device <device>] [--name <client name>] [--width <width>] [--height <height>]\n");
 	(void)switches;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
@@ -122,6 +191,7 @@ main(int argc, const char **argv)
 
 	if ((opt = lws_cmdline_option(argc, argv, switches[LWS_SW_URL].sw))) url = opt;
 	if ((opt = lws_cmdline_option(argc, argv, switches[LWS_SW_VIDEO_DEVICE].sw))) devs_list = opt;
+	if ((opt = lws_cmdline_option(argc, argv, switches[LWS_SW_AUDIO_DEVICE].sw))) audio_dev = opt;
 	if ((opt = lws_cmdline_option(argc, argv, switches[LWS_SW_NAME].sw))) client_name = opt;
 	if ((opt = lws_cmdline_option(argc, argv, switches[LWS_SW_WIDTH].sw))) app_width = (uint32_t)atoi(opt);
 	if ((opt = lws_cmdline_option(argc, argv, switches[LWS_SW_HEIGHT].sw))) app_height = (uint32_t)atoi(opt);
@@ -140,6 +210,17 @@ main(int argc, const char **argv)
 	info.plugin_dirs = plugin_dirs;
 #endif
 
+	info.system_ops = &system_ops;
+
+	static const struct lws_protocols protocols[] = {
+		{ NULL, NULL, 0, 0, 0, NULL, 0 }
+	};
+	info.protocols = protocols;
+
+	/* Wire up cert trust bundle so wss:// connections can verify the peer */
+	info.client_ssl_ca_filepath = "/etc/ssl/certs/ca-certificates.crt";
+
+
 	/*
 	 * Provide the state_cb up front so the plugin has it when it overwrites
 	 * the pointer to point to its own op struct.
@@ -152,6 +233,7 @@ main(int argc, const char **argv)
 	vinfo.vhost_name = "camshow-clients";
 	vinfo.port = CONTEXT_PORT_NO_LISTEN;
 	vinfo.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+	vinfo.client_ssl_ca_filepath = info.client_ssl_ca_filepath;
 
 	static struct lws_webrtc_ops webrtc_ops;
 
@@ -174,7 +256,13 @@ main(int argc, const char **argv)
 	static struct lws_protocol_vhost_options pvo_cam_status = { &pvo_ops, NULL, "status", "ok" };
 	static struct lws_protocol_vhost_options pvo = { &pvo_cam_v4l2, &pvo_cam_status, "lws-rtc-camera", "" };
 
-	vinfo.pvo = &pvo;
+	/* For lws-auth-device-client */
+	static struct lws_protocol_vhost_options pvo_auth_api = { NULL, NULL, "lws-auth-client-api", (void *)&auth_api };
+	static struct lws_protocol_vhost_options pvo_auth_ops = { &pvo_auth_api, NULL, "app-auth-ops", (void *)&auth_ops };
+	static struct lws_protocol_vhost_options pvo_auth_status = { &pvo_auth_ops, NULL, "status", "ok" };
+	static struct lws_protocol_vhost_options pvo_auth = { &pvo, &pvo_auth_status, "lws-auth-device-client", "" };
+
+	vinfo.pvo = &pvo_auth;
 
 	cx = lws_create_context(&info);
 	if (!cx) {
@@ -188,13 +276,10 @@ main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (!interrupted)
-		if (lws_service(cx, 0) < 0)
-			break;
+	while (lws_service(cx, 0) >= 0)
+		;
 
 	lws_context_destroy(cx);
-
-	if (devices_copy) free(devices_copy);
 
 	return 0;
 }

@@ -49,7 +49,8 @@ enum lws_spa_fileupload_states {
 	LWS_UFS_FINAL_CONTENT,
 	/**< the last chunk (possibly zero length) of file content has arrived */
 	LWS_UFS_OPEN,
-	/**< a new file is starting to arrive */
+	/**< a new file is starting to arrive: once per multipart part that
+	 * names a filename, before any of its content */
 	LWS_UFS_CLOSE
 	/**< the file decode stuff is being destroyed */
 };
@@ -163,6 +164,10 @@ lws_spa_get_length(struct lws_spa *spa, int n);
  * lws_spa_get_string() - return pointer to parameter value
  * \param spa: the parser object previously created
  * \param n: parameter ordinal to return pointer to value for
+ *
+ * Returns NULL if the form did not have the parameter at all, and "" if it
+ * had it with an empty value (urlencoded `name`, `name=`, or a multipart
+ * part with no content).
  */
 LWS_VISIBLE LWS_EXTERN const char *
 lws_spa_get_string(struct lws_spa *spa, int n);

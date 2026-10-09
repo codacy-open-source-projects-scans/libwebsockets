@@ -1,3 +1,4 @@
+#include <sys/wait.h>
 /*
  * lws-minimal-secure-streams
  *
@@ -30,31 +31,33 @@ enum {
 	LWS_SW_OTS,
 	LWS_SW_PASS_LIMIT,
 	LWS_SW_RESPMAP,
-	LWS_SW_TIMEOUT_MS,
-	LWS_SW_A,
-	LWS_SW_C,
-	LWS_SW_D,
-	LWS_SW_I,
-	LWS_SW_P,
-	LWS_SW_HELP,
-};
+		LWS_SW_TIMEOUT_MS,
+		LWS_SW_A,
+		LWS_SW_C,
+		LWS_SW_D,
+		LWS_SW_I,
+		LWS_SW_P,
+		LWS_SW_POLICY,
+		LWS_SW_HELP,
+	};
 
-static const struct lws_switches switches[] = {
-	[LWS_SW_BUDGET]	= { "--budget",        "Enable --budget feature" },
-	[LWS_SW_EXPECTED_EXIT]	= { "--expected-exit", "Enable --expected-exit feature" },
-	[LWS_SW_FORCE_NO_INTERNET]	= { "--force-no-internet", "Enable --force-no-internet feature" },
-	[LWS_SW_FORCE_PORTAL]	= { "--force-portal",  "Enable --force-portal feature" },
-	[LWS_SW_OTS]	= { "--ots",           "Enable --ots feature" },
-	[LWS_SW_PASS_LIMIT]	= { "--pass-limit",    "Enable --pass-limit feature" },
-	[LWS_SW_RESPMAP]	= { "--respmap",       "Enable --respmap feature" },
-	[LWS_SW_TIMEOUT_MS]	= { "--timeout_ms",    "Enable --timeout_ms feature" },
-	[LWS_SW_A]	= { "-a",              "Enable -a feature" },
-	[LWS_SW_C]	= { "-c",              "Client connections" },
-	[LWS_SW_D]	= { "-d",              "Debug logs (e.g. -d 15)" },
-	[LWS_SW_I]	= { "-i",              "Interface to bind to" },
-	[LWS_SW_P]	= { "-p",              "Port number to listen or connect on" },
-	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
-};
+	static const struct lws_switches switches[] = {
+		[LWS_SW_BUDGET]	= { "--budget",        "Enable --budget feature" },
+		[LWS_SW_EXPECTED_EXIT]	= { "--expected-exit", "Enable --expected-exit feature" },
+		[LWS_SW_FORCE_NO_INTERNET]	= { "--force-no-internet", "Enable --force-no-internet feature" },
+		[LWS_SW_FORCE_PORTAL]	= { "--force-portal",  "Enable --force-portal feature" },
+		[LWS_SW_OTS]	= { "--ots",           "Enable --ots feature" },
+		[LWS_SW_PASS_LIMIT]	= { "--pass-limit",    "Enable --pass-limit feature" },
+		[LWS_SW_RESPMAP]	= { "--respmap",       "Enable --respmap feature" },
+		[LWS_SW_TIMEOUT_MS]	= { "--timeout_ms",    "Enable --timeout_ms feature" },
+		[LWS_SW_A]	= { "-a",              "Enable -a feature" },
+		[LWS_SW_C]	= { "-c",              "Client connections" },
+		[LWS_SW_D]	= { "-d",              "Debug logs (e.g. -d 15)" },
+		[LWS_SW_I]	= { "-i",              "Interface to bind to" },
+		[LWS_SW_P]	= { "-p",              "Port number to listen or connect on" },
+		[LWS_SW_POLICY]	= { "--policy",        "Policy JSON filepath" },
+		[LWS_SW_HELP]	= { "--help",		"Show this help information" },
+	};
 
 #include <string.h>
 #include <signal.h>
@@ -74,13 +77,15 @@ static const struct lws_switches switches[] = {
  */
 // #define VIA_LOCALHOST_SOCKS
 
-static int interrupted, bad = 1, force_cpd_fail_portal,
+static int bad = 1, force_cpd_fail_portal,
 	   force_cpd_fail_no_internet, test_respmap, test_ots,
 	   budget = 1, predicted_good = 1, good, orig_budget;
 static unsigned int timeout_ms = 8000;
 static lws_state_notify_link_t nl;
 struct lws_context *context;
 static lws_sorted_usec_list_t sul_timeout; /* for each process to complete */
+static lws_sorted_usec_list_t sul_create;
+
 
 /*
  * If the -proxy app is fulfilling our connection, then we don't need to have
@@ -123,7 +128,7 @@ static const char * const default_ss_policy =
 		 * using that.
 		 */
 #if !defined(FORCE_OS_TRUST_STORE)
-	  		"{\"isrg_root_x1\": \""
+					"{\"isrg_root_x1\": \""
 	"MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw"
 	"TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh"
 	"cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4"
@@ -151,8 +156,22 @@ static const char * const default_ss_policy =
 	"jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc"
 	"oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq"
 	"4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA"
-	"mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d"
-	"emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc="
+	"mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57de"
+	"myPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc="
+	  "\"},\n"
+		"{\"isrg_root_x2\": \""
+	"MIICGzCCAaGgAwIBAgIQQdKd0XLq7qeAwSxs6S+HUjAKBggqhkjOPQQDAzBPMQsw"
+	"CQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJuZXQgU2VjdXJpdHkgUmVzZWFyY2gg"
+	"R3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBYMjAeFw0yMDA5MDQwMDAwMDBaFw00"
+	"MDA5MTcxNjAwMDBaME8xCzAJBgNVBAYTAlVTMSkwJwYDVQQKEyBJbnRlcm5ldCBT"
+	"ZWN1cml0eSBSZXNlYXJjaCBHcm91cDEVMBMGA1UEAxMMSVNSRyBSb290IFgyMHYw"
+	"EAYHKoZIzj0CAQYFK4EEACIDYgAEzZvVn4CDCuwJSvMWSj5cz3es3mcFDR0HttwW"
+	"+1qLFNvicWDEukWVEYmO6gbf9yoWHKS5xcUy4APgHoIYOIvXRdgKam7mAHf7AlF9"
+	"ItgKbppbd9/w+kHsOdx1ymgHDB/qo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0T"
+	"AQH/BAUwAwEB/zAdBgNVHQ4EFgQUfEKWrt5LSDv6kviejM9ti6lyN5UwCgYIKoZI"
+	"zj0EAwMDaAAwZQIwe3lORlCEwkSHRhtFcP9Ymd70/aTSVaYgLXTWNLxBo1BfASdW"
+	"tL4ndQavEi51mI38AjEAi/V3bNTIZargCyzuFJ0nN6T5U6VR5CmD1/iQMVtCnwr1"
+	"/q4AaOeMSQ+2b1tbFfLn"
 		"\"}"
 #endif
 	  "],"
@@ -161,7 +180,8 @@ static const char * const default_ss_policy =
 		"{"
 			"\"name\": \"le_via_isrg\","
 			"\"stack\": ["
-				"\"isrg_root_x1\""
+				"\"isrg_root_x1\","
+				"\"isrg_root_x2\""
 			"]"
 		"}"
 #endif
@@ -246,6 +266,13 @@ typedef struct myss {
 static int
 create_ss(struct lws_context *cx);
 
+static void
+sul_create_cb(lws_sorted_usec_list_t *sul)
+{
+	if (budget)
+		create_ss(context);
+}
+
 #if !defined(LWS_SS_USE_SSPC)
 
 static const char *canned_root_token_payload =
@@ -269,7 +296,8 @@ process_timeout(lws_sorted_usec_list_t *sul)
 {
 	lwsl_err("%s: process timed out\n", __func__);
 
-	exit(1);
+	lws_default_loop_exit(context);
+	bad = 1;
 }
 
 /* secure streams payload interface */
@@ -370,7 +398,7 @@ myss_state(void *userobj, void *sh, lws_ss_constate_t state,
 
 	case LWSSSCS_ALL_RETRIES_FAILED:
 		/* if we're out of retries, we want to close the app and FAIL */
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		bad = 2;
 		break;
 
@@ -398,18 +426,18 @@ myss_state(void *userobj, void *sh, lws_ss_constate_t state,
 
 	case LWSSSCS_DISCONNECTED: /* attempt is over */
 		if (budget)
-			create_ss(context);
+			lws_sul_schedule(context, 0, &sul_create, sul_create_cb, 1);
 		else
-			interrupted = 1;
+			lws_default_loop_exit(context);
 		return LWSSSSRET_DESTROY_ME;
 
 	case LWSSSCS_TIMEOUT:
 		lwsl_ss_notice(m->ss, "LWSSSCS_TIMEOUT");
 		bad = 3;
 		if (budget)
-			create_ss(context);
+			lws_sul_schedule(context, 0, &sul_create, sul_create_cb, 1);
 		else
-			interrupted = 1;
+			lws_default_loop_exit(context);
 		return LWSSSSRET_DESTROY_ME;
 
 	case LWSSSCS_USER_BASE:
@@ -578,7 +606,7 @@ static const lws_system_ops_t system_ops = {
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 static lws_log_cx_t my_log_cx = {
@@ -604,8 +632,7 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	memset(&info, 0, sizeof info);
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	lws_context_info_defaults(&info, NULL);lws_cmdline_option_handle_builtin(argc, argv, &info);
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_C].sw)))
 		concurrent = atoi(p);
@@ -636,7 +663,7 @@ int main(int argc, const char **argv)
 
 	info.log_cx = &my_log_cx;
 	info.vhost_name = cxname;
-	lws_snprintf(logpath, sizeof(logpath), "/tmp/%s.log", cxname);
+	lws_snprintf(logpath, sizeof(logpath), "/tmp/%s.log", cxname); // NOSONAR
 	my_log_cx.opaque = (void *)logpath;
 
 	lwsl_user("LWS secure streams test client [-d<verb>]\n");
@@ -671,7 +698,7 @@ int main(int argc, const char **argv)
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_PASS_LIMIT].sw)))
 		predicted_good = atoi(p);
 
-	info.fd_limit_per_thread = 1 + 26 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 26;
 	info.port = CONTEXT_PORT_NO_LISTEN;
 #if defined(LWS_SS_USE_SSPC)
 	info.protocols = lws_sspc_protocols;
@@ -681,7 +708,14 @@ int main(int argc, const char **argv)
 		/* connect to ssproxy via UDS by default, else via
 		 * tcp connection to this port */
 		if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_P].sw)))
-			info.ss_proxy_port = (uint16_t)atoi(p);
+			{
+				int __pt = atoi(p);
+				if (__pt < 0 || __pt > 65535) {
+					lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+					return 1;
+				}
+				info.ss_proxy_port = (uint16_t)__pt;
+			}
 
 		/* UDS "proxy.ss.lws" in abstract namespace, else this socket
 		 * path; when -p given this can specify the network interface
@@ -693,12 +727,20 @@ int main(int argc, const char **argv)
 		if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_A].sw)))
 			info.ss_proxy_address = p;
 	}
-#else
-	info.pss_policies_json = default_ss_policy;
-	info.options = LWS_SERVER_OPTION_EXPLICIT_VHOSTS |
-		       LWS_SERVER_OPTION_H2_JUST_FIX_WINDOW_UPDATE_OVERFLOW |
-		       LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
-#endif
+	#else
+		/*
+		 * If --policy <file> is given, use that instead of the built-in
+		 * default policy, so the test can be pointed at a locally-generated
+		 * policy targeting a local test server instead of warmcat.com.
+		 */
+		if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_POLICY].sw)))
+			info.pss_policies_json = p;
+		else
+			info.pss_policies_json = default_ss_policy;
+		info.options = LWS_SERVER_OPTION_EXPLICIT_VHOSTS |
+			       LWS_SERVER_OPTION_H2_JUST_FIX_WINDOW_UPDATE_OVERFLOW |
+			       LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+	#endif
 
 #if defined(LWS_WITH_MBEDTLS)
 
@@ -732,8 +774,8 @@ int main(int argc, const char **argv)
 	/* timeout for each forked process */
 
 	lws_sul_schedule(context, 0, &sul_timeout, process_timeout,
-			 (lws_usec_t)((lws_usec_t)budget *
-				       (lws_usec_t)timeout_ms * LWS_US_PER_MS));
+			 (lws_usec_t)((lws_usec_t)budget * 3 *
+				      (lws_usec_t)timeout_ms * LWS_US_PER_MS));
 
 #if !defined(LWS_SS_USE_SSPC)
 	/*
@@ -773,7 +815,7 @@ int main(int argc, const char **argv)
 	/* the event loop */
 
 	n = 0;
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_sul_cancel(&sul_timeout);
@@ -790,9 +832,21 @@ bail:
 
 	if (bad == expected) {
 		lwsl_user("Completed: OK (seen expected %d)\n", expected);
-		return 0;
-	} else
+		bad = 0;
+	} else {
 		lwsl_err("Completed: failed: exit %d, expected %d\n", bad, expected);
+		bad = 1;
+	}
 
-	return 1;
+#if !defined(WIN32)
+	{
+		int status;
+		while (waitpid(-1, &status, 0) > 0) {
+			if (WIFEXITED(status) && WEXITSTATUS(status))
+				bad = 1;
+		}
+	}
+#endif
+
+	return bad;
 }

@@ -1,5 +1,49 @@
 // auth.js - CSP Compliant Frontend Logic
 
+/*
+ * A fetch() that never reached the server has no status and no body to explain
+ * itself: the browser just reports "NetworkError".  Name the absolute URL we
+ * were trying to reach, so a connection that was dropped (a ban, a proxy, a
+ * broken transport) can be told from a server that answered badly.
+ */
+function lwsAuthNetErr(path, err) {
+    let u = path;
+
+    try {
+        u = new URL(path, window.location.origin).href;
+    } catch (e) {}
+
+    return 'Network communication failed reaching ' + u +
+           (err && err.message ? ': ' + err.message : '');
+}
+
+/*
+ * F-050: html escaper for every dynamic string composed into
+ * innerHTML.  Covers the urlarg-sourced service_name (reflected),
+ * and, as defense-in-depth, the /api/status-sourced fields.  Escapes
+ * the F-021 set including quotes, so the same escaper serves both
+ * text and attribute contexts.
+ */
+function lwsAuthEsc(s) {
+    const m = { '&': '&amp;', '<': '&lt;', '>': '&gt;',
+                '"': '&quot;', "'": '&#39;' };
+    return String(s).replace(/[&<>"']/g, c => m[c]);
+}
+
+/*
+ * A target that did not parse as an absolute URL is only followed if it
+ * is a same-origin *path*.  A leading "//" -- or "/\", or "/<TAB>/",
+ * since the URL parser folds backslash and strips tab/LF/CR first -- is
+ * an authority, ie somebody else's host.  Returns null if unsafe.
+ */
+function lwsAuthSafeRelative(s) {
+    if (typeof s !== 'string' || /[\u0000-\u001f\u007f]/.test(s) ||
+        s[0] !== '/' || s[1] === '/' || s[1] === '\\')
+        return null;
+
+    return s;
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     // Elements
     const loginForm = document.getElementById('login-form');
@@ -10,13 +54,16 @@ document.addEventListener('DOMContentLoaded', () => {
     const logToggleBox = document.getElementById('login-toggle-box');
     const switchRegBtn = document.getElementById('switch-to-reg');
     const switchLoginBtn = document.getElementById('switch-to-login');
+    const switchForgotBtn = document.getElementById('switch-to-forgot');
+
+    const forgotForm = document.getElementById('forgot-password-form');
+    const resetForm = document.getElementById('reset-password-form');
 
     const notifBox = document.getElementById('notification');
     const notifMsg = document.getElementById('notif-message');
     const subtitle = document.getElementById('subtitle');
 
     let isRegistrationMode = false;
-    let totpRequired = false;
 
     const urlParams = new URLSearchParams(window.location.search);
     const clientId = urlParams.get('client_id');
@@ -25,6 +72,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const codeChallenge = urlParams.get('code_challenge');
     const codeChallengeMethod = urlParams.get('code_challenge_method');
     const serviceName = urlParams.get('service_name');
+    const resetToken = urlParams.get('reset_token');
 
 
     async function loadManifest() {
@@ -68,7 +116,7 @@ document.addEventListener('DOMContentLoaded', () => {
         let grantsHtml = Object.keys(data.grants || {}).length
             ? '<table class="auth-grants-table">' +
               '<tr><th>Service</th><th class="level-col">Level</th></tr>' +
-              Object.keys(data.grants).map(k => `<tr><td>${k}</td><td class="level-col">L${data.grants[k]}</td></tr>`).join('') +
+              Object.keys(data.grants).map(k => `<tr><td>${lwsAuthEsc(k)}</td><td class="level-col">L${lwsAuthEsc(data.grants[k])}</td></tr>`).join('') +
               '</table>'
             : '<div class="auth-grants-empty">No Active Grants</div>';
 
@@ -76,19 +124,26 @@ document.addEventListener('DOMContentLoaded', () => {
             ? '<p class="auth-session-title auth-log-title">Valid JWK Peers</p>' +
               '<table class="auth-log-table">' +
               '<tr><th>Date / Time</th><th class="ip-col">IP Address</th></tr>' +
-              data.logs.map(lg => `<tr><td class="time-col">${new Date(lg.time * 1000).toLocaleString()}</td><td class="ip-col">${lg.ip}</td></tr>`).join('') +
+              data.logs.map(lg => `<tr><td class="time-col">${lwsAuthEsc(new Date(lg.time * 1000).toLocaleString())}</td><td class="ip-col">${lwsAuthEsc(lg.ip)}</td></tr>`).join('') +
               '</table>'
             : '';
 
         let headerHtml = `<div class="auth-status-row success-row">
             <span class="auth-status-icon">✅</span>
-            <span class="auth-status-text">Logged in as ${data.email || 'Unknown User'}</span>
+            <span class="auth-status-text">Logged in as ${lwsAuthEsc(data.email || 'Unknown User')}</span>
         </div>`;
+
+        if (data.is_admin) {
+            headerHtml += `<div class="auth-status-row auth-status-spacer auth-status-admin-row">
+                <span class="auth-status-icon">🛠️</span>
+                <span class="auth-status-text"><a href="/api/admin" class="auth-admin-link">Admin Console</a></span>
+            </div>`;
+        }
 
         if (isDenied) {
             headerHtml += `<div class="auth-status-row error-row auth-status-spacer">
                 <span class="auth-status-icon">❌</span>
-                <span class="auth-status-text">Doesn't grant '${serviceName || 'required service'}'</span>
+                <span class="auth-status-text">Doesn't grant '${lwsAuthEsc(serviceName || 'required service')}'</span>
             </div>`;
         } else {
             headerHtml += `<div class="auth-status-spacer"></div>`;
@@ -101,11 +156,27 @@ document.addEventListener('DOMContentLoaded', () => {
             <button type="button" id="btn-destroy-session" class="btn primary-btn">${isDenied ? 'Logout / Switch User' : 'Logout'}</button>
         </div>`;
 
-        document.getElementById('btn-destroy-session').addEventListener('click', async function() {
-            const btn = this;
+        document.getElementById('btn-destroy-session').addEventListener('click', async function(ev) {
+            const btn = ev.currentTarget;
             btn.innerText = "Logging out...";
             btn.disabled = true;
-            await fetch('/api/status?destroy=1', { cache: 'no-store', credentials: 'include' });
+            /*
+             * Teardown is state-changing: a POST carrying the
+             * auth_csrf double submit, not a CSRF-able GET.
+             */
+            const body = new URLSearchParams();
+            body.append('csrf_token', window.csrf_token || '');
+            try {
+                await fetch('/api/logout', {
+                    method: 'POST',
+                    cache: 'no-store',
+                    credentials: 'include',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: body.toString()
+                });
+            } catch (e) {
+                console.error("Logout failed", e);
+            }
             window.location.reload();
         });
     }
@@ -133,17 +204,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
 
                 if (data.logged_in) {
-                    regToggleBox.classList.add('hidden');
-
                     if (data.lacks_grant) {
+                        regToggleBox.classList.remove('hidden');
                         renderAuthStatus(data, true);
                         subtitle.innerText = "Insufficient Privileges";
-                        /* The user requested getting rid of this error box entirely and standardizing.
-                           Since showNotif generates this other error box, let's remove it if the user doesn't want redundancy,
-                           or keep it if it's the notification. "I'd like to get rid of the first error box... and change it to this kind of simplified and standardized flow" */
-                        // showNotif('error', 'You lack the required grant to access this service.');
                         return;
                     }
+                    regToggleBox.classList.add('hidden');
 
                     if (clientId && redirectUri) {
                         /*alert("auth.js auth redirect -> " + `/api/authorize`); */ window.location.href = `/api/authorize?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${encodeURIComponent(state||'')}&response_type=code` + (codeChallenge ? `&code_challenge=${encodeURIComponent(codeChallenge)}` : '') + (codeChallengeMethod ? `&code_challenge_method=${encodeURIComponent(codeChallengeMethod)}` : '');
@@ -189,8 +256,8 @@ document.addEventListener('DOMContentLoaded', () => {
                                         <span class="auth-status-icon">❌</span>
                                         <span class="auth-status-text">Security Violation</span>
                                     </div>
-                                    <p class="auth-session-email">${errData.error || 'Untrusted Redirect URI'}</p>
-                                    <p style="font-size: 0.8rem; color: #94a3b8; text-align: center; margin-top: 10px;">The specified redirection target is not whitelisted by the network administrator.</p>
+                                    <p class="auth-session-email">${lwsAuthEsc(errData.error || 'Untrusted Redirect URI')}</p>
+                                    <p class="redirect-whitelist-error">The specified redirection target is not whitelisted by the network administrator.</p>
                                 </div>`;
                                 subtitle.innerText = "Access Blocked";
                                 showNotif('error', errData.error || 'Untrusted Redirect URI');
@@ -224,6 +291,20 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    /*
+     * SSO completion is a cross-origin form POST, so the app's origin
+     * must be in this vhost's CSP form-action (see the README).  If it
+     * is not, the browser refuses the submission silently -- form.submit()
+     * returns normally -- so report the violation instead of idling.
+     */
+    document.addEventListener('securitypolicyviolation', (e) => {
+        if (e.effectiveDirective === 'form-action' ||
+            e.violatedDirective === 'form-action')
+            showNotif('error', 'The browser blocked handover to the ' +
+                      'application: this auth server\'s CSP form-action ' +
+                      'does not list its origin.');
+    });
+
     loadManifest();
     checkServerStatus();
 
@@ -231,6 +312,8 @@ document.addEventListener('DOMContentLoaded', () => {
     switchRegBtn.addEventListener('click', () => {
         isRegistrationMode = true;
         loginForm.classList.add('hidden');
+        forgotForm.classList.add('hidden');
+        resetForm.classList.add('hidden');
         registerForm.classList.remove('hidden');
         regToggleBox.classList.add('hidden');
         logToggleBox.classList.remove('hidden');
@@ -241,6 +324,8 @@ document.addEventListener('DOMContentLoaded', () => {
     switchLoginBtn.addEventListener('click', () => {
         isRegistrationMode = false;
         registerForm.classList.add('hidden');
+        forgotForm.classList.add('hidden');
+        resetForm.classList.add('hidden');
         loginForm.classList.remove('hidden');
         logToggleBox.classList.add('hidden');
         regToggleBox.classList.remove('hidden');
@@ -248,7 +333,27 @@ document.addEventListener('DOMContentLoaded', () => {
         hideNotif();
     });
 
-    if (serviceName && !isRegistrationMode) {
+    if (switchForgotBtn) {
+        switchForgotBtn.addEventListener('click', () => {
+            loginForm.classList.add('hidden');
+            registerForm.classList.add('hidden');
+            forgotForm.classList.remove('hidden');
+            regToggleBox.classList.add('hidden');
+            logToggleBox.classList.remove('hidden');
+            subtitle.innerText = "Recover your password";
+            hideNotif();
+        });
+    }
+
+    if (resetToken) {
+        loginForm.classList.add('hidden');
+        registerForm.classList.add('hidden');
+        regToggleBox.classList.add('hidden');
+        logToggleBox.classList.remove('hidden');
+        resetForm.classList.remove('hidden');
+        document.getElementById('reset-token').value = resetToken;
+        subtitle.innerText = "Reset your password";
+    } else if (serviceName && !isRegistrationMode) {
         subtitle.innerText = "Authenticate to access " + serviceName;
     }
 
@@ -283,9 +388,12 @@ document.addEventListener('DOMContentLoaded', () => {
             if (response.status === 401) {
                 const reqTotp = response.headers.get('X-Requires-TOTP');
                 if (reqTotp) {
-                    totpRequired = true;
                     totpGroup.classList.remove('hidden');
                     showNotif('error', 'Authenticator code required.');
+                    setTimeout(() => {
+                        const firstBox = document.querySelector('.totp-box');
+                        if (firstBox) firstBox.focus();
+                    }, 50);
                 } else {
                     let errMsg = 'Invalid security credentials.';
                     try {
@@ -304,41 +412,43 @@ document.addEventListener('DOMContentLoaded', () => {
                 showNotif('error', errMsg);
             } else if (response.ok) {
                 const data = await response.json();
-                showNotif('success', 'Clearance accepted. Welcome.');
                 const stkOverlay = document.getElementById('strike-overlay');
                 if (stkOverlay) {
                     stkOverlay.classList.remove('show-strike');
                 }
                 if (data.redirect) {
-                    setTimeout(() => { /*alert("auth.js data.redirect -> "+ data.redirect);*/ window.location.href = data.redirect; }, 1000);
+                    window.location.href = data.redirect;
                 } else if (redirectUri) {
-                    setTimeout(() => {
-                        let u;
-                        try { u = new URL(redirectUri); } catch(e) {}
-                        if (u) {
-                            const form = document.createElement('form');
-                            form.method = 'POST';
-                            let path = u.pathname;
-                            if (path.endsWith('/')) path = path.slice(0, -1);
-                            form.action = u.origin + path + '/.lws-login-sso';
-                            const tInput = document.createElement('input');
-                            tInput.type = 'hidden';
-                            tInput.name = 'token';
-                            tInput.value = data.token;
-                            form.appendChild(tInput);
-                            const rInput = document.createElement('input');
-                            rInput.type = 'hidden';
-                            rInput.name = 'target';
-                            rInput.value = redirectUri;
-                            form.appendChild(rInput);
-                            document.body.appendChild(form);
-                            form.submit();
-                        } else {
-                            /*alert("auth.js redirectUri -> " + redirectUri);*/ window.location.href = redirectUri;
-                        }
-                    }, 1000);
+                    let u;
+                    try { u = new URL(redirectUri); } catch(e) {}
+                    if (u) {
+                        const form = document.createElement('form');
+                        form.method = 'POST';
+                        let path = u.pathname;
+                        if (path.endsWith('/')) path = path.slice(0, -1);
+                        form.action = u.origin + path + '/.lws-login-sso';
+                        const tInput = document.createElement('input');
+                        tInput.type = 'hidden';
+                        tInput.name = 'token';
+                        tInput.value = data.token;
+                        form.appendChild(tInput);
+                        const rInput = document.createElement('input');
+                        rInput.type = 'hidden';
+                        rInput.name = 'target';
+                        rInput.value = redirectUri;
+                        form.appendChild(rInput);
+                        document.body.appendChild(form);
+                        form.submit();
+                    } else {
+                        /* not a URL: a same-origin path or nothing */
+                        const rel = lwsAuthSafeRelative(redirectUri);
+                        if (!rel)
+                            console.error("Unusable redirect target");
+                        /* anchored to our own origin: it can only be a path here */
+                        window.location.href = window.location.origin + (rel || '/');
+                    }
                 } else {
-                    setTimeout(() => window.location.href = '/', 1000);
+                    window.location.href = '/';
                 }
             } else {
                 let errMsg = 'Server anomaly detected.';
@@ -349,7 +459,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 showNotif('error', errMsg);
             }
         } catch (err) {
-            showNotif('error', 'Network communication failed.' + err.message);
+            showNotif('error', lwsAuthNetErr('/api/login', err));
         } finally {
             btn.classList.remove('loading');
         }
@@ -363,8 +473,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const formData = new FormData(registerForm);
         formData.append("csrf_token", window.csrf_token || "");
-        const payload = Object.fromEntries(formData.entries());
-
         try {
             const response = await fetch('/api/register', {
                 method: 'POST',
@@ -389,11 +497,88 @@ document.addEventListener('DOMContentLoaded', () => {
                 showNotif('error', errMsg);
             }
         } catch (err) {
-            showNotif('error', 'Network communication failed.');
+            showNotif('error', lwsAuthNetErr('/api/register', err));
         } finally {
             btn.classList.remove('loading');
         }
     });
+
+    if (forgotForm) {
+        forgotForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = document.getElementById('forgot-btn');
+            btn.classList.add('loading');
+            hideNotif();
+
+            const formData = new FormData(forgotForm);
+            formData.append("csrf_token", window.csrf_token || "");
+
+            try {
+                const response = await fetch('/api/forgot_password', {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams(formData).toString()
+                });
+
+                if (response.ok) {
+                    showNotif('success', 'If the email exists, a recovery link has been sent.');
+                    setTimeout(() => switchLoginBtn.click(), 3000);
+                } else {
+                    let errMsg = 'Recovery request failed.';
+                    try {
+                        const data = await response.json();
+                        if (data && data.error) errMsg = data.error;
+                    } catch (e) {}
+                    showNotif('error', errMsg);
+                }
+            } catch (err) {
+                showNotif('error', lwsAuthNetErr('/api/forgot_password', err));
+            } finally {
+                btn.classList.remove('loading');
+            }
+        });
+    }
+
+    if (resetForm) {
+        resetForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = document.getElementById('reset-btn');
+            btn.classList.add('loading');
+            hideNotif();
+
+            const formData = new FormData(resetForm);
+            formData.append("csrf_token", window.csrf_token || "");
+
+            try {
+                const response = await fetch('/api/reset_password', {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams(formData).toString()
+                });
+
+                if (response.ok) {
+                    showNotif('success', 'Password reset successfully. Please log in.');
+                    setTimeout(() => {
+                        /* back to the login form: the UI is at the root */
+                        window.location.href = '/';
+                    }, 2000);
+                } else {
+                    let errMsg = 'Reset failed.';
+                    try {
+                        const data = await response.json();
+                        if (data && data.error) errMsg = data.error;
+                    } catch (e) {}
+                    showNotif('error', errMsg);
+                }
+            } catch (err) {
+                showNotif('error', lwsAuthNetErr('/api/reset_password', err));
+            } finally {
+                btn.classList.remove('loading');
+            }
+        });
+    }
 
     function showNotif(type, msg) {
         notifBox.className = `notification ${type}`;
@@ -407,5 +592,162 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function hideNotif() {
         notifBox.className = 'notification hidden';
+    }
+
+    // TOTP Box Logic
+    const totpBoxes = document.querySelectorAll('.totp-box');
+    const totpHidden = document.getElementById('login-totp');
+
+    if (totpBoxes.length > 0) {
+        totpBoxes.forEach((box, index) => {
+            box.addEventListener('input', (e) => {
+                // Ensure only digits
+                e.target.value = e.target.value.replace(/\D/g, '');
+
+                if (e.target.value.length === 1) {
+                    if (index < totpBoxes.length - 1) {
+                        totpBoxes[index + 1].focus();
+                    } else {
+                        updateTotpHidden();
+                        // Delay slightly so the input value registers visually before submit
+                        setTimeout(() => loginForm.requestSubmit(), 50);
+                    }
+                }
+                updateTotpHidden();
+            });
+
+            box.addEventListener('keydown', (e) => {
+                if (e.key === 'Backspace' && !e.target.value && index > 0) {
+                    totpBoxes[index - 1].focus();
+                } else if (e.key === 'Enter') {
+                    e.preventDefault();
+                    loginForm.requestSubmit();
+                }
+            });
+
+            box.addEventListener('paste', (e) => {
+                e.preventDefault();
+                const pasted = (e.clipboardData || window.clipboardData).getData('text').trim().replace(/\D/g, '').slice(0, 6);
+                if (pasted) {
+                    for (let i = 0; i < pasted.length; i++) {
+                        if (totpBoxes[i]) totpBoxes[i].value = pasted[i];
+                    }
+                    updateTotpHidden();
+                    if (pasted.length === 6) {
+                        totpBoxes[5].focus();
+                        setTimeout(() => loginForm.requestSubmit(), 50);
+                    } else {
+                        totpBoxes[pasted.length].focus();
+                    }
+                }
+            });
+        });
+
+        function updateTotpHidden() {
+            let code = '';
+            totpBoxes.forEach(b => code += b.value);
+            if (totpHidden) totpHidden.value = code;
+        }
+    }
+
+    // Initial Focus Management
+    setTimeout(() => {
+        const emailInput = document.getElementById('login-username');
+        const passInput = document.getElementById('login-password');
+
+        if (emailInput && !emailInput.value) {
+            emailInput.focus();
+        } else if (passInput && !passInput.value) {
+            passInput.focus();
+        } else if (totpBoxes.length > 0) {
+            const tGroup = document.getElementById('totp-group');
+            if (tGroup && !tGroup.classList.contains('hidden')) {
+                totpBoxes[0].focus();
+            }
+        }
+    }, 150);
+
+    const deviceCodeParam = urlParams.get('device_code');
+    const deviceAuthBox = document.getElementById('device-auth-box');
+    const deviceAuthBtn = document.getElementById('device-auth-btn');
+    const deviceCodeInput = document.getElementById('device-code');
+
+    if (deviceCodeParam) {
+        // Hide standard forms
+        if (loginForm) loginForm.classList.add('hidden');
+        if (registerForm) registerForm.classList.add('hidden');
+        if (regToggleBox) regToggleBox.classList.add('hidden');
+        if (logToggleBox) logToggleBox.classList.add('hidden');
+
+        // Show device auth
+        if (deviceAuthBox) {
+            deviceAuthBox.classList.remove('hidden');
+            deviceAuthBox.classList.add('active');
+        }
+        if (deviceCodeInput) {
+            deviceCodeInput.value = deviceCodeParam;
+        }
+        if (subtitle) {
+            subtitle.innerText = "Authorize a new device";
+        }
+    }
+
+    if (deviceAuthBtn) {
+        deviceAuthBtn.addEventListener('click', async () => {
+            const code = deviceCodeInput.value.trim();
+            if (code.length < 8) {
+                showNotif('error', 'Invalid code length');
+                return;
+            }
+
+            const loader = deviceAuthBtn.querySelector('.loader');
+            const span = deviceAuthBtn.querySelector('span');
+
+            deviceAuthBtn.disabled = true;
+            if (loader) loader.classList.remove('hidden');
+            if (span) span.innerText = 'Authorizing...';
+
+            try {
+                const formData = new URLSearchParams();
+                formData.append('user_code', code);
+                if (window.csrf_token) formData.append('csrf_token', window.csrf_token);
+
+                const response = await fetch('/api/device_approve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    credentials: 'include',
+                    body: formData.toString()
+                });
+
+                if (response.ok) {
+                    showNotif('success', 'Device authorized successfully!');
+                    deviceAuthBox.innerHTML = `
+                        <div class="auth-status-row success-row mb-0">
+                            <span class="auth-status-icon">✅</span>
+                            <span class="auth-status-text">Device Authorized</span>
+                        </div>
+                        <p class="auto-redirect-msg">
+                            You may now close this tab. The device will connect automatically.
+                        </p>
+                    `;
+                } else {
+                    deviceAuthBtn.disabled = false;
+                    if (loader) loader.classList.add('hidden');
+                    if (span) span.innerText = 'Authorize Device';
+
+                    let errMsg = 'Authorization failed';
+                    try {
+                        const data = await response.json();
+                        if (data && data.error) errMsg = data.error;
+                    } catch (e) {}
+                    showNotif('error', errMsg);
+                }
+            } catch (e) {
+                deviceAuthBtn.disabled = false;
+                if (loader) loader.classList.add('hidden');
+                if (span) span.innerText = 'Authorize Device';
+                showNotif('error', 'Network error');
+            }
+        });
     }
 });

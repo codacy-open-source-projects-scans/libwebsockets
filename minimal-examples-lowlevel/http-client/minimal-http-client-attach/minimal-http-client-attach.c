@@ -37,7 +37,7 @@ static const struct lws_switches switches[] = {
 static struct lws_context *context;
 static pthread_t lws_thread;
 static pthread_mutex_t lock;
-static int interrupted, bad = 1, status;
+static int bad = 1, status;
 
 static int
 callback_http(struct lws *wsi, enum lws_callback_reasons reason,
@@ -49,7 +49,7 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
 		lwsl_err("CLIENT_CONNECTION_ERROR: %s\n",
 			 in ? (char *)in : "(null)");
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		break;
 
 	case LWS_CALLBACK_ESTABLISHED_CLIENT_HTTP:
@@ -95,13 +95,13 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 
 	case LWS_CALLBACK_COMPLETED_CLIENT_HTTP:
 		lwsl_user("LWS_CALLBACK_COMPLETED_CLIENT_HTTP\n");
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		bad = status != 200;
 		lws_cancel_service(lws_get_context(wsi)); /* abort poll wait */
 		break;
 
 	case LWS_CALLBACK_CLOSED_CLIENT_HTTP:
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		bad = status != 200;
 		lws_cancel_service(lws_get_context(wsi)); /* abort poll wait */
 		break;
@@ -124,7 +124,7 @@ static const struct lws_protocols protocols[] = {
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 static void
@@ -193,7 +193,8 @@ lws_create(void *d)
 
        lwsl_user("%s: tid %p\n", __func__, (void *)(intptr_t)pthread_self());
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	
 	info.port = CONTEXT_PORT_NO_LISTEN;
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 	info.system_ops = &ops;
@@ -207,9 +208,8 @@ lws_create(void *d)
 
 	/* start the event loop */
 
-	while (!interrupted)
-		if (lws_service(context, 0))
-			interrupted = 1;
+	while (lws_service(context, 0) >= 0)
+		;
 
 	lws_context_destroy(context);
 
@@ -221,8 +221,7 @@ bail:
 
 int main(int argc, const char **argv)
 {
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
-	const char *p;
+	int n = 0;
 	void *retval;
 	(void)switches;
 
@@ -234,10 +233,7 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal http client attach\n");
 
 	pthread_mutex_init(&lock, NULL);
@@ -261,8 +257,10 @@ int main(int argc, const char **argv)
 	 * may run before the lws context was created.
 	 */
 
-	while (!context && n++ < 30)
+	while (!context && n < 30) {
+		n++;
 		usleep(10000);
+	}
 
 	if (!context) {
 		lwsl_err("%s: context didn't start\n", __func__);

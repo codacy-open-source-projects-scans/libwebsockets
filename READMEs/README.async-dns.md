@@ -19,8 +19,9 @@ that directly queries the configured nameserver itself over UDP,
 from the event loop.
 
 It supports both ipv4 / A records and ipv6 / AAAA records (see later
-for a description about how).  One server supported over UDP :53,
-and the nameserver is autodicovered on linux, windows, and freertos.
+for a description about how).  Multiple servers are supported over
+UDP :53, and the nameservers are autodiscovered on linux, macos,
+windows, android and freertos.
     
 Other features
 
@@ -29,7 +30,8 @@ Other features
  - it's really integrated with the lws event loop, it does not spawn
    threads or use the libc resolver, and of course no blocking at all
  - platform-specific server address capturing (from /etc/resolv.conf
-   on linux, windows apis on windows)
+   on linux, the SystemConfiguration dynamic store on macOS, windows apis on
+   windows), with changes watched and distributed via SMD
  - LRU caching
  - piggybacking (multiple requests before the first completes go on
     a list on the first request, not spawn multiple requests)
@@ -101,6 +103,12 @@ and restarts it.  It allows this to happen for 3 CNAME deep.
 At the end, either way, the cached result is set using the original
 query name and the results from the last CNAME in the chain.
 
+A lookup that validates DNSSEC (see below) doesn't use the target's records
+from the packet that brought the CNAME, since they are signed, if at all, by
+the target's zone.  It first validates the CNAME itself, as an RRset of the
+queried name, and only then restarts the query for the target, whose answers
+have to validate on their own.  An unsigned CNAME fails a validating lookup.
+
 ## DNSSEC Support
 
 Async DNS supports DNSSEC validation of responses. This is optional and provides robust protection against DNS spoofing or injection of forged results.
@@ -114,18 +122,75 @@ lws_async_dns_dnssec_set_mode(context, LWS_ADNS_DNSSEC_REQUIRE);
 
 When validation is set to `LWS_ADNS_DNSSEC_REQUIRE`, queries failing to authenticate computationally with upstream Trust Anchors (or those lacking RRSIG/DNSKEY records entirely) will be explicitly rejected by the resolver and not propagate to callbacks or connections. But some domains inherently lack DNSSEC. For situations where strict DNSSEC is globally mandated, but a small handful of known-unsigned destinations must be reached, clients can explicitly set the `LWS_ADNS_INDICATE_LACKS_DNSSEC` bitflag natively on integer `qtype` lookups. This allows the resolver to tolerate missing records explicitly for that singular lookup, while strictly required globally.
 
+Independent of the context mode, a single lookup can be made to validate by
+ORing `LWS_ADNS_WANT_DNSSEC` into its `qtype`.  Only a lookup that validated
+reports `LWS_ADNS_DNSSEC_VALID` in the callback's `n`, including when a later
+lookup is served the same records from the cache; a lookup that has to validate
+is never served records that were cached by one that didn't.
+
+A lookup that validates keeps only the records of the type it asked for, which
+are exactly the RRset its RRSIG covers: other records the response carried,
+including the RRSIGs themselves, are not cached, so they can't be found later,
+eg, with `lws_async_dns_get_rr_cache()`, as if they had been validated.  An
+RRset of more than 16 records fails to validate.
+
+The TTLs on the wire aren't covered by the signatures, so a validated answer
+is only cached, and served as validated, until the earliest of its RRSIG's
+expiration, its RRSIG's Original TTL from when it was validated, and the
+expiry of the signer zone's authenticated keys (for an answer reached through
+a CNAME, the CNAME's too).  Any answer, validated or not, is cached for at
+most a day whatever TTL it came with.
+
+### Chain of trust
+
+An answer's RRSIG is only checked with a key of the signer's zone once that
+zone's keys are themselves authenticated, the same way a validating recursive
+resolver does it:
+
+ - the zone's DS RRset is fetched, and must be signed by an authenticated key
+   of the zone that signed it (its parent), which is authenticated the same way
+   in turn, up to the root
+ - the zone's DNSKEY RRset is fetched, and must be signed by a key in it that
+   one of those DS records vouches for; for the root, one of the trust anchors
+
+The chain is walked once per zone, and the authenticated keys are kept until
+the earlier of their signatures' expiry and their TTL, so later lookups signed
+by the same zones only cost the RRSIG check.  A zone that fails to authenticate
+is also remembered for 10s, so a broken chain is not walked again for every
+lookup that needs it.
+
+Delegations to unsigned zones are not proven with NSEC / NSEC3: anything under
+a zone without DS records fails to validate.  The supported algorithms are
+RSASHA256, RSASHA512, ECDSAP256SHA256 and ECDSAP384SHA384, with DS digests of
+SHA-256 or SHA-384.
+
+The ICANN root KSK DS records are built in as the trust anchors.  They can be
+replaced, eg, for a private DNS hierarchy, with
+
+```c
+lws_async_dns_dnssec_set_root_anchors(context, anchors, count);
+```
+
+which also forgets any keys authenticated under the previous anchors, and
+stops cached answers validated with them being served as validated;
+`minimal-examples-lowlevel/api-tests/api-test-dnssec-chain` does this to test
+the validator against a signed hierarchy of its own.
+
 ## Network configuration changes and failover
 
-Since lws async DNS natively talks to the DNS servers over UDP, it doesn't automatically adapt when the OS routing table or network configuration changes (e.g., when a mobile device moves from WiFi to a cellular network and loses access to the previous local DNS server).
+Since lws async DNS natively talks to the DNS servers over UDP, it doesn't automatically adapt when the OS routing table or network configuration changes (e.g., when a laptop is unplugged from ethernet and moves to wlan, losing access to the previous local DNS server).
 
-To handle this gracefully, there are three mechanisms:
+To handle this gracefully, there are these mechanisms:
 
-1. **Reactive Failover**: The adaptive server selection tracks response latencies using `lws_adapt`. If all active DNS servers consecutively fail to respond or experience severe timeouts (e.g. >10s tracking averages), the lws async DNS system will infer the network configuration has changed and will automatically flush its active nameserver list. It then re-queries the system (e.g., via `GetNetworkParams` on Windows or `__system_property_get` on Android) to learn the new servers. This occurs automatically.
-2. **File Monitoring (POSIX)**: On POSIX systems (Linux, macOS, etc.), lws async DNS automatically checks the modification time of `/etc/resolv.conf` before making new queries. If the file has changed since the last check, it transparently reloads the DNS servers.
-3. **Explicit API**: Applications can explicitly tell lws to drop its currently tracked DNS servers and refresh its understanding of the network environment by calling the public API:
+1. **Reactive Failover**: The adaptive server selection tracks response latencies using `lws_adapt`. If all active DNS servers consecutively fail to respond or experience severe timeouts (e.g., >10s tracking averages), the lws async DNS system will infer the network configuration has changed and will automatically flush its active nameserver list.  It then re-queries the system (e.g., via `GetNetworkParams` on Windows or `__system_property_get` on Android) to learn the new servers. This occurs automatically.
+2. **Platform DNS server watching**: every platform exposes its current effective DNS server list through the platform primitive (`/etc/resolv.conf` on linux, system properties on android, the SystemConfiguration dynamic store on macOS, `GetNetworkParams` on windows).  Lws watches for changes in that list: natively pushed from the macOS dynamic store on a dispatch queue (this also sees per-service and split-DNS resolver sets that `/etc/resolv.conf` does not mirror), and by a lightweight poll (~3s, overridable with the `LWS_ASYNCDNS_WATCH_MS` env var for testing) everywhere else.  When the effective list changes, lws publishes it on SMD class `LWSSMDCL_DNS` as JSON like `{"ns":["192.168.1.1","1.1.1.1"]}`, at context creation and on every subsequent change; that event both drives an internal requery-and-reload of the resolver's server list (the message is a trigger, the platform is re-queried for the authoritative list) and is available to user SMD observers, including in other processes via the secure streams proxy.  Enabling `LWS_WITH_SYS_ASYNC_DNS` selects `LWS_WITH_SYS_SMD` accordingly.
+3. **Boot synchronization**: with `LWS_WITH_SYS_STATE`, system state transitions hold at `LWS_SYSTATE_DNS` until the resolver has acquired at least one usable DNS server from the platform, or user code pinned one (via `info.async_dns_servers` or `lws_async_dns_server_add()`).  This synchronizes user code that waits for `LWS_SYSTATE_OPERATIONAL` against being able to actually perform DNS lookups.
+4. **Explicit API**: Applications can explicitly tell lws to drop its currently tracked DNS servers and refresh its understanding of the network environment by calling the public API:
 
 ```c
 lws_async_dns_server_reload(context);
 ```
 
 This is particularly useful on Android, where native C code cannot easily hook onto Java `ConnectivityManager` link change broadcasts. Android applications can listen to `onLinkPropertiesChanged()` natively in Kotlin/Java and call a JNI function that executes `lws_async_dns_server_reload()` out-of-band to proactively trigger the failover.
+
+For testing, the `LWS_ASYNCDNS_RESOLV_CONF` env var redirects resolv.conf-shaped platform discovery to an arbitrary file path, so tests can drive discovery and change detection through a scratch file they control.

@@ -158,7 +158,7 @@ callback_dumb_increment(struct lws *wsi, enum lws_callback_reasons reason,
 
 		for (n = 0; n < (int)LWS_ARRAY_SIZE(wsi_multi); n++)
 			if (wsi == wsi_multi[n]) {
-				sprintf(which_wsi, "multi %d", n);
+				lws_snprintf(which_wsi, sizeof(which_wsi), "multi %d", n);
 				which = which_wsi;
 				wsi_multi[n] = NULL;
 			}
@@ -290,7 +290,8 @@ callback_dumb_increment(struct lws *wsi, enum lws_callback_reasons reason,
 
 #if defined(LWS_WITH_TLS) && defined(LWS_HAVE_SSL_CTX_set1_param) && \
 	!defined(LWS_WITH_MBEDTLS) && !defined(LWS_WITH_GNUTLS) && \
-	!defined(LWS_WITH_BEARSSL)
+	!defined(LWS_WITH_BEARSSL) && \
+	!defined(LWS_WITH_OPENHITLS)
 	case LWS_CALLBACK_OPENSSL_LOAD_EXTRA_CLIENT_VERIFY_CERTS:
 		if (crl_path[0]) {
 			/* Enable CRL checking of the server certificate */
@@ -415,7 +416,7 @@ callback_lws_mirror(struct lws *wsi, enum lws_callback_reasons reason,
 		for (n = 0; n < 1; n++) {
 			lws_get_random(lws_get_context(wsi), rands,
 				       sizeof(rands));
-			l += sprintf((char *)&buf[LWS_PRE + l],
+			l += lws_snprintf((char *)&buf[LWS_PRE + l], (size_t)(block_size - l),
 					"c #%06X %u %u %u;",
 					rands[0] & 0xffffff,	/* colour */
 					rands[1] & 511,		/* x */
@@ -733,9 +734,10 @@ int main(int argc, char **argv)
 	 * since we know this lws context is only ever going to be used with
 	 * a few client wsis / fds / sockets at a time, let lws know it doesn't
 	 * have to use the default allocations for fd tables up to ulimit -n.
-	 * It will just allocate for 2 internal and 4 that we might use.
+	 * It will just allocate for its own fds and overhead
+	 * (LWS_FD_LIMIT_PER_THREAD_MIN) plus the 4 connections we might use.
 	 */
-	info.fd_limit_per_thread = 2 + 4;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 4;
 
 #if defined(LWS_WITH_TLS)
 	info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;

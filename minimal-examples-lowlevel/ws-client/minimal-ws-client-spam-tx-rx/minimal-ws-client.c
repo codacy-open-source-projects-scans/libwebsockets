@@ -38,7 +38,7 @@ static int message_delay = 500000; // microseconds
 static int connection_delay = 100000; // microseconds
 static struct lws_context *context;
 static const char *server_address = "localhost", *pro = "lws-minimal";
-static int interrupted = 0, port = 7681, ssl_connection = 0;
+static int port = 7681, ssl_connection = 0;
 
 static int connect_client()
 {
@@ -85,7 +85,7 @@ callback(struct lws *wsi, enum lws_callback_reasons reason,
 	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
 		lwsl_err("CLIENT_CONNECTION_ERROR: %s\n", in ? (char *)in :
 				"(null)");
-		if(--nclients == 0) interrupted = 1;
+		if(--nclients == 0) lws_default_loop_exit(context);
 		break;
 
 		/* --- client callbacks --- */
@@ -98,7 +98,7 @@ callback(struct lws *wsi, enum lws_callback_reasons reason,
 
 	case LWS_CALLBACK_CLIENT_CLOSED:
 		lwsl_user("%s: CLOSED\n", __func__);
-		if(--nclients == 0) interrupted = 1;
+		if(--nclients == 0) lws_default_loop_exit(context);
 		break;
 
 	case LWS_CALLBACK_CLIENT_WRITEABLE:
@@ -158,15 +158,14 @@ static const struct lws_protocols protocols[] = {
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
 	const char *p;
-	int n = 0, logs =
-			LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	int n = 0;
 #ifndef WIN32
 	srandom((unsigned int)time(0));
 #endif
@@ -182,16 +181,14 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if (lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw))
-		logs |= LLL_INFO | LLL_DEBUG;
 
-	lws_set_log_level(logs, NULL);
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 	info.port = CONTEXT_PORT_NO_LISTEN; /* we do not run any server */
 	info.protocols = protocols;
-#if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL)
+#if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL) || defined(LWS_WITH_OPENHITLS)
 	/*
 	 * OpenSSL uses the system trust store.  mbedTLS has to be told which
 	 * CA to trust explicitly.
@@ -211,7 +208,14 @@ int main(int argc, const char **argv)
 	}
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_P].sw))) {
-		port = atoi(p);
+		{
+			int __pt = atoi(p);
+			if (__pt < 0 || __pt > 65535) {
+				lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+				return 1;
+			}
+			port = __pt;
+		}
 		if (port > 65535 || port < 0)
 			return 1;
 	}
@@ -237,7 +241,7 @@ int main(int argc, const char **argv)
 		lwsl_notice("Message delay: %d\n", connection_delay);
 	}
 
-	info.fd_limit_per_thread = (unsigned int)(1 + nclients + 1);
+	info.fd_limit_per_thread = (unsigned int)(LWS_FD_LIMIT_PER_THREAD_MIN + nclients);
 
 	context = lws_create_context(&info);
 	if (!context) {
@@ -245,11 +249,10 @@ int main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
-	lwsl_notice("%s: exiting service loop. n = %d, interrupted = %d\n",
-			__func__, n, interrupted);
+	lwsl_notice("%s: exiting service loop. n = %d\n", __func__, n);
 
 	lws_context_destroy(context);
 

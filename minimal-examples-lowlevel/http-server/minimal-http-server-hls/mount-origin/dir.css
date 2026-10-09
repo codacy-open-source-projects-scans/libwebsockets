@@ -1,0 +1,39 @@
+body { font-family: sans-serif; background: #1a1a1a; color: #eee; }
+.item { display: inline-block; margin: 10px; text-align: center; background: #333; padding: 10px; border-radius: 8px; }
+.item a { position: relative; display: inline-block; }
+.thumb { width: 320px; height: 180px; object-fit: cover; background: #000; border-radius: 4px; }
+a { color: #4db8ff; text-decoration: none; }
+#auth-status { float: right; margin-top: 10px; margin-right: 20px; }
+
+/* Resume-position badge over a thumbnail's top right corner, injected by
+ * dir.js for items we have a localStorage resume entry for.  Top, not
+ * bottom: the filename sits under the thumbnail and must stay readable. */
+.resume-badge {
+    position: absolute;
+    right: 4px;
+    top: 4px;
+    text-align: right;
+    background: rgba(0, 0, 0, 0.72);
+    color: #fff;
+    font-size: 12px;
+    line-height: 1.25;
+    padding: 3px 7px;
+    border-radius: 4px;
+    pointer-events: none;
+    max-width: calc(100% - 8px);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+
+/* Media still being copied in, or whose copy stopped short: listed, but
+ * with the state where the thumbnail would be and nothing to click. */
+.item.pending { opacity: 0.6; }
+.pending-thumb {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: #bbb;
+    font-style: italic;
+}

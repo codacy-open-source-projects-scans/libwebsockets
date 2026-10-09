@@ -33,6 +33,14 @@ typedef struct lws_tls_session_cache_openssl {
 	/* name is overallocated here */
 } lws_tls_sco_t;
 
+/*
+ * Bounds we are prepared to accept for a peer-provided session ticket
+ * lifetime hint, in seconds
+ */
+
+#define LWS_TLS_SESSION_TTL_MAX		(7 * 24 * 3600)
+#define LWS_TLS_SESSION_TTL_DEFAULT	300
+
 #define tlssess_loglevel		LLL_INFO
 #if (_LWS_ENABLED_LOGS & tlssess_loglevel)
 #define lwsl_tlssess(...)		_lws_log(tlssess_loglevel, __VA_ARGS__)
@@ -43,8 +51,12 @@ typedef struct lws_tls_session_cache_openssl {
 static void
 __lws_tls_session_destroy(lws_tls_sco_t *ts)
 {
+	unsigned int count = lws_dll2_count(lws_dll2_owner(&ts->list));
+
+	(void)count; /* logs-off builds drop the only use */
+
 	lwsl_tlssess("%s: %s (%u)\n", __func__, (const char *)&ts[1],
-				     ts->list.owner->count - 1);
+		     count ? count - 1 : 0);
 
 	lws_sul_cancel(&ts->sul_ttl);
 	SSL_SESSION_free(ts->session);
@@ -97,7 +109,7 @@ lws_tls_reuse_session(struct lws *wsi)
 
 	lwsl_tlssess("%s: %s\n", __func__, (const char *)&ts[1]);
 
-	if (!SSL_set_session(wsi->tls.ssl, ts->session)) {
+	if (!SSL_set_session(wsi->io->tls.ssl, ts->session)) {
 		lwsl_err("%s: session not set for %s\n", __func__, tag);
 		goto bail;
 	}
@@ -135,10 +147,10 @@ lws_tls_session_is_reused(struct lws *wsi)
 #if defined(LWS_WITH_CLIENT)
 	struct lws *nwsi = lws_get_network_wsi(wsi);
 
-	if (!nwsi || !nwsi->tls.ssl)
+	if (!nwsi || !nwsi->io->tls.ssl)
 		return 0;
 
-       return (int)SSL_session_reused(nwsi->tls.ssl);
+       return (int)SSL_session_reused(nwsi->io->tls.ssl);
 #else
        return 0;
 #endif
@@ -165,7 +177,7 @@ static void
 lws_tls_session_expiry_cb(lws_sorted_usec_list_t *sul)
 {
 	lws_tls_sco_t *ts = lws_container_of(sul, lws_tls_sco_t, sul_ttl);
-	struct lws_vhost *vh = lws_container_of(ts->list.owner,
+	struct lws_vhost *vh = lws_dll2_owner_container(&ts->list,
 						struct lws_vhost, tls_sessions);
 
 	lws_context_lock(vh->context, __func__); /* -------------- cx { */
@@ -181,14 +193,14 @@ lws_tls_session_add_entry(struct lws_vhost *vh, const char *tag)
 	lws_tls_sco_t *ts;
 	size_t nl = strlen(tag);
 
-	if (vh->tls_sessions.count == (vh->tls_session_cache_max ?
+	if (lws_dll2_count(&vh->tls_sessions) == (vh->tls_session_cache_max ?
 				      vh->tls_session_cache_max : 10)) {
 
 		/*
 		 * We have reached the vhost's session cache limit,
 		 * prune the LRU / head
 		 */
-		ts = lws_container_of(vh->tls_sessions.head,
+		ts = lws_container_of(lws_dll2_get_head(&vh->tls_sessions),
 				      lws_tls_sco_t, list);
 
 		if (ts) { /* centos 7 ... */
@@ -233,7 +245,8 @@ lws_tls_session_new_cb(SSL *ssl, SSL_SESSION *sess)
 	}
 
 	vh = wsi->a.vhost;
-	if (vh->options & LWS_SERVER_OPTION_DISABLE_TLS_SESSION_CACHE)
+	if ((vh->options & LWS_SERVER_OPTION_DISABLE_TLS_SESSION_CACHE) ||
+	    vh->being_destroyed)
 		return 0;
 
 	if (lws_tls_session_tag_from_wsi(wsi, tag, sizeof(tag)))
@@ -242,6 +255,16 @@ lws_tls_session_new_cb(SSL *ssl, SSL_SESSION *sess)
 	/* api return is long, although we only support setting
 	 * default (300s) or max uint32_t */
 	ttl = SSL_SESSION_get_timeout(sess);
+
+	/*
+	 * For TLS1.2 this is the peer's ticket_lifetime_hint, ie, wholly
+	 * peer-controlled: on a 32-bit long it can come back negative and
+	 * evict the entry immediately, and on 64-bit it can pin the entry
+	 * effectively forever.  Clamp it to something we are willing to hold
+	 */
+
+	if (ttl <= 0 || ttl > (long)LWS_TLS_SESSION_TTL_MAX)
+		ttl = (long)LWS_TLS_SESSION_TTL_DEFAULT;
 
 	lws_context_lock(vh->context, __func__); /* -------------- cx { */
 	lws_vhost_lock(vh); /* -------------- vh { */
@@ -274,6 +297,15 @@ lws_tls_session_new_cb(SSL *ssl, SSL_SESSION *sess)
 		 */
 		SSL_SESSION_free(ts->session);
 
+		/*
+		 * The replacement session has its own lifetime, so the expiry
+		 * has to follow it rather than stay on the old one's schedule
+		 */
+
+		lws_sul_schedule(wsi->a.context, wsi->tsi, &ts->sul_ttl,
+				 lws_tls_session_expiry_cb,
+				 ttl * LWS_US_PER_SEC);
+
 		/* keep our session list sorted in lru -> mru order */
 
 		lws_dll2_remove(&ts->list);
@@ -287,7 +319,7 @@ lws_tls_session_new_cb(SSL *ssl, SSL_SESSION *sess)
 
 	lwsl_tlssess("%s: %p: %s: %s %s, ttl %lds (%s:%u)\n", __func__,
 		     sess, wsi->lc.gutag, disposition, tag, ttl, vh->name,
-		     vh->tls_sessions.count);
+		     lws_dll2_count(&vh->tls_sessions));
 
 	/*
 	 * indicate we will hold on to the SSL_SESSION reference, and take
@@ -322,7 +354,7 @@ lws_sess_cache_synth_cb(lws_sorted_usec_list_t *sul)
 {
 	struct lws_lws_tls *tls = lws_container_of(sul, struct lws_lws_tls,
 						   sul_cb_synth);
-	struct lws *wsi = lws_container_of(tls, struct lws, tls);
+	struct lws *wsi = lws_container_of(tls, struct lws_io_adjunct, tls)->wsi;
 	SSL_SESSION *sess;
 
 	if (lws_tls_session_is_reused(wsi))
@@ -354,8 +386,18 @@ lws_tls_session_cache(struct lws_vhost *vh, uint32_t ttl)
 
 	cmode = SSL_CTX_get_session_cache_mode(vh->tls.ssl_client_ctx);
 
+	/*
+	 * We keep and look up our own tagged sessions in vh->tls_sessions and
+	 * never ask openssl's internal store for anything, so leaving that
+	 * store enabled is pure retention: a server sending a stream of
+	 * NewSessionTickets can park thousands of SSL_SESSIONs, each with its
+	 * own ticket, in a ctx that is shared between vhosts, for as long as
+	 * the ctx timeout.  Ask for the callback without the store.
+	 */
+
 	SSL_CTX_set_session_cache_mode(vh->tls.ssl_client_ctx,
-				       (int)(cmode | SSL_SESS_CACHE_CLIENT));
+				       (int)(cmode | SSL_SESS_CACHE_CLIENT |
+					     SSL_SESS_CACHE_NO_INTERNAL_STORE));
 
 	SSL_CTX_sess_set_new_cb(vh->tls.ssl_client_ctx, lws_tls_session_new_cb);
 
@@ -370,8 +412,9 @@ lws_tls_session_cache(struct lws_vhost *vh, uint32_t ttl)
 }
 
 int
-lws_tls_session_dump_save(struct lws_vhost *vh, const char *host, uint16_t port,
-			  lws_tls_sess_cb_t cb_save, void *opq)
+lws_tls_session_dump_save_flags(struct lws_vhost *vh, const char *host,
+				uint16_t port, unsigned int flags,
+				lws_tls_sess_cb_t cb_save, void *opq)
 {
 	struct lws_tls_session_dump d;
 	lws_tls_sco_t *ts;
@@ -381,7 +424,9 @@ lws_tls_session_dump_save(struct lws_vhost *vh, const char *host, uint16_t port,
 	if (vh->options & LWS_SERVER_OPTION_DISABLE_TLS_SESSION_CACHE)
 		return 1;
 
-	lws_tls_session_tag_discrete(vh->name, host, port, d.tag, sizeof(d.tag));
+	if (lws_tls_session_tag_dump(vh, host, port, flags, d.tag,
+				     sizeof(d.tag)))
+		return 1; /* there is no such tag */
 
 	lws_context_lock(vh->context, __func__); /* -------------- cx { */
 	lws_vhost_lock(vh); /* -------------- vh { */
@@ -422,19 +467,23 @@ bail:
 }
 
 int
-lws_tls_session_dump_load(struct lws_vhost *vh, const char *host, uint16_t port,
-			  lws_tls_sess_cb_t cb_load, void *opq)
+lws_tls_session_dump_load_flags(struct lws_vhost *vh, const char *host,
+				uint16_t port, unsigned int flags,
+				lws_tls_sess_cb_t cb_load, void *opq)
 {
 	struct lws_tls_session_dump d;
 	lws_tls_sco_t *ts;
 	SSL_SESSION *sess = NULL; /* allow it to "bail" early */
+	long ttl;
 	void *v;
 
 	if (vh->options & LWS_SERVER_OPTION_DISABLE_TLS_SESSION_CACHE)
 		return 1;
 
 	d.opaque = opq;
-	lws_tls_session_tag_discrete(vh->name, host, port, d.tag, sizeof(d.tag));
+	if (lws_tls_session_tag_dump(vh, host, port, flags, d.tag,
+				     sizeof(d.tag)))
+		return 1; /* there is no such tag */
 
 	lws_context_lock(vh->context, __func__); /* -------------- cx { */
 	lws_vhost_lock(vh); /* -------------- vh { */
@@ -479,6 +528,23 @@ lws_tls_session_dump_load(struct lws_vhost *vh, const char *host, uint16_t port,
 	}
 
 	ts->session = sess;
+
+	/*
+	 * A session that came back from cold storage needs the same expiry
+	 * as one we just negotiated: lws_tls_session_add_entry() zeroes the
+	 * sul, so without this the entry occupies a cache slot for the life
+	 * of the vhost and keeps being offered long after the server forgot
+	 * the key.  Bound it by what the blob itself says, clamped the same
+	 * way lws_tls_session_new_cb() clamps a peer-supplied lifetime.
+	 */
+
+	ttl = SSL_SESSION_get_timeout(sess);
+	if (ttl <= 0 || ttl > (long)LWS_TLS_SESSION_TTL_MAX)
+		ttl = (long)LWS_TLS_SESSION_TTL_DEFAULT;
+
+	lws_sul_schedule(vh->context, 0, &ts->sul_ttl,
+			 lws_tls_session_expiry_cb, ttl * LWS_US_PER_SEC);
+
 	lwsl_tlssess("%s: session loaded OK\n", __func__);
 
 	lws_vhost_unlock(vh); /* } vh --------------  */

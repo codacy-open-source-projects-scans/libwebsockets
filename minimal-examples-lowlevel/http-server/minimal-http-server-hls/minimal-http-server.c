@@ -1,0 +1,220 @@
+/*
+ * lws-minimal-http-server-hls
+ */
+
+#include <libwebsockets.h>
+#include <string.h>
+#include <signal.h>
+
+static struct lws_context *context;
+
+enum {
+	LWS_SW_H2_PRIOR_KNOWLEDGE,
+	LWS_SW_D,
+	LWS_SW_MEDIA_DIR,
+	LWS_SW_JWK,
+	LWS_SW_TRUST_LOGIN_HEADERS,
+	LWS_SW_PORT,
+	LWS_SW_HELP,
+};
+
+static const struct lws_switches switches[] = {
+	[LWS_SW_H2_PRIOR_KNOWLEDGE]	= { "--h2-prior-knowledge", "Enable --h2-prior-knowledge feature" },
+	[LWS_SW_D]			= { "-d", "Debug logs (e.g. -d 15)" },
+	[LWS_SW_MEDIA_DIR]		= { "--media-dir", "Directory containing media files (default: ./media)" },
+	[LWS_SW_JWK]			= { "-j", "JWK for JWT auth" },
+	[LWS_SW_TRUST_LOGIN_HEADERS]	= { "--trust-login-headers", "Trust x-lws-login-* headers from an lws proxy in front (see plugin README)" },
+	[LWS_SW_PORT]			= { "--port",          "Port to listen on (default 7681)" },
+	[LWS_SW_HELP]			= { "--help", "Show this help information" },
+};
+
+#ifndef INSTALL_DATADIR
+#define INSTALL_DATADIR "/usr/local/share"
+#endif
+
+static struct lws_protocol_vhost_options pvo_media = {
+	NULL, NULL, "media-dir", INSTALL_DATADIR "/libwebsockets-test-server/hls"
+};
+
+
+static const struct lws_protocol_vhost_options pvo_csp = {
+        NULL, NULL, "content-security-policy:",
+        "default-src 'self'; img-src 'self' data: ; "
+        "script-src 'self'; script-src-elem 'self'; font-src 'self'; "
+        "style-src 'self'; connect-src 'self' ws: wss:; "
+        "worker-src 'self' blob:; child-src 'self' blob:; media-src 'self' blob:; "
+        "frame-ancestors 'none'; base-uri 'none'; form-action 'self';"
+};
+
+static struct lws_protocol_vhost_options pvo_jwk = {
+	NULL, NULL, "jwt-jwk", ""
+};
+
+static struct lws_protocol_vhost_options pvo_trust = {
+	NULL, NULL, "trust-login-headers", "1"
+};
+
+/*
+ * The plugin serves the player page and its assets itself from this
+ * directory (its own flat URL space); the default <media-dir>/mount-origin
+ * is right when the installed media dir is used, but an explicit path keeps
+ * it correct across --media-dir overrides.
+ */
+static struct lws_protocol_vhost_options pvo_www = {
+	&pvo_media, NULL, "www-dir",
+	INSTALL_DATADIR "/libwebsockets-test-server/hls/mount-origin"
+};
+
+static struct lws_protocol_vhost_options pvo = {
+	NULL, &pvo_www, "lws-hls", ""
+};
+
+static const struct lws_protocol_vhost_options pvo_mime_mkv = {
+        NULL, NULL, ".mkv", "video/webm"
+};
+
+static const struct lws_protocol_vhost_options pvo_mime_mp4 = {
+        &pvo_mime_mkv, NULL, ".mp4", "video/mp4"
+};
+
+static struct lws_http_mount mount_raw_media = {
+        .mount_next             = NULL,
+        .mountpoint             = "/media",             /* mountpoint URL */
+        .origin                 = NULL,                 /* set at runtime */
+        .def                    = "index.html",
+        .origin_protocol        = LWSMPRO_FILE, /* serve from dir */
+        .mountpoint_len         = 6,
+        .extra_mimetypes        = &pvo_mime_mp4,
+};
+
+/*
+ * One flat callback mount: the plugin composes the directory page for "/",
+ * serves the player page and its assets beside it (www-dir pvo), and owns
+ * the stream/init/segment/... endpoints -- no separate /hls level, so the
+ * app works unchanged behind a reverse proxy at an arbitrary URL point.
+ * Only /media (the raw media files) is a mount of its own.
+ */
+static const struct lws_http_mount mount_root = {
+	.mount_next		= &mount_raw_media,
+	.mountpoint		= "/",
+	.protocol		= "lws-hls",
+	.origin_protocol	= LWSMPRO_CALLBACK,
+	.mountpoint_len		= 1,
+};
+
+void sigint_handler(int sig)
+{
+	lws_default_loop_exit(context);
+}
+
+int main(int argc, const char **argv)
+{
+	struct lws_context_creation_info info;
+	int n = 0;
+	const char *p;
+	
+#if defined(LWS_WITH_PLUGINS)
+	/* LWS searches for plugins in this array of paths */
+	static const char * const plugin_dirs[] = {
+		"../../lib", /* For running from build/minimal-examples-lowlevel/... */
+		"./lib",
+		NULL
+	};
+#endif
+
+	if (lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
+		lws_switches_print_help(argv[0], switches, LWS_ARRAY_SIZE(switches));
+		return 0;
+	}
+
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_MEDIA_DIR].sw)))
+		pvo_media.value = p;
+
+	signal(SIGINT, sigint_handler);
+
+	lws_context_info_defaults(&info, NULL);
+	/* a server: size the fds tables to the process limit */
+	info.fd_limit_per_thread = 0;
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
+
+	if ((p = lws_cmdline_option(argc, argv, "-i")))
+		info.iface = p;
+	else
+		info.iface = "lo";
+
+	if ((p = lws_cmdline_option(argc, argv, "-b")))
+		pvo_media.value = p;
+
+	if ((p = lws_cmdline_option(argc, argv, "-j"))) {
+		pvo_jwk.value = p;
+		pvo_jwk.next = pvo.options;
+		pvo.options = &pvo_jwk;
+	}
+
+	if (lws_cmdline_option(argc, argv,
+			       switches[LWS_SW_TRUST_LOGIN_HEADERS].sw)) {
+		pvo_trust.next = pvo.options;
+		pvo.options = &pvo_trust;
+	}
+
+	lwsl_user("LWS minimal http server HLS | visit http://localhost:7681\n");
+	lwsl_user("Media dir: %s\n", pvo_media.value);
+	if (info.iface)
+		lwsl_user("Binding to interface: %s\n", info.iface);
+
+	info.port = 7681;
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_PORT].sw))) {
+		int pt = atoi(p);
+
+		if (pt <= 0 || pt > 65535) {
+			lwsl_err("Port %d is outside valid 16-bit range\n", pt);
+			return 1;
+		}
+		info.port = pt;
+	}
+	
+	info.headers = &pvo_csp;
+	info.pvo = &pvo;
+	mount_raw_media.origin = pvo_media.value;
+	info.mounts = &mount_root;
+#if defined(LWS_WITH_PLUGINS)
+	info.plugin_dirs = plugin_dirs;
+#endif
+
+	info.options = LWS_SERVER_OPTION_HTTP_HEADERS_SECURITY_BEST_PRACTICES_ENFORCE |
+		       LWS_SERVER_OPTION_EXPLICIT_VHOSTS;
+
+	if (lws_cmdline_option(argc, argv, switches[LWS_SW_H2_PRIOR_KNOWLEDGE].sw))
+		info.options |= LWS_SERVER_OPTION_H2_PRIOR_KNOWLEDGE;
+
+	context = lws_create_context(&info);
+	if (!context) {
+		lwsl_err("lws init failed\n");
+		return 1;
+	}
+
+	/*
+	 * The hls plugin does its deletes in a stub child, which is this
+	 * executable run again with --lws-stub=lws-hls-stub.  The plugin's
+	 * init already did everything that process is for, as the context
+	 * was created: it must not serve on our port as well.
+	 */
+	if (!lws_cmdline_option(argc, argv, "--lws-stub=")) {
+		/* We create the vhost explicitly so plugins are loaded and
+		 * attached */
+		struct lws_vhost *vh = lws_create_vhost(context, &info);
+
+		if (!vh) {
+			lwsl_err("Failed to create vhost\n");
+			lws_context_destroy(context);
+			return 1;
+		}
+	}
+
+	while (n >= 0)
+		n = lws_service(context, 0);
+
+	lws_context_destroy(context);
+
+	return 0;
+}

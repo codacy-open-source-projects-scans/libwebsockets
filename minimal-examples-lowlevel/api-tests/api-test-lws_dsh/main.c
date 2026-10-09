@@ -107,7 +107,10 @@ test3(void)
 {
 	struct lws_dsh *dsh, *dsh2;
 	lws_dll2_owner_t owner;
-	uint8_t blob[4096];
+	/* big enough that the umeetable 5000-byte request below is a real,
+	 * in-bounds source: the request must fail because the 4096-byte dsh
+	 * cannot hold it, not because the caller lied about the length */
+	uint8_t blob[8192];
 
 	memset(blob, 0, sizeof(blob));
 
@@ -421,23 +424,148 @@ bail:
 	return 1;
 }
 
+int
+test7(void)
+{
+	static uint8_t big[3000];
+	struct lws_dsh *dsh;
+	size_t size;
+	void *a1;
+
+	/*
+	 * test 7: an allocation may leave less free space than its own size,
+	 * that's fine as long as it fit; one that doesn't fit is refused
+	 */
+
+	memset(big, 0x5a, sizeof(big));
+
+	dsh = lws_dsh_create(NULL, 4096, 2);
+	if (!dsh) {
+		lwsl_err("%s: Failed to create dsh\n", __func__);
+
+		return 1;
+	}
+
+	if (lws_dsh_alloc_tail(dsh, 0, big, sizeof(big), NULL, 0)) {
+		lwsl_err("%s: Failed to alloc 1\n", __func__);
+
+		goto bail;
+	}
+
+	if (!lws_dsh_alloc_tail(dsh, 1, big, sizeof(big), NULL, 0)) {
+		lwsl_err("%s: alloc 2 should not have fit\n", __func__);
+
+		goto bail;
+	}
+
+	if (lws_dsh_get_head(dsh, 0, &a1, &size)) {
+		lwsl_err("%s: no head\n", __func__);
+
+		goto bail;
+	}
+	if (size != sizeof(big) || memcmp(a1, big, sizeof(big))) {
+		lwsl_err("%s: mismatch\n", __func__);
+
+		goto bail;
+	}
+	lws_dsh_free(&a1);
+
+	lws_dsh_destroy(&dsh);
+
+	return 0;
+bail:
+#if defined(_DEBUG)
+	lws_dsh_describe(dsh, "test7 fail");
+#endif
+	lws_dsh_destroy(&dsh);
+
+	return 1;
+}
+
+int
+test8(void)
+{
+	static uint8_t big[3000];
+	struct lws_dsh *dsh;
+	size_t size;
+	void *a1;
+
+	/*
+	 * test 8: consume an object partially, then the rest of it, and
+	 * confirm all its space came back
+	 */
+
+	memset(big, 0xa5, sizeof(big));
+
+	dsh = lws_dsh_create(NULL, 4096, 2);
+	if (!dsh) {
+		lwsl_err("%s: Failed to create dsh\n", __func__);
+
+		return 1;
+	}
+
+	if (lws_dsh_alloc_tail(dsh, 0, "0123456789", 10, NULL, 0)) {
+		lwsl_err("%s: Failed to alloc 1\n", __func__);
+
+		goto bail;
+	}
+
+	lws_dsh_consume(dsh, 0, 4);
+
+	if (lws_dsh_get_head(dsh, 0, &a1, &size)) {
+		lwsl_err("%s: no head\n", __func__);
+
+		goto bail;
+	}
+	if (size != 6 || memcmp(a1, "456789", 6)) {
+		lwsl_err("%s: partial consume mismatch\n", __func__);
+
+		goto bail;
+	}
+
+	lws_dsh_consume(dsh, 0, 6);
+
+	if (!lws_dsh_get_head(dsh, 0, &a1, &size) ||
+	    lws_dsh_get_size(dsh, 0)) {
+		lwsl_err("%s: object still there after full consume\n",
+			 __func__);
+
+		goto bail;
+	}
+
+	/* the whole buffer must be available again */
+
+	if (lws_dsh_alloc_tail(dsh, 1, big, sizeof(big), NULL, 0)) {
+		lwsl_err("%s: space not recovered\n", __func__);
+
+		goto bail;
+	}
+
+	lws_dsh_destroy(&dsh);
+
+	return 0;
+bail:
+#if defined(_DEBUG)
+	lws_dsh_describe(dsh, "test8 fail");
+#endif
+	lws_dsh_destroy(&dsh);
+
+	return 1;
+}
+
 int main(int argc, const char **argv)
 {
-	int logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	
 	int ret = 0, n;
-	const char *p;
 	(void)switches;
 
-	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
+	if (lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
 		lws_switches_print_help(argv[0], switches, LWS_ARRAY_SIZE(switches));
 		return 0;
 	}
 
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS API selftest: lws_dsh\n");
 
 	n = test1();
@@ -466,6 +594,18 @@ int main(int argc, const char **argv)
 
 	n = test6();
 	lwsl_user("%s: test6: %d\n", __func__, n);
+	ret |= n;
+	if (ret)
+		goto bail;
+
+	n = test7();
+	lwsl_user("%s: test7: %d\n", __func__, n);
+	ret |= n;
+	if (ret)
+		goto bail;
+
+	n = test8();
+	lwsl_user("%s: test8: %d\n", __func__, n);
 	ret |= n;
 
 bail:

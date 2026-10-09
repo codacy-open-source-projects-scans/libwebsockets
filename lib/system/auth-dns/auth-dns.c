@@ -40,8 +40,10 @@ strexp_cb(void *priv, const char *name, char *out, size_t *pos,
 	size_t l;
 	const char *val = NULL;
 
-	if (info->subst_cb)
+	if (info->subst_cb) {
+		lwsl_notice("%s: attempting substitution for macro name: '%s'\n", __func__, name);
 		val = info->subst_cb(info, name);
+	}
 
 	if (!val) {
 		for (n = 0; n < info->num_substs; n++) {
@@ -84,17 +86,76 @@ strexp_cb(void *priv, const char *name, char *out, size_t *pos,
 	return LSTRX_FILLED_OUT;
 }
 
+/*
+ * Zone files may write $ORIGIN with or without the trailing root dot, but
+ * everything downstream (the signer's name_to_wire(), the NSEC3 hashing, the
+ * plugin's answer serialization) decides whether a name still needs the
+ * origin appended by looking for that dot.  A dotless origin therefore makes
+ * an already-qualified owner name get the origin appended a second time, eg
+ * "x.example.com" under "$ORIGIN example.com" hashes and encodes as
+ * "x.example.com.example.com".
+ *
+ * So we normalise here, once, at the only place zones enter the library: the
+ * origin always ends in a dot, and every owner name is stored fully
+ * qualified with a trailing dot.
+ */
+
+static void
+auth_dns_origin_normalise(char *origin, size_t len)
+{
+	size_t l = strlen(origin);
+
+	if (!l || origin[l - 1] == '.' || l + 2 > len)
+		return;
+
+	origin[l] = '.';
+	origin[l + 1] = '\0';
+}
+
+/*
+ * Bring one owner name to fully-qualified form: "@" is the origin, a name
+ * that already ends in a dot is left alone, and anything else gets the
+ * (already normalised) origin appended.  Without an origin there is nothing
+ * to qualify against, so the name is left as it was.
+ */
+
+static void
+auth_dns_name_qualify(char *name, size_t len, const char *origin)
+{
+	size_t l = strlen(name);
+	char t[256];
+
+	if (!strcmp(name, "@")) {
+		if (origin[0])
+			lws_strncpy(name, origin, len);
+
+		return;
+	}
+
+	if (!l || name[l - 1] == '.' || !origin[0])
+		return;
+
+	if (!strcmp(origin, "."))
+		lws_snprintf(t, sizeof(t), "%s.", name);
+	else
+		lws_snprintf(t, sizeof(t), "%s.%s", name, origin);
+
+	lws_strncpy(name, t, len);
+}
+
 int
-lws_auth_dns_parse_zone_buf(const char *buf, size_t len, struct auth_dns_zone *zone, const char *ipv4, const char *ipv6)
+lws_auth_dns_parse_zone_buf(const char *buf, size_t len, struct auth_dns_zone *zone)
 {
 	const char *p = buf, *end = buf + len;
 	char last_name[256] = "";
 	int in_parens = 0;
 	int in_comment = 0;
 
-	char line_accum[4096];
+	char line_accum[16384] = {0};
 	size_t lptr = 0;
 	int loop_cycles = 0;
+
+	lwsl_notice("%s: Parsing zone buffer of length %zu\n", __func__, len);
 
 	while (p <= end) {
 		if (++loop_cycles > 5000000) {
@@ -120,46 +181,54 @@ lws_auth_dns_parse_zone_buf(const char *buf, size_t len, struct auth_dns_zone *z
 			if (lptr > 0) {
 				lws_tokenize_t ts;
 				lws_tokenize_elem e;
-				char toks[8][256];
+				lws_tokenize_init(&ts, line_accum, LWS_TOKENIZE_F_DOT_NONTERM | LWS_TOKENIZE_F_NO_FLOATS | LWS_TOKENIZE_F_MINUS_NONTERM | LWS_TOKENIZE_F_SLASH_NONTERM | LWS_TOKENIZE_F_COLON_NONTERM | LWS_TOKENIZE_F_EQUALS_NONTERM | LWS_TOKENIZE_F_PLUS_NONTERM);
+				ts.len = lptr;
+
+				char toks[32][256];
+				const char *tok_ptr[32];
 				int num_toks = 0, name_inherited = 0, n;
 
 				if (line_accum[0] == ' ' || line_accum[0] == '\t')
 					name_inherited = 1;
 
-				lws_tokenize_init(&ts, line_accum, LWS_TOKENIZE_F_HASH_COMMENT | LWS_TOKENIZE_F_DOT_NONTERM | LWS_TOKENIZE_F_NO_FLOATS | LWS_TOKENIZE_F_MINUS_NONTERM | LWS_TOKENIZE_F_SLASH_NONTERM | LWS_TOKENIZE_F_COLON_NONTERM | LWS_TOKENIZE_F_EQUALS_NONTERM | LWS_TOKENIZE_F_PLUS_NONTERM);
-				ts.len = lptr;
-
 				int max_tokens = 0;
 				do {
 					e = lws_tokenize(&ts);
-					if (e == LWS_TOKZE_ENDED || ++max_tokens > 256)
+					if (e == LWS_TOKZE_ENDED)
+						break;
+					max_tokens++;
+					if (max_tokens > 256)
 						break;
 
 					if (e == LWS_TOKZE_TOKEN || e == LWS_TOKZE_QUOTED_STRING || e == LWS_TOKZE_INTEGER) {
-						if (num_toks < 8) {
+						if (num_toks < 32) {
 							n = (int)ts.token_len;
 							if (n > (int)sizeof(toks[0]) - 1)
 								n = sizeof(toks[0]) - 1;
 							memcpy(toks[num_toks], ts.token, (size_t)n);
 							toks[num_toks][n] = '\0';
+							tok_ptr[num_toks] = ts.start;
+							num_toks++;
 						}
-						num_toks++;
 					}
+
 				} while (e > 0);
 
 				if (!strncmp(line_accum, "$ORIGIN", 7)) {
 					const char *v = line_accum + 7;
 					while (*v == ' ' || *v == '\t') v++;
 					lws_strncpy(zone->origin, v, sizeof(zone->origin));
-					char *sp = strchr(zone->origin, ' ');
-					if (!sp) sp = strchr(zone->origin, '\t');
+					char *sp = (char *)strchr(zone->origin, ' ');
+					if (!sp) sp = (char *)strchr(zone->origin, '\t');
 					if (sp) *sp = '\0';
+					auth_dns_origin_normalise(zone->origin,
+							  sizeof(zone->origin));
 				} else if (!strncmp(line_accum, "$TTL", 4)) {
 					const char *v = line_accum + 4;
 					while (*v == ' ' || *v == '\t') v++;
 					lws_strncpy(zone->default_ttl, v, sizeof(zone->default_ttl));
-					char *sp = strchr(zone->default_ttl, ' ');
-					if (!sp) sp = strchr(zone->default_ttl, '\t');
+					char *sp = (char *)strchr(zone->default_ttl, ' ');
+					if (!sp) sp = (char *)strchr(zone->default_ttl, '\t');
 					if (sp) *sp = '\0';
 				} else if (num_toks > 0) {
 					{
@@ -192,14 +261,9 @@ lws_auth_dns_parse_zone_buf(const char *buf, size_t len, struct auth_dns_zone *z
 							type_idx++;
 						}
 
-						/* canonicalize name: lowercase and append origin if relative */
-						if (!strcmp(cur_name, "@") && zone->origin[0]) {
-							lws_strncpy(cur_name, zone->origin, sizeof(cur_name));
-						} else if (cur_name[0] && cur_name[strlen(cur_name) - 1] != '.' && zone->origin[0]) {
-							char t[256];
-							lws_snprintf(t, sizeof(t), "%s.%s", cur_name, zone->origin);
-							lws_strncpy(cur_name, t, sizeof(cur_name));
-						}
+						/* canonicalize name: fully qualify it, then lowercase */
+						auth_dns_name_qualify(cur_name, sizeof(cur_name),
+								      zone->origin);
 						for (char *c = cur_name; *c; c++)
 							*c = (char)tolower((unsigned char)*c);
 
@@ -216,28 +280,19 @@ lws_auth_dns_parse_zone_buf(const char *buf, size_t len, struct auth_dns_zone *z
 							}
 						}
 
-						if (type_idx < num_toks && !strcmp(toks[type_idx], "IN")) {
+						if (type_idx < num_toks && !strcasecmp(toks[type_idx], "IN")) {
 							class_ = 1;
 							type_idx++;
 						}
 
 						if (type_idx < num_toks) {
-							/* simplistic type assignment */
-							if (!strcmp(toks[type_idx], "A")) type = 1;
-							else if (!strcmp(toks[type_idx], "NS")) type = 2;
-							else if (!strcmp(toks[type_idx], "SOA")) type = 6;
-							else if (!strcmp(toks[type_idx], "MX")) type = 15;
-							else if (!strcmp(toks[type_idx], "TXT")) type = 16;
-							else if (!strcmp(toks[type_idx], "AAAA")) type = 28;
-							else if (!strcmp(toks[type_idx], "RRSIG")) type = 46;
-							else if (!strcmp(toks[type_idx], "DNSKEY")) type = 48;
-							else if (!strcmp(toks[type_idx], "NSEC3")) type = 50;
-							else if (!strcmp(toks[type_idx], "NSEC3PARAM")) type = 51;
-							else if (!strcmp(toks[type_idx], "TLSA")) type = 52;
-							else if (!strcmp(toks[type_idx], "CAA")) type = 257;
-							else type = 0; /* unknown */
+							// lwsl_notice("  Attempting type match at type_idx=%d: '%s'\n", type_idx, toks[type_idx]);
+							/* 0 if it is not a type we can read */
+							type = lws_auth_dns_type_from_str(toks[type_idx]);
 							type_idx++;
 						}
+
+						// lwsl_notice("%s: Record: name=%s, type=%u, class=%u, tokens=%d, final_type_idx=%d\n", __func__, cur_name, type, class_, num_toks, type_idx);
 
 						/* find existing rrset */
 						lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&zone->rrset_list)) {
@@ -265,27 +320,43 @@ lws_auth_dns_parse_zone_buf(const char *buf, size_t len, struct auth_dns_zone *z
 
 						/* The remainder of the line is rdata. */
 						{
-							char *rd = strstr(line_accum, toks[type_idx - 1]);
+							const char *rd = tok_ptr[type_idx - 1];
 							if (rd) {
-								rd += strlen(toks[type_idx - 1]);
 								while (*rd == ' ' || *rd == '\t') rd++;
 
 								/* Strip surrounding quotes if present (TXT records) */
 								size_t rdlen = strlen(rd);
 								if (rdlen >= 2 && rd[0] == '"' && rd[rdlen - 1] == '"') {
-									rd[rdlen - 1] = '\0';
-									rdlen -= 2;
-									rd++;
+									char *qrd = lws_strdup(rd);
+									if (qrd) {
+										rdlen = strlen(qrd);
+										qrd[rdlen - 1] = '\0';
+										rr->rdata = lws_strdup(qrd + 1);
+										rr->rdata_len = rdlen - 2;
+										lws_free(qrd);
+									}
+								} else {
+									rr->rdata = lws_strdup(rd);
+									if (rr->rdata)
+										rr->rdata_len = rdlen;
 								}
-
-								rr->rdata = lws_strdup(rd);
-								if (rr->rdata)
-									rr->rdata_len = rdlen;
 							}
 						}
 
 						lws_dll2_add_tail(&rr->list, &rrset->rr_list);
-						if (lws_auth_dns_rdata_to_wire(zone, rr, rrset->type, ipv4, ipv6))
+
+						/*
+						 * The signer expands ${...} substitutions
+						 * before it parses, so rdata still holding
+						 * one comes from a reader of the raw
+						 * zonefile (eg, the monitor's inventory),
+						 * which only wants the text: keep it as
+						 * that, there is no wire form to fail at
+						 */
+						if (rr->rdata && strstr(rr->rdata, "${"))
+							lwsl_info("%s: %s: unexpanded '%s' kept as text\n",
+								  __func__, rrset->name, rr->rdata);
+						else if (lws_auth_dns_rdata_to_wire(zone, rr, rrset->type))
 							lwsl_err("Failed to wire-encode rdata for %s\n", rrset->name);
 
 						lwsl_info("Parsed RR: name=%s type=%d ttl=%u rdata=%s\n", rrset->name, rrset->type, rrset->ttl, rr->rdata ? rr->rdata : "");
@@ -295,7 +366,7 @@ lws_auth_dns_parse_zone_buf(const char *buf, size_t len, struct auth_dns_zone *z
 
 			lptr = 0;
 		} else {
-			if (lptr < sizeof(line_accum) - 1)
+			if (!in_comment && *p != '(' && *p != ')' && *p != '\n' && *p != '\r' && lptr < sizeof(line_accum) - 1)
 				line_accum[lptr++] = *p;
 		}
 		p++;
@@ -326,11 +397,35 @@ lws_auth_dns_free_zone(struct auth_dns_zone *z)
 	} lws_end_foreach_dll_safe(d, d1);
 }
 
+/*
+ * write() may legally return short or fail, eg, on ENOSPC or a signal.
+ * Loop until everything is out, or fail.
+ */
+static int
+auth_dns_write_all(int fd, const void *p, size_t len)
+{
+	const uint8_t *q = (const uint8_t *)p;
+
+	while (len) {
+		ssize_t w = write(fd, q, len);
+
+		if (w < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		q += w;
+		len -= (size_t)w;
+	}
+
+	return 0;
+}
+
 int
 lws_auth_dns_sign_zone(struct lws_auth_dns_sign_info *info)
 {
 	char obuf[8192]; /* simple large enough buffer for test */
-	int fd, n, ofd = -1, res_wr, temp_len = 0, temp_max = 0;
+	int fd, n, ofd = -1, res_wr, temp_len = 0, temp_max = 0, ret = 1;
 	size_t uout = 0;
 	struct stat st;
 	char *buf, *expbuf;
@@ -339,7 +434,10 @@ lws_auth_dns_sign_zone(struct lws_auth_dns_sign_info *info)
 	struct lws_jose jose;
 	struct lws_jws jws;
 	struct stat ost;
-	char *outbuf = NULL;
+	char *outbuf = NULL, *compact = NULL, *temp = NULL;
+
+	/* it is logged below even if the fstat did not happen */
+	memset(&ost, 0, sizeof(ost));
 
 	lwsl_info("%s: starting zone signing from %s\n", __func__, info->input_filepath);
 
@@ -379,7 +477,7 @@ lws_auth_dns_sign_zone(struct lws_auth_dns_sign_info *info)
 	char *lb = buf;
 	uout = 0;
 	while (lb < buf + st.st_size) {
-		char *le = strchr(lb, '\n');
+		char *le = (char *)strchr(lb, '\n');
 		if (!le)
 			le = buf + st.st_size;
 		else
@@ -417,12 +515,15 @@ lws_auth_dns_sign_zone(struct lws_auth_dns_sign_info *info)
 	struct auth_dns_zone zone;
 	memset(&zone, 0, sizeof(zone));
 
-	if (lws_auth_dns_parse_zone_buf(expbuf, uout, &zone, info->ipv4, info->ipv6)) {
+	if (lws_auth_dns_parse_zone_buf(expbuf, uout, &zone)) {
 		lwsl_err("Failed to parse zone\n");
-		goto bail;
+		goto bail_zone;
 	}
 
-	lws_auth_dns_inject_mock_keys(info, &zone);
+	if (lws_auth_dns_inject_mock_keys(info, &zone)) {
+		lwsl_err("%s: unable to build the NSEC3 chain\n", __func__);
+		goto bail_zone;
+	}
 	lws_auth_dns_sort_zone(info, &zone);
 	lws_auth_dns_sign_rrsets(info, &zone);
 
@@ -430,32 +531,23 @@ lws_auth_dns_sign_zone(struct lws_auth_dns_sign_info *info)
 	fd = open(info->output_filepath ? info->output_filepath : "signed.zone", LWS_O_WRONLY | LWS_O_CREAT | LWS_O_TRUNC, 0644);
 	if (fd < 0) {
 		lwsl_err("Failed to open output file for signing results\n");
-		goto bail;
+		goto bail_zone;
 	}
 
 	/* Write generic setup string at top */
 	n = lws_snprintf(obuf, sizeof(obuf), "$ORIGIN %s\n$TTL %u\n\n", zone.origin, atoi(zone.default_ttl) ? atoi(zone.default_ttl) : 3600);
 	if (n > (int)sizeof(obuf) - 1)
 		n = (int)sizeof(obuf) - 1;
-	(void)write(fd, obuf, (unsigned int)n);
+	if (auth_dns_write_all(fd, obuf, (size_t)n)) {
+		lwsl_err("%s: write failed on signed zone\n", __func__);
+		goto bail_fd;
+	}
 
 	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&zone.rrset_list)) {
 		struct auth_dns_rrset *rs = lws_container_of(d, struct auth_dns_rrset, list);
 
-		const char *ts = "UNKNOWN";
-		switch (rs->type) {
-			case 1: ts = "A"; break;
-			case 2: ts = "NS"; break;
-			case 6: ts = "SOA"; break;
-			case 15: ts = "MX"; break;
-			case 16: ts = "TXT"; break;
-			case 28: ts = "AAAA"; break;
-			case 46: ts = "RRSIG"; break;
-			case 48: ts = "DNSKEY"; break;
-			case 50: ts = "NSEC3"; break;
-			case 51: ts = "NSEC3PARAM"; break;
-			case 257: ts = "CAA"; break;
-		}
+		char tn[16];
+		const char *ts = lws_auth_dns_type_to_str(rs->type, tn, sizeof(tn));
 
 		lws_start_foreach_dll(struct lws_dll2 *, d2, lws_dll2_get_head(&rs->rr_list)) {
 			struct auth_dns_rr *rr = lws_container_of(d2, struct auth_dns_rr, list);
@@ -464,12 +556,17 @@ lws_auth_dns_sign_zone(struct lws_auth_dns_sign_info *info)
 				rs->name, rs->ttl, ts, rr->rdata ? rr->rdata : "");
 			if (n > (int)sizeof(obuf) - 1)
 				n = (int)sizeof(obuf) - 1;
-			(void)write(fd, obuf, (unsigned int)n);
+			if (auth_dns_write_all(fd, obuf, (size_t)n)) {
+				lwsl_err("%s: write failed on signed zone\n", __func__);
+				goto bail_fd;
+			}
 		} lws_end_foreach_dll(d2);
 	} lws_end_foreach_dll(d);
 
-
-	close(fd);
+	if (close(fd)) {
+		lwsl_err("%s: close failed on signed zone\n", __func__);
+		goto bail_zone;
+	}
 	lwsl_info("lws_auth_dns_sign_zone succeeded! Wrote to %s\n", info->output_filepath ? info->output_filepath : "signed.zone");
 
 	if (!info->jws_filepath || !info->ksk_jwk_filepath) {
@@ -485,9 +582,9 @@ lws_auth_dns_sign_zone(struct lws_auth_dns_sign_info *info)
 	}
 
 	ofd = open(info->output_filepath ? info->output_filepath : "signed.zone", LWS_O_RDONLY);
-	if (ofd < 0 || fstat(ofd, &ost) || ost.st_size <= 0 || ost.st_size >= 10000) {
+	if (ofd < 0 || fstat(ofd, &ost) || ost.st_size <= 0 || ost.st_size >= 1048576) {
 		lwsl_err("Failed file open/stat ofd=%d st_size=%ld\n", ofd, (long)ost.st_size);
-		goto bail_jwk;
+		goto bail_ofd;
 	}
 
 	outbuf = lws_malloc((size_t)ost.st_size, "auth_dns_out_jws");
@@ -495,9 +592,6 @@ lws_auth_dns_sign_zone(struct lws_auth_dns_sign_info *info)
 		lwsl_err("Failed read or malloc\n");
 		goto bail_ofd;
 	}
-
-	char *compact = NULL;
-	char *temp = NULL;
 
 	compact = lws_malloc((size_t)ost.st_size * 2 + 1024, "jws_compact");
 	if (!compact) {
@@ -584,33 +678,55 @@ lws_auth_dns_sign_zone(struct lws_auth_dns_sign_info *info)
 
 	{
 		int jfd = open(info->jws_filepath, LWS_O_WRONLY | LWS_O_CREAT | LWS_O_TRUNC, 0644);
-		if (jfd >= 0) {
-			size_t clen = strlen(compact);
-			(void)write(jfd, compact, (unsigned int)clen);
-			close(jfd);
-			lwsl_info("Wrote outer signature JWS to %s\n", info->jws_filepath);
-		} else {
+
+		if (jfd < 0) {
 			lwsl_err("Failed opening JWS output file\n");
+			goto bail_jose;
 		}
+
+		if (auth_dns_write_all(jfd, compact, strlen(compact))) {
+			lwsl_err("%s: write failed on JWS output\n", __func__);
+			close(jfd);
+			goto bail_jose;
+		}
+
+		if (close(jfd)) {
+			lwsl_err("%s: close failed on JWS output\n", __func__);
+			goto bail_jose;
+		}
+
+		lwsl_info("Wrote outer signature JWS to %s\n", info->jws_filepath);
 	}
 
-	lws_free(compact);
-	lws_free(temp);
+	lws_free_set_NULL(compact);
+	lws_free_set_NULL(temp);
+
+	/* the only way to get here is with both output files fully written */
+	ret = 0;
 
 bail_jose:
 	lws_jose_destroy(&jose);
 bail_ofd:
+	/* NULL on the success path, which already freed them */
+	lws_free(compact);
+	lws_free(temp);
 	if (outbuf)
 		lws_free(outbuf);
 	if (ofd >= 0)
 		close(ofd);
-bail_jwk:
 	lws_jwk_destroy(&jwk);
 bail_jws:
+bail_zone:
+	/* every path here has a zone that must be freed */
+	lws_auth_dns_free_zone(&zone);
 	lws_free(expbuf);
 	lws_free(buf);
 
-	return 0;
+	return ret;
+
+bail_fd:
+	close(fd);
+	goto bail_zone;
 
 bail:
 	if (expbuf)

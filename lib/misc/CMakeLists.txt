@@ -48,6 +48,11 @@ if (LWS_WITH_NETWORK)
 			misc/cache-ttl/file.c)
 	endif()
 
+	if (LWS_WITH_CACHE_BLOB)
+		list(APPEND SOURCES
+			misc/cache-ttl/blob.c)
+	endif()
+
 endif()
 
 if (LWS_WITH_COMPRESSED_BACKTRACES)
@@ -74,6 +79,15 @@ if (LWS_WITH_JPEG)
 	list(APPEND SOURCES
 		misc/jpeg.c)
 endif()
+if (LWS_WITH_SVG)
+	list(APPEND SOURCES
+		misc/svg.c
+		misc/svg-raster.c)
+endif()
+if (LWS_WITH_GIF)
+	list(APPEND SOURCES
+		misc/gif.c)
+endif()
 if (LWS_WITH_DHT)
 	list(APPEND SOURCES
 		misc/dht/dht.c
@@ -96,6 +110,7 @@ if (LWS_WITH_DLO)
 	list(APPEND SOURCES
 		misc/dlo/dlo.c
 		misc/dlo/dlo-rect.c
+		misc/dlo/dlo-hit.c
 		misc/dlo/dlo-font-mcufont.c
 		misc/dlo/dlo-text.c)
 
@@ -114,6 +129,16 @@ if (LWS_WITH_DLO)
 			misc/dlo/dlo-jpeg.c)
 	endif()
 
+	if (LWS_WITH_SVG)
+		list(APPEND SOURCES
+			misc/dlo/dlo-svg.c)
+	endif()
+
+	if (LWS_WITH_GIF)
+		list(APPEND SOURCES
+			misc/dlo/dlo-gif.c)
+	endif()
+
 	if (LWS_WITH_LHP)
 		list(APPEND SOURCES
 			misc/dlo/dlo-lhp.c
@@ -123,8 +148,9 @@ if (LWS_WITH_DLO)
 endif()  #dlo
 
 # this is an older, standalone hashed disk cache
-# implementation unrelated to lws-cache-ttl
-if (LWS_WITH_DISKCACHE)
+# implementation unrelated to lws-cache-ttl... except the blob cache
+# level is a thin lws-cache-ttl wrapper on top of it
+if (LWS_WITH_DISKCACHE OR LWS_WITH_CACHE_BLOB)
 	list(APPEND SOURCES
 		misc/diskcache.c)
 endif()
@@ -201,6 +227,28 @@ if (LWS_WITH_LHP)
 			misc/lhp-ss.c)
 	endif()
 
+endif()
+
+if (LWS_WITH_HL)
+	list(APPEND SOURCES
+		misc/hl.c
+		misc/hl-html.c)
+
+	if (LWS_WITH_HL_LANG_C)
+		list(APPEND SOURCES
+			misc/hl-c.c)
+	endif()
+
+	if (LWS_WITH_HL_LANG_DIFF)
+		list(APPEND SOURCES
+			misc/hl-diff.c)
+	endif()
+endif()
+
+if (LWS_WITH_MD)
+	list(APPEND SOURCES
+		misc/md.c
+		misc/md-html.c)
 endif()
 
 if (LWS_WITH_MNEMONIC)

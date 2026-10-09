@@ -25,7 +25,8 @@ static const struct lws_switches switches[] = {
 #include <string.h>
 #include <signal.h>
 
-static int interrupted, bad = 0, status, completed;
+static int bad = 0, status, completed;
+static struct lws_context *context;
 static lws_state_notify_link_t nl;
 static struct lws *client_wsi;
 
@@ -43,7 +44,7 @@ static int form_pass = 0;
 static void
 sanitize_ft(char *ft)
 {
-	char *p, *eq = strchr(ft, '=');
+	char *p, *eq = (char *)strchr(ft, '=');
 	if (!eq) return;
 	eq++;
 
@@ -75,7 +76,7 @@ form_cb(struct lws_context *cx, char *ft, size_t ft_len, const char **last)
 		if (form_pass == 0) {
 			p = lws_cmdline_options_cx(cx, "--form", p);
 			if (p) {
-				if (!strchr(p, '@')) {
+				if (!(char *)strchr(p, '@')) {
 					*last = p;
 					lws_strnncpy(ft, p, strlen(p), ft_len);
 					sanitize_ft(ft);
@@ -90,7 +91,7 @@ form_cb(struct lws_context *cx, char *ft, size_t ft_len, const char **last)
 		if (form_pass == 1) {
 			p = lws_cmdline_options_cx(cx, "--form", p);
 			if (p) {
-				if (strchr(p, '@')) {
+				if ((char *)strchr(p, '@')) {
 					*last = p;
 					lws_strnncpy(ft, p, strlen(p), ft_len);
 					sanitize_ft(ft);
@@ -109,7 +110,7 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 {
 	struct pss *pss = (struct pss *)user;
 	uint8_t buf[LWS_PRE + 1024], *start = &buf[LWS_PRE], *p = start,
-		*end = &buf[sizeof(buf) - LWS_PRE - 1];
+		*end = &buf[sizeof(buf) - 1];
 	int n;
 
 	switch (reason) {
@@ -211,8 +212,8 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 			return 0;
 		}
 
-		size_t len = (size_t)lws_ptr_diff(p, start);
-		// lwsl_user("%s: filling mp_sm produced %llu bytes (n=%d)\n", __func__, (unsigned long long)len, n);
+		size_t blen = (size_t)lws_ptr_diff(p, start);
+		// lwsl_user("%s: filling mp_sm produced %llu bytes (n=%d)\n", __func__, (unsigned long long)blen, n);
 
 		if (!n) {
 			lwsl_user("%s: final part, terminating body pending\n", __func__);
@@ -220,12 +221,12 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 			lws_http_mp_sm_destroy(&pss->hmp);
 		}
 
-		if (lws_write(wsi, start, len, n ? LWS_WRITE_HTTP : LWS_WRITE_HTTP_FINAL) != (int)len) {
+		if (lws_write(wsi, start, blen, n ? LWS_WRITE_HTTP : LWS_WRITE_HTTP_FINAL) != (int)blen) {
 			lwsl_err("%s: lws_write failed\n", __func__);
 			return 1;
 		}
 
-		pss->bytes_sent += len;
+		pss->bytes_sent += blen;
 		// lwsl_user("%s: payload part written successfully. total=%llu\n", __func__, (unsigned long long)pss->bytes_sent);
 
 		if (n)
@@ -302,7 +303,14 @@ sul_connect_cb(lws_sorted_usec_list_t *sul)
 
 		p = lws_cmdline_option_cx(cx, "--port");
 		if (p)
-			i.port = (uint16_t)atoi(p);
+			{
+				int __pt = atoi(p);
+				if (__pt < 0 || __pt > 65535) {
+					lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+					return;
+				}
+				i.port = (uint16_t)__pt;
+			}
 
 		if (lws_cmdline_option_cx(cx, "--form1"))
 			i.path			= "/form1";
@@ -310,9 +318,6 @@ sul_connect_cb(lws_sorted_usec_list_t *sul)
 		i.host				= i.address;
 		i.origin			= i.address;
 		i.method			= "POST";
-
-		if (lws_cmdline_option_cx(cx, "--h1"))
-			i.alpn			= "http/1.1";
 
 		i.protocol			= protocols[0].name;
 		i.pwsi				= &client_wsi;
@@ -360,13 +365,12 @@ static lws_state_notify_link_t * const app_notifier_list[] = {
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	struct lws_context *context;
 	int n = 0;
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
 		lws_switches_print_help(argv[0], switches, LWS_ARRAY_SIZE(switches));
@@ -375,9 +379,8 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
-	lwsl_user("LWS minimal http client form - POST [-d<verbosity>] [-l] [--h1] https://libwebsockets.org/testserver/formtest\n");
+	lws_context_info_defaults(&info, NULL);lws_cmdline_option_handle_builtin(argc, argv, &info);
+	lwsl_user("LWS minimal http client form - POST [-d<verbosity>] [-l] https://libwebsockets.org/testserver/formtest\n");
 
 	info.options			= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT |
 					  LWS_SERVER_OPTION_H2_JUST_FIX_WINDOW_UPDATE_OVERFLOW;
@@ -389,9 +392,9 @@ int main(int argc, const char **argv)
 	nl.name				= "app";
 	nl.notify_cb			= app_system_state_nf;
 	info.register_notifier_list	= app_notifier_list;
-	info.fd_limit_per_thread = (unsigned int)(1 + 1 + 1);
+	info.fd_limit_per_thread = (unsigned int)(LWS_FD_LIMIT_PER_THREAD_MIN + 1);
 
-#if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL)
+#if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL) || defined(LWS_WITH_OPENHITLS)
 	/*
 	 * OpenSSL uses the system trust store.  mbedTLS has to be told which
 	 * CA to trust explicitly.
@@ -418,7 +421,7 @@ int main(int argc, const char **argv)
 	 * state OPERATIONAL
 	 */
 
-	while (n >= 0 && completed != 1 && !interrupted)
+	while (n >= 0 && completed != 1)
 		n = lws_service(context, 0);
 
 bail:

@@ -43,6 +43,33 @@
 
 #define LWS_AUTH_DNS_MAX_ZONE_SIZE (1024 * 1024)
 
+/* absolute length caps on the two suspended-query queues */
+#define LWS_AUTH_DNS_MAX_PENDING_QUERIES	1024
+#define LWS_AUTH_DNS_MAX_PENDING_DNSBL		256
+
+/*
+ * RFC 5155 7.2: a denial of existence never needs more than the NSEC3 RRs
+ * matching the closest encloser and covering the next closer name and the
+ * wildcard at the closest encloser
+ */
+#define LWS_AUTH_DNS_MAX_NSEC3_PROOF		3
+
+/*
+ * The NSEC3 owner hash is recomputed per query, so the zone's iteration
+ * count is a CPU cost an (untrusted, eg DHT-published) zone gets to choose.
+ * RFC 5155 A.1 caps useful iterations at 150 and RFC 9276 deprecates any
+ * value above 0, so refuse to hash beyond that rather than burn the event
+ * loop thread.
+ */
+#define LWS_AUTH_DNS_MAX_NSEC3_ITERATIONS	150
+
+#if !defined(O_NOFOLLOW)
+#define O_NOFOLLOW 0
+#endif
+#if !defined(O_DIRECTORY)
+#define O_DIRECTORY 0
+#endif
+
 #if defined(LWS_WITH_AUTHORITATIVE_DNS)
 
 static int
@@ -97,6 +124,365 @@ name_to_wire(const char *name, const char *origin, uint8_t *wire, size_t *wire_l
 	return 0;
 }
 
+/*
+ * Serialize one RR (owner name, type, class, ttl, rdlen, rdata) into the
+ * response at *rp, returning nonzero without writing anything if it does not
+ * fit inside max_buf.
+ *
+ * The owner name is encoded into a scratch buffer first because
+ * name_to_wire() may re-qualify a relative owner name with the zone origin,
+ * so its encoded length cannot be predicted from strlen(rs->name) and the
+ * room has to be checked against what was actually produced.  The zone
+ * parser now stores every owner name fully qualified, but this stays the
+ * belt-and-braces check on the actual encoded length.
+ */
+
+static int
+auth_dns_emit_rr(uint8_t **rp, uint8_t *dbuf, size_t max_buf,
+		 struct auth_dns_rrset *rs, struct auth_dns_rr *rr,
+		 const char *origin)
+{
+	uint8_t wire[256], *p = *rp;
+	size_t wl = sizeof(wire);
+
+	if (name_to_wire(rs->name, origin, wire, &wl))
+		return 1;
+
+	if (lws_ptr_diff_size_t(p, dbuf) + wl + 10 + rr->wire_rdata_len >
+								      max_buf)
+		return 1;
+
+	memcpy(p, wire, wl);
+	p += wl;
+
+	*p++ = (uint8_t)(rs->type >> 8);	*p++ = (uint8_t)(rs->type);
+	*p++ = (uint8_t)(rs->class_ >> 8);	*p++ = (uint8_t)(rs->class_);
+	*p++ = (uint8_t)(rs->ttl >> 24);	*p++ = (uint8_t)(rs->ttl >> 16);
+	*p++ = (uint8_t)(rs->ttl >> 8);		*p++ = (uint8_t)(rs->ttl);
+	*p++ = (uint8_t)(rr->wire_rdata_len >> 8);
+	*p++ = (uint8_t)(rr->wire_rdata_len);
+
+	memcpy(p, rr->wire_rdata, rr->wire_rdata_len);
+	*rp = p + rr->wire_rdata_len;
+
+	return 0;
+}
+
+/*
+ * base32hex (RFC 4648 7, no padding) as used for NSEC3 owner names.  The
+ * alphabet is ordered, so encoded hashes can be compared with strcmp() to
+ * place a hash in the NSEC3 chain.
+ */
+
+static const char b32hextab[] = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
+
+static void
+auth_dns_b32hex(const uint8_t *in, size_t len, char *out, size_t out_len)
+{
+	unsigned int bitb = 0;
+	size_t o = 0;
+	int bits = 0;
+
+	while (len--) {
+		bitb = (bitb << 8) | *in++;
+		bits += 8;
+
+		while (bits >= 5 && o + 2 <= out_len) {
+			out[o++] = b32hextab[(bitb >> (bits - 5)) & 31];
+			bits -= 5;
+		}
+	}
+
+	if (bits && o + 2 <= out_len)
+		out[o++] = b32hextab[(bitb << (5 - bits)) & 31];
+
+	out[o] = '\0';
+}
+
+struct auth_dns_nsec3_params {
+	uint8_t		salt[255];
+	size_t		salt_len;
+	uint16_t	iterations;
+	uint8_t		alg;
+};
+
+/*
+ * NSEC3PARAM and NSEC3 RDATA both start with
+ * alg(1) flags(1) iterations(2) salt-len(1) salt(salt-len), so either kind
+ * of record can tell us the zone's hash parameters.  Returns 0 if usable
+ * parameters were found.
+ */
+
+static int
+auth_dns_nsec3_params(struct auth_dns_zone *z,
+		      struct auth_dns_nsec3_params *pa)
+{
+	lws_start_foreach_dll(struct lws_dll2 *, d,
+			      lws_dll2_get_head(&z->rrset_list)) {
+		struct auth_dns_rrset *rs = lws_container_of(d,
+						struct auth_dns_rrset, list);
+		struct auth_dns_rr *rr;
+
+		if ((rs->type != 50 && rs->type != 51) ||
+		    lws_dll2_is_empty(&rs->rr_list))
+			continue;
+
+		rr = lws_container_of(lws_dll2_get_head(&rs->rr_list),
+				      struct auth_dns_rr, list);
+
+		if (rr->wire_rdata_len < 5)
+			continue;
+
+		pa->alg = rr->wire_rdata[0];
+		pa->iterations = (uint16_t)((rr->wire_rdata[2] << 8) |
+					     rr->wire_rdata[3]);
+		pa->salt_len = rr->wire_rdata[4];
+
+		if (pa->salt_len > sizeof(pa->salt) ||
+		    5 + pa->salt_len > rr->wire_rdata_len)
+			continue;
+
+		if (pa->salt_len)
+			memcpy(pa->salt, rr->wire_rdata + 5, pa->salt_len);
+
+		/* SHA-1 is the only defined NSEC3 hash algorithm */
+
+		return pa->alg != 1 ||
+		       pa->iterations > LWS_AUTH_DNS_MAX_NSEC3_ITERATIONS;
+	} lws_end_foreach_dll(d);
+
+	return 1;
+}
+
+/*
+ * Compute the base32hex NSEC3 owner hash of a name.  The name is used fully
+ * qualified so name_to_wire() cannot append the origin to it a second time.
+ */
+
+static int
+auth_dns_nsec3_hash(const char *name, const struct auth_dns_nsec3_params *pa,
+		    char *b32, size_t b32_len)
+{
+	uint8_t wire[256], hash[LWS_AUTH_DNS_NSEC3_HASH_LEN];
+	size_t wl = sizeof(wire), nl = strlen(name);
+	char fq[260];
+
+	lws_snprintf(fq, sizeof(fq), "%s%s", name,
+		     nl && name[nl - 1] == '.' ? "" : ".");
+
+	if (name_to_wire(fq, "", wire, &wl))
+		return 1;
+
+	/*
+	 * auth_dns_nsec3_params() already refuses a zone whose NSEC3PARAM asks
+	 * for more than this, but the bound belongs next to the work it limits
+	 */
+	if (pa->iterations > LWS_AUTH_DNS_MAX_NSEC3_ITERATIONS)
+		return 1;
+
+	if (lws_auth_dns_nsec3_hash(wire, wl, pa->salt, pa->salt_len,
+				    (unsigned int)pa->iterations, hash))
+		return 1;
+
+	auth_dns_b32hex(hash, sizeof(hash), b32, b32_len);
+
+	return 0;
+}
+
+/* the first label of an NSEC3 owner name, uppercased for comparison */
+
+static void
+auth_dns_nsec3_owner_hash(const char *name, char *b32, size_t b32_len)
+{
+	size_t n = 0;
+
+	while (name[n] && name[n] != '.' && n + 1 < b32_len) {
+		b32[n] = (char)toupper((unsigned char)name[n]);
+		n++;
+	}
+
+	b32[n] = '\0';
+}
+
+/* the Next Hashed Owner Name field of an NSEC3 RDATA, base32hex encoded */
+
+static int
+auth_dns_nsec3_next_hash(const struct auth_dns_rr *rr, char *b32,
+			 size_t b32_len)
+{
+	size_t sl, hl;
+
+	if (rr->wire_rdata_len < 6)
+		return 1;
+
+	sl = rr->wire_rdata[4];
+	if (6 + sl > rr->wire_rdata_len)
+		return 1;
+
+	hl = rr->wire_rdata[5 + sl];
+	if (6 + sl + hl > rr->wire_rdata_len)
+		return 1;
+
+	auth_dns_b32hex(rr->wire_rdata + 6 + sl, hl, b32, b32_len);
+
+	return 0;
+}
+
+/*
+ * An NSEC3 RR covers a hash when the hash sorts after its owner hash and
+ * before its next hash.  The last RR in the chain wraps, ie, its owner hash
+ * sorts after its next hash.
+ */
+
+static int
+auth_dns_nsec3_covers(const char *owner, const char *next, const char *h)
+{
+	if (strcmp(owner, next) < 0)
+		return strcmp(owner, h) < 0 && strcmp(h, next) < 0;
+
+	return strcmp(owner, h) < 0 || strcmp(h, next) < 0;
+}
+
+static struct auth_dns_rrset *
+auth_dns_nsec3_find(struct auth_dns_zone *z, const char *h, int cover)
+{
+	char owner[64], next[64];
+
+	lws_start_foreach_dll(struct lws_dll2 *, d,
+			      lws_dll2_get_head(&z->rrset_list)) {
+		struct auth_dns_rrset *rs = lws_container_of(d,
+						struct auth_dns_rrset, list);
+		struct auth_dns_rr *rr;
+
+		if (rs->type != 50 || lws_dll2_is_empty(&rs->rr_list))
+			continue;
+
+		auth_dns_nsec3_owner_hash(rs->name, owner, sizeof(owner));
+
+		if (!cover) {
+			if (!strcmp(owner, h))
+				return rs;
+			continue;
+		}
+
+		rr = lws_container_of(lws_dll2_get_head(&rs->rr_list),
+				      struct auth_dns_rr, list);
+
+		if (!auth_dns_nsec3_next_hash(rr, next, sizeof(next)) &&
+		    auth_dns_nsec3_covers(owner, next, h))
+			return rs;
+	} lws_end_foreach_dll(d);
+
+	return NULL;
+}
+
+/* does any rrset in the zone own this (trailing-dot-insensitive) name? */
+
+static int
+auth_dns_name_exists(struct auth_dns_zone *z, const char *name)
+{
+	size_t nl = strlen(name);
+
+	lws_start_foreach_dll(struct lws_dll2 *, d,
+			      lws_dll2_get_head(&z->rrset_list)) {
+		struct auth_dns_rrset *rs = lws_container_of(d,
+						struct auth_dns_rrset, list);
+		size_t rnl = strlen(rs->name);
+
+		if (rnl && rs->name[rnl - 1] == '.')
+			rnl--;
+
+		if (rnl == nl && !strncmp(rs->name, name, nl))
+			return 1;
+	} lws_end_foreach_dll(d);
+
+	return 0;
+}
+
+/*
+ * C-238: fill sel[] with the NSEC3 rrsets that RFC 5155 7.2 requires to deny
+ * qname, returning how many were found (0 - 3).
+ *
+ * We used to serialize *every* NSEC3 rrset in the zone into the authority
+ * section of every negative answer.  That handed each querier the complete
+ * set of owner-name hashes -- offline zone walking for free, which is
+ * precisely what NSEC3 exists to prevent -- and made every NXDOMAIN a
+ * maximum-sized response regardless of the size of the query.
+ */
+
+static int
+auth_dns_nsec3_proof(struct auth_dns_zone *z, const char *qname,
+		     struct auth_dns_rrset **sel, int max)
+{
+	char ce[256], nc[256], wc[260], h[64];
+	struct auth_dns_nsec3_params pa;
+	struct auth_dns_rrset *r;
+	int count = 0, n, have_nc = 0;
+
+	if (max < LWS_AUTH_DNS_MAX_NSEC3_PROOF || auth_dns_nsec3_params(z, &pa))
+		return 0;
+
+	/*
+	 * The closest encloser is the longest ancestor of qname that exists
+	 * in the zone (qname itself in the NODATA case); the next closer
+	 * name is the ancestor one label below that.
+	 */
+
+	lws_strncpy(ce, qname, sizeof(ce));
+	nc[0] = '\0';
+
+	while (ce[0] && !auth_dns_name_exists(z, ce)) {
+		const char *dot = strchr(ce, '.');
+
+		lws_strncpy(nc, ce, sizeof(nc));
+		have_nc = 1;
+
+		if (!dot) {
+			ce[0] = '\0';
+			break;
+		}
+
+		memmove(ce, dot + 1, strlen(dot + 1) + 1);
+	}
+
+	if (!ce[0])
+		return 0;
+
+	if (!have_nc) {
+		/* NODATA: the name exists, prove the type at it does not */
+
+		if (!auth_dns_nsec3_hash(qname, &pa, h, sizeof(h)) &&
+		    (r = auth_dns_nsec3_find(z, h, 0)) != NULL)
+			sel[count++] = r;
+
+		return count;
+	}
+
+	if (!auth_dns_nsec3_hash(ce, &pa, h, sizeof(h)) &&
+	    (r = auth_dns_nsec3_find(z, h, 0)) != NULL)
+		sel[count++] = r;
+
+	if (!auth_dns_nsec3_hash(nc, &pa, h, sizeof(h)) &&
+	    (r = auth_dns_nsec3_find(z, h, 1)) != NULL) {
+		for (n = 0; n < count && sel[n] != r; n++)
+			;
+		if (n == count)
+			sel[count++] = r;
+	}
+
+	lws_snprintf(wc, sizeof(wc), "*.%s", ce);
+
+	if (!auth_dns_nsec3_hash(wc, &pa, h, sizeof(h)) &&
+	    (r = auth_dns_nsec3_find(z, h, 1)) != NULL) {
+		for (n = 0; n < count && sel[n] != r; n++)
+			;
+		if (n == count)
+			sel[count++] = r;
+	}
+
+	return count;
+}
+
 struct auth_dns_cache_entry {
 	lws_dll2_t list;
 	struct auth_dns_zone zone;
@@ -121,6 +507,14 @@ struct per_vhost_data__auth_dns {
 	lws_dll2_owner_t pending_queries;
 	lws_sorted_usec_list_t sul_evict;
 
+	/*
+	 * C-239: count of distinct domains in pending_queries, maintained
+	 * incrementally.  It used to be recomputed by a nested walk of the
+	 * (up to 1024-entry) queue on every cache-missing query, ie, O(n^2)
+	 * strcmp() on the event loop thread driven by unauthenticated UDP.
+	 */
+	uint32_t pending_unique_domains;
+
 	/* DNSBL tracking */
 	int has_dnsbl;                     /* 1 if we have any DNSBLs configured */
 	char dnsbl_list[256];              /* Comma-separated list of DNSBL domains */
@@ -139,6 +533,14 @@ struct pending_dns_query {
 	char domain[256];
 	uint8_t packet[512];
 	size_t packet_len;
+
+	/*
+	 * ^ up to here the layout must stay identical to struct
+	 * pending_dnsbl_query, LWS_CALLBACK_USER casts either kind to this
+	 * type and reads only that common prefix
+	 */
+
+	char peer_ip[64];
 	lws_sorted_usec_list_t sul_timeout;
 };
 
@@ -168,13 +570,24 @@ struct pending_dnsbl_query {
 struct per_session_data__auth_dns {
 	unsigned char rx_buf[1024];
 	int rx_len;
-	unsigned char buf[LWS_PRE + 1024];
+	unsigned char buf[LWS_PRE + 4096];
 	int len;
 };
+
+/*
+ * C-240: qname and everything derived from it comes straight off the wire,
+ * and a DNS label may contain any octet, including newlines and terminal
+ * escapes.  Nothing wire-derived may reach a log line without passing
+ * through lws_json_purify() first, and per-query lines are info level so an
+ * unauthenticated peer cannot drive the operator's log volume.
+ */
 
 static void
 extract_base_domain(const char *qname, char *base, size_t max)
 {
+#if (_LWS_ENABLED_LOGS & LLL_INFO)
+	char pn[512];
+#endif
 	int dots = 0;
 	const char *p = qname + strlen(qname) - 1;
 
@@ -199,7 +612,10 @@ extract_base_domain(const char *qname, char *base, size_t max)
 	if (bl > 0 && base[bl - 1] == '.')
 		base[bl - 1] = '\0';
 
-	lwsl_notice("%s: Extracted base domain '%s' from qname '%s'\n", __func__, base, qname);
+#if (_LWS_ENABLED_LOGS & LLL_INFO)
+	lwsl_info("%s: Extracted base domain '%s'\n", __func__,
+		  lws_json_purify(pn, base, (int)sizeof(pn), NULL));
+#endif
 }
 
 static void
@@ -217,11 +633,129 @@ auth_dns_sul_subscribe_cb(lws_sorted_usec_list_t *sul)
 	}
 }
 
+/*
+ * Cache admission control: evict the oldest zone cache entry (the list tail,
+ * fresh entries go on the head).  The on-disk zone file under dir_prefix, if
+ * any, is removed along with it.
+ */
+static void
+auth_dns_evict_oldest(struct per_vhost_data__auth_dns *vhd,
+		      const char *dir_prefix)
+{
+	struct auth_dns_cache_entry *old = lws_container_of(
+			lws_dll2_get_tail(&vhd->zones),
+			struct auth_dns_cache_entry, list);
+	char dpath[1024];
+
+	if (dir_prefix && dir_prefix[0]) {
+		lws_snprintf(dpath, sizeof(dpath), "%s/%s", dir_prefix,
+			     old->filename);
+		unlink(dpath);
+	}
+
+	lws_sul_cancel(&old->sul_subscribe);
+	lws_auth_dns_free_zone(&old->zone);
+	lws_dll2_remove(&old->list);
+	free(old);
+}
+
+/*
+ * F-055: cache entries mint a filename label from the zone origin,
+ * <origin>_<ttl-expiry>_<sig-expiry>_<serial>.zone, that is later used to
+ * compose unlink paths inside the zone dir and to prefix-match other cache
+ * entries.  Restrict the origin part to presentation-format DNS names
+ * without underscores, so '_' can only act as the decorator separator and
+ * the prefix matching cannot be made ambiguous (eg, a zone for
+ * "a_b.example" matching victim prefix "a_").
+ */
+static int
+auth_dns_zone_origin_valid(const char *origin)
+{
+	size_t i, len = strlen(origin), label = 0;
+
+	if (!len || len > 253)
+		return 0;
+
+	for (i = 0; i < len; i++) {
+		char c = origin[i];
+
+		if (c == '.') {
+			if (!label || label > 63)
+				return 0;
+			label = 0;
+			continue;
+		}
+
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		      (c >= '0' && c <= '9') || c == '-'))
+			return 0;
+		label++;
+	}
+
+	/* final label may be empty only for a single trailing root dot */
+	return label || origin[len - 1] == '.';
+}
+
+/*
+ * F-055: the init dir-scan only accepts zone files named in the decorated
+ * <origin>_<ttl-expiry>_<sig-expiry>_<serial>.zone shape the plugin itself
+ * labels cache entries with; filenames other than that shape are not
+ * trusted for cache admission regardless of their content.
+ *
+ * Returns 0 and fills \p origin and the numeric fields from \p name when it
+ * has exactly that shape, else nonzero.
+ */
+static int
+auth_dns_zone_filename_parse(const char *name, char *origin, size_t origin_len,
+			     unsigned long long *ttl_exp,
+			     unsigned long long *sig_exp,
+			     unsigned long long *serial)
+{
+	unsigned long long *field[3] = { serial, sig_exp, ttl_exp };
+	size_t len = strlen(name), e, s;
+	int f;
+
+	if (len < 12 || memcmp(&name[len - 5], ".zone", 5))
+		return 1;
+
+	/* from the right: serial, sig expiry, ttl expiry, '_' delimited */
+
+	e = len - 5;
+	for (f = 0; f < 3; f++) {
+		s = e;
+		while (s > 0 && isdigit((unsigned char)name[s - 1]))
+			s--;
+		if (s == e || e - s > 20)
+			return 1;	/* empty or silly-sized numeric field */
+		if (!s || name[s - 1] != '_')
+			return 1;
+		*field[f] = 0;
+		{
+			size_t i;
+
+			for (i = s; i < e; i++)
+				*field[f] = (*field[f] * 10) +
+					(unsigned long long)(name[i] - '0');
+		}
+		e = s - 1;
+	}
+
+	if (!e || e + 1 > origin_len)
+		return 1;
+	memcpy(origin, name, e);
+	origin[e] = '\0';
+
+	return !auth_dns_zone_origin_valid(origin);
+}
+
 static int
 auth_dns_dir_cb(const char *dirpath, void *user, struct lws_dir_entry *lde)
 {
 	struct per_vhost_data__auth_dns *vhd = (struct per_vhost_data__auth_dns *)user;
 	char filepath[1024];
+	char name[256];		/* same size as auth_dns_cache_entry.filename */
+	char origin[256];
+	unsigned long long ttl_exp, sig_exp, serial;
 	int fd;
 	size_t len;
 	char *buf;
@@ -234,16 +768,44 @@ auth_dns_dir_cb(const char *dirpath, void *user, struct lws_dir_entry *lde)
 		return 0;
 
 	len = strlen(lde->name);
-	if (len < 6 || strcmp(&lde->name[len - 5], ".zone"))
-			/* With DHT integration we don't try to sync initial loads since it comes ad-hoc */{ lwsl_notice("open failed\n"); return 0; }
+	if (len >= sizeof(name)) {
+		lwsl_notice("%s: name too long\n", __func__);
+		return 0;
+	}
+	lws_strncpy(name, lde->name, sizeof(name));
 
-	lws_snprintf(filepath, sizeof(filepath), "%s/%s", dirpath, lde->name);
+	/*
+	 * F-055: with DHT integration initial loads come ad-hoc anyway; only
+	 * the plugin's own decorated filename shape is admitted from the
+	 * local dir scan
+	 */
+	if (auth_dns_zone_filename_parse(name, origin, sizeof(origin),
+					 &ttl_exp, &sig_exp, &serial)) {
+		lwsl_notice("%s: ignoring zone file with foreign name %s\n",
+				__func__, name);
+		return 0;
+	}
 
-	fd = open(filepath, O_RDONLY);
+	lws_snprintf(filepath, sizeof(filepath), "%s/%s", dirpath, name);
+
+	fd = open(filepath, O_RDONLY | O_NOFOLLOW);
 	if (fd < 0) { lwsl_notice("open failed\n"); return 0; }
 
 	if (fstat(fd, &st) < 0 || st.st_size <= 0 || st.st_size >= LWS_AUTH_DNS_MAX_ZONE_SIZE) {
 		lwsl_notice("fstat failed or size invalid\n");
+		close(fd);
+		return 0;
+	}
+
+	/*
+	 * F-055: everything loaded from here is served as authoritative data
+	 * and its filename drives later unlinks in this dir; only files the
+	 * service uid owns, that nobody else can write, are admitted
+	 */
+	if (!S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
+	    (st.st_mode & (S_IWGRP | S_IWOTH))) {
+		lwsl_notice("%s: refusing foreign or group/world-writable zone file %s\n",
+				__func__, lde->name);
 		close(fd);
 		return 0;
 	}
@@ -271,25 +833,11 @@ auth_dns_dir_cb(const char *dirpath, void *user, struct lws_dir_entry *lde)
 		return 0;
 	}
 	memset(ce, 0, sizeof(*ce));
-	lws_strncpy(ce->filename, lde->name, sizeof(ce->filename));
+	lws_strncpy(ce->filename, name, sizeof(ce->filename));
 
-	/* Parse suffix format: domain_ttl_sig_serial.zone */
-	{
-		char *p = ce->filename + (len - 5);
-		while (p > ce->filename && *(p - 1) != '_') p--;
-		if (p > ce->filename) {
-			ce->serial = strtoull(p, NULL, 10);
-			p--;
-			while (p > ce->filename && *(p - 1) != '_') p--;
-			if (p > ce->filename) {
-				ce->sig_expiry = (time_t)strtoull(p, NULL, 10);
-				p--;
-				while (p > ce->filename && *(p - 1) != '_') p--;
-				if (p > ce->filename)
-					ce->ttl_expiry = (time_t)strtoull(p, NULL, 10);
-			}
-		}
-	}
+	ce->serial = serial;
+	ce->sig_expiry = (time_t)sig_exp;
+	ce->ttl_expiry = (time_t)ttl_exp;
 
 	time_t now = time(NULL);
 	if ((ce->ttl_expiry && now >= ce->ttl_expiry) ||
@@ -301,7 +849,7 @@ auth_dns_dir_cb(const char *dirpath, void *user, struct lws_dir_entry *lde)
 		return 0;
 	}
 
-	if (lws_auth_dns_parse_zone_buf(buf, (size_t)st.st_size, &ce->zone, NULL, NULL)) {
+	if (lws_auth_dns_parse_zone_buf(buf, (size_t)st.st_size, &ce->zone)) {
 		lwsl_notice("parse failed\n");
 		free(ce);
 		free(buf);
@@ -310,16 +858,9 @@ auth_dns_dir_cb(const char *dirpath, void *user, struct lws_dir_entry *lde)
 	free(buf);
 
 	/* Limit cache */
-	while ((uint32_t)vhd->zones.count >= vhd->cache_max_zones) {
-		struct auth_dns_cache_entry *old = lws_container_of(vhd->zones.tail, struct auth_dns_cache_entry, list);
-		char dpath[1024];
-		lws_snprintf(dpath, sizeof(dpath), "%s/%s", dirpath, old->filename);
-		unlink(dpath);
-		lws_sul_cancel(&old->sul_subscribe);
-		lws_auth_dns_free_zone(&old->zone);
-		lws_dll2_remove(&old->list);
-		free(old);
-	}
+	while (lws_dll2_count(&vhd->zones) > 0 &&
+	       lws_dll2_count(&vhd->zones) >= vhd->cache_max_zones)
+		auth_dns_evict_oldest(vhd, dirpath);
 
 	ce->vhd = vhd;
 	lws_dll2_add_head(&ce->list, &vhd->zones);
@@ -330,9 +871,12 @@ auth_dns_dir_cb(const char *dirpath, void *user, struct lws_dir_entry *lde)
 
 	if (vhd->dht_ops && vhd->dht_ops->subscribe_zone) {
 		/* Kick off initial subscription and schedule rolling updates */
+		lwsl_notice("%s: Triggering DHT subscription for %s\n", __func__, ce->zone.origin);
 		vhd->dht_ops->subscribe_zone(vhd->vhost, ce->zone.origin);
 		lws_sul_schedule(vhd->context, 0, &ce->sul_subscribe,
 				 auth_dns_sul_subscribe_cb, 45 * 60 * LWS_US_PER_SEC);
+	} else {
+		lwsl_notice("%s: No DHT ops for subscription of %s\n", __func__, ce->zone.origin);
 	}
 
 	return 0;
@@ -364,7 +908,7 @@ auth_dns_local_zone_cb(void *opaque, const char *domain, const char *payload_pat
 				time_t sig_expiry = 0;
 				time_t default_ttl = 3600;
 
-				if (!lws_auth_dns_parse_zone_buf(buf, (size_t)st.st_size, &z, NULL, NULL)) {
+				if (!lws_auth_dns_parse_zone_buf(buf, (size_t)st.st_size, &z)) {
 					if (z.default_ttl[0]) default_ttl = (time_t)atoi(z.default_ttl);
 
 					lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&z.rrset_list)) {
@@ -417,10 +961,27 @@ auth_dns_local_zone_cb(void *opaque, const char *domain, const char *payload_pat
 						col--;
 					}
 
+					/*
+					 * F-055: the origin becomes the cache
+					 * entry's filename label, which is
+					 * used to compose unlink paths and
+					 * prefix-match other entries in the
+					 * zone dir; keep it to unambiguous
+					 * presentation-format DNS names
+					 */
+					if (!auth_dns_zone_origin_valid(clean_origin)) {
+						lwsl_notice("%s: refusing zone with invalid origin '%s'\n",
+								__func__, z.origin);
+						lws_auth_dns_free_zone(&z);
+						if (buf) free(buf);
+						close(fpin);
+						return;
+					}
+
 					int serial_is_newer = 1;
 
 					/* Remove old versions from memory cache */
-					lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, vhd->zones.head) {
+					lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, lws_dll2_get_head(&vhd->zones)) {
 						struct auth_dns_cache_entry *old = lws_container_of(d, struct auth_dns_cache_entry, list);
 						if (!strncmp(old->filename, clean_origin, (size_t)col) && old->filename[col] == '_') {
 							if ((int32_t)((uint32_t)serial - (uint32_t)old->serial) <= 0) {
@@ -449,18 +1010,9 @@ auth_dns_local_zone_cb(void *opaque, const char *domain, const char *payload_pat
 					}
 
 					/* Enforce cache limits */
-					while ((uint32_t)vhd->zones.count >= vhd->cache_max_zones) {
-						struct auth_dns_cache_entry *old = lws_container_of(vhd->zones.tail, struct auth_dns_cache_entry, list);
-						char dpath[1024];
-						if (tzdir[0]) {
-							lws_snprintf(dpath, sizeof(dpath), "%s/%s", tzdir, old->filename);
-							unlink(dpath);
-						}
-						lws_sul_cancel(&old->sul_subscribe);
-						lws_auth_dns_free_zone(&old->zone);
-						lws_dll2_remove(&old->list);
-						free(old);
-					}
+					while (lws_dll2_count(&vhd->zones) > 0 &&
+					       lws_dll2_count(&vhd->zones) >= vhd->cache_max_zones)
+						auth_dns_evict_oldest(vhd, tzdir);
 
 					struct auth_dns_cache_entry *ce = malloc(sizeof(*ce));
 					if (ce) {
@@ -478,8 +1030,12 @@ auth_dns_local_zone_cb(void *opaque, const char *domain, const char *payload_pat
 						memset(&z, 0, sizeof(z)); /* Prevent free_zone locally */
 
 						/* Safely repoint all child elements to the new heap owner instead of the original stack address */
-						lws_start_foreach_dll(struct lws_dll2 *, d, ce->zone.rrset_list.head) {
+						lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&ce->zone.rrset_list)) {
+							struct auth_dns_rrset *rs = lws_container_of(d, struct auth_dns_rrset, list);
 							d->owner = &ce->zone.rrset_list;
+							lws_start_foreach_dll(struct lws_dll2 *, d2, lws_dll2_get_head(&rs->rr_list)) {
+								d2->owner = &rs->rr_list;
+							} lws_end_foreach_dll(d2);
 						} lws_end_foreach_dll(d);
 
 						ce->vhd = vhd;
@@ -510,6 +1066,39 @@ auth_dns_local_zone_cb(void *opaque, const char *domain, const char *payload_pat
 	}
 }
 
+/*
+ * Take one pending query off the vhd queue, cancelling its timeout and
+ * keeping vhd->pending_unique_domains in step.  Every free of a
+ * struct pending_dns_query goes through here.
+ */
+
+static void
+pending_query_detach(struct pending_dns_query *q)
+{
+	struct per_vhost_data__auth_dns *vhd = q->vhd;
+	int others = 0;
+
+	lws_sul_cancel(&q->sul_timeout);
+	lws_dll2_remove(&q->list);
+
+	if (!vhd)
+		return;
+
+	lws_start_foreach_dll(struct lws_dll2 *, d,
+			      lws_dll2_get_head(&vhd->pending_queries)) {
+		struct pending_dns_query *q2 = lws_container_of(d,
+					struct pending_dns_query, list);
+
+		if (!strcmp(q2->domain, q->domain)) {
+			others = 1;
+			break;
+		}
+	} lws_end_foreach_dll(d);
+
+	if (!others && vhd->pending_unique_domains)
+		vhd->pending_unique_domains--;
+}
+
 static void
 auth_dns_fetch_cb(void *opaque, const char *domain, int status)
 {
@@ -522,11 +1111,10 @@ auth_dns_fetch_cb(void *opaque, const char *domain, int status)
 		 */
 	}
 
-	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, vhd->pending_queries.head) {
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, lws_dll2_get_head(&vhd->pending_queries)) {
 		struct pending_dns_query *q = lws_container_of(d, struct pending_dns_query, list);
 		if (!strcmp(q->domain, domain)) {
-			lws_sul_cancel(&q->sul_timeout);
-			lws_dll2_remove(&q->list);
+			pending_query_detach(q);
 
 			if (q->wsi) {
 				const struct lws_protocols *prot = lws_get_protocol(q->wsi);
@@ -556,7 +1144,7 @@ dnsbl_cache_add(struct per_vhost_data__auth_dns *vhd, const char *target, int is
 	struct dnsbl_cache_entry *c;
 
 	/* Search if already exists */
-	lws_start_foreach_dll(struct lws_dll2 *, d, vhd->dnsbl_cache.head) {
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&vhd->dnsbl_cache)) {
 		c = lws_container_of(d, struct dnsbl_cache_entry, list);
 		if (!strcmp(c->target, target)) {
 			c->is_blacklisted = is_blacklisted;
@@ -566,8 +1154,8 @@ dnsbl_cache_add(struct per_vhost_data__auth_dns *vhd, const char *target, int is
 	} lws_end_foreach_dll(d);
 
 	/* Limit cache size */
-	if (vhd->dnsbl_cache.count > 1024) {
-		c = lws_container_of(vhd->dnsbl_cache.tail, struct dnsbl_cache_entry, list);
+	if (lws_dll2_count(&vhd->dnsbl_cache) > 1024) {
+		c = lws_container_of(lws_dll2_get_tail(&vhd->dnsbl_cache), struct dnsbl_cache_entry, list);
 		lws_sul_cancel(&c->sul_expire);
 		lws_dll2_remove(&c->list);
 		free(c);
@@ -587,7 +1175,7 @@ dnsbl_cache_add(struct per_vhost_data__auth_dns *vhd, const char *target, int is
 static int
 dnsbl_cache_lookup(struct per_vhost_data__auth_dns *vhd, const char *target, int *is_blacklisted)
 {
-	lws_start_foreach_dll(struct lws_dll2 *, d, vhd->dnsbl_cache.head) {
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&vhd->dnsbl_cache)) {
 		struct dnsbl_cache_entry *c = lws_container_of(d, struct dnsbl_cache_entry, list);
 		if (!strcmp(c->target, target)) {
 			*is_blacklisted = c->is_blacklisted;
@@ -609,7 +1197,7 @@ auth_dns_evict_cb(lws_sorted_usec_list_t *sul)
 	else
 		return;
 
-	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, vhd->zones.head) {
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, lws_dll2_get_head(&vhd->zones)) {
 		struct auth_dns_cache_entry *ce = lws_container_of(d, struct auth_dns_cache_entry, list);
 		if ((ce->ttl_expiry && now >= ce->ttl_expiry) ||
 		    (ce->sig_expiry && now >= ce->sig_expiry)) {
@@ -636,12 +1224,15 @@ pending_query_timeout_cb(lws_sorted_usec_list_t *sul)
 {
 	struct pending_dns_query *q = lws_container_of(sul, struct pending_dns_query, sul_timeout);
 	lwsl_info("%s: timeout for query\n", __func__);
+
+	pending_query_detach(q);
+
 	if (q->wsi) {
 		const struct lws_protocols *prot = lws_get_protocol(q->wsi);
 		if (prot && prot->callback)
 			prot->callback(q->wsi, LWS_CALLBACK_USER, lws_wsi_user(q->wsi), q, 0);
 	}
-	lws_dll2_remove(&q->list);
+
 	free(q);
 }
 
@@ -650,6 +1241,15 @@ dnsbl_timeout_cb(lws_sorted_usec_list_t *sul)
 {
 	struct pending_dnsbl_query *q = lws_container_of(sul, struct pending_dnsbl_query, sul_timeout);
 	lwsl_info("%s: dnsbl timeout for query\n", __func__);
+
+	/*
+	 * The resolver may still be holding in-flight lookups issued with q
+	 * as their opaque... they must not be able to call back into freed
+	 * heap if they complete later.  Cancelling before the replay also
+	 * means lookups the replay re-issues get fresh resolver queries,
+	 * instead of piggybacking onto these doomed ones.
+	 */
+	lws_async_dns_cancel_by_opaque(q->vhd->context, q);
 
 	/* Assume clean if timeout */
 	if (!q->is_blacklisted && q->wsi) {
@@ -666,16 +1266,26 @@ static struct lws *
 dnsbl_query_cb(struct lws *wsi, const char *ads, const struct addrinfo *result, int n, void *opaque)
 {
 	struct pending_dnsbl_query *q = (struct pending_dnsbl_query *)opaque;
-	lwsl_info("%s: n=%d for ads=%s\n", __func__, n, ads ? ads : "null");
+	char pn[512];
+
+	lwsl_info("%s: n=%d for ads=%s\n", __func__, n,
+		  ads ? lws_json_purify(pn, ads, (int)sizeof(pn), NULL) : "null");
 
 	q->pending_lookups--;
 
+	/*
+	 * ads is only NULL on the synchronous-failure path out of
+	 * lws_async_dns_query(); there is nothing cacheable we can key it by
+	 * then.
+	 */
 	if (n >= 0 && (n & ~LWS_ADNS_DNSSEC_VALID) == LADNS_RET_FOUND) {
 		/* Found an A record on the DNSBL - it's blacklisted! */
-		lwsl_notice("%s: DNSBL HIT for %s\n", __func__, ads ? ads : "known target");
+		lwsl_notice("%s: DNSBL HIT for %s\n", __func__,
+			    ads ? lws_json_purify(pn, ads, (int)sizeof(pn), NULL) :
+				  "known target");
 		dnsbl_cache_add(q->vhd, ads, 1);
 		q->is_blacklisted = 1;
-	} else if (n == LADNS_RET_NXDOMAIN || n == LADNS_RET_TIMEDOUT || n == LADNS_RET_FAILED) {
+	} else if (ads && (n == LADNS_RET_NXDOMAIN || n == LADNS_RET_TIMEDOUT || n == LADNS_RET_FAILED)) {
 		/* Clean or timeout */
 		dnsbl_cache_add(q->vhd, ads, 0);
 	}
@@ -693,6 +1303,9 @@ dnsbl_query_cb(struct lws *wsi, const char *ads, const struct addrinfo *result, 
 				prot->callback(q->wsi, LWS_CALLBACK_USER, lws_wsi_user(q->wsi), q, 0);
 		}
 
+		/* any stragglers must not call back into freed q */
+		lws_async_dns_cancel_by_opaque(q->vhd->context, q);
+
 		lws_dll2_remove(&q->list);
 		free(q);
 	}
@@ -700,7 +1313,7 @@ dnsbl_query_cb(struct lws *wsi, const char *ads, const struct addrinfo *result, 
 	if (result)
 		lws_async_dns_freeaddrinfo(&result);
 
-	return wsi;
+	return wsi ? wsi : LADNS_NO_WSI_BUT_OK;
 }
 
 static int
@@ -718,6 +1331,8 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 
 	switch (reason) {
 	case LWS_CALLBACK_PROTOCOL_INIT:
+		if (lws_cmdline_option_cx(lws_get_context(wsi), "--lws-stub"))
+			return 0;
 		if (!in)
 			return 0;
 
@@ -729,7 +1344,7 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 		vhd->context = lws_get_context(wsi);
 		vhd->protocol = lws_get_protocol(wsi);
 		vhd->vhost = lws_get_vhost(wsi);
-		vhd->dht_max_pending = 16;
+		vhd->dht_max_pending = 128;
 		vhd->cache_max_zones = 1000;
 
 		{
@@ -753,7 +1368,7 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 					vhd->dnsbl_count = 0;
 					while (p && *p && vhd->dnsbl_count < 16) {
 						vhd->dnsbl[vhd->dnsbl_count++] = p;
-						p = strchr(p, ',');
+						p = (char *)strchr(p, ',');
 						if (p) {
 							*p++ = '\0';
 							while (*p == ' ') p++; /* Skip leading spaces */
@@ -763,11 +1378,57 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 				}
 				pvo = pvo->next;
 			}
+
+			/*
+			 * F-055: there is no default zone dir.  A missing
+			 * "zone-dir" pvo used to default to shared
+			 * /tmp/lws-auth-dns, where any local user could
+			 * pre-create the directory and have their zone
+			 * files served as authoritative (and victim zone
+			 * files unlinked); the protocol now refuses to
+			 * start instead.
+			 */
 			if (vhd->zone_dir[0] == '\0') {
-				lws_strncpy(vhd->zone_dir, "/tmp/lws-auth-dns", sizeof(vhd->zone_dir));
-				if (!lws_vhost_name_to_protocol(vhd->vhost, "lws-dht-dnssec"))
-					lwsl_vhost_warn(vhd->vhost, "%s: Missing pvo \"zone-dir\", defaulting to %s",
-						 __func__, vhd->zone_dir);
+				lwsl_vhost_err(vhd->vhost, "%s: the \"zone-dir\" pvo is "
+						"required, refusing to start",
+						__func__);
+				return -1;
+			}
+
+			/*
+			 * F-055: fail closed on a zone dir that is not
+			 * exclusively controlled by the service uid: it
+			 * must already exist, be a real directory (not a
+			 * symlink), belong to our effective uid and not be
+			 * group- or world-writable.  Otherwise the dir scan
+			 * would load, and the expiry / evict paths unlink,
+			 * files other local users control.
+			 */
+			{
+				struct stat st;
+				int dfd = open(vhd->zone_dir,
+					       O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+
+				if (dfd < 0) {
+					lwsl_vhost_err(vhd->vhost,
+						"%s: zone dir %s cannot be opened "
+						"(errno %d), refusing to start",
+						__func__, vhd->zone_dir, errno);
+					return -1;
+				}
+
+				if (fstat(dfd, &st) < 0 || !S_ISDIR(st.st_mode) ||
+				    st.st_uid != geteuid() ||
+				    (st.st_mode & (S_IWGRP | S_IWOTH))) {
+					lwsl_vhost_err(vhd->vhost,
+						"%s: zone dir %s is not a service-owned, "
+						"non-group/world-writable directory, "
+						"refusing to start",
+						__func__, vhd->zone_dir);
+					close(dfd);
+					return -1;
+				}
+				close(dfd);
 			}
 		}
 
@@ -776,13 +1437,16 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 			const struct lws_protocols *prot = lws_vhost_name_to_protocol(vhd->vhost, "lws-dht-dnssec");
 			if (prot && prot->user) {
 				vhd->dht_ops = (const struct lws_dht_dnssec_ops *)prot->user;
+				lwsl_notice("%s: Successfully linked with lws-dht-dnssec operations at %p\n", __func__, vhd->dht_ops);
 				if (vhd->dht_ops->register_auth_cb)
 					vhd->dht_ops->register_auth_cb(vhd->vhost, auth_dns_local_zone_cb, vhd);
+			} else {
+				lwsl_notice("%s: lws-dht-dnssec not found or ops missing (prot=%p, user=%p)\n", __func__, prot, prot ? prot->user : NULL);
 			}
 		}
 
-		/* read zone files only if DHT is not taking over zone management */
-		if (vhd->zone_dir[0] != '\0' && !vhd->dht_ops) {
+		/* read zone files to identify domains we are authoritative for */
+		if (vhd->zone_dir[0] != '\0') {
 			lwsl_notice("%s: scanning directory %s (local disk mode)\n", __func__, vhd->zone_dir);
 			int r = lws_dir(vhd->zone_dir, vhd, auth_dns_dir_cb);
 			lwsl_notice("%s: lws_dir returned %d\n", __func__, r);
@@ -830,7 +1494,7 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 		{
 			lws_sul_cancel(&vhd->sul_evict);
 
-			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, vhd->zones.head) {
+			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, lws_dll2_get_head(&vhd->zones)) {
 				struct auth_dns_cache_entry *ce = lws_container_of(d, struct auth_dns_cache_entry, list);
 				lws_sul_cancel(&ce->sul_subscribe);
 				lws_auth_dns_free_zone(&ce->zone);
@@ -838,8 +1502,17 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 				free(ce);
 			} lws_end_foreach_dll_safe(d, d1);
 
-			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, vhd->pending_queries.head) {
+			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, lws_dll2_get_head(&vhd->pending_queries)) {
 				struct pending_dns_query *q = lws_container_of(d, struct pending_dns_query, list);
+				/*
+				 * C-241: the 5s replay timeout is a live node
+				 * in the pt sul list until it is cancelled;
+				 * freeing without cancelling left it pointing
+				 * into freed heap, and on a vhost destroy
+				 * (eg, lwsws config reload) the context
+				 * outlives it and services it.
+				 */
+				lws_sul_cancel(&q->sul_timeout);
 				lws_dll2_remove(&q->list);
 				if (vhd->dht_ops && vhd->dht_ops->fetch_zone) {
 					struct lws_dht_dnssec_fetch_zone_args args;
@@ -853,14 +1526,18 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 				free(q);
 			} lws_end_foreach_dll_safe(d, d1);
 
-			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, vhd->pending_dnsbl.head) {
+			vhd->pending_unique_domains = 0;
+
+			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, lws_dll2_get_head(&vhd->pending_dnsbl)) {
 				struct pending_dnsbl_query *q = lws_container_of(d, struct pending_dnsbl_query, list);
 				lws_sul_cancel(&q->sul_timeout);
+				/* in-flight resolver lookups hold q as opaque */
+				lws_async_dns_cancel_by_opaque(vhd->context, q);
 				lws_dll2_remove(&q->list);
 				free(q);
 			} lws_end_foreach_dll_safe(d, d1);
 
-			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, vhd->dnsbl_cache.head) {
+			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, lws_dll2_get_head(&vhd->dnsbl_cache)) {
 				struct dnsbl_cache_entry *c = lws_container_of(d, struct dnsbl_cache_entry, list);
 				lws_sul_cancel(&c->sul_expire);
 				lws_dll2_remove(&c->list);
@@ -871,11 +1548,30 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 
 	case LWS_CALLBACK_RAW_CLOSE:
 		if (vhd) {
-			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, vhd->pending_queries.head) {
+			/*
+			 * C-242: whether the wsi being destroyed is the
+			 * accepted TCP connection or the adopted UDP
+			 * listener has no bearing on whether a suspended
+			 * query is holding a pointer to it; the "&&
+			 * q->is_tcp" that used to be here left every
+			 * UDP-originated entry with a dangling q->wsi that
+			 * the 5s timeout then called back through.
+			 */
+			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, lws_dll2_get_head(&vhd->pending_queries)) {
 				struct pending_dns_query *q = lws_container_of(d, struct pending_dns_query, list);
-				if (q->wsi == wsi && q->is_tcp) {
+				if (q->wsi == wsi)
 					q->wsi = NULL;
-				}
+			} lws_end_foreach_dll_safe(d, d1);
+
+			/*
+			 * Same for queries suspended on DNSBL lookups: the
+			 * wsi is about to be destroyed, later completion /
+			 * timeout must not deref it.
+			 */
+			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, lws_dll2_get_head(&vhd->pending_dnsbl)) {
+				struct pending_dnsbl_query *q = lws_container_of(d, struct pending_dnsbl_query, list);
+				if (q->wsi == wsi)
+					q->wsi = NULL;
 			} lws_end_foreach_dll_safe(d, d1);
 		}
 		break;
@@ -883,6 +1579,23 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 	case LWS_CALLBACK_USER:
 	case LWS_CALLBACK_RAW_RX: {
 		uint8_t *p = (uint8_t *)in;
+
+		/*
+		 * The vhost listener can still accept TCP conns when our
+		 * protocol init failed (eg, F-055 zone dir policy refusal,
+		 * which frees vhd); nothing can be served without it.
+		 */
+		if (!vhd)
+			return -1;
+
+		/*
+		 * Every path into here has a wsi: RAW_RX is only issued
+		 * for a live connection, and the delayed LWS_CALLBACK_USER
+		 * re-entry is only made while q->wsi is still set.
+		 */
+		if (!wsi)
+			return -1;
+
 		uint8_t *end = p + len;
 		int is_tcp = (lws_get_udp(wsi) == NULL);
 		uint16_t req_len = 0;
@@ -890,40 +1603,39 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 		char qname[256];
 		int qname_len = 0;
 		char peer_ip[64] = "unknown";
+#if (_LWS_ENABLED_LOGS & LLL_INFO)
+		char pn[512]; /* purified copy of a wire name, for logging */
+#endif
 		struct pending_dns_query *delayed_q = NULL;
 
 		if (reason == LWS_CALLBACK_USER) {
-			/* Either returning from DHT or from DNSBL */
-			/* Distinguish based on struct type or caller logic */
+			/*
+			 * Q-35: returning from either the DHT or the DNSBL
+			 * lookup.  struct pending_dns_query and struct
+			 * pending_dnsbl_query share an identical layout prefix
+			 * (list, vhd, wsi, sa46_peer, is_tcp, domain, packet,
+			 * packet_len) -- see lines 133/152 -- and below we read
+			 * only those common-prefix fields, so a single cast is
+			 * safe regardless of which struct the caller actually
+			 * passed.  No type discrimination is needed here.
+			 */
 			struct pending_dns_query *pqdht = (struct pending_dns_query *)in;
-
-			/* Hacky check: we only have two possible `in` types here.
-			   Both have `list` as first member then `vhd`. We can check if `pqbl->pending_lookups` is initialized, etc.
-			   Actually we can distinguish by looking at the originating list?
-			   Let's just use the `is_tcp` offset or `vhd` offset.
-			   Actually both share standard fields up to `packet_len`.
-			   We should probably add a magic number. But since we originate it...
-			   Let's check if the list head matches pending_dnsbl or pending_queries.
-			   No, it's removed from the list right before calling LWS_CALLBACK_USER!
-			   For now, assume if it has `is_blacklisted` logic it's coming from DNSBL if we dispatched it.
-			   Actually, let's just make both structurally compatible up to packet_len. */
 
 			p = pqdht->packet;
 			end = p + pqdht->packet_len;
 			is_tcp = pqdht->is_tcp;
 			req_len = (uint16_t)pqdht->packet_len;
 
-			/* It could be delayed_q or delayed_dnsbl. For extracting packet it doesn't matter since they start identical */
 			delayed_q = pqdht;
 			lws_sa46_write_numeric_address(&delayed_q->sa46_peer, peer_ip, sizeof(peer_ip));
 		} else {
-			if (wsi) {
-				const struct lws_udp *udp = lws_get_udp(wsi);
-				if (!is_tcp && udp)
-					lws_sa46_write_numeric_address((lws_sockaddr46 *)&udp->sa46, peer_ip, sizeof(peer_ip));
-				else
-					lws_get_peer_simple(wsi, peer_ip, sizeof(peer_ip));
-			}
+			const struct lws_udp *udp = lws_get_udp(wsi);
+
+			if (!is_tcp && udp)
+				lws_sa46_write_numeric_address((lws_sockaddr46 *)&udp->sa46, peer_ip, sizeof(peer_ip));
+			else
+				lws_get_peer_simple(wsi, peer_ip, sizeof(peer_ip));
+
 			if (is_tcp) {
 				if ((size_t)pss->rx_len + len > sizeof(pss->rx_buf)) { lwsl_notice("tcp req too large (%d)\n", (int)len); return -1; }
 				memcpy(pss->rx_buf + pss->rx_len, in, len);
@@ -936,7 +1648,7 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 			}
 		}
 
-		lwsl_notice("LWS_CALLBACK_RAW_RX len %ld, reason %d, is_tcp=%d, peer=%s\n", (long)len, reason, is_tcp, peer_ip);
+		lwsl_info("LWS_CALLBACK_RAW_RX len %ld, reason %d, is_tcp=%d, peer=%s\n", (long)len, reason, is_tcp, peer_ip);
 
 		if (p + 12 > end) {
 			if (reason == LWS_CALLBACK_RAW_RX) lwsl_notice("short header (len %d)\n", (int)len);
@@ -984,9 +1696,14 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 		qclass = (q[2] << 8) | q[3];
 		q += 4;
 
-		lwsl_info("DNS qname '%s' type %d class %d\n", qname, qtype, qclass);
+#if (_LWS_ENABLED_LOGS & LLL_INFO)
+		lwsl_info("DNS qname '%s' type %d class %d\n",
+			  lws_json_purify(pn, qname, (int)sizeof(pn), NULL),
+			  qtype, qclass);
+#endif
 
 		int do_bit = 0;
+		uint16_t udp_payload_size = 512;
 		if (ancount == 0 && nscount == 0 && arcount > 0) {
 			uint8_t *arq = q;
 			int ar_c = arcount;
@@ -1004,6 +1721,7 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 				if (arq + 10 <= end) {
 					uint16_t type = (uint16_t)((arq[0] << 8) | arq[1]);
 					if (type == 41) { /* OPT */
+						udp_payload_size = (uint16_t)((arq[2] << 8) | arq[3]);
 						if (arq[6] & 0x80)
 							do_bit = 1;
 						break;
@@ -1019,6 +1737,7 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 
 		uint8_t *dbuf = pss->buf + LWS_PRE;
 		uint8_t *rp = dbuf;
+		size_t max_buf = is_tcp ? (sizeof(pss->buf) - LWS_PRE) : (udp_payload_size < sizeof(pss->buf) - LWS_PRE ? udp_payload_size : sizeof(pss->buf) - LWS_PRE);
 		if (is_tcp) rp += 2;
 
 		rp[0] = (uint8_t)(id >> 8); rp[1] = (uint8_t)(id & 0xff);
@@ -1027,7 +1746,7 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 		struct auth_dns_cache_entry *matched_ce = NULL;
 		struct auth_dns_rrset *found_rs = NULL;
 
-		lws_start_foreach_dll(struct lws_dll2 *, d, vhd->zones.head) {
+		lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&vhd->zones)) {
 			struct auth_dns_cache_entry *ce = lws_container_of(d, struct auth_dns_cache_entry, list);
 			int ql = (int)strlen(qname);
 			int ol = (int)strlen(ce->zone.origin);
@@ -1056,6 +1775,12 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 			/* MRU Promotion */
 			lws_dll2_remove(&matched_ce->list);
 			lws_dll2_add_head(&matched_ce->list, &vhd->zones);
+#if (_LWS_ENABLED_LOGS & LLL_INFO)
+			lwsl_info("'%s' %d from %s, %s serial %llu\n",
+				lws_json_purify(pn, qname, (int)sizeof(pn), NULL),
+				qtype, peer_ip, matched_ce->zone.origin,
+				(unsigned long long)matched_ce->serial);
+#endif
 		}
 
 		lwsl_info("found_rs? %p\n", found_rs);
@@ -1066,14 +1791,81 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 				goto send_nxdomain;
 			}
 			if (vhd->dht_ops && vhd->dht_ops->fetch_zone && reason == LWS_CALLBACK_RAW_RX) {
-				if ((uint32_t)vhd->pending_queries.count >= vhd->dht_max_pending) {
-					lwsl_notice("dht pending queries maxed out\n");
-					goto send_refused;
-				}
 				char base[256];
 				extract_base_domain(qname, base, sizeof(base));
 
-				lwsl_notice("Initiating DHT fetch for missing zone %s (qname %s)\n", base, qname);
+				int is_already_fetching_globally = 0;
+				int is_already_fetching_ip = 0;
+
+				const char *ip_domains[16];
+				int ip_domains_count = 0;
+				int ip_total_queries = 0;
+
+				/*
+				 * C-239: one cheap pass.  The unique-domain
+				 * total is kept incrementally on the vhd, and
+				 * each entry carries the printable form of
+				 * its peer address so we do not run an
+				 * inet_ntop() per queue entry per query.
+				 */
+
+				lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&vhd->pending_queries)) {
+					struct pending_dns_query *q = lws_container_of(d, struct pending_dns_query, list);
+
+					if (!strcmp(q->domain, base))
+						is_already_fetching_globally = 1;
+
+					if (strcmp(q->peer_ip, peer_ip))
+						continue;
+
+					ip_total_queries++;
+					if (!strcmp(q->domain, base))
+						is_already_fetching_ip = 1;
+
+					if (ip_domains_count < 16) {
+						int i, found = 0;
+
+						for (i = 0; i < ip_domains_count; i++)
+							if (!strcmp(ip_domains[i], q->domain)) {
+								found = 1;
+								break;
+							}
+
+						if (!found)
+							ip_domains[ip_domains_count++] = q->domain;
+					}
+				} lws_end_foreach_dll(d);
+
+				if (!is_already_fetching_globally) {
+					if (vhd->pending_unique_domains >= vhd->dht_max_pending) {
+						lwsl_notice("dht pending queries maxed out (globally %u unique) from %s\n",
+							    (unsigned int)vhd->pending_unique_domains, peer_ip);
+						goto send_refused;
+					}
+				}
+
+				if (!is_already_fetching_ip) {
+					if (ip_domains_count >= 16) {
+						lwsl_notice("dht pending queries IP limit maxed out (16 unique domains) from %s\n", peer_ip);
+						goto send_refused;
+					}
+				}
+
+				if (ip_total_queries >= 64) {
+					lwsl_notice("dht pending queries IP absolute limit (64) reached from %s\n", peer_ip);
+					goto send_refused;
+				}
+
+				if ((uint32_t)lws_dll2_count(&vhd->pending_queries) >=
+						LWS_AUTH_DNS_MAX_PENDING_QUERIES) {
+					lwsl_notice("dht pending queries absolute queue limit reached from %s\n", peer_ip);
+					goto send_refused;
+				}
+
+#if (_LWS_ENABLED_LOGS & LLL_INFO)
+				lwsl_info("Initiating DHT fetch for missing zone %s\n",
+					  lws_json_purify(pn, base, (int)sizeof(pn), NULL));
+#endif
 
 				struct pending_dns_query *pq = malloc(sizeof(*pq));
 				if (!pq) goto send_refused;
@@ -1084,9 +1876,19 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 				else if (!is_tcp && lws_get_udp(wsi)) pq->sa46_peer = lws_get_udp(wsi)->sa46;
 				pq->is_tcp = is_tcp;
 				lws_strncpy(pq->domain, base, sizeof(pq->domain));
+				lws_strncpy(pq->peer_ip, peer_ip, sizeof(pq->peer_ip));
 				pq->packet_len = is_tcp ? (size_t)req_len : len;
-				if (pq->packet_len <= sizeof(pq->packet))
-					memcpy(pq->packet, p, pq->packet_len);
+				/*
+				 * The stored length is what the replay uses as
+				 * the packet end, so it must never exceed what
+				 * we actually copied
+				 */
+				if (pq->packet_len > sizeof(pq->packet))
+					pq->packet_len = sizeof(pq->packet);
+				memcpy(pq->packet, p, pq->packet_len);
+
+				if (!is_already_fetching_globally)
+					vhd->pending_unique_domains++;
 
 				lws_dll2_add_tail(&pq->list, &vhd->pending_queries);
 				lws_sul_schedule(vhd->context, 0, &pq->sul_timeout, pending_query_timeout_cb, 5 * LWS_US_PER_SEC);
@@ -1105,7 +1907,21 @@ callback_auth_dns(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 			}
 
 send_refused:
-			rflags |= 5; /* REFUSED */
+			/*
+			 * C-243: REFUSED is always composed from a clean
+			 * header.  The DNSBL drop paths reach here from the
+			 * answer branch, after the header (with a nonzero
+			 * ANCOUNT) and the question were already written;
+			 * falling into send_out: then appended a *second*
+			 * header and question at the current rp and left the
+			 * real RCODE at NOERROR.  Rewinding rp and
+			 * recomposing rflags means no answer RR, and no
+			 * stale count, can survive into a REFUSED reply.
+			 */
+			rp = dbuf + (is_tcp ? 2 : 0);
+			rp[0] = (uint8_t)(id >> 8);
+			rp[1] = (uint8_t)(id & 0xff);
+			rflags = (uint16_t)(0x8400 | (flags & 0x0100) | 5);
 			goto send_out;
 
 send_nxdomain:
@@ -1139,25 +1955,32 @@ send_nxdomain:
 					}
 				} lws_end_foreach_dll(cd);
 
-				size_t max_buf = sizeof(pss->buf) - LWS_PRE;
 
 				rp[2] = (uint8_t)(rflags >> 8); rp[3] = (uint8_t)(rflags & 0xff);
 				rp[4] = 0; rp[5] = 1; /* QDCOUNT = 1 */
 				rp[6] = 0; rp[7] = 0; /* ANCOUNT = 0 */
 
 				/* Write standard DNS Question */
+				uint8_t *rp_flags = rp + 2; /* Save pointer to flags */
 				uint8_t *rp_auth_count = rp + 8; /* Save pointer to NSCOUNT */
+				uint8_t *rp_ar_count = rp + 10; /* Save pointer to ARCOUNT */
+				int trunc = 0;
 				rp[8] = 0; rp[9] = 0; /* NSCOUNT */
 				rp[10] = 0; rp[11] = 0; /* ARCOUNT = 0 */
 				rp += 12;
 
 				int qlen = (int)(q - (p + 12));
+				if ((size_t)(rp - dbuf) + 12 + (size_t)qlen > max_buf) {
+					lwsl_notice("DNS: response too large for buffer\n");
+					goto done;
+				}
 				memcpy(rp, p + 12, (size_t)qlen);
 				rp += qlen;
 
 				/* Serialize SOA */
-				if (soa_rs && soa_rs->rr_list.head) {
-					struct auth_dns_rr *soa_rr = lws_container_of(soa_rs->rr_list.head, struct auth_dns_rr, list);
+				if (soa_rs && lws_dll2_get_head(&soa_rs->rr_list)) {
+					struct auth_dns_rr *soa_rr = lws_container_of(lws_dll2_get_head(
+						&soa_rs->rr_list), struct auth_dns_rr, list);
 					if ((size_t)(rp - dbuf) + 16 + soa_rr->wire_rdata_len <= max_buf) {
 						int ql = (int)strlen(qname);
 						int ol = (int)strlen(matched_ce->zone.origin);
@@ -1176,48 +1999,120 @@ send_nxdomain:
 					}
 				}
 
-				/* Serialize NSEC3 and their RRSIGs if requested */
-				if (do_bit) {
+				/*
+				 * A validator can only trust the SOA (and so
+				 * the negative answer's TTL) with its RRSIG
+				 */
+				if (do_bit && soa_rs && added_auth) {
 					lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&matched_ce->zone.rrset_list)) {
-						struct auth_dns_rrset *rs = lws_container_of(d, struct auth_dns_rrset, list);
-						if (rs->type == 50 || (rs->type == 46)) {
-							/* check if it's an RRSIG for NSEC3 */
-							int is_nsec3_rrsig = 0;
-							if (rs->type == 46) {
-								if (rs->rr_list.head) {
-									struct auth_dns_rr *rr = lws_container_of(rs->rr_list.head, struct auth_dns_rr, list);
-									if (rr->wire_rdata_len >= 2 && ((rr->wire_rdata[0] << 8) | rr->wire_rdata[1]) == 50)
-										is_nsec3_rrsig = 1;
-								}
-							}
+						struct auth_dns_rrset *sg = lws_container_of(d, struct auth_dns_rrset, list);
 
-							if (rs->type == 50 || is_nsec3_rrsig) {
-								lws_start_foreach_dll(struct lws_dll2 *, d2, lws_dll2_get_head(&rs->rr_list)) {
-									struct auth_dns_rr *rr = lws_container_of(d2, struct auth_dns_rr, list);
-									size_t nlen = strlen(rs->name);
-									if ((size_t)(rp - dbuf) + 12 + nlen + 1 + rr->wire_rdata_len <= max_buf) {
-										if (name_to_wire(rs->name, matched_ce->zone.origin, rp, &max_buf) == 0) {
-											size_t written_len = strlen((char *)rp) + 1; /* Name length including root dot */
-											rp += written_len;
-											*rp++ = (uint8_t)(rs->type >> 8); *rp++ = (uint8_t)(rs->type & 0xff);
-											*rp++ = (uint8_t)(rs->class_ >> 8); *rp++ = (uint8_t)(rs->class_ & 0xff);
-											*rp++ = (uint8_t)(rs->ttl >> 24); *rp++ = (uint8_t)(rs->ttl >> 16);
-											*rp++ = (uint8_t)(rs->ttl >> 8); *rp++ = (uint8_t)(rs->ttl);
-											*rp++ = (uint8_t)(rr->wire_rdata_len >> 8); *rp++ = (uint8_t)(rr->wire_rdata_len);
-											memcpy(rp, rr->wire_rdata, rr->wire_rdata_len);
-											rp += rr->wire_rdata_len;
-											added_auth++;
-										}
-									}
-								} lws_end_foreach_dll(d2);
+						if (trunc || sg->type != 46 || strcmp(sg->name, soa_rs->name))
+							continue;
+
+						lws_start_foreach_dll(struct lws_dll2 *, d2, lws_dll2_get_head(&sg->rr_list)) {
+							struct auth_dns_rr *rr = lws_container_of(d2, struct auth_dns_rr, list);
+
+							if (rr->wire_rdata_len < 2 ||
+							    ((rr->wire_rdata[0] << 8) | rr->wire_rdata[1]) != 6)
+								continue;
+
+							if (auth_dns_emit_rr(&rp, dbuf, max_buf, sg, rr,
+									     matched_ce->zone.origin)) {
+								trunc = 1;
+								break;
 							}
-						}
+							added_auth++;
+						} lws_end_foreach_dll(d2);
 					} lws_end_foreach_dll(d);
+				}
+
+				/*
+				 * Serialize the NSEC3 denial-of-existence
+				 * proof and its RRSIGs, if the querier asked
+				 * for DNSSEC.  C-238: only the (at most
+				 * three) NSEC3 RRs RFC 5155 7.2 actually
+				 * requires, not the whole chain.
+				 */
+				if (do_bit) {
+					struct auth_dns_rrset *sel[LWS_AUTH_DNS_MAX_NSEC3_PROOF];
+					int sn, sel_count;
+
+					sel_count = auth_dns_nsec3_proof(
+						&matched_ce->zone, qname, sel,
+						LWS_ARRAY_SIZE(sel));
+
+					for (sn = 0; sn < sel_count && !trunc; sn++) {
+						struct auth_dns_rrset *n3 = sel[sn];
+
+						lws_start_foreach_dll(struct lws_dll2 *, d2, lws_dll2_get_head(&n3->rr_list)) {
+							struct auth_dns_rr *rr = lws_container_of(d2, struct auth_dns_rr, list);
+
+							if (auth_dns_emit_rr(&rp, dbuf, max_buf, n3, rr,
+									     matched_ce->zone.origin)) {
+								trunc = 1;
+								break;
+							}
+							added_auth++;
+						} lws_end_foreach_dll(d2);
+
+						/* ... and the RRSIG(s) covering it */
+
+						lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&matched_ce->zone.rrset_list)) {
+							struct auth_dns_rrset *sg = lws_container_of(d, struct auth_dns_rrset, list);
+
+							if (trunc || sg->type != 46 || strcmp(sg->name, n3->name))
+								continue;
+
+							lws_start_foreach_dll(struct lws_dll2 *, d2, lws_dll2_get_head(&sg->rr_list)) {
+								struct auth_dns_rr *rr = lws_container_of(d2, struct auth_dns_rr, list);
+
+								if (rr->wire_rdata_len < 2 ||
+								    ((rr->wire_rdata[0] << 8) | rr->wire_rdata[1]) != 50)
+									continue;
+
+								if (auth_dns_emit_rr(&rp, dbuf, max_buf, sg, rr,
+										     matched_ce->zone.origin)) {
+									trunc = 1;
+									break;
+								}
+								added_auth++;
+							} lws_end_foreach_dll(d2);
+						} lws_end_foreach_dll(d);
+					}
+
+				}
+
+				if (trunc) {
+					/*
+					 * an incomplete proof is not a proof;
+					 * say so rather than emit a partial one
+					 */
+					rflags |= 0x0200; /* TC */
+					rp_flags[0] = (uint8_t)(rflags >> 8);
+					rp_flags[1] = (uint8_t)(rflags & 0xff);
 				}
 
 				/* Update Authority Count dynamically */
 				rp_auth_count[0] = (uint8_t)(added_auth >> 8);
 				rp_auth_count[1] = (uint8_t)(added_auth & 0xff);
+
+				/*
+				 * Answer EDNS with EDNS, as the positive path
+				 * does: without the OPT echoing DO, a
+				 * resolver cannot tell this responder speaks
+				 * DNSSEC at all
+				 */
+				if (arcount > 0 && !trunc &&
+				    lws_ptr_diff_size_t(rp, dbuf) + 11 <= max_buf) {
+					*rp++ = 0; /* root name */
+					*rp++ = 0; *rp++ = 41; /* Type OPT */
+					*rp++ = 16; *rp++ = 0; /* UDP payload size 4096 */
+					*rp++ = 0; *rp++ = 0; /* Ext rcode + version */
+					*rp++ = do_bit ? 0x80 : 0; *rp++ = 0; /* DO bit */
+					*rp++ = 0; *rp++ = 0; /* rdlen 0 */
+					rp_ar_count[1] = 1;
+				}
 
 				goto after_refused;
 			}
@@ -1230,6 +2125,10 @@ send_out:
 			rp[10] = 0; rp[11] = 0; /* ARCOUNT = 0 */
 			rp += 12;
 			int qlen = (int)(q - (p + 12));
+			if ((size_t)(rp - dbuf) + 12 + (size_t)qlen > max_buf) {
+				lwsl_notice("DNS: response too large for buffer\n");
+				goto done;
+			}
 			memcpy(rp, p + 12, (size_t)qlen);
 			rp += qlen;
 
@@ -1237,7 +2136,6 @@ after_refused:
 			;
 		} else {
 			int anc = 0;
-			size_t max_buf = sizeof(pss->buf) - LWS_PRE;
 			size_t total_size = lws_ptr_diff_size_t(rp, dbuf) + 12 + (size_t)(q - (p + 12));
 			lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&found_rs->rr_list)) {
 				struct auth_dns_rr *rr = lws_container_of(d, struct auth_dns_rr, list);
@@ -1286,6 +2184,10 @@ after_refused:
 			rp[10] = (uint8_t)(added_opt >> 8); rp[11] = (uint8_t)(added_opt & 0xff);
 			rp += 12;
 			int qlen = (int)(q - (p + 12));
+			if ((size_t)(rp - dbuf) + 12 + (size_t)qlen > max_buf) {
+				lwsl_notice("DNS: response too large for buffer\n");
+				goto done;
+			}
 			memcpy(rp, p + 12, (size_t)qlen);
 			rp += qlen;
 
@@ -1336,19 +2238,51 @@ after_refused:
 				}
 
 				if (missing_cache) {
-					lwsl_notice("%s: Suspending query for DNSBL lookups (%d targets)\n", __func__, num_targets);
+					/*
+					 * C-244: the DNSBL cache is only
+					 * populated when a lookup completes,
+					 * so without these two guards every
+					 * repeat of the same query inside the
+					 * 5s window allocated another ~1KB
+					 * entry and issued another
+					 * targets * dnsbls (up to 256)
+					 * outbound lookups... ie, an
+					 * unauthenticated, spoofable heap
+					 * growth and query amplifier aimed at
+					 * the configured DNSBL operators.
+					 */
+
+					lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&vhd->pending_dnsbl)) {
+						struct pending_dnsbl_query *iq = lws_container_of(d, struct pending_dnsbl_query, list);
+
+						if (!strcmp(iq->domain, qname)) {
+							lwsl_info("%s: DNSBL lookups already in flight for this name, dropping\n", __func__);
+							goto done;
+						}
+					} lws_end_foreach_dll(d);
+
+					if ((uint32_t)lws_dll2_count(&vhd->pending_dnsbl) >=
+							LWS_AUTH_DNS_MAX_PENDING_DNSBL) {
+						lwsl_notice("%s: dnsbl pending queue limit reached from %s\n", __func__, peer_ip);
+						goto send_refused;
+					}
+
+					lwsl_info("%s: Suspending query for DNSBL lookups (%d targets)\n", __func__, num_targets);
 					struct pending_dnsbl_query *q = calloc(1, sizeof(*q));
 					if (!q) goto send_refused;
 					q->wsi = wsi;
 					q->vhd = vhd;
 					q->is_tcp = is_tcp;
+					lws_strncpy(q->domain, qname, sizeof(q->domain));
 					if (!is_tcp) {
 						const struct lws_udp *udp = lws_get_udp(wsi);
 						if (udp) q->sa46_peer = udp->sa46;
 					}
 					q->packet_len = is_tcp ? (size_t)req_len : len;
-					if (q->packet_len <= sizeof(q->packet))
-						memcpy(q->packet, p, q->packet_len);
+					/* the replay uses this as the packet end */
+					if (q->packet_len > sizeof(q->packet))
+						q->packet_len = sizeof(q->packet);
+					memcpy(q->packet, p, q->packet_len);
 
 					lws_dll2_add_tail(&q->list, &vhd->pending_dnsbl);
 					lws_sul_schedule(vhd->context, 0, &q->sul_timeout, dnsbl_timeout_cb, 5 * LWS_US_PER_SEC);
@@ -1362,14 +2296,21 @@ after_refused:
 							for (b = 0; b < vhd->dnsbl_count; b++) {
 								char lookup[512];
 								lws_snprintf(lookup, sizeof(lookup), "%s.%s", targets[i], vhd->dnsbl[b]);
-								lwsl_notice("%s: Issuing DNSBL lookup for %s\n", __func__, lookup);
+#if (_LWS_ENABLED_LOGS & LLL_INFO)
+								lwsl_info("%s: Issuing DNSBL lookup for %s\n", __func__,
+									  lws_json_purify(pn, lookup, (int)sizeof(pn), NULL));
+#endif
 								q->pending_lookups++;
 
-								if (lws_async_dns_query(vhd->context, 0, lookup,
+								/*
+								 * The cb accounts for the
+								 * increment on every outcome,
+								 * including the synchronous
+								 * failure path.
+								 */
+								lws_async_dns_query(vhd->context, 0, lookup,
 										LWS_ADNS_RECORD_A, dnsbl_query_cb,
-										NULL, q, NULL) == LADNS_RET_FAILED) {
-									q->pending_lookups--;
-								}
+										NULL, q, NULL);
 							}
 						}
 					}
@@ -1460,9 +2401,8 @@ after_refused:
 					ssize_t snt = sendto(sockfd, (char *)dbuf, (size_t)pss->len, 0, sa, salen);
 					if (snt < 0) {
 						lwsl_err("%s: sendto failed on fd %d: err %d\n", __func__, sockfd, errno);
-					} else {
-						lwsl_notice("%s: sendto succeeded %ld bytes to delayed peer on fd %d\n", __func__, (long)snt, sockfd);
-					}
+					} else
+						lwsl_info("%s: sendto succeeded %ld bytes to delayed peer on fd %d\n", __func__, (long)snt, sockfd);
 				}
 			} else {
 				lws_write(wsi, dbuf, (size_t)pss->len, LWS_WRITE_RAW);

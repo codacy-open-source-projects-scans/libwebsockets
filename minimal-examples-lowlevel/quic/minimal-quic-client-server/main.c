@@ -1,0 +1,793 @@
+/*
+ * lws-minimal-quic-client-server
+ *
+ * Written in 2010-2026 by Andy Green <andy@warmcat.com>
+ *
+ * This file is made available under the Creative Commons CC0 1.0
+ * Universal Public Domain Dedication.
+ *
+ * This demonstrates the native libwebsockets QUIC transport implementation,
+ * instantiating a server via lejp-conf, and optionally a client that links up
+ * and passes bulk bidirectional data.
+ *
+ * With --relay <port>, the client reaches the server through a UDP relay in
+ * this process that sends each direction's datagrams on in batches, last
+ * first, so both ends see the handshake and the stream data out of order and
+ * have to reassemble it.  --write-size sets how much each lws_write() sends,
+ * so small values make many small STREAM frames.  With --stray as well,
+ * the relay also sends the client, now and then, a datagram that belongs to
+ * some other QUIC connection, which the client must ignore.
+ */
+
+#include <libwebsockets.h>
+#include <string.h>
+#include <signal.h>
+
+static struct lws_context *context;
+static int result = 1; /* 1 means failed/timeout, 0 means success */
+static int server_only = 0;
+static size_t write_size = 1024;
+
+static const struct lws_http_mount mount_redir = {
+	.mountpoint = "/",
+	.origin = "warmcat.com/git/blog",
+	.origin_protocol = LWSMPRO_REDIR_HTTPS,
+	.mountpoint_len = 1,
+	.exact_match = 1,
+};
+
+static const char * const test_cert =
+"-----BEGIN CERTIFICATE-----\n"
+"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\n"
+"e2Hl/7M0c/lbZ4FvXgARlex2rkgS0Ka06HE=\n"
+"-----END CERTIFICATE-----\n";
+
+static const char * const test_key =
+"-----BEGIN PRIVATE KEY-----\n"
+"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\n"
+"fBrpEY1IATtPq1taBZZogRqI3rOkkPk=\n"
+"-----END PRIVATE KEY-----\n";
+
+#define TOTAL_DATA (128 * 1024)
+
+/*
+ * The reordering relay.  Datagrams from the server go to the client, all
+ * others go to the server, and the client is whoever sent us one last.  Each
+ * direction holds up to RELAY_BATCH, and sends them on last first when that
+ * many arrived or RELAY_HOLD_US after the first one, so a lone datagram, such
+ * as the client's first Initial, is only delayed.  A datagram arriving while
+ * its direction is full is dropped, which QUIC recovers from like any loss.
+ */
+
+#define RELAY_BATCH	4
+#define RELAY_HOLD_US	(2 * LWS_US_PER_MS)
+#define RELAY_DGRAM_MAX	2048
+
+/*
+ * With --stray, ahead of every RELAY_STRAY_EVERY-th batch to the client,
+ * starting with the first, which carries the server's first Initial, the relay
+ * sends the client a stray long header packet (RFC 9000 17.2) of some other
+ * connection: connection IDs that are not the client's, alternately in QUIC
+ * v2 and v1, and a payload nobody has keys for.  Packets like that are an
+ * ordinary network event; the client must drop them without them changing
+ * anything about its own connection, before or after its handshake.
+ */
+#define RELAY_STRAY_EVERY	8
+
+struct relay_dgram {
+	size_t			len;
+	uint8_t			buf[RELAY_DGRAM_MAX];
+};
+
+struct relay_dir {
+	lws_sorted_usec_list_t	sul;
+	struct relay_dgram	q[RELAY_BATCH];
+	lws_sockaddr46		dest;
+	int			count;
+	char			due;
+};
+
+static struct {
+	struct lws		*wsi;
+	struct relay_dir	dir[2]; /* to the server, to the client */
+	unsigned int		batches_to_client;
+	unsigned int		strays;
+	char			stray;
+} relay;
+
+static void
+relay_send(lws_sockfd_type fd, const uint8_t *buf, size_t len,
+	   const lws_sockaddr46 *dest)
+{
+	/* UDP send failures are losses QUIC recovers from */
+	if (sendto(fd,
+#if defined(WIN32)
+		   (const char *)
+#endif
+		   buf,
+#if defined(WIN32)
+		   (int)
+#endif
+		   len, 0, sa46_sockaddr(dest), sa46_socklen(dest)) < 0)
+		lwsl_info("relay: sendto failed\n");
+}
+
+static void
+relay_send_stray(struct lws *wsi, lws_sockfd_type fd,
+		 const lws_sockaddr46 *dest)
+{
+	uint8_t d[57];
+	int v2 = !(relay.strays++ & 1);
+
+	/* random CIDs, packet number and payload... */
+	if (lws_get_random(lws_get_context(wsi), d, sizeof(d)) != sizeof(d))
+		return;
+
+	/* ... in a Handshake packet's long header */
+	d[0] = v2 ? 0xf1 : 0xe1;
+	d[1] = v2 ? 0x6b : 0x00;
+	d[2] = v2 ? 0x33 : 0x00;
+	d[3] = v2 ? 0x43 : 0x00;
+	d[4] = v2 ? 0xcf : 0x01;
+	d[5] = 8;	/* DCID length, 8 random bytes follow */
+	d[14] = 8;	/* SCID length, 8 random bytes follow */
+	d[23] = 0x40;	/* 2-byte varint Length: the 32 bytes after it */
+	d[24] = 32;
+
+	relay_send(fd, d, sizeof(d), dest);
+}
+
+static void
+relay_due(struct relay_dir *d)
+{
+	d->due = 1;
+	if (relay.wsi)
+		lws_callback_on_writable(relay.wsi);
+}
+
+static void
+relay_hold_cb(lws_sorted_usec_list_t *sul)
+{
+	relay_due(lws_container_of(sul, struct relay_dir, sul));
+}
+
+static int
+callback_relay(struct lws *wsi, enum lws_callback_reasons reason,
+	       void *user, void *in, size_t len)
+{
+	const struct lws_udp *udp;
+	struct relay_dir *d;
+	lws_sockfd_type fd;
+	int n, m;
+
+	switch (reason) {
+	case LWS_CALLBACK_RAW_ADOPT:
+		relay.wsi = wsi;
+		break;
+
+	case LWS_CALLBACK_RAW_CLOSE:
+		relay.wsi = NULL;
+		for (n = 0; n < 2; n++)
+			lws_sul_cancel(&relay.dir[n].sul);
+		break;
+
+	case LWS_CALLBACK_RAW_RX:
+		udp = lws_get_udp(wsi);
+		if (!udp || len > RELAY_DGRAM_MAX)
+			break;
+
+		if (!lws_sa46_compare_ads(&udp->sa46, &relay.dir[0].dest) &&
+		    udp->sa46.sa4.sin_port == relay.dir[0].dest.sa4.sin_port)
+			d = &relay.dir[1];
+		else {
+			relay.dir[1].dest = udp->sa46;
+			d = &relay.dir[0];
+		}
+
+		if (d->count == RELAY_BATCH)
+			break; /* dropped */
+
+		d->q[d->count].len = len;
+		memcpy(d->q[d->count].buf, in, len);
+		if (++d->count == RELAY_BATCH) {
+			lws_sul_cancel(&d->sul);
+			relay_due(d);
+		} else if (d->count == 1)
+			lws_sul_schedule(lws_get_context(wsi), 0, &d->sul,
+					 relay_hold_cb, RELAY_HOLD_US);
+		break;
+
+	case LWS_CALLBACK_RAW_WRITEABLE:
+		fd = lws_get_socket_fd(wsi);
+		if (fd == LWS_SOCK_INVALID)
+			break;
+
+		for (n = 0; n < 2; n++) {
+			d = &relay.dir[n];
+			if (!d->due)
+				continue;
+
+			if (n == 1 && relay.stray &&
+			    !(relay.batches_to_client++ % RELAY_STRAY_EVERY))
+				relay_send_stray(wsi, fd, &d->dest);
+
+			for (m = d->count - 1; m >= 0; m--)
+				relay_send(fd, d->q[m].buf, d->q[m].len,
+					   &d->dest);
+			d->count = 0;
+			d->due = 0;
+		}
+		break;
+
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+static struct lws_protocols relay_protocols[] = {
+	{ "quic-relay", callback_relay, 0, 0, 0, NULL, 0 },
+	LWS_PROTOCOL_LIST_TERM
+};
+
+static size_t client_sent = 0;
+static size_t client_rx = 0;
+static uint32_t client_hash = 5381; /* djb2 init */
+static int client_done = 0;
+
+static size_t server_sent = 0;
+static size_t server_rx = 0;
+static uint32_t server_hash = 5381; /* djb2 init */
+static int server_done = 0;
+
+static lws_usec_t last_rx_us;
+
+static uint32_t
+simple_hash(uint32_t hash, const uint8_t *data, size_t len)
+{
+	size_t i;
+	for (i = 0; i < len; i++)
+		hash = (hash << 5) + hash + data[i]; /* hash * 33 + c */
+	return hash;
+}
+
+
+
+/*
+ * Each byte sent is a function of its stream offset, so the receiver can tell
+ * the data came in the right order, with nothing lost or repeated
+ */
+static uint8_t
+pattern_byte(size_t ofs)
+{
+	return (uint8_t)(ofs + (ofs >> 8));
+}
+
+static void
+pattern_fill(size_t at, uint8_t *data, size_t len)
+{
+	size_t i;
+
+	for (i = 0; i < len; i++)
+		data[i] = pattern_byte(at + i);
+}
+
+static int
+pattern_ok(size_t at, const uint8_t *data, size_t len)
+{
+	size_t i;
+
+	for (i = 0; i < len; i++)
+		if (data[i] != pattern_byte(at + i))
+			return 0;
+
+	return 1;
+}
+
+static void
+teardown_cb(lws_sorted_usec_list_t *sul)
+{
+	lws_default_loop_exit(context);
+}
+
+static lws_sorted_usec_list_t sul_teardown;
+
+static void
+check_test_completion(struct lws *wsi)
+{
+	if (client_done && server_done) {
+		lwsl_notice("Test completed successfully! Both sides received full data. Waiting 1.5s for ACKs...\n");
+		result = 0;
+		if (!server_only)
+			lws_sul_schedule(lws_get_context(wsi), 0, &sul_teardown, teardown_cb, 1500 * 1000);
+	}
+}
+
+/*
+ * This is the application protocol callback for the QUIC stream data.
+ */
+static int
+callback_quic_test(struct lws *wsi, enum lws_callback_reasons reason,
+		   void *user, void *in, size_t len)
+{
+	switch (reason) {
+
+	case LWS_CALLBACK_PROTOCOL_INIT:
+	{
+#if (_LWS_ENABLED_LOGS & LLL_INFO)
+		struct lws_vhost *vh = lws_get_vhost(wsi);
+		lwsl_vhost_info(vh, "Protocol init");
+#endif
+		break;
+	}
+
+	case LWS_CALLBACK_SERVER_NEW_CLIENT_INSTANTIATED:
+		lwsl_wsi_info(wsi, "Server received new QUIC client connection!");
+		lws_callback_on_writable(wsi);
+		break;
+
+	case LWS_CALLBACK_CLIENT_ESTABLISHED:
+		lwsl_wsi_notice(wsi, "Client successfully established QUIC connection!");
+		/* Trigger a write to send bulk data */
+		lws_callback_on_writable(wsi);
+		break;
+
+	case LWS_CALLBACK_CLIENT_WRITEABLE:
+	{
+		uint8_t buf[LWS_PRE + 1024];
+
+		if (client_sent >= TOTAL_DATA)
+			break;
+
+		size_t to_send = TOTAL_DATA - client_sent;
+		if (to_send > write_size)
+			to_send = write_size;
+		pattern_fill(client_sent, &buf[LWS_PRE], to_send);
+                lwsl_wsi_info(wsi, "CLIENT WSI allowance=%d", (int)lws_get_peer_write_allowance(wsi));
+		int n = lws_write(wsi, &buf[LWS_PRE], to_send, LWS_WRITE_BINARY);
+                if (n > 0) {
+                        client_sent += (size_t)n;
+                        if (client_sent < TOTAL_DATA)
+                                lws_callback_on_writable(wsi);
+                }
+		break;
+	}
+	case LWS_CALLBACK_ESTABLISHED:
+		lwsl_wsi_notice(wsi, "SERVER ESTABLISHED!");
+		lws_callback_on_writable(wsi);
+		break;
+
+	case LWS_CALLBACK_SERVER_WRITEABLE:
+	{
+		uint8_t buf[LWS_PRE + 1024];
+
+		if (server_only)
+			break;
+
+		if (server_sent >= TOTAL_DATA)
+                        break;
+		size_t to_send = TOTAL_DATA - server_sent;
+		if (to_send > write_size)
+			to_send = write_size;
+		pattern_fill(server_sent, &buf[LWS_PRE], to_send);
+                lwsl_wsi_info(wsi, "SERVER WSI allowance=%d", (int)lws_get_peer_write_allowance(wsi));
+		int n = lws_write(wsi, &buf[LWS_PRE], to_send, LWS_WRITE_BINARY);
+		if (n > 0) {
+			server_sent += (size_t)n;
+			if (server_sent < TOTAL_DATA)
+				lws_callback_on_writable(wsi);
+		} else {
+                        lwsl_err("SERVER WROTE FAILED n=%d\n", n);
+		}
+		break;
+	}
+
+	case LWS_CALLBACK_QT_CLIENT_RECEIVE:
+	{
+		last_rx_us = lws_now_usecs();
+
+		if (!pattern_ok(client_rx, in, len)) {
+			lwsl_wsi_err(wsi, "Client rx data wrong near offset %lu",
+				     (unsigned long)client_rx);
+			result = 1;
+			lws_default_loop_exit(lws_get_context(wsi));
+			return -1;
+		}
+		client_rx += len;
+		client_hash = simple_hash(client_hash, in, len);
+		if (client_rx >= TOTAL_DATA && !client_done) {
+			lwsl_wsi_notice(wsi, "Client received all %lu bytes, hash %u", (unsigned long)client_rx, client_hash);
+			client_done = 1;
+			check_test_completion(wsi);
+		}
+		break;
+	}
+
+	case LWS_CALLBACK_QT_SERVER_RECEIVE:
+	{
+		last_rx_us = lws_now_usecs();
+
+		if (!pattern_ok(server_rx, in, len)) {
+			lwsl_wsi_err(wsi, "Server rx data wrong near offset %lu",
+				     (unsigned long)server_rx);
+			result = 1;
+			lws_default_loop_exit(lws_get_context(wsi));
+			return -1;
+		}
+		server_rx += len;
+		server_hash = simple_hash(server_hash, in, len);
+		if (server_rx >= TOTAL_DATA && !server_done) {
+			lwsl_wsi_notice(wsi, "Server received all %lu bytes, hash %u", (unsigned long)server_rx, server_hash);
+			server_done = 1;
+			check_test_completion(wsi);
+		}
+		break;
+	}
+
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+static struct lws_protocols protocols[] = {
+	{ "quic-test-protocol", callback_quic_test, 0, 2048, 0, NULL, 0 },
+	LWS_PROTOCOL_LIST_TERM
+};
+
+void sigint_handler(int sig)
+{
+	lws_default_loop_exit(context);
+}
+
+enum {
+	LWS_SW_HELP,
+	LWS_SW_URL,
+	LWS_SW_PORT,
+	LWS_SW_SERVER_ONLY,
+	LWS_SW_SERVER,
+	LWS_SW_RELAY,
+	LWS_SW_STRAY,
+	LWS_SW_WRITE_SIZE,
+	LWS_SW_CUBIC,
+};
+
+static const struct lws_switches switches[] = {
+	[LWS_SW_HELP]	= { "--help",	"Show this help information" },
+	[LWS_SW_URL]	= { "-u",	"URL to connect to (if absent, acts as server too)" },
+	[LWS_SW_PORT]	= { "-p",	"Port to connect to / listen on (default 7681)" },
+	[LWS_SW_SERVER_ONLY] = { "-s",	"Server only mode (do not launch client, do not send data unprompted)" },
+	[LWS_SW_SERVER]	= { "--server",	"Server address to connect to (default 127.0.0.1)" },
+	[LWS_SW_RELAY]	= { "--relay",	"Connect via a relay on this port that reorders datagrams (needs a numeric --server)" },
+	[LWS_SW_STRAY] = { "--stray",	"The relay also sends the client stray packets of another connection (needs --relay)" },
+	[LWS_SW_WRITE_SIZE] = { "--write-size", "Bytes sent per write, 1 to 1024 (default 1024)" },
+	[LWS_SW_CUBIC]	= { "--cubic",	"Use the CUBIC congestion controller instead of the default NewReno" },
+};
+
+#if defined(WIN32) && defined(LWS_WITH_SCHANNEL)
+#include <windows.h>
+static int is_quic_supported_on_os(void) {
+    OSVERSIONINFOEXW osvi = { sizeof(osvi), 0, 0, 0, 0, {0}, 0, 0 };
+    DWORDLONG const dwlConditionMask = VerSetConditionMask(
+        VerSetConditionMask(
+        VerSetConditionMask(
+            0, VER_MAJORVERSION, VER_GREATER_EQUAL),
+               VER_MINORVERSION, VER_GREATER_EQUAL),
+               VER_BUILDNUMBER,  VER_GREATER_EQUAL);
+
+    osvi.dwMajorVersion = 10;
+    osvi.dwMinorVersion = 0;
+    osvi.dwBuildNumber  = 20348; /* Windows Server 2022 */
+
+    return VerifyVersionInfoW(&osvi, VER_MAJORVERSION | VER_MINORVERSION | VER_BUILDNUMBER, dwlConditionMask) != FALSE;
+}
+#endif
+
+int main(int argc, const char **argv)
+{
+	struct lws_context_creation_info info;
+	struct lws_client_connect_info i;
+	struct lws *client_wsi;
+	struct lws_vhost *vh;
+	lws_usec_t start_us;
+	char url_buf[128];
+	const char *p, *prot, *address, *path;
+	int port = 7681, relay_port = 0;
+	int url_port = 0;
+
+	lws_context_info_defaults(&info, NULL);
+	info.fd_limit_per_thread = 0;
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
+
+#if defined(WIN32) && defined(LWS_WITH_SCHANNEL)
+       // if (!is_quic_supported_on_os()) {
+       //      lwsl_user("SChannel QUIC requires Windows 11+ / Server 2022+\n");
+       //      return 0;
+       // }
+#endif
+
+	if (lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
+		lws_switches_print_help(argv[0], switches, LWS_ARRAY_SIZE(switches));
+		return 0;
+	}
+
+	p = lws_cmdline_option(argc, argv, "-p");
+	if (p)
+		{
+			int __pt = atoi(p);
+			if (__pt < 0 || __pt > 65535) {
+				lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+				return 1;
+			}
+			port = __pt;
+		}
+
+	if (lws_cmdline_option(argc, argv, "-s"))
+		server_only = 1;
+
+	p = lws_cmdline_option(argc, argv, switches[LWS_SW_WRITE_SIZE].sw);
+	if (p) {
+		int ws = atoi(p);
+
+		if (ws < 1 || ws > 1024) {
+			lwsl_err("--write-size must be 1 to 1024\n");
+			return 1;
+		}
+		write_size = (size_t)ws;
+	}
+
+	p = lws_cmdline_option(argc, argv, switches[LWS_SW_RELAY].sw);
+	if (p) {
+		relay_port = atoi(p);
+		if (relay_port < 1 || relay_port > 65535) {
+			lwsl_err("--relay port %d is outside valid 16-bit range\n",
+				 relay_port);
+			return 1;
+		}
+	}
+
+	if (lws_cmdline_option(argc, argv, switches[LWS_SW_STRAY].sw) &&
+	    !relay_port) {
+		lwsl_err("--stray needs --relay\n");
+		return 1;
+	}
+
+	p = lws_cmdline_option(argc, argv, "-u");
+	if (p) {
+		lws_strncpy(url_buf, p, sizeof(url_buf));
+		if (lws_parse_uri(url_buf, &prot, &address, &url_port, &path)) {
+			lwsl_err("Failed to parse URL\n");
+			return 1;
+		}
+		port = url_port;
+	} else {
+		address = lws_cmdline_option(argc, argv, switches[LWS_SW_SERVER].sw);
+	}
+
+	signal(SIGINT, sigint_handler);
+
+	info.port                               = 7681;
+	info.protocols                          = protocols;
+	info.options                            = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT |
+                                                 LWS_SERVER_OPTION_EXPLICIT_VHOSTS |
+                                                 LWS_SERVER_OPTION_IPV6_V6ONLY_MODIFY |
+                                                 0;
+	if (lws_cmdline_option(argc, argv, switches[LWS_SW_CUBIC].sw))
+		/* both the server and the client in this context use it */
+		info.quic_cc_ops		= &lws_cc_ops_cubic;
+
+	context = lws_create_context(&info);
+	if (!context) {
+		lwsl_err("lws init failed\n");
+		return 1;
+	}
+
+	if (!p) {
+		/*
+		 * We instantiate the QUIC server vhost explicitly.
+		 * We pass CONTEXT_PORT_NO_LISTEN_SERVER so it doesn't create a TCP listener!
+		 */
+		info.port			        = CONTEXT_PORT_NO_LISTEN_SERVER;
+		info.vhost_name			        = "quic-server";
+		info.listen_accept_role		        = "quic";
+		info.listen_accept_protocol	        = "quic-test-protocol";
+		info.alpn				= "h3,lws-quic";
+
+		/* TLS 1.3 requires valid certificates for QUIC. Use our in-memory certs. */
+		info.server_ssl_cert_mem	        = test_cert;
+		info.server_ssl_cert_mem_len            = (unsigned int)strlen(test_cert);
+		info.server_ssl_private_key_mem         = test_key;
+		info.server_ssl_private_key_mem_len     = (unsigned int)strlen(test_key);
+		info.mounts                             = &mount_redir;
+	} else {
+		info.port			        = CONTEXT_PORT_NO_LISTEN;
+		info.vhost_name			        = "quic-client";
+	}
+
+	vh = lws_create_vhost(context, &info);
+	if (!vh) {
+		lwsl_err("Failed to create QUIC vhost\n");
+		goto bail;
+	}
+
+	if (!p) {
+		/* Explicitly instantiate a UDP listener socket and bind it to QUIC! */
+		if (!lws_create_adopt_udp(vh, NULL, port, LWS_CAUDP_BIND,
+					  "quic-test-protocol", NULL, NULL, NULL,
+					  NULL, "quic_listen")) {
+			lwsl_err("Failed to bind QUIC UDP listener\n");
+			goto bail;
+		}
+	}
+
+	if (relay_port) {
+		struct lws_context_creation_info ri;
+		const char *ads = address ? address : "127.0.0.1";
+		struct lws_vhost *rvh;
+
+		if (p || server_only) {
+			lwsl_err("--relay needs the server and client in this process\n");
+			goto bail;
+		}
+
+		/* the relay sends to the server at the client's address */
+		memset(&relay, 0, sizeof(relay));
+		relay.stray = !!lws_cmdline_option(argc, argv,
+					switches[LWS_SW_STRAY].sw);
+		if (lws_sa46_parse_numeric_address(ads, &relay.dir[0].dest)) {
+			lwsl_err("--relay needs a numeric --server address\n");
+			goto bail;
+		}
+#if defined(LWS_WITH_IPV6)
+		if (relay.dir[0].dest.sa4.sin_family == AF_INET6)
+			relay.dir[0].dest.sa6.sin6_port = htons((uint16_t)port);
+		else
+#endif
+			relay.dir[0].dest.sa4.sin_port = htons((uint16_t)port);
+
+		memset(&ri, 0, sizeof(ri));
+		ri.port		= CONTEXT_PORT_NO_LISTEN_SERVER;
+		ri.vhost_name	= "quic-relay";
+		ri.protocols	= relay_protocols;
+		ri.options	= info.options;
+
+		rvh = lws_create_vhost(context, &ri);
+		if (!rvh || !lws_create_adopt_udp(rvh, ads, relay_port,
+						  LWS_CAUDP_BIND, "quic-relay",
+						  NULL, NULL, NULL, NULL,
+						  "quic_relay")) {
+			lwsl_err("Failed to create the relay\n");
+			goto bail;
+		}
+	}
+
+	if (!server_only) {
+		/*
+		 * Immediately launch the client.
+		 */
+		memset(&i, 0, sizeof(i));
+		i.context		= context;
+		i.port			= relay_port ? relay_port : port;
+		i.address		= address ? address : "127.0.0.1";
+		i.host			= address ? address : "localhost";
+		i.origin		= i.address;
+		i.vhost			= vh;
+		i.ssl_connection	= LCCSCF_USE_SSL;
+		if (!p) /* by default, we use our canned selfsigned cert for local tests */
+			i.ssl_connection |= LCCSCF_ALLOW_SELFSIGNED |
+					    LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK;
+		i.protocol		= "quic-test-protocol";
+		i.alpn			= "lws-quic";
+		i.local_protocol_name	= "quic-test-protocol";
+		i.method		= "QUIC";
+
+		client_wsi = lws_client_connect_via_info(&i);
+		if (!client_wsi) {
+			lwsl_err("Client connection failed\n");
+			goto bail;
+		}
+	}
+
+	start_us = lws_now_usecs();
+	last_rx_us = start_us;
+
+        while (lws_service(context, 0) >= 0) {
+		if (!server_only) {
+			if (lws_now_usecs() - start_us > 60000000) {
+				lwsl_err("Timeout waiting for QUIC transfer (60s absolute)\n");
+				result = 1;
+				break;
+			}
+			if (lws_now_usecs() - last_rx_us > 15000000) {
+				lwsl_err("Timeout waiting for QUIC transfer (15s idle RX)\n");
+				result = 1;
+				break;
+			}
+		}
+	}
+
+bail:
+	lws_context_destroy(context);
+
+        return lws_cmdline_passfail(argc, argv, result);
+}

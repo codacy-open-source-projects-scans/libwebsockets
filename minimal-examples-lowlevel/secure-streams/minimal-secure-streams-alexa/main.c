@@ -27,7 +27,7 @@ static const struct lws_switches switches[] = {
 extern int
 avs_example_start(struct lws_context *context);
 
-static int interrupted;
+static struct lws_context *context;
 static lws_state_notify_link_t nl;
 
 #if !defined(LWS_SS_USE_SSPC)
@@ -348,7 +348,7 @@ app_system_state_nf(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 static lws_state_notify_link_t * const app_notifier_list[] = {
@@ -367,7 +367,6 @@ static const struct lws_protocols *protocols[] = {
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	struct lws_context *context;
 	int n = 0;
 	(void)switches;
 
@@ -378,12 +377,11 @@ int main(int argc, const char **argv)
 
 
 	signal(SIGINT, sigint_handler);
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	lws_context_info_defaults(&info, NULL);lws_cmdline_option_handle_builtin(argc, argv, &info);
 
 	lwsl_user("LWS secure streams - Alexa voice test [-d<verb>]\n");
 
-	info.fd_limit_per_thread = 1 + 6 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 6;
 #if !defined(LWS_SS_USE_SSPC)
 	info.options = LWS_SERVER_OPTION_EXPLICIT_VHOSTS |
 		       LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
@@ -395,7 +393,14 @@ int main(int argc, const char **argv)
 		/* connect to ssproxy via UDS by default, else via
 		 * tcp connection to this port */
 		if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_P].sw)))
-			info.ss_proxy_port = atoi(p);
+			{
+				int __pt = atoi(p);
+				if (__pt < 0 || __pt > 65535) {
+					lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+					return 1;
+				}
+				info.ss_proxy_port = (uint16_t)__pt;
+			}
 
 		/* UDS "proxy.ss.lws" in abstract namespace, else this socket
 		 * path; when -p given this can specify the network interface
@@ -432,7 +437,7 @@ int main(int argc, const char **argv)
 
 	/* the event loop */
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 bail:

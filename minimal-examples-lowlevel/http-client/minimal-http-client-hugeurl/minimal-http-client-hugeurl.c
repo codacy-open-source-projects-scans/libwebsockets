@@ -15,21 +15,24 @@
 #include <libwebsockets.h>
 
 enum {
-	LWS_SW_H1,
 	LWS_SW_L,
+	LWS_SW_SERVER,
+	LWS_SW_PORT,
 	LWS_SW_HELP,
 };
 
 static const struct lws_switches switches[] = {
-	[LWS_SW_H1]	= { "--h1",            "Enable --h1 feature" },
 	[LWS_SW_L]	= { "-l",              "Enable -l feature" },
+	[LWS_SW_SERVER]	= { "--server",        "Server address to connect to" },
+	[LWS_SW_PORT]	= { "-p",              "Port to connect to" },
 	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
 };
 
 #include <string.h>
 #include <signal.h>
 
-static int interrupted, bad = 1, status;
+static int bad = 1, status;
+static struct lws_context *context;
 static struct lws *client_wsi;
 
 static const char * const uri =
@@ -153,14 +156,14 @@ static const struct lws_protocols protocols[] = {
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
 	struct lws_client_connect_info i;
-	struct lws_context *context;
+	const char *p;
 	int n = 0;
 	(void)switches;
 
@@ -172,10 +175,9 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	lws_context_info_defaults(&info, NULL);lws_cmdline_option_handle_builtin(argc, argv, &info);
 
-	lwsl_user("LWS minimal http client hugeurl [-d <verbosity>] [-l] [--h1]\n");
+	lwsl_user("LWS minimal http client hugeurl [-d <verbosity>] [-l]\n");
 
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 	info.port = CONTEXT_PORT_NO_LISTEN; /* we do not run any server */
@@ -187,10 +189,10 @@ int main(int argc, const char **argv)
 	 * since we know this lws context is only ever going to be used with
 	 * one client wsis / fds / sockets at a time, let lws know it doesn't
 	 * have to use the default allocations for fd tables up to ulimit -n.
-	 * It will just allocate for 1 internal and 1 (+ 1 http2 nwsi) that we
-	 * will use.
+	 * It will just allocate for its own fds and overhead
+	 * (LWS_FD_LIMIT_PER_THREAD_MIN) plus the one connection we will use.
 	 */
-	info.fd_limit_per_thread = 1 + 1 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 1;
 
 #if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL)
 	/*
@@ -216,11 +218,21 @@ int main(int argc, const char **argv)
 		i.ssl_connection |= LCCSCF_ALLOW_SELFSIGNED;
 	} else {
 		i.port = 443;
-		i.address = "warmcat.com";
+		i.address = "libwebsockets.org";
 	}
 
-	if (lws_cmdline_option(argc, argv, switches[LWS_SW_H1].sw))
-		i.alpn = "http/1.1";
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_SERVER].sw)))
+		i.address = p;
+
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_PORT].sw)))
+		{
+			int __pt = atoi(p);
+			if (__pt < 0 || __pt > 65535) {
+				lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+				return 1;
+			}
+			i.port = (uint16_t)__pt;
+		}
 
 	i.path = uri;
 	i.host = i.address;
@@ -231,7 +243,7 @@ int main(int argc, const char **argv)
 
 	lws_client_connect_via_info(&i);
 
-	while (n >= 0 && client_wsi && !interrupted)
+	while (n >= 0 && client_wsi)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

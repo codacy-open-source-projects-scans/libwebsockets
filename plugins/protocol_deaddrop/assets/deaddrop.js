@@ -2,6 +2,9 @@
 
 	var server_max_size = 0, username = "", ws;
 
+	/* most text we will pull into the textarea from a shared file */
+	var max_text_view = 1024 * 1024;
+
 	function san(s)
 	{
 		if (!s)
@@ -17,9 +20,16 @@
 		return n < 10 ? '0' + n : n;
 	}
 
+	/*
+	 * Everything we build a URL from here is a single path segment (a
+	 * filename), so it must be escaped with encodeURIComponent(), not
+	 * encodeURI(): encodeURI() deliberately passes the reserved set
+	 * through, so a name containing '#', '?', '/' or '&' would change
+	 * which resource the URL names.
+	 */
 	function lws_urlencode(s)
 	{
-		return encodeURI(s).replace(/@/g, "%40");
+		return encodeURIComponent(s);
 	}
 
 	function trim(num)
@@ -80,7 +90,7 @@
 	}
 
 	function clear_errors() {
-		var n, t = document.getElementById("ongoing");
+		var n, t = document.getElementById("ongoing-tbody");
 
 		for (n = 0; n < t.rows.length; n++)
 			if (t.rows[n].cells[0].classList.contains("err"))
@@ -91,7 +101,7 @@
 	 * Generic uploader: takes FormData, a display name and a display size
 	 */
 	function _do_upload(formData, displayName, displaySize) {
-		var t = document.getElementById("ongoing");
+		var t = document.getElementById("ongoing-tbody");
 		var row = t.insertRow(0), c1 = row.insertCell(0),
 		    c2 = row.insertCell(1), c3 = row.insertCell(2);
 
@@ -198,18 +208,32 @@
 		text_inp(); // Manually update button state after clearing
 	}
 
-	function delfile(e)
+	/*
+	 * `filename` is the original, unescaped name as it arrived in the
+	 * listing JSON, held in the click closure.  Do not recover it from the
+	 * markup: the HTML parser decodes the escaping san() applied, so what
+	 * comes back out of the attribute is the raw name again.  And compose
+	 * the request with JSON.stringify() rather than by concatenation, so a
+	 * name containing a quote or a backslash cannot forge the message.
+	 */
+	function delfile(e, filename)
 	{
 		e.stopPropagation();
 		e.preventDefault();
 
-		ws.send("{\"del\":\"" + e.target.getAttribute("file") + "\"}");
+		if (ws && ws.readyState === WebSocket.OPEN)
+			ws.send(JSON.stringify({ del: filename }));
 	}
 
-	function load_text(e)
+	/*
+	 * The drop is shared, so this loads content another user uploaded.  It
+	 * goes into the textarea only: the clipboard is the user's, and is not
+	 * ours to overwrite as a side effect of viewing a file.  "Copy" does
+	 * that, when the user asks for it.
+	 */
+	function load_text(e, filename)
 	{
-		var filename = e.target.getAttribute("file"),
-		    content = document.getElementById("text_content");
+		var content = document.getElementById("text_content");
 
 		e.stopPropagation();
 		e.preventDefault();
@@ -219,12 +243,25 @@
 		})
 		.then(response => response.text())
 		.then(text => {
+			if (text.length > max_text_view)
+				text = text.substring(0, max_text_view);
 			content.value = text;
 			content.select();
-			if (navigator.clipboard)
-				navigator.clipboard.writeText(text);
 			text_inp();
-		});
+		})
+		.catch((ex) => { console.error("load_text failed", ex); });
+	}
+
+	function copy_text_button(e)
+	{
+		var content = document.getElementById("text_content");
+
+		e.preventDefault();
+
+		content.select();
+		if (navigator.clipboard)
+			navigator.clipboard.writeText(content.value).
+				catch((ex) => { console.error("clipboard", ex); });
 	}
 
 	function body_drop(e) {
@@ -239,8 +276,11 @@
 
 	function text_inp() {
 		var content = document.getElementById("text_content"),
-		    upl_text = document.getElementById("upl_text");
+		    upl_text = document.getElementById("upl_text"),
+		    copy_text = document.getElementById("copy_text");
 		upl_text.disabled = !content.value.length;
+		if (copy_text)
+			copy_text.disabled = !content.value.length;
 	}
 
 	function get_appropriate_ws_url(extra_url) {
@@ -282,6 +322,67 @@
 		sessionStorage.setItem('ddTabId', tabId);
 	}
 
+	function updateTable(tbodyId, rowDataArray, rowIdFn, createRowHtmlFn, postUpdateFn) {
+		var tbody = document.getElementById(tbodyId);
+		if (!tbody) return;
+
+		var existingRows = {};
+		for (var i = 0; i < tbody.children.length; i++) {
+			var tr = tbody.children[i];
+			if (tr.id) existingRows[tr.id] = tr;
+		}
+
+		var newRows = {};
+		rowDataArray.forEach(function(item, index) {
+			var id = rowIdFn(item, index);
+			newRows[id] = item;
+			var tr = existingRows[id];
+			var newHtml = createRowHtmlFn(item, index);
+			
+			if (!tr) {
+				tr = document.createElement("tr");
+				tr.id = id;
+				tr.innerHTML = newHtml;
+				tr.classList.add("fade-in");
+				tr.setAttribute("data-content", newHtml);
+			} else {
+				if (tr.getAttribute("data-content") !== newHtml) {
+					tr.innerHTML = newHtml;
+					tr.setAttribute("data-content", newHtml);
+					tr.classList.remove("fade-in");
+					/* force a reflow so re-adding the class restarts the animation */
+					tr.getBoundingClientRect();
+					tr.classList.add("fade-in");
+				}
+			}
+
+			/* Place it in the correct order in the DOM, ignoring fade-out rows */
+			var targetNode = tbody.children[index];
+			/* If the row is already in the right place, do nothing. 
+			 * Otherwise, insert it before the current node at this index.
+			 * (If targetNode is null, it appends to the end) */
+			if (targetNode !== tr) {
+				tbody.insertBefore(tr, targetNode);
+			}
+
+			if (postUpdateFn) postUpdateFn(tr, item, index);
+		});
+
+		for (var id in existingRows) {
+			if (!newRows[id]) {
+				var gone = existingRows[id];
+				if (!gone.classList.contains("fade-out")) {
+					gone.classList.add("fade-out");
+					setTimeout((function(el) { 
+						return function() { 
+							if (el.parentNode) el.parentNode.removeChild(el); 
+						}; 
+					})(gone), 500);
+				}
+			}
+		}
+	}
+
 	document.addEventListener("DOMContentLoaded", function() {
 		console.log("deaddrop DOMContentLoaded fired. lws-login status: ", typeof renderLwsLoginStatus);
 		if (typeof renderLwsLoginStatus === 'function')
@@ -293,7 +394,8 @@
 		    fi = document.getElementById("file"),
 		    upl = document.getElementById("upl"),
 		    text_content = document.getElementById("text_content"),
-		    upl_text = document.getElementById("upl_text");
+		    upl_text = document.getElementById("upl_text"),
+		    copy_text = document.getElementById("copy_text");
 
 		da.addEventListener("dragenter", da_enter, false);
 		da.addEventListener("dragleave", da_leave, false);
@@ -304,6 +406,8 @@
 		fi.addEventListener("change", file_inp, false);
 
 		upl_text.addEventListener("click", upl_text_button, false);
+		if (copy_text)
+			copy_text.addEventListener("click", copy_text_button, false);
 		text_content.addEventListener("input", text_inp, false);
 
 		window.addEventListener("dragover", body_drop, false);
@@ -329,104 +433,88 @@
 				};
 
 				ws.onmessage = function got_packet(msg) {
-					var j = JSON.parse(msg.data),
-					    s_files = "", s_users = "", n,
-					    t_files = document.getElementById("dd-list"),
-					    t_users = document.getElementById("connected-users-list");
+					var j = JSON.parse(msg.data);
 
-				username = j.user || "";
-				server_max_size = j.max_size;
-
-				document.getElementById("size").innerHTML =
-					"Server maximum file size " +
-					humanize(j.max_size);
-
-				s_files += "<table class=\"nb\">";
-				for (n = 0; n < j.files.length; n++) {
-					var fullName = j.files[n].name;
-					var displayName = fullName;
-					/*
-					 * The server is the single source of truth.
-					 * We trust the "yours" flag it sends us.
-					 */
-					var isOwner = j.files[n].yours;
-
-					// Strip username prefix for display if owner
-					if (isOwner && username.length > 0)
-						displayName = fullName.substring(
-								username.length + 1);
-
-					var date = new Date(j.files[n].mtime * 1000);
-					s_files += "<tr><td class=\"dow r\">" +
-					humanize(j.files[n].size) +
-					"</td><td class=\"dow\">" +
-					date.toDateString() + " " +
-					date.toLocaleTimeString() + "</td><td class=\"btn-cell\">";
-
-					/* Show text button if it's a .txt file from textarea */
-					if (j.files[n].is_text)
-						s_files += "<button id=\"t" + n +
-						"\" class=\"textbtn\" file=\"" +
-						san(fullName) + "\">T</button>";
-					else
-						s_files += "<span class=\"textbtn_spacer\"></span>";
-
-
-					/* Only show delete button if the server said we are the owner */
-					if (isOwner)
-						s_files += "<img id=\"d" + n +
-					  "\" class=\"delbtn\" file=\"" +
-						san(fullName) + "\">";
-					else
-						s_files += " ";
-
-					s_files += "</td><td class=\"ogn\"><a href=\"get/" +
-					lws_urlencode(san(fullName)) +
-					  "\" download=\"" + san(displayName) + "\">" +
-					san(displayName) + "</a></td></tr>";
-				}
-				s_files += "</table>";
-
-				t_files.innerHTML = s_files;
-
-				for (n = 0; n < j.files.length; n++) {
-					var d = document.getElementById("d" + n);
-					if (d)
-						d.addEventListener("click", delfile, false);
-					var t = document.getElementById("t" + n);
-					if (t)
-						t.addEventListener("click", load_text, false);
-				}
-
-				/*
-				 * Render the list of connected users
-				 */
-				if (t_users && j.connected_users) {
-					s_users += "<h3>Live Connections</h3>" +
-						"<table class=\"nb\">" +
-						"<tr><th>User</th><th>IP Address</th>" +
-						"<th>Platform</th><th>Client</th></tr>";
-
-					for (n = 0; n < j.connected_users.length; n++) {
-						var u = j.connected_users[n];
-						var display_user = san(u.user);
-
-						if (u.is_self)
-							display_user = "<b>" + display_user + "</b>";
-
-						if (u.is_admin)
-							display_user += " (Admin)";
-
-						s_users += "<tr><td>" + display_user +
-							"</td><td>" + san(u.ip) +
-							"</td><td>" + san(u.platform) +
-							"</td><td>" + san(u.browser) +
-							"</td></tr>";
+					username = j.user || "";
+					if (j.max_size) {
+						server_max_size = j.max_size;
+						document.getElementById("size").innerHTML =
+							"Server maximum file size " + humanize(j.max_size);
 					}
-					s_users += "</table>";
-					t_users.innerHTML = s_users;
-				}
-			};
+
+					if (j.files) {
+						updateTable("files-tbody", j.files, 
+							function(f) { return "file-" + btoa(unescape(encodeURIComponent(f.name))).replace(/=/g, ""); },
+							function(f) {
+								var fullName = f.name;
+								var displayName = fullName;
+								var isOwner = f.yours;
+
+								if (f.uploader && f.uploader.length > 0)
+									displayName = fullName.substring(f.uploader.length + 1);
+
+								var date = new Date(f.mtime * 1000);
+								var html = "<td class=\"dow r\">" + humanize(f.size) + "</td>" +
+										   "<td class=\"dow\">" + date.toDateString() + " " + date.toLocaleTimeString() + "</td>" +
+										   "<td class=\"btn-cell\">";
+
+								/*
+								 * No filename is carried in the markup: the
+								 * click handlers close over the original name
+								 * from the listing instead.
+								 */
+								if (f.is_text)
+									html += "<button class=\"textbtn\" title=\"" + san(displayName) + "\">T</button>";
+								else
+									html += "<span class=\"textbtn_spacer\"></span>";
+
+								if (isOwner)
+									html += "<img class=\"delbtn\" title=\"Delete " + san(displayName) + "\">";
+								else
+									html += " ";
+
+								/*
+								 * encodeURIComponent() escapes '&', '"', '<'
+								 * and '>', so its result is already safe in
+								 * this double-quoted attribute; san()ing it
+								 * first would only get undone by the HTML
+								 * parser and corrupt the path.
+								 */
+								html += "</td><td class=\"ogn\"><a href=\"get/" +
+										lws_urlencode(fullName) + "\" download=\"" + san(displayName) + "\">" +
+										san(displayName) + "</a></td>";
+								return html;
+							},
+							function(tr, f) {
+								/*
+								 * onclick, not addEventListener: this runs on
+								 * every listing update, including ones that
+								 * leave the row's markup (and so its button
+								 * elements) alone.
+								 */
+								var d = tr.querySelector(".delbtn");
+								if (d) d.onclick = function(e) { delfile(e, f.name); };
+								var t = tr.querySelector(".textbtn");
+								if (t) t.onclick = function(e) { load_text(e, f.name); };
+							}
+						);
+					}
+
+					if (j.connected_users) {
+						updateTable("users-tbody", j.connected_users,
+							function(u) { return "user-" + btoa(unescape(encodeURIComponent(u.user + u.ip + u.platform))).replace(/=/g, ""); },
+							function(u) {
+								var display_user = san(u.user);
+								if (u.is_self) display_user = "<b>" + display_user + "</b>";
+								if (u.is_admin) display_user += " (Admin)";
+								return "<td>" + display_user + "</td>" +
+									   "<td>" + san(u.ip) + "</td>" +
+									   "<td>" + san(u.platform) + "</td>" +
+									   "<td>" + san(u.browser) + "</td>";
+							}
+						);
+					}
+				};
 
 			ws.onclose = function() {
 				var dd = document.getElementById("ddrop"),

@@ -284,10 +284,10 @@ static struct lejp_results {
 	{ 17, 1, 0, { 1,  }, "targets[]", "0" },
 	{ 3, 1, 0, { 1,  }, "targets[]", "0" },
 }, r2[] = {
-	{ 0, 0, 0, { 0 }, "", "0" },
-	{ 2, 0, 0, { 0 }, "", "0" },
-	{ 16, 0, 0, { 0 }, "", "0" },
-	{ 5, 0, 0, { 0 }, "schema", "0" },
+	{ 0, 0, 0, { 0 }, "", "" },
+	{ 2, 0, 0, { 0 }, "", "" },
+	{ 16, 0, 0, { 0 }, "", "" },
+	{ 5, 0, 0, { 0 }, "schema", "" },
 	{ 11, 0, 0, { 0 }, "schema", "" },
 	{ 77, 0, 0, { 0 }, "schema", "com-warmcat-sai-builder" },
 	{ 5, 0, 0, { 0 }, "hostname", "com-warmcat-sai-builder" },
@@ -314,10 +314,10 @@ static struct lejp_results {
 	{ 17, 1, 0, { 2,  }, "targets[]", "target3" },
 	{ 3, 1, 0, { 2,  }, "targets[]", "target3" },
 }, r3[] = {
-	{ 0, 0, 0, { 0 }, "", "target3" },
-	{ 2, 0, 0, { 0 }, "", "target3" },
-	{ 16, 0, 0, { 0 }, "", "target3" },
-	{ 5, 0, 0, { 0 }, "schema", "target3" },
+	{ 0, 0, 0, { 0 }, "", "" },
+	{ 2, 0, 0, { 0 }, "", "" },
+	{ 16, 0, 0, { 0 }, "", "" },
+	{ 5, 0, 0, { 0 }, "schema", "" },
 	{ 11, 0, 0, { 0 }, "schema", "" },
 	{ 77, 0, 0, { 0 }, "schema", "com-warmcat-sai-builder" },
 	{ 5, 0, 0, { 0 }, "hostname", "com-warmcat-sai-builder" },
@@ -356,10 +356,10 @@ static struct lejp_results {
 	{ 17, 1, 0, { 1,  }, "targets[]", "target2" },
 	{ 3, 1, 0, { 1,  }, "targets[]", "target2" },
 }, r4[] = {
-	{ 0, 0, 0, { 0 }, "", "target2" },
-	{ 2, 0, 0, { 0 }, "", "target2" },
-	{ 16, 0, 0, { 0 }, "", "target2" },
-	{ 5, 0, 0, { 0 }, "schema", "target2" },
+	{ 0, 0, 0, { 0 }, "", "" },
+	{ 2, 0, 0, { 0 }, "", "" },
+	{ 16, 0, 0, { 0 }, "", "" },
+	{ 5, 0, 0, { 0 }, "schema", "" },
 	{ 11, 0, 0, { 0 }, "schema", "" },
 	{ 77, 0, 0, { 0 }, "schema", "com-warmcat-sai-builder" },
 	{ 5, 0, 0, { 0 }, "hostname", "com-warmcat-sai-builder" },
@@ -370,19 +370,19 @@ static struct lejp_results {
 	{ 17, 0, 0, { 0 }, "nspawn_timeout", "1800" },
 	{ 3, 0, 0, { 0 }, "nspawn_timeout", "1800" },
 }, r5[] = {
-	{ 0, 0, 0, { 0 }, "", "1800" },
-	{ 2, 0, 0, { 0 }, "", "1800" },
-	{ 16, 0, 0, { 0 }, "", "1800" },
-	{ 5, 0, 0, { 0 }, "schema", "1800" },
+	{ 0, 0, 0, { 0 }, "", "" },
+	{ 2, 0, 0, { 0 }, "", "" },
+	{ 16, 0, 0, { 0 }, "", "" },
+	{ 5, 0, 0, { 0 }, "schema", "" },
 	{ 11, 0, 0, { 0 }, "schema", "" },
 	{ 77, 0, 0, { 0 }, "schema", "com-warmcat-sai-builder" },
 	{ 17, 0, 0, { 0 }, "schema", "com-warmcat-sai-builder" },
 	{ 3, 0, 0, { 0 }, "schema", "com-warmcat-sai-builder" },
 }, r6[] = {
-	{ 0, 0, 0, { 0 }, "", "com-warmcat-sai-builder" },
-	{ 2, 0, 0, { 0 }, "", "com-warmcat-sai-builder" },
-	{ 16, 0, 0, { 0 }, "", "com-warmcat-sai-builder" },
-	{ 5, 0, 0, { 0 }, "schema", "com-warmcat-sai-builder" },
+	{ 0, 0, 0, { 0 }, "", "" },
+	{ 2, 0, 0, { 0 }, "", "" },
+	{ 16, 0, 0, { 0 }, "", "" },
+	{ 5, 0, 0, { 0 }, "schema", "" },
 	{ 11, 0, 0, { 0 }, "schema", "" },
 	{ 77, 0, 0, { 0 }, "schema", "com-warmcat-sai-builder" },
 	{ 5, 0, 0, { 0 }, "hostname", "com-warmcat-sai-builder" },
@@ -395,10 +395,10 @@ static struct lejp_results {
 	{ 17, 0, 0, { 0 }, "hostname", "ucvM9BEC" },
 	{ 3, 0, 0, { 0 }, "hostname", "ucvM9BEC" },
 }, r7[] = {
-	{ 0, 0, 0, { 0 }, "", "ucvM9BEC" },
-	{ 2, 0, 0, { 0 }, "", "ucvM9BEC" },
-	{ 16, 0, 0, { 0 }, "", "ucvM9BEC" },
-	{ 5, 0, 0, { 0 }, "schema", "ucvM9BEC" },
+	{ 0, 0, 0, { 0 }, "", "" },
+	{ 2, 0, 0, { 0 }, "", "" },
+	{ 16, 0, 0, { 0 }, "", "" },
+	{ 5, 0, 0, { 0 }, "schema", "" },
 	{ 11, 0, 0, { 0 }, "schema", "" },
 	{ 77, 0, 0, { 0 }, "schema", "com-warmcat-sai-builder" },
 	{ 5, 0, 0, { 0 }, "targets", "com-warmcat-sai-builder" },
@@ -416,10 +416,10 @@ static struct lejp_results {
 	{ 17, 1, 0, { 0,  }, "targets[]", "ucvM9BEC" },
 	{ 3, 1, 0, { 0,  }, "targets[]", "ucvM9BEC" },
 }, r8[] = {
-	{ 0, 0, 0, { 0 }, "", "ucvM9BEC" },
-	{ 2, 0, 0, { 0 }, "", "ucvM9BEC" },
-	{ 16, 0, 0, { 0 }, "", "ucvM9BEC" },
-	{ 5, 0, 0, { 0 }, "schema", "ucvM9BEC" },
+	{ 0, 0, 0, { 0 }, "", "" },
+	{ 2, 0, 0, { 0 }, "", "" },
+	{ 16, 0, 0, { 0 }, "", "" },
+	{ 5, 0, 0, { 0 }, "schema", "" },
 	{ 11, 0, 0, { 0 }, "schema", "" },
 	{ 77, 0, 0, { 0 }, "schema", "com-warmcat-sai-logs" },
 	{ 5, 0, 0, { 0 }, "task_uuid", "com-warmcat-sai-logs" },
@@ -437,10 +437,10 @@ static struct lejp_results {
 	{ 17, 0, 0, { 0 }, "log", "PnNhaWI+IE5TU1RBVEVfSU5JVAo=" },
 	{ 3, 0, 0, { 0 }, "log", "PnNhaWI+IE5TU1RBVEVfSU5JVAo=" },
 }, r9[] = {
-	{ 0, 0, 0, { 0 }, "", "PnNhaWI+IE5TU1RBVEVfSU5JVAo=" },
-	{ 2, 0, 0, { 0 }, "", "PnNhaWI+IE5TU1RBVEVfSU5JVAo=" },
-	{ 16, 0, 0, { 0 }, "", "PnNhaWI+IE5TU1RBVEVfSU5JVAo=" },
-	{ 5, 0, 0, { 0 }, "a", "PnNhaWI+IE5TU1RBVEVfSU5JVAo=" },
+	{ 0, 0, 0, { 0 }, "", "" },
+	{ 2, 0, 0, { 0 }, "", "" },
+	{ 16, 0, 0, { 0 }, "", "" },
+	{ 5, 0, 0, { 0 }, "a", "" },
 	{ 73, 0, 0, { 0 }, "a", "123" },
 	{ 5, 0, 0, { 0 }, "b", "123" },
 	{ 16, 0, 0, { 0 }, "b", "123" },
@@ -448,20 +448,20 @@ static struct lejp_results {
 	{ 17, 0, 0, { 0 }, "b", "123" },
 	{ 3, 0, 0, { 0 }, "b", "123" },
 }, r10[] = {
-	{ 0, 0, 0, { 0 }, "", "123" },
-	{ 2, 0, 0, { 0 }, "", "123" },
-	{ 16, 0, 0, { 0 }, "", "123" },
-	{ 5, 0, 0, { 0 }, "a", "123" },
+	{ 0, 0, 0, { 0 }, "", "" },
+	{ 2, 0, 0, { 0 }, "", "" },
+	{ 16, 0, 0, { 0 }, "", "" },
+	{ 5, 0, 0, { 0 }, "a", "" },
 	{ 73, 0, 0, { 0 }, "a", "123" },
 	{ 5, 0, 0, { 0 }, "b", "123" },
 	{ 4, 0, 0, { 0 }, "b", "123" },
 }, r11[] = {
-	{ 0, 0, 0, { 0 }, "", "123" },
-	{ 2, 0, 0, { 0 }, "", "123" },
-	{ 16, 0, 0, { 0 }, "", "123" },
-	{ 5, 0, 0, { 0 }, "array1", "123" },
-	{ 14, 0, 2, { 0 }, "array1[]", "123" },
-	{ 14, 1, 1, { 0,  }, "array1[][]", "123" },
+	{ 0, 0, 0, { 0 }, "", "" },
+	{ 2, 0, 0, { 0 }, "", "" },
+	{ 16, 0, 0, { 0 }, "", "" },
+	{ 5, 0, 0, { 0 }, "array1", "" },
+	{ 14, 0, 2, { 0 }, "array1[]", "" },
+	{ 14, 1, 1, { 0,  }, "array1[][]", "" },
 	{ 11, 2, 1, { 0, 0,  }, "array1[][]", "" },
 	{ 77, 2, 1, { 0, 0,  }, "array1[][]", "a" },
 	{ 11, 2, 1, { 0, 1,  }, "array1[][]", "" },
@@ -500,12 +500,12 @@ static struct lejp_results {
 	{ 17, 2, 0, { 1, 1,  }, "array2[]", "h1" },
 	{ 3, 2, 0, { 1, 1,  }, "array2[]", "h1" },
 }, r12[] = { /* test 11 but done with LEJP_FLAG_FEAT_OBJECT_INDEXES */
-	{ 0, 0, 0, { 0 }, "", "h1" },
-	{ 2, 0, 0, { 0 }, "", "h1" },
-	{ 16, 1, 0, { 0, }, "", "h1" },
-	{ 5, 1, 0, { 0, }, "array1", "h1" },
-	{ 14, 1, 2, { 0, }, "array1[]", "h1" },
-	{ 14, 2, 1, { 0, 0, }, "array1[][]", "h1" },
+	{ 0, 0, 0, { 0 }, "", "" },
+	{ 2, 0, 0, { 0 }, "", "" },
+	{ 16, 1, 0, { 0, }, "", "" },
+	{ 5, 1, 0, { 0, }, "array1", "" },
+	{ 14, 1, 2, { 0, }, "array1[]", "" },
+	{ 14, 2, 1, { 0, 0, }, "array1[][]", "" },
 	{ 11, 3, 1, { 0, 0, 0,  }, "array1[][]", "" },
 	{ 77, 3, 1, { 0, 0, 0,  }, "array1[][]", "a" },
 	{ 11, 3, 1, { 0, 0, 1,  }, "array1[][]", "" },
@@ -544,10 +544,10 @@ static struct lejp_results {
 	{ 17, 1, 0, { 1, }, "array2[]", "h1" },
 	{ 3, 1, 0, { 1,  }, "array2[]", "h1" },
 }, r13[] = {
-	{ 0, 0, 0, {  }, "", "h1" },
-	{ 2, 0, 0, {  }, "", "h1" },
-	{ 16, 0, 0, { 0,  }, "", "h1" },
-	{ 5, 0, 0, { 0,  }, "a", "h1" },
+	{ 0, 0, 0, {  }, "", "" },
+	{ 2, 0, 0, {  }, "", "" },
+	{ 16, 0, 0, { 0,  }, "", "" },
+	{ 5, 0, 0, { 0,  }, "a", "" },
 	{ 73, 0, 0, { 0,  }, "a", "1" },
 	{ 5, 0, 0, { 1,  }, "b", "1" },
 	{ 74, 0, 0, { 1,  }, "b", "1.0" },
@@ -558,16 +558,16 @@ static struct lejp_results {
 	{ 17, 0, 0, { 3,  }, "d", "1e3" },
 	{ 3, 0, 0, { 3,  }, "d", "1e3" },
 }, r14[] = {
-	{ 0, 0, 0, {  }, "", "1e3" },
-	{ 2, 0, 0, {  }, "", "1e3" },
-	{ 16, 0, 0, {  }, "", "1e3" },
-	{ 17, 0, 0, {  }, "", "1e3" },
-	{ 3, 0, 0, {  }, "", "1e3" },
+	{ 0, 0, 0, {  }, "", "" },
+	{ 2, 0, 0, {  }, "", "" },
+	{ 16, 0, 0, {  }, "", "" },
+	{ 17, 0, 0, {  }, "", "" },
+	{ 3, 0, 0, {  }, "", "" },
 }, r15[] = {
-	{ 0, 0, 0, {  }, "", "1e3" },
-	{ 2, 0, 0, {  }, "", "1e3" },
-	{ 16, 0, 0, {  }, "", "1e3" },
-	{ 5, 0, 0, {  }, "schema", "1e3" },
+	{ 0, 0, 0, {  }, "", "" },
+	{ 2, 0, 0, {  }, "", "" },
+	{ 16, 0, 0, {  }, "", "" },
+	{ 5, 0, 0, {  }, "schema", "" },
 	{ 11, 0, 0, {  }, "schema", "" },
 	{ 77, 0, 0, {  }, "schema", "sai-1" },
 	{ 5, 0, 0, {  }, "platforms", "sai-1" },
@@ -632,10 +632,10 @@ static struct lejp_results {
 	{ 17, 0, 0, {  }, "configurations.builder-only", "build/sai-*.rpm" },
 	{ 3, 0, 0, {  }, "configurations.builder-only", "build/sai-*.rpm" },
 }, r16[] = {
-	{ 0, 0, 0, {  }, "", "build/sai-*.rpm" },
-	{ 2, 0, 0, {  }, "", "build/sai-*.rpm" },
-	{ 16, 0, 0, {  }, "", "build/sai-*.rpm" },
-	{ 5, 0, 1, {  }, "schema", "build/sai-*.rpm" },
+	{ 0, 0, 0, {  }, "", "" },
+	{ 2, 0, 0, {  }, "", "" },
+	{ 16, 0, 0, {  }, "", "" },
+	{ 5, 0, 1, {  }, "schema", "" },
 	{ 11, 0, 1, {  }, "schema", "" },
 	{ 77, 0, 1, {  }, "schema", "sai-1" },
 	{ 5, 0, 0, {  }, "platforms", "sai-1" },
@@ -644,8 +644,8 @@ static struct lejp_results {
 	{ 16, 0, 5, {  }, "platforms.rocky9/aarch64-a72a55-rk3588/gcc", "sai-1" },
 	{ 5, 0, 3, {  }, "platforms.rocky9/aarch64-a72a55-rk3588/gcc.build", "sai-1" },
 	{ 14, 0, 3, {  }, "platforms.rocky9/aarch64-a72a55-rk3588/gcc.build[]", "sai-1" },
-	{ 11, 1, 3, { 0,  }, "platforms.rocky9/aarch64-a72a55-rk3588/gcc.build[]", "" },
-	{ 77, 1, 3, { 0,  }, "platforms.rocky9/aarch64-a72a55-rk3588/gcc.build[]", "mkdir build destdir;cd build; CCACHE_DISABLE=1 cmake .. ${cmake}" },
+	{ 11, 1, 2, { 0,  }, "platforms.rocky9/aarch64-a72a55-rk3588/gcc.build[]", "" },
+	{ 77, 1, 2, { 0,  }, "platforms.rocky9/aarch64-a72a55-rk3588/gcc.build[]", "mkdir build destdir;cd build; CCACHE_DISABLE=1 cmake .. ${cmake}" },
 	{ 11, 1, 2, { 1,  }, "platforms.rocky9/aarch64-a72a55-rk3588/gcc.build[]", "" },
 	{ 77, 1, 2, { 1,  }, "platforms.rocky9/aarch64-a72a55-rk3588/gcc.build[]", "make -j" },
 	{ 11, 1, 2, { 2,  }, "platforms.rocky9/aarch64-a72a55-rk3588/gcc.build[]", "" },
@@ -656,9 +656,9 @@ static struct lejp_results {
 	{ 16, 0, 5, {  }, "platforms.netbsd-OSX-bigsur/x86_64-intel-i3/llvm", "SAI_CPACK=\"-G RPM\" ${cpack}" },
 	{ 5, 0, 3, {  }, "platforms.netbsd-OSX-bigsur/x86_64-intel-i3/llvm.build", "SAI_CPACK=\"-G RPM\" ${cpack}" },
 	{ 14, 0, 3, {  }, "platforms.netbsd-OSX-bigsur/x86_64-intel-i3/llvm.build[]", "SAI_CPACK=\"-G RPM\" ${cpack}" },
-	{ 11, 1, 3, { 0,  }, "platforms.netbsd-OSX-bigsur/x86_64-intel-i3/llvm.build[]", "" },
-	{ 76, 1, 3, { 0,  }, "platforms.netbsd-OSX-bigsur/x86_64-intel-i3/llvm.build[]", "mkdir build destdir; cd build; MACOSX_DEPLOYMENT_TARGET=10.14 ; cmake .. -DCMAKE_MAKE_PROGRAM=/usr/bin/make -DLWS_OPENSSL_INCLUDE_DIRS=/usr/local/opt/openssl@1.1/include -DLWS_OPENSSL_LIBRARIES=\"/usr/local/opt/openssl/lib/libssl.dylib;/usr/local/opt/open" },
-	{ 77, 1, 3, { 0,  }, "platforms.netbsd-OSX-bigsur/x86_64-intel-i3/llvm.build[]", "ssl/lib/libcrypto.dylib\" ${cmake} " },
+	{ 11, 1, 2, { 0,  }, "platforms.netbsd-OSX-bigsur/x86_64-intel-i3/llvm.build[]", "" },
+	{ 76, 1, 2, { 0,  }, "platforms.netbsd-OSX-bigsur/x86_64-intel-i3/llvm.build[]", "mkdir build destdir; cd build; MACOSX_DEPLOYMENT_TARGET=10.14 ; cmake .. -DCMAKE_MAKE_PROGRAM=/usr/bin/make -DLWS_OPENSSL_INCLUDE_DIRS=/usr/local/opt/openssl@1.1/include -DLWS_OPENSSL_LIBRARIES=\"/usr/local/opt/openssl/lib/libssl.dylib;/usr/local/opt/open" },
+	{ 77, 1, 2, { 0,  }, "platforms.netbsd-OSX-bigsur/x86_64-intel-i3/llvm.build[]", "ssl/lib/libcrypto.dylib\" ${cmake} " },
 	{ 11, 1, 2, { 1,  }, "platforms.netbsd-OSX-bigsur/x86_64-intel-i3/llvm.build[]", "" },
 	{ 77, 1, 2, { 1,  }, "platforms.netbsd-OSX-bigsur/x86_64-intel-i3/llvm.build[]", "make -j && make -j DESTDIR=../destdir install" },
 	{ 11, 1, 2, { 2,  }, "platforms.netbsd-OSX-bigsur/x86_64-intel-i3/llvm.build[]", "" },
@@ -741,6 +741,139 @@ struct lejp_results_pkg {
 
 static unsigned int m, step;
 
+/* set when the F-023 regression checks below see a problem */
+static int wild_fail;
+
+static signed char
+wild_cb(struct lejp_ctx *ctx, char reason)
+{
+	char wild[16];
+
+	if (reason != LEJPCB_VAL_STR_END || !ctx->path_match)
+		return 0;
+
+	/* positive-length sanity: the wildcard is the object name "name"
+	 * and its length including the terminator is reported */
+
+	memset(wild, 0x55, sizeof(wild));
+	if (lejp_get_wildcard(ctx, 0, wild, (int)sizeof(wild)) != 5 ||
+	    strcmp(wild, "name"))
+		wild_fail |= 1;
+
+	/* F-023 regression: a non-positive len must mean "no room" and
+	 * fail cleanly, rather than copy with no effective bound
+	 */
+
+	memset(wild, 0x55, sizeof(wild));
+	if (lejp_get_wildcard(ctx, 0, wild, -5) || wild[0] != 0x55)
+		wild_fail |= 2;
+
+	memset(wild, 0x55, sizeof(wild));
+	if (lejp_get_wildcard(ctx, 0, wild, 0) || wild[0] != 0x55)
+		wild_fail |= 4;
+
+	return 0;
+}
+
+/* for the LEJP_FLAG_FEAT_COMMENTS test, which only cares about the verdict */
+
+static signed char
+quiet_cb(struct lejp_ctx *ctx, char reason)
+{
+	(void)ctx;
+	(void)reason;
+
+	return 0;
+}
+
+/*
+ * Pushed parsers inside an object that did not itself push: the parent's
+ * path must be as it was when the pushed parser pops, or the parent's
+ * members after it never match.  We render every matched number as
+ * "path=value;" to compare with what the document says.
+ */
+
+struct push_render {
+	char		*p;
+	char		*end;
+	int		ends;	/* also render the pushing parser's OBJECT_END */
+};
+
+static const char * const push_paths_parent[] = { "o.l", "o.c", "o.n", "o.m" };
+static const char * const push_paths_child[] = { "k" };
+
+static void
+push_record(struct lejp_ctx *ctx)
+{
+	struct push_render *r = (struct push_render *)ctx->user;
+
+	r->p += lws_snprintf(r->p, lws_ptr_diff_size_t(r->end, r->p), "%s=%s;",
+			     ctx->path, ctx->buf);
+}
+
+/* the parser for the elements of "o.l", popped by lejp at the array's ']' */
+
+static signed char
+push_elem_cb(struct lejp_ctx *ctx, char reason)
+{
+	if (reason == LEJPCB_VAL_NUM_INT && ctx->path_match)
+		push_record(ctx);
+
+	return 0;
+}
+
+/* the parser for the object "o.c", which pops itself at its end */
+
+static signed char
+push_obj_cb(struct lejp_ctx *ctx, char reason)
+{
+	if (reason == LEJPCB_VAL_NUM_INT && ctx->path_match)
+		push_record(ctx);
+
+	if (reason == LEJPCB_OBJECT_END &&
+	    ctx->sp == ctx->pst[ctx->pst_sp].sp)
+		/* back at the depth we were pushed at, it's our own '}' */
+		lejp_parser_pop(ctx);
+
+	return 0;
+}
+
+static signed char
+push_parent_cb(struct lejp_ctx *ctx, char reason)
+{
+	struct push_render *r;
+
+	switch (reason) {
+	case LEJPCB_ARRAY_START:
+		if (ctx->path_match == 1 && /* o.l */
+		    lejp_parser_push(ctx, NULL, push_paths_child,
+				     LWS_ARRAY_SIZE(push_paths_child),
+				     push_elem_cb))
+			return -1;
+		break;
+	case LEJPCB_OBJECT_START:
+		if (ctx->path_match == 2 && /* o.c */
+		    lejp_parser_push(ctx, NULL, push_paths_child,
+				     LWS_ARRAY_SIZE(push_paths_child),
+				     push_obj_cb))
+			return -1;
+		break;
+	case LEJPCB_VAL_NUM_INT:
+		if (ctx->path_match)
+			push_record(ctx);
+		break;
+	case LEJPCB_OBJECT_END:
+		r = (struct push_render *)ctx->user;
+		if (r->ends)
+			r->p += lws_snprintf(r->p,
+					     lws_ptr_diff_size_t(r->end, r->p),
+					     "}%s;", ctx->path);
+		break;
+	}
+
+	return 0;
+}
+
 
 
 static signed char
@@ -802,12 +935,11 @@ test_cb(struct lejp_ctx *ctx, char reason)
 
 int main(int argc, const char **argv)
 {
-	int n, e = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	int n, e = 0;
 	struct lejp_ctx ctx;
-	const char *p;
 	(void)switches;
 
-	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
+	if (lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
 		lws_switches_print_help(argv[0], switches, LWS_ARRAY_SIZE(switches));
 		return 0;
 	}
@@ -815,10 +947,7 @@ int main(int argc, const char **argv)
 
 	memset(&ctx, 0, sizeof(ctx));
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS API selftest: lws_struct JSON\n");
 
 	for (m = 0; m < (int)LWS_ARRAY_SIZE(json_tests); m++) {
@@ -866,9 +995,162 @@ int main(int argc, const char **argv)
 		}
 		cs = lws_json_simple_find("{\"blah\":123,\"auth_user\":\"andy@warmcat.com\",\"thing\":\"yeah\"}", 57,
 					    "\"auth_user\":", &cslen);
-		if (cslen != 16) {
+		if (!cs || cslen != 16) {
 			lwsl_err("%s: wrong string len %d isolated\n", __func__, (int)cslen);
 			e++;
+		}
+	}
+
+	/*
+	 * F-023 companion: lejp_get_wildcard() with a negative length must
+	 * refuse to copy anything
+	 */
+	{
+		static const char * const wpaths[] = { "x.*" };
+
+		lejp_construct(&ctx, wild_cb, NULL, wpaths, 1);
+		n = lejp_parse(&ctx,
+			(const unsigned char *)"{\"x\":{\"name\":\"value\"}}", 22);
+		lejp_destruct(&ctx);
+
+		if (n < 0 || wild_fail) {
+			lwsl_err("%s: wildcard len guard failed (0x%x)\n",
+				 __func__, wild_fail);
+			e++;
+		}
+	}
+
+	/*
+	 * '#' to-end-of-line comments are a nonstandard extension: they must
+	 * be inert unless the user opted in with LEJP_FLAG_FEAT_COMMENTS, so
+	 * that a network-facing parse cannot be steered into seeing a
+	 * different document than an RFC 8259 parser sees
+	 */
+	{
+		static const char *cj = "{\"a\":1#,\"b\":2\n}";
+		int cjl = (int)strlen(cj);
+
+		lejp_construct(&ctx, quiet_cb, NULL, NULL, 0);
+		n = lejp_parse(&ctx, (const unsigned char *)cj, cjl);
+		lejp_destruct(&ctx);
+
+		if (n >= 0) {
+			lwsl_err("%s: '#' comment accepted with the feature "
+				 "off\n", __func__);
+			e++;
+		}
+
+		lejp_construct(&ctx, quiet_cb, NULL, NULL, 0);
+		ctx.flags = LEJP_FLAG_FEAT_COMMENTS;
+		n = lejp_parse(&ctx, (const unsigned char *)cj, cjl);
+		lejp_destruct(&ctx);
+
+		if (n < 0) {
+			lwsl_err("%s: '#' comment rejected with the feature "
+				 "on: %s\n", __func__, lejp_error_to_string(n));
+			e++;
+		}
+	}
+
+	/*
+	 * C-079 / C-600: nothing may put a NUL inside a decoded key or value,
+	 * since consumers treat ctx->path and ctx->buf as C strings and would
+	 * silently see them truncated.  A '\\' followed by a raw NUL byte is
+	 * not a JSON escape and \u0000 must be refused too.  The lengths are
+	 * explicit, since the documents contain NULs.
+	 */
+	{
+		static const struct {
+			const char	*j;
+			int		len;
+			int		expect;
+		} nt[] = {
+#define LEJPT_NUL(_j, _e) { _j, (int)sizeof(_j) - 1, _e }
+			/* in a key */
+			LEJPT_NUL("{\"a\\\0b\":1}",
+				  LEJP_REJECT_MP_STRING_ESC_ILLEGAL_ESC),
+			/* in a value */
+			LEJPT_NUL("{\"a\":\"b\\\0c\"}",
+				  LEJP_REJECT_MP_STRING_ESC_ILLEGAL_ESC),
+			LEJPT_NUL("{\"a\":\"b\\u0000c\"}",
+				  LEJP_REJECT_MP_ILLEGAL_CTRL),
+#undef LEJPT_NUL
+		};
+		size_t q;
+
+		for (q = 0; q < LWS_ARRAY_SIZE(nt); q++) {
+			lejp_construct(&ctx, quiet_cb, NULL, NULL, 0);
+			n = lejp_parse(&ctx, (const unsigned char *)nt[q].j,
+				       nt[q].len);
+			lejp_destruct(&ctx);
+
+			if (n != nt[q].expect) {
+				lwsl_err("%s: NUL case %d: got %d (%s), "
+					 "expected %d\n", __func__, (int)q, n,
+					 lejp_error_to_string(n), nt[q].expect);
+				e++;
+			}
+		}
+	}
+
+	/*
+	 * A pushed parser used to write its paths from ctx->path[0] over the
+	 * pushing parser's path, and leave it like that when popped: here the
+	 * pushing parser's "o.n" and "o.m" after "o.l" or "o.c" never matched
+	 */
+	{
+		static const struct {
+			const char	*j;
+			const char	*expect;
+			int		ends;
+		} pt[] = {
+			/* element parser popped at the array's ']' */
+			{ "{\"o\":{\"l\":[{\"k\":1},{\"k\":2}],\"n\":3}}",
+			  "k=1;k=2;o.n=3;", 0 },
+			/* ... also when the array is empty */
+			{ "{\"o\":{\"l\":[],\"n\":3}}",
+			  "o.n=3;", 0 },
+			/* ... with members before and after it */
+			{ "{\"o\":{\"n\":3,\"l\":[{\"k\":1}],\"m\":4}}",
+			  "o.n=3;k=1;o.m=4;", 0 },
+			/* object parser popped by itself at its '}' */
+			{ "{\"o\":{\"c\":{\"k\":5},\"n\":6,\"m\":7}}",
+			  "k=5;o.n=6;o.m=7;", 0 },
+			/* both, one after the other */
+			{ "{\"o\":{\"l\":[{\"k\":1}],\"c\":{\"k\":2},"
+			  "\"n\":3}}",
+			  "k=1;k=2;o.n=3;", 0 },
+			/*
+			 * an object ending straight after the array: the ']'
+			 * took the path back to "o", in the pushing parser's
+			 * terms, the same as for a parse that doesn't push
+			 */
+			{ "{\"o\":{\"n\":3,\"l\":[{\"k\":1}]}}",
+			  "o.n=3;k=1;}o;}o;", 1 },
+		};
+		struct push_render r;
+		char out[128];
+		size_t q;
+
+		for (q = 0; q < LWS_ARRAY_SIZE(pt); q++) {
+			out[0] = '\0';
+			r.p = out;
+			r.end = out + sizeof(out);
+			r.ends = pt[q].ends;
+
+			lejp_construct(&ctx, push_parent_cb, &r,
+				       push_paths_parent,
+				       LWS_ARRAY_SIZE(push_paths_parent));
+			n = lejp_parse(&ctx, (const unsigned char *)pt[q].j,
+				       (int)strlen(pt[q].j));
+			lejp_destruct(&ctx);
+
+			if (n < 0 || strcmp(out, pt[q].expect)) {
+				lwsl_err("%s: push case %d: %d, '%s' not '%s'\n",
+					 __func__, (int)q, n, out,
+					 pt[q].expect);
+				e++;
+			}
 		}
 	}
 

@@ -1,0 +1,143 @@
+#
+# ctest driver for one lhp layout case
+#
+# cmake -DTOOL=<lws-api-test-lhp-dlo> -DHTML=<case.html> -DGOLDEN=<case.dlo>
+#       -DOUT=<scratch.dlo> [-DW=400 -DH=300] [-DUPDATE=1] [-DLOCALIZE=1]
+#       [-DFLAGS=<extra tool switches>] [-DCSS_FILTER=<filter.css>]
+#       [-DBLOCK_LIST=<filter.list>] -P lhp-dlo-case.cmake
+#
+# Lays out HTML with the tool, dumps the resulting DLO tree as text and
+# compares it with GOLDEN.  With UPDATE=1 the golden is overwritten instead,
+# for use after an intentional layout change:
+#
+#   cd build && ctest -R api-test-lhp-dlo- --output-on-failure   # check
+#   cmake -DUPDATE=1 ... -P lhp-dlo-case.cmake                    # accept
+#
+
+if (NOT W)
+	set(W 400)
+endif()
+if (NOT H)
+	set(H 300)
+endif()
+
+if (LOCALIZE)
+	#
+	# A captured page refers to assets on the real network.  Rewrite those
+	# references to a local path that does not exist, so the test never
+	# touches the network and the (unavailable) assets fail the same way
+	# every time.
+	#
+	file(READ ${HTML} html)
+	get_filename_component(HD ${HTML} DIRECTORY)
+	get_filename_component(HN ${HTML} NAME)
+	get_filename_component(OD ${OUT} DIRECTORY)
+
+	# An asset that the page pulls from the network can be made available
+	# offline by placing it in the capture at revived/<host>/<path>; refs
+	# to files that exist there are pointed at the local copy instead of
+	# being made to fail
+
+	file(GLOB_RECURSE REVIVED RELATIVE ${HD} "${HD}/revived/*")
+	foreach(RV ${REVIVED})
+		string(SUBSTRING ${RV} 8 -1 RP)		# peel off "revived/"
+		string(REPLACE "https://${RP}" "file://${HD}/revived/${RP}" html "${html}")
+		string(REPLACE "http://${RP}" "file://${HD}/revived/${RP}" html "${html}")
+		string(REPLACE "//${RP}" "file://${HD}/revived/${RP}" html "${html}")
+	endforeach()
+
+	string(REGEX REPLACE "(href|src)=([\"'])(https?:)?//" "\\1=\\2missing/" html "${html}")
+	# the copy lives in the build dir: keep relative references (captured
+	# stylesheets, images) pointing at the source directory
+	string(REGEX REPLACE "(href|src)=\"([^\"/:#][^\":]*)\"" "\\1=\"file://${HD}/\\2\"" html "${html}")
+	string(REGEX REPLACE "(href|src)=\"/([^\"/][^\":]*)\"" "\\1=\"file://${HD}/\\2\"" html "${html}")
+
+	#
+	# The same remote references appear as url(...) inside captured local
+	# stylesheets.  Copy each css into the build dir, pointing url()s of
+	# assets that exist under revived/ at the local copy and the rest at a
+	# local path that does not exist, and repoint the html at the copies,
+	# so css-driven image fetches are the same every run.
+	#
+
+	file(GLOB CSSFILES "${HD}/assets/*.css")
+	if (CSSFILES)
+		file(MAKE_DIRECTORY "${OD}/${HN}-assets")
+		foreach(CS ${CSSFILES})
+			file(READ ${CS} css)
+			foreach(RV ${REVIVED})
+				string(SUBSTRING ${RV} 8 -1 RP)
+				string(REPLACE "https://${RP}" "file://${HD}/revived/${RP}" css "${css}")
+				string(REPLACE "http://${RP}" "file://${HD}/revived/${RP}" css "${css}")
+				string(REPLACE "//${RP}" "file://${HD}/revived/${RP}" css "${css}")
+			endforeach()
+			string(REGEX REPLACE "url\\(([\"']?)(https?:)?//" "url(\\1missing/" css "${css}")
+			get_filename_component(CN ${CS} NAME)
+			file(WRITE "${OD}/${HN}-assets/${CN}" "${css}")
+		endforeach()
+		string(REPLACE "file://${HD}/assets/" "file://${OD}/${HN}-assets/" html "${html}")
+	endif()
+
+	file(WRITE ${OUT}-${HN} "${html}")
+	set(HTML ${OUT}-${HN})
+endif()
+
+set(tool_flags "")
+if (FLAGS)
+	list(APPEND tool_flags ${FLAGS})
+endif()
+if (CSS_FILTER)
+	list(APPEND tool_flags --css-filter=${CSS_FILTER})
+endif()
+if (BLOCK_LIST)
+	list(APPEND tool_flags --block-list=${BLOCK_LIST})
+endif()
+if (ASSET_CACHE_DIR)
+	# each run gets its own empty asset cache, so concurrent runs in the
+	# same build tree cannot see each other's files
+	string(RANDOM LENGTH 8 rnd)
+	set(ASSET_CACHE_DIR "${ASSET_CACHE_DIR}-${rnd}")
+	file(REMOVE_RECURSE ${ASSET_CACHE_DIR})
+	list(APPEND tool_flags --asset-cache=${ASSET_CACHE_DIR})
+endif()
+if (PRESEED)
+	list(APPEND tool_flags --preseed=${PRESEED})
+endif()
+
+execute_process(COMMAND ${TOOL} file://${HTML} --w ${W} --h ${H} ${tool_flags}
+			--dump ${OUT} -d 3
+			RESULT_VARIABLE r OUTPUT_QUIET ERROR_QUIET TIMEOUT 30)
+if (ASSET_CACHE_DIR)
+	file(REMOVE_RECURSE ${ASSET_CACHE_DIR})
+endif()
+if (NOT r EQUAL 0)
+	message(FATAL_ERROR "${TOOL} failed (${r}) on ${HTML}")
+endif()
+
+#
+# Link hit regions in the dump carry hrefs as written, and LOCALIZE rewrote
+# those to file:// paths into this tree: put placeholders back so the dump
+# is the same wherever the tree lives
+#
+if (LOCALIZE)
+	file(READ ${OUT} dump)
+	string(REPLACE "file://${OD}/" "build:/" dump "${dump}")
+	string(REPLACE "file://${HD}/" "vector:/" dump "${dump}")
+	file(WRITE ${OUT} "${dump}")
+endif()
+
+if (UPDATE)
+	configure_file(${OUT} ${GOLDEN} COPYONLY)
+	message("updated ${GOLDEN}")
+	return()
+endif()
+
+execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files ${GOLDEN} ${OUT}
+		RESULT_VARIABLE r)
+if (NOT r EQUAL 0)
+	find_program(DIFF diff)
+	if (DIFF)
+		execute_process(COMMAND ${DIFF} -u ${GOLDEN} ${OUT})
+	endif()
+	message(FATAL_ERROR "layout of ${HTML} differs from ${GOLDEN}")
+endif()

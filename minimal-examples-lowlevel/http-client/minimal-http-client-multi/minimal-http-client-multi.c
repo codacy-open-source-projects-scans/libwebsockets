@@ -41,7 +41,6 @@ enum {
 	LWS_SW_EV,
 	LWS_SW_EVENT,
 	LWS_SW_GLIB,
-	LWS_SW_H1,
 	LWS_SW_LIMIT,
 	LWS_SW_NO_TLS,
 	LWS_SW_NO_TLS_SESSION_REUSE,
@@ -56,6 +55,12 @@ enum {
 	LWS_SW_N,
 	LWS_SW_P,
 	LWS_SW_S,
+	LWS_SW_OUTDIR,
+	LWS_SW_SAVE_TICKET,
+	LWS_SW_LOAD_TICKET,
+	LWS_SW_SEQ,
+	LWS_SW_QUIC_INITIAL_CWND,
+	LWS_SW_CA_FILE,
 	LWS_SW_HELP,
 };
 
@@ -64,7 +69,6 @@ static const struct lws_switches switches[] = {
 	[LWS_SW_EV]	= { "--ev",            "Enable --ev feature" },
 	[LWS_SW_EVENT]	= { "--event",         "Enable --event feature" },
 	[LWS_SW_GLIB]	= { "--glib",          "Enable --glib feature" },
-	[LWS_SW_H1]	= { "--h1",            "Enable --h1 feature" },
 	[LWS_SW_LIMIT]	= { "--limit",         "Enable --limit feature" },
 	[LWS_SW_NO_TLS]	= { "--no-tls",        "Enable --no-tls feature" },
 	[LWS_SW_NO_TLS_SESSION_REUSE]	= { "--no-tls-session-reuse", "Enable --no-tls-session-reuse feature" },
@@ -79,7 +83,13 @@ static const struct lws_switches switches[] = {
 	[LWS_SW_N]	= { "-n",              "Enable -n feature" },
 	[LWS_SW_P]	= { "-p",              "Port number to listen or connect on" },
 	[LWS_SW_S]	= { "-s",              "Use TLS / https" },
-	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
+	[LWS_SW_OUTDIR]	= { "-O",              "Output directory for downloads" },
+	[LWS_SW_SAVE_TICKET] = { "--save-ticket", "Path to save TLS session ticket" },
+	[LWS_SW_LOAD_TICKET] = { "--load-ticket", "Path to load TLS session ticket" },
+	[LWS_SW_SEQ]         = { "--seq", "Run sequentially" },
+	[LWS_SW_QUIC_INITIAL_CWND] = { "--quic-initial-cwnd", "Initial congestion window in bytes" },
+	[LWS_SW_CA_FILE]     = { "--ca-file", "PEM CA file to trust for the server cert (instead of the OS trust store)" },
+	[LWS_SW_HELP]	= { "--help", 		"Show this help information" },
 };
 
 #include <string.h>
@@ -92,27 +102,56 @@ static const struct lws_switches switches[] = {
 #include <unistd.h>
 #endif
 
-#define COUNT 8
+#define COUNT 4096
 
 struct cliuser {
 	int index;
 };
 
-static int completed, failed, numbered, stagger_idx, posting, count = COUNT,
+static int completed, failed, stagger_idx, posting, count = COUNT,
 #if defined(LWS_WITH_TLS_SESSIONS)
 	   reuse,
 #endif
-	   staggered;
+	   staggered, sequential;
 static lws_sorted_usec_list_t sul_stagger;
 static struct lws_client_connect_info i;
 static struct lws *client_wsi[COUNT];
-static char urlpath[64], intr;
+static int conn_state[COUNT];
+
+static void
+lws_try_client_connection(struct lws_client_connect_info *ii, int m);
 static struct lws_context *context;
 
 /* we only need this for tracking POST emit state */
 
+static char out_dir[256];
+static char save_ticket[256];
+static char load_ticket[256];
+#if defined(LWS_WITH_TLS_SESSIONS) && !defined(LWS_WITH_MBEDTLS) && !defined(WIN32)
+/*
+ * quic sessions are cached apart from tls over tcp ones, a ticket saved after
+ * --h3 is the quic session, and only quic connections may resume it
+ */
+static unsigned int sess_dump_flags;
+#endif
+
+struct req {
+	char path[512];
+	char address[256];
+	int port;
+};
+static struct req reqs[COUNT];
+
 struct pss {
+	/*
+	 * pss arrives zeroed for every wsi bound to this protocol: that
+	 * includes the h3 control / qpack streams and the quic nwsi, which
+	 * never open a download file.  Track the outfile with an explicit
+	 * flag rather than fd alone, since fd 0 is a real fd (stdin).
+	 */
 	char body_part;
+	char outfile_open;
+	int fd;
 };
 
 #if defined(LWS_WITH_TLS_SESSIONS) && !defined(LWS_WITH_MBEDTLS) && !defined(WIN32)
@@ -122,19 +161,15 @@ struct pss {
 static int
 sess_save_cb(struct lws_context *cx, struct lws_tls_session_dump *info)
 {
-	char path[128];
 	int fd, n;
 
-	lws_snprintf(path, sizeof(path), "%s/lws_tls_sess_%s", (const char *)info->opaque,
-			info->tag);
-	fd = open(path, LWS_O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	fd = open(save_ticket, LWS_O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	if (fd < 0) {
-		lwsl_warn("%s: cannot open %s\n", __func__, path);
+		lwsl_warn("%s: cannot open %s\n", __func__, save_ticket);
 		return 1;
 	}
 
 	n = (int)write(fd, info->blob, info->blob_len);
-
 	close(fd);
 
 	return n != (int)info->blob_len;
@@ -144,12 +179,9 @@ static int
 sess_load_cb(struct lws_context *cx, struct lws_tls_session_dump *info)
 {
 	struct stat sta;
-	char path[128];
 	int fd, n;
 
-	lws_snprintf(path, sizeof(path), "%s/lws_tls_sess_%s", (const char *)info->opaque,
-			info->tag);
-	fd = open(path, LWS_O_RDONLY);
+	fd = open(load_ticket, LWS_O_RDONLY);
 	if (fd < 0)
 		return 1;
 
@@ -157,12 +189,10 @@ sess_load_cb(struct lws_context *cx, struct lws_tls_session_dump *info)
 		goto bail;
 
 	info->blob = malloc((size_t)sta.st_size);
-	/* caller will free this */
 	if (!info->blob)
 		goto bail;
 
 	info->blob_len = (size_t)sta.st_size;
-
 	n = (int)read(fd, info->blob, info->blob_len);
 	close(fd);
 
@@ -170,7 +200,6 @@ sess_load_cb(struct lws_context *cx, struct lws_tls_session_dump *info)
 
 bail:
 	close(fd);
-
 	return 1;
 }
 #endif
@@ -220,22 +249,42 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 
 	switch (reason) {
 
+	case LWS_CALLBACK_CLIENT_ESTABLISHED_EARLY:
+		lwsl_user("LWS_CALLBACK_CLIENT_ESTABLISHED_EARLY: idx: %d, opting into 0-RTT\n", idx);
+		return 1;
+
 	case LWS_CALLBACK_ESTABLISHED_CLIENT_HTTP:
 		lwsl_user("LWS_CALLBACK_ESTABLISHED_CLIENT_HTTP: idx: %d, resp %u\n",
 				idx, lws_http_client_http_response(wsi));
+		
+		if (out_dir[0] && lws_http_client_http_response(wsi) == 200) {
+			char path[512];
+			const char *basename = reqs[idx].path;
+			const char *p = strrchr(basename, '/');
+			if (p) basename = p + 1;
+			if (!basename[0]) basename = "index.html";
+			
+			lws_snprintf(path, sizeof(path), "%s/%s", out_dir, basename);
+			pss->fd = open(path, LWS_O_WRONLY | O_CREAT | O_TRUNC, 0644); /* NOSONAR */
+			if (pss->fd < 0) {
+				lwsl_err("Failed to open %s for writing\n", path);
+			} else {
+				pss->outfile_open = 1;
+				lwsl_user("Opened %s for writing\n", path);
+			}
+		} else {
+			pss->fd = -1;
+		}
 
 #if defined(LWS_WITH_TLS_SESSIONS) && !defined(LWS_WITH_MBEDTLS) && !defined(WIN32)
 		if (lws_tls_session_is_reused(wsi))
 			reuse++;
-		else
-			/*
-			 * Attempt to store any new session into
-			 * external storage
-			 */
-			if (lws_tls_session_dump_save(lws_get_vhost_by_name(context, "default"),
-					i.host, (uint16_t)i.port,
-					sess_save_cb, "/tmp"))
-		lwsl_warn("%s: session save failed\n", __func__);
+		/*
+		 * Don't attempt to save the session here: the NewSessionTicket
+		 * arrives asynchronously AFTER this callback fires, so the
+		 * vhost session cache is empty or has only a stub at this
+		 * point.  The deferred save happens after the event loop exits.
+		 */
 #endif
 		break;
 
@@ -244,6 +293,9 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 		lwsl_err("CLIENT_CONNECTION_ERROR: %s\n",
 			 in ? (char *)in : "(null)");
 		client_wsi[idx] = NULL;
+		if (conn_state[idx] == 2)
+			break;
+		conn_state[idx] = 2;
 		failed++;
 
 #if defined(LWS_WITH_CONMON)
@@ -255,7 +307,12 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 	/* chunks of chunked content, with header removed */
 	case LWS_CALLBACK_RECEIVE_CLIENT_HTTP_READ:
 		lwsl_user("RECEIVE_CLIENT_HTTP_READ: conn %d: read %d\n", idx, (int)len);
-		lwsl_hexdump_info(in, len);
+		if (!pss)
+			break;
+		if (pss->outfile_open && pss->fd >= 0) {
+			if (write(pss->fd, in, (unsigned int)len) != (ssize_t)len)
+				lwsl_err("Write failed\n");
+		}
 		return 0; /* don't passthru */
 
 	case LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER:
@@ -286,23 +343,43 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 	case LWS_CALLBACK_COMPLETED_CLIENT_HTTP:
 		lwsl_user("LWS_CALLBACK_COMPLETED_CLIENT_HTTP %s: idx %d\n",
 			  lws_wsi_tag(wsi), idx);
+		if (!pss)
+			break;
+		if (pss->outfile_open && pss->fd >= 0) {
+			close(pss->fd);
+			pss->fd = -1;
+			pss->outfile_open = 0;
+		}
 		client_wsi[idx] = NULL;
+		if (conn_state[idx] == 2)
+			break;
+		conn_state[idx] = 2;
 		goto finished;
 
 	case LWS_CALLBACK_CLOSED_CLIENT_HTTP:
-		lwsl_info("%s: closed: %s\n", __func__, lws_wsi_tag(client_wsi[idx]));
+		lwsl_info("%s: closed: %s\n", __func__, lws_wsi_tag(wsi));
+
+		if (!pss)
+			break;
+
+		if (pss->outfile_open && pss->fd >= 0) {
+			close(pss->fd);
+			pss->fd = -1;
+			pss->outfile_open = 0;
+		}
 
 #if defined(LWS_WITH_CONMON)
 		dump_conmon_data(wsi);
 #endif
 
-		if (client_wsi[idx]) {
+		if (conn_state[idx] != 2) {
 			/*
 			 * If it completed normally, it will have been set to
-			 * NULL then already.  So we are dealing with an
+			 * 2 then already.  So we are dealing with an
 			 * abnormal, failing, close
 			 */
 			client_wsi[idx] = NULL;
+			conn_state[idx] = 2;
 			failed++;
 			goto finished;
 		}
@@ -381,13 +458,14 @@ finished:
 			lwsl_user("Done: all OK\n");
 		else
 			lwsl_err("Done: failed: %d\n", failed);
-		intr = 1;
+		lws_default_loop_exit(context);
 		/*
-		 * This is how we can exit the event loop even when it's an
-		 * event library backing it... it will start and stage the
-		 * destroy to happen after we exited this service for each pt
+		 * Exit the loop by cancelling service so we can save TLS
+		 * sessions in main() before actually destroying the context.
 		 */
-		lws_context_destroy(lws_get_context(wsi));
+		lws_cancel_service(lws_get_context(wsi));
+	} else if (sequential) {
+		lws_try_client_connection(&i, completed);
 	}
 
 	return 0;
@@ -416,7 +494,7 @@ my_metric_report(lws_metric_pub_t *mp)
 	return 1;
 }
 
-static const lws_system_ops_t system_ops = {
+static lws_system_ops_t system_ops = {
 	.metric_report = my_metric_report,
 };
 
@@ -428,27 +506,32 @@ stagger_cb(lws_sorted_usec_list_t *sul);
 static void
 lws_try_client_connection(struct lws_client_connect_info *ii, int m)
 {
-	char path[128];
-
-	if (numbered) {
-		lws_snprintf(path, sizeof(path), "/%d.png", m + 1);
-		ii->path = path;
-	} else
-		ii->path = urlpath;
+	ii->address = reqs[m].address;
+	ii->host = reqs[m].address;
+	ii->origin = reqs[m].address;
+	ii->port = reqs[m].port;
+	ii->path = reqs[m].path;
 
 	ii->pwsi = &client_wsi[m];
 	ii->opaque_user_data = (void *)(intptr_t)m;
 
 	if (!lws_client_connect_via_info(ii)) {
-		failed++;
-		lwsl_user("%s: failed: conn idx %d\n", __func__, m);
-		if (++completed == count) {
-			lwsl_user("Done: failed: %d\n", failed);
-			lws_context_destroy(context);
+		if (conn_state[m] != 2) {
+			conn_state[m] = 2;
+			failed++;
+			lwsl_user("%s: failed: conn idx %d\n", __func__, m);
+			if (++completed == count) {
+				lwsl_user("Done: failed: %d\n", failed);
+				lws_default_loop_exit(context);
+				lws_cancel_service(context);
+			}
 		}
-	} else
+	} else {
+		if (conn_state[m] != 2)
+			conn_state[m] = 1;
 		lwsl_user("started connection %s: idx %d (%s)\n",
 			  lws_wsi_tag(client_wsi[m]), m, ii->path);
+	}
 }
 
 
@@ -464,7 +547,9 @@ system_notify_cb(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 
 	/* all the system prerequisites are ready */
 
-	if (!staggered)
+	if (sequential)
+		lws_try_client_connection(&i, 0);
+	else if (!staggered)
 		/*
 		 * just pile on all the connections at once, testing the
 		 * pipeline queuing before the first is connected
@@ -492,7 +577,8 @@ signal_cb(void *handle, int signum)
 		lwsl_err("%s: signal %d\n", __func__, signum);
 		break;
 	}
-	lws_context_destroy(context);
+	lws_default_loop_exit(context);
+	lws_cancel_service(context);
 }
 
 static void
@@ -548,7 +634,7 @@ stagger_cb(lws_sorted_usec_list_t *sul)
 	if (stagger_idx == count)
 		return;
 
-	next = 150 * LWS_US_PER_MS;
+	if (count > 100) next = 1 * LWS_US_PER_MS; else next = 150 * LWS_US_PER_MS;
 	if (stagger_idx == count - 1)
 		next += 400 * LWS_US_PER_MS;
 
@@ -558,6 +644,11 @@ stagger_cb(lws_sorted_usec_list_t *sul)
 #endif
 
 	lws_sul_schedule(context, 0, &sul_stagger, stagger_cb, next);
+}
+
+static int custom_cpd_bypass(struct lws_context *cx) {
+        lws_system_cpd_set(cx, LWS_CPD_INTERNET_OK);
+        return 0;
 }
 
 int main(int argc, const char **argv)
@@ -572,13 +663,14 @@ int main(int argc, const char **argv)
 	int pl = 0;
 #endif
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
-	memset(&i, 0, sizeof i); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
 
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
+        lws_cmdline_option_handle_builtin(argc, argv, &info);
+
+	info.timeout_secs = 120;
 
 	info.signal_cb = signal_cb;
-	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+	info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 
 	if (lws_cmdline_option(argc, argv, switches[LWS_SW_UV].sw))
 		info.options |= LWS_SERVER_OPTION_LIBUV;
@@ -595,9 +687,10 @@ int main(int argc, const char **argv)
 					signal(SIGINT, sigint_handler);
 
 	staggered = !!lws_cmdline_option(argc, argv, switches[LWS_SW_S].sw);
+	sequential = !!lws_cmdline_option(argc, argv, switches[LWS_SW_SEQ].sw);
 
 	lwsl_user("LWS minimal http client [-s (staggered)] [-p (pipeline)]\n");
-	lwsl_user("   [--h1 (http/1 only)] [-l (localhost)] [-d <logs>]\n");
+	lwsl_user("   [-l (localhost)] [-d <logs>]\n");
 	lwsl_user("   [-n (numbered)] [--post]\n");
 
 	info.port = CONTEXT_PORT_NO_LISTEN; /* we do not run any server */
@@ -606,24 +699,43 @@ int main(int argc, const char **argv)
 	 * since we know this lws context is only ever going to be used with
 	 * COUNT client wsis / fds / sockets at a time, let lws know it doesn't
 	 * have to use the default allocations for fd tables up to ulimit -n.
-	 * It will just allocate for 1 internal and COUNT + 1 (allowing for h2
-	 * network wsi) that we will use.
+	 * It will just allocate for its own fds and overhead
+	 * (LWS_FD_LIMIT_PER_THREAD_MIN) plus the COUNT connections and
+	 * their h2 network connections that we will use.
 	 */
-	info.fd_limit_per_thread = 1 + COUNT + 8 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + COUNT + 8;
 	info.register_notifier_list = na;
 	info.pcontext = &context;
 
 #if defined(LWS_WITH_SYS_METRICS)
-	info.system_ops = &system_ops;
+        info.system_ops = &system_ops;
 #endif
+        if (lws_cmdline_option(argc, argv, "--cpd-bypass")) {
+#if defined(LWS_WITH_SYS_METRICS)
+                system_ops.captive_portal_detect_request = custom_cpd_bypass;
+#else
+                static lws_system_ops_t sops;
+                sops.captive_portal_detect_request = custom_cpd_bypass;
+                info.system_ops = &sops;
+#endif
+        }
 
-#if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL)
+#if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL) || defined(LWS_WITH_OPENHITLS)
 	/*
 	 * OpenSSL uses the system trust store.  mbedTLS has to be told which
 	 * CA to trust explicitly.
 	 */
 	info.client_ssl_ca_filepath = "./warmcat.com.cer";
 #endif
+
+	/*
+	 * Explicitly trust a CA file, eg, the QUIC interop runner's
+	 * /certs/ca.pem: the peer cert is then verified strictly, which is
+	 * what lets its session go in the session cache for resumption and
+	 * 0-RTT... sessions from -j / -k / -m connections are never cached
+	 */
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_CA_FILE].sw)))
+		info.client_ssl_ca_filepath = p;
 
 	/* vhost option allowing tls session reuse, requires
 	 * LWS_WITH_TLS_SESSIONS build option */
@@ -639,7 +751,64 @@ int main(int argc, const char **argv)
 		 */
 		info.simultaneous_ssl_handshake_restriction = atoi(p);
 
-	context = lws_create_context(&info);
+        if ((p = lws_cmdline_option(argc, argv, "--tls13-ciphers"))) {
+                info.client_tls_1_3_plus_cipher_list = p;
+                info.client_ssl_cipher_list = p;
+        }
+        
+        // lwsl_notice("AGY-DEBUG: minimal: before TESTCASE check, client_ssl_cipher_list is '%s'\n", info.client_ssl_cipher_list ? info.client_ssl_cipher_list : "NULL");
+
+        const char *testcase = getenv("TESTCASE");
+        if (testcase && !strcmp(testcase, "chacha20")) {
+#if defined(LWS_WITH_GNUTLS)
+                info.client_tls_1_3_plus_cipher_list = "NORMAL:-CIPHER-ALL:-AES-256-GCM:-AES-128-GCM:-AES-128-CCM:-AES-128-CCM-8:+CHACHA20-POLY1305";
+                info.client_ssl_cipher_list = "NORMAL:-CIPHER-ALL:-AES-256-GCM:-AES-128-GCM:-AES-128-CCM:-AES-128-CCM-8:+CHACHA20-POLY1305";
+#else
+                info.client_tls_1_3_plus_cipher_list = "TLS_CHACHA20_POLY1305_SHA256";
+                info.client_ssl_cipher_list = "TLS_CHACHA20_POLY1305_SHA256";
+#endif
+        }
+
+        if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_QUIC_INITIAL_CWND].sw))) {
+                int val = atoi(p);
+                if (val > 0)
+                        info.quic_initial_cwnd = (uint32_t)val;
+        }
+
+#if defined(LWS_WITH_TLS_SESSIONS) && !defined(LWS_WITH_MBEDTLS) && !defined(WIN32)
+        /*
+         * When --0rtt or the QIR harness (TESTCASE=zerortt) is used,
+         * auto-configure the ticket persistence path so that phase 1
+         * saves the ticket and phase 2 can load it and attempt 0-RTT,
+         * provided the caller hasn't already set an explicit path.
+         */
+        if ((info.options & LWS_SERVER_OPTION_ALLOW_EARLY_DATA) ||
+	    (testcase && !strcmp(testcase, "zerortt"))) {
+                if (!save_ticket[0])
+                        lws_strncpy(save_ticket, "./lws_session_ticket",
+                                    sizeof(save_ticket));
+                if (!load_ticket[0])
+                        lws_strncpy(load_ticket, "./lws_session_ticket",
+                                    sizeof(load_ticket));
+                lwsl_notice("%s: early-data/zerortt: ticket path '%s'\n",
+                            __func__, save_ticket);
+                if (!info.quic_initial_cwnd)
+                        info.quic_initial_cwnd = 250000;
+        }
+#endif
+
+        if (lws_cmdline_option(argc, argv, "--quicv2"))
+                info.options |= LWS_SERVER_OPTION_QUIC_LATEST_VERSION;
+
+        if (lws_cmdline_option(argc, argv, "--quic-early-key-update"))
+                info.options |= LWS_SERVER_OPTION_QUIC_EARLY_KEY_UPDATE;
+
+        /* lws_context_info_defaults sets LWS_SERVER_OPTION_EXPLICIT_VHOSTS by default now,
+         * which skips creating the default vhost using our info struct. Clear it so
+         * our TLS cipher overrides are actually used to create the default vhost! */
+        info.options &= ~(uint64_t)LWS_SERVER_OPTION_EXPLICIT_VHOSTS;
+
+        context = lws_create_context(&info);
 	if (!context) {
 		lwsl_err("lws init failed\n");
 		return 1;
@@ -654,9 +823,17 @@ int main(int argc, const char **argv)
 #endif
 
 	i.context = context;
-	i.ssl_connection = LCCSCF_USE_SSL |
-			   LCCSCF_H2_QUIRK_OVERFLOWS_TXCR |
-			   LCCSCF_H2_QUIRK_NGHTTP2_END_STREAM;
+	i.ssl_connection = LCCSCF_USE_SSL | LCCSCF_H2_QUIRK_OVERFLOWS_TXCR | LCCSCF_H2_QUIRK_NGHTTP2_END_STREAM;
+
+	if (lws_cmdline_option(argc, argv, "-j"))
+		i.ssl_connection |= LCCSCF_ALLOW_SELFSIGNED;
+	if (lws_cmdline_option(argc, argv, "-k"))
+		i.ssl_connection |= LCCSCF_ALLOW_INSECURE;
+	if (lws_cmdline_option(argc, argv, "-m"))
+		i.ssl_connection |= LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK;
+	if (lws_cmdline_option(argc, argv, "-e"))
+		i.ssl_connection |= LCCSCF_ALLOW_EXPIRED;
+
 
 	if (lws_cmdline_option(argc, argv, switches[LWS_SW_POST].sw)) {
 		posting = 1;
@@ -674,63 +851,158 @@ int main(int argc, const char **argv)
 	}
 
 #if defined(LWS_WITH_CONMON)
-	if (lws_cmdline_option(argc, argv, switches[LWS_SW_CONMON].sw))
+	if (lws_cmdline_option(argc, argv, "--conmon"))
 		i.ssl_connection |= LCCSCF_CONMON;
 #endif
 
 	/* force h1 even if h2 available */
-	if (lws_cmdline_option(argc, argv, switches[LWS_SW_H1].sw))
+	if (lws_cmdline_option(argc, argv, "--h3")) {
+		i.alpn = "h3";
+		/*
+		 * h3 was explicitly requested: falling back to TCP turns a
+		 * failing QUIC path into a silent success on the wrong
+		 * transport (eg, for interop testing where the result is
+		 * judged by whether h3 worked at all).
+		 */
+		i.disable_h3_fallback = 1;
+#if defined(LWS_WITH_TLS_SESSIONS) && !defined(LWS_WITH_MBEDTLS) && !defined(WIN32)
+		sess_dump_flags = LWS_TLS_SESSION_DUMP_F_QUIC;
+#endif
+	}
+
+	if (lws_cmdline_option(argc, argv, "--quicv2"))
+		info.options |= LWS_SERVER_OPTION_QUIC_LATEST_VERSION;
+	
+	if (lws_cmdline_option(argc, argv, "--quic-early-key-update"))
+		info.options |= LWS_SERVER_OPTION_QUIC_EARLY_KEY_UPDATE;
+
+
+
+	if (lws_cmdline_option(argc, argv, "--h1"))
 		i.alpn = "http/1.1";
 
-	strcpy(urlpath, "/");
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_OUTDIR].sw)))
+		lws_strncpy(out_dir, p, sizeof(out_dir));
 
-	if (lws_cmdline_option(argc, argv, switches[LWS_SW_L].sw)) {
-		i.port = 7681;
-		i.address = "localhost";
-		i.ssl_connection |= LCCSCF_ALLOW_SELFSIGNED;
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_SAVE_TICKET].sw)))
+		lws_strncpy(save_ticket, p, sizeof(save_ticket));
+
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_LOAD_TICKET].sw)))
+		lws_strncpy(load_ticket, p, sizeof(load_ticket));
+
+	/* Parse URLs */
+	count = 0;
+
+	for (int j = 1; j < argc; j++) {
+		if (!strncmp(argv[j], "https://", 8)) {
+			const char *url = argv[j] + 8;
+			const char *slash = strchr(url, '/');
+			const char *colon = strchr(url, ':');
+			
+			if (slash) {
+				lws_strncpy(reqs[count].path, slash, sizeof(reqs[count].path));
+			} else {
+				lws_strncpy(reqs[count].path, "/", sizeof(reqs[count].path));
+			}
+			
+			if (colon && (!slash || colon < slash)) {
+				reqs[count].port = atoi(colon + 1);
+				lws_strncpy(reqs[count].address, url, lws_ptr_diff_size_t(colon, url) + 1);
+			} else {
+				reqs[count].port = 443;
+				if (slash)
+					lws_strncpy(reqs[count].address, url, lws_ptr_diff_size_t(slash, url) + 1);
+				else
+					lws_strncpy(reqs[count].address, url, sizeof(reqs[count].address));
+			}
+			count++;
+			if (count == COUNT) break;
+		}
+	}
+	int default_urls = 0;
+	if (count == 0) {
+		/* Fallback to default */
+		lws_strncpy(reqs[0].address, "libwebsockets.org", sizeof(reqs[0].address));
+		reqs[0].port = 443;
 		if (posting)
-			strcpy(urlpath, "/formtest");
-	} else {
-		i.port = 443;
-		i.address = "libwebsockets.org";
-		if (posting)
-			strcpy(urlpath, "/testserver/formtest");
+			lws_strncpy(reqs[0].path, "/testserver/formtest", sizeof(reqs[0].path));
+		else
+			lws_strncpy(reqs[0].path, "/", sizeof(reqs[0].path));
+		count = 8;
+		default_urls = 1;
+
+		if (lws_cmdline_option(argc, argv, switches[LWS_SW_L].sw)) {
+			reqs[0].port = 7681;
+			lws_strncpy(reqs[0].address, "localhost", sizeof(reqs[0].address));
+			i.ssl_connection |= LCCSCF_ALLOW_SELFSIGNED;
+			if (posting)
+				lws_strncpy(reqs[0].path, "/formtest", sizeof(reqs[0].path));
+		} else if (lws_cmdline_option(argc, argv, "--h3")) {
+			reqs[0].port = 443;
+			lws_strncpy(reqs[0].address, "cloudflare-quic.com", sizeof(reqs[0].address));
+			lws_strncpy(reqs[0].path, "/", sizeof(reqs[0].path));
+		}
+
+		if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_SERVER].sw)))
+			lws_strncpy(reqs[0].address, p, sizeof(reqs[0].address));
+
+		if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_PORT].sw)))
+			reqs[0].port = atoi(p);
+
+		if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_PATH].sw)))
+			lws_strncpy(reqs[0].path, p, sizeof(reqs[0].path));
 	}
 
 	if (lws_cmdline_option(argc, argv, switches[LWS_SW_NO_TLS].sw))
 		i.ssl_connection &= ~(LCCSCF_USE_SSL);
 
-	if (lws_cmdline_option(argc, argv, switches[LWS_SW_N].sw))
-		numbered = 1;
+	if (lws_cmdline_option(argc, argv, "--0rtt") ||
+	    (testcase && !strcmp(testcase, "zerortt")))
+		i.ssl_connection |= LCCSCF_ALLOW_EARLY_DATA;
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_SERVER].sw)))
-		i.address = p;
+	int c_opt = count;
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_C].sw))) {
+		c_opt = atoi(p);
+		if (c_opt > COUNT || c_opt <= 0)
+			c_opt = count;
+	}
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_PORT].sw)))
-		i.port = atoi(p);
+	if (count <= 1 || default_urls) {
+		for (int j = 1; j < c_opt; j++) {
+			reqs[j] = reqs[0];
+		}
+	} else {
+		/* If explicit URLs were provided, don't overwrite them. 
+		 * If -c was larger than the provided URLs, limit it. */
+		c_opt = count;
+	}
+	count = c_opt;
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_PATH].sw)))
-		lws_strncpy(urlpath, p, sizeof(urlpath));
+	if (lws_cmdline_option(argc, argv, switches[LWS_SW_N].sw)) {
+		for (int j = 0; j < count; j++) {
+			lws_snprintf(reqs[j].path, sizeof(reqs[j].path), "/%d.png", j + 1);
+		}
+	}
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_C].sw)))
-		if (atoi(p) <= COUNT && atoi(p))
-			count = atoi(p);
-
-	i.host = i.address;
-	i.origin = i.address;
+	i.host = reqs[0].address;
+	i.origin = reqs[0].address;
 	i.protocol = protocols[0].name;
 
 #if defined(LWS_WITH_TLS_SESSIONS) && !defined(LWS_WITH_MBEDTLS) && !defined(WIN32)
 	/*
 	 * Attempt to preload a session from external storage
 	 */
-	if (lws_tls_session_dump_load(lws_get_vhost_by_name(context, "default"),
-				  i.host, (uint16_t)i.port, sess_load_cb, "/tmp"))
-		lwsl_warn("%s: session load failed\n", __func__);
+	if (load_ticket[0]) {
+		if (lws_tls_session_dump_load_flags(
+				lws_get_vhost_by_name(context, "default"),
+				i.host, (uint16_t)reqs[0].port, sess_dump_flags,
+				sess_load_cb, load_ticket))
+			lwsl_warn("%s: session load failed\n", __func__);
+	}
 #endif
 
 	start = us();
-	while (!intr && !lws_service(context, 0))
+	while (lws_service(context, 0) >= 0)
 		;
 
 #if defined(LWS_WITH_TLS_SESSIONS)
@@ -744,6 +1016,33 @@ int main(int argc, const char **argv)
 #endif
 
 	lwsl_user("Duration: %lldms\n", (us() - start) / 1000);
+
+#if defined(LWS_WITH_TLS_SESSIONS) && !defined(LWS_WITH_MBEDTLS) && !defined(WIN32)
+	/*
+	 * Save TLS session AFTER the event loop, not at ESTABLISHED time.
+	 * The TLS 1.3 NewSessionTicket arrives from the server asynchronously
+	 * after the HTTP response begins.  By the time we reach here the
+	 * session is fully cached in-memory and ready for disk persistence.
+	 * This is especially important for zerortt: phase 2 is a separate
+	 * process and needs the ticket on disk to attempt early data.
+	 */
+	lwsl_user("save_ticket = %s\n", save_ticket);
+	if (save_ticket[0]) {
+		struct lws_vhost *save_vh = lws_get_vhost_by_name(context, "default");
+		if (save_vh) {
+			if (lws_tls_session_dump_save_flags(save_vh, i.host,
+						(uint16_t)reqs[0].port,
+						sess_dump_flags, sess_save_cb,
+						save_ticket))
+				lwsl_warn("%s: deferred session save failed\n",
+					  __func__);
+			else
+				lwsl_notice("%s: session saved to %s\n",
+					    __func__, save_ticket);
+		}
+	}
+#endif
+
 	lws_context_destroy(context);
 
 	lwsl_user("Exiting with %d\n", failed || completed != count);

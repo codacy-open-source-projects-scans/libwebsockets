@@ -29,7 +29,7 @@
 
 #if defined(LWS_WITH_SYS_SMD)
 const lws_ss_policy_t pol_smd = {
-	.flags			= 0, /* have to set something for windows */
+	.streamtype		= LWS_SMD_STREAMTYPENAME,
 };
 #endif
 
@@ -182,12 +182,29 @@ lws_ss_get_metadata(struct lws_ss_handle *h, const char *name,
 
 	n = lws_http_string_to_known_header(name, strlen(name));
 	if (n != LWS_HTTP_NO_KNOWN_HEADER) {
-		*len = (size_t)lws_hdr_total_length(h->wsi, n);
+		const char *hp;
+
+		*len = (size_t)lws_hdr_total_length(h->wsi,
+						    (enum lws_token_indexes)n);
 		if (!*len)
 			goto bail;
-		*value = lws_hdr_simple_ptr(h->wsi, n);
-		if (!*value)
+		hp = lws_hdr_simple_ptr(h->wsi, (enum lws_token_indexes)n);
+		if (!hp)
 			goto bail;
+
+		/*
+		 * The header lives in the wsi's header table, which the
+		 * connection gives up once it has acted on the request: what
+		 * we hand user code must outlive that, so it is copied into
+		 * the handle's arena like a custom header is
+		 */
+		*value = lwsac_use(&h->imd_ac, *len + 1, *len + 1);
+		if (!*value) {
+			lwsl_err("%s ac OOM\n", __func__);
+			return 1;
+		}
+		memcpy((char *)*value, hp, *len);
+		((char *)*value)[*len] = '\0';
 
 		return 0;
 	}
@@ -414,8 +431,8 @@ lws_ss_policy_set(struct lws_context *context, const char *name)
 #if !defined(LWS_WITH_SECURE_STREAMS_STATIC_POLICY_ONLY)
 	struct policy_cb_args *args = (struct policy_cb_args *)context->pol_args;
 	const lws_ss_policy_t *pol;
+	lws_ss_x509_t *x, **px;
 	struct lws_vhost *v;
-	lws_ss_x509_t *x;
 	char buf[16];
 	int m;
 
@@ -429,12 +446,31 @@ lws_ss_policy_set(struct lws_context *context, const char *name)
 
 	lejp_destruct(&args->jctx);
 
+	/*
+	 * The server certs the old policy kept are on server_der_list behind
+	 * the ones the new policy kept, and the objects are in the old
+	 * policy's lwsac that we are about to free... unlink them and free
+	 * their DER, so the list only holds the new policy's
+	 */
+
+	px = &context->server_der_list;
+	while (*px && *px != args->prev_server_der_list)
+		px = &(*px)->next;
+	x = *px;
+	*px = NULL;
+	while (x) {
+		lws_free((void *)x->ca_der);
+		x->ca_der = NULL;
+
+		x = x->next;
+	}
+
 	if (context->ac_policy) {
 		int n;
 
 #if defined(LWS_WITH_SYS_METRICS)
 		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
-					   context->owner_mtr_dynpol.head) {
+					   lws_dll2_get_head(&context->owner_mtr_dynpol)) {
 			lws_metric_policy_dyn_t *dm =
 				lws_container_of(d, lws_metric_policy_dyn_t, list);
 
@@ -487,16 +523,16 @@ lws_ss_policy_set(struct lws_context *context, const char *name)
 		 * short time later, the vhost is actually destroyed.
 		 */
 
-		v = context->vhost_list;
+		v = lws_vhost_first(context);
 		while (v) {
 			if (v->from_ss_policy) {
-				struct lws_vhost *vh = v->vhost_next;
+				struct lws_vhost *vh = lws_vhost_next(v);
 				lwsl_debug("%s: destroying %s\n", __func__, lws_vh_tag(v));
 				lws_vhost_destroy(v);
 				v = vh;
 				continue;
 			}
-			v = v->vhost_next;
+			v = lws_vhost_next(v);
 		}
 	}
 
@@ -544,10 +580,10 @@ lws_ss_policy_set(struct lws_context *context, const char *name)
 	 * which socks5 proxy to use...
 	 */
 
-	v = context->vhost_list;
+	v = lws_vhost_first(context);
 	while (v) {
 		lws_set_socks(v, args->socks5_proxy);
-		v = v->vhost_next;
+		v = lws_vhost_next(v);
 	}
 	if (context->vhost_system)
 		lws_set_socks(context->vhost_system, args->socks5_proxy);

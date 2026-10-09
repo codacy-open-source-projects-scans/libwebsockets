@@ -28,11 +28,11 @@ enum {
 };
 
 static const struct lws_switches switches[] = {
-	[LWS_SW_A]	= { "-a",              "Enable -a feature" },
-	[LWS_SW_C]	= { "-c",              "Client connections" },
+	[LWS_SW_A]	= { "-a",              "With -p, the proxy address to connect to" },
+	[LWS_SW_C]	= { "-c",              "Messages to send before exiting (default 100)" },
 	[LWS_SW_D]	= { "-d",              "Debug logs (e.g. -d 15)" },
-	[LWS_SW_I]	= { "-i",              "Interface to bind to" },
-	[LWS_SW_P]	= { "-p",              "Port number to listen or connect on" },
+	[LWS_SW_I]	= { "-i",              "Proxy UDS path, or with -p the interface to bind to" },
+	[LWS_SW_P]	= { "-p",              "Connect to the proxy on this tcp port" },
 	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
 };
 
@@ -42,7 +42,8 @@ static const struct lws_switches switches[] = {
 #define PKT_SIZE 80
 #define RATE_US 50000
 
-static int interrupted, bad = 1, reads = 100;
+static int bad = 1, reads = 100;
+static struct lws_context *context;
 
 typedef struct myss {
 	struct lws_ss_handle 	*ss;
@@ -74,7 +75,7 @@ txcb(struct lws_sorted_usec_list *sul)
 	 */
 
 	if (m->count == reads) {
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		bad = 0;
 	} else {
 		m->due = 1;
@@ -132,7 +133,7 @@ myss_state(void *userobj, void *sh, lws_ss_constate_t state,
 		break;
 	case LWSSSCS_ALL_RETRIES_FAILED:
 		/* if we're out of retries, we want to close the app and FAIL */
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		break;
 	default:
 		break;
@@ -144,7 +145,7 @@ myss_state(void *userobj, void *sh, lws_ss_constate_t state,
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 static const lws_ss_info_t ssi = {
@@ -159,9 +160,8 @@ static const lws_ss_info_t ssi = {
 
 int main(int argc, const char **argv)
 {
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	int n = 0;
 	struct lws_context_creation_info info;
-	struct lws_context *context;
 	const char *p;
 	(void)switches;
 
@@ -173,19 +173,16 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_C].sw)))
 		reads = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS secure streams client TX [-d<verb>]\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
-
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
-	info.fd_limit_per_thread = 1 + 6 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 6;
 	info.port = CONTEXT_PORT_NO_LISTEN;
 	info.protocols = lws_sspc_protocols;
 	{
@@ -194,7 +191,14 @@ int main(int argc, const char **argv)
 		/* connect to ssproxy via UDS by default, else via
 		 * tcp connection to this port */
 		if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_P].sw)))
-			info.ss_proxy_port = (uint16_t)atoi(p);
+			{
+				int __pt = atoi(p);
+				if (__pt < 0 || __pt > 65535) {
+					lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+					return 1;
+				}
+				info.ss_proxy_port = (uint16_t)__pt;
+			}
 
 		/* UDS "proxy.ss.lws" in abstract namespace, else this socket
 		 * path; when -p given this can specify the network interface
@@ -220,7 +224,7 @@ int main(int argc, const char **argv)
 
 	/* the event loop */
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 bail:

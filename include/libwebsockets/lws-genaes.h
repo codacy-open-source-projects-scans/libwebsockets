@@ -34,8 +34,15 @@
 ///@{
 
 #if defined(LWS_WITH_MBEDTLS)
+#if !defined(LWS_HAVE_MBEDTLS_V4)
 #include <mbedtls/aes.h>
 #include <mbedtls/gcm.h>
+#else
+#include <psa/crypto.h>
+#endif
+#endif
+#if defined(LWS_WITH_OPENHITLS)
+#include <crypt_eal_cipher.h>
 #endif
 
 enum enum_aes_modes {
@@ -67,6 +74,7 @@ enum enum_aes_padding {
 
 struct lws_genaes_ctx {
 #if defined(LWS_WITH_MBEDTLS)
+#if !defined(LWS_HAVE_MBEDTLS_V4)
 	union {
 		mbedtls_aes_context ctx;
 #if defined(MBEDTLS_CIPHER_MODE_XTS)
@@ -74,6 +82,12 @@ struct lws_genaes_ctx {
 #endif
 		mbedtls_gcm_context ctx_gcm;
 	} u;
+#else
+	psa_key_id_t key_id;
+	psa_algorithm_t alg;
+	psa_cipher_operation_t cipher_ctx;
+	psa_aead_operation_t aead_ctx;
+#endif
 #elif defined(LWS_WITH_SCHANNEL)
 	struct {
 		void *hAlg;
@@ -95,12 +109,12 @@ struct lws_genaes_ctx {
 	union {
 		br_aes_ct_cbcenc_keys cbcenc;
 		br_aes_ct_cbcdec_keys cbcdec;
-		br_aes_ct_ctr_keys ctr;
+		br_aes_ct_ctr_keys ctr;		/* GCM's underlying CTR */
+		br_aes_ct_ctrcbc_keys ctrcbc;	/* CTR mode */
 	} u;
 	br_gcm_context gcm;
-	const br_block_cbcenc_class *cbcenc_vtable;
-	const br_block_cbcdec_class *cbcdec_vtable;
-	const br_block_ctr_class *ctr_vtable;
+#elif defined(LWS_WITH_OPENHITLS)
+	CRYPT_EAL_CipherCtx *ctx;
 #else
 	EVP_CIPHER_CTX *ctx;
 	const EVP_CIPHER *cipher;
@@ -184,6 +198,12 @@ lws_genaes_destroy(struct lws_genaes_ctx *ctx, unsigned char *tag, size_t tlen);
  *				   :   input data
  * len				   : first call: add data length, subsequently
  *				   :   input / output length
+ * out				   : first call: NULL, subsequently output data
+ *
+ * The first GCM call is always the additional data pass, even if there is
+ * no additional data (pass in NULL and len 0 then): the payload only goes
+ * in from the second call on.  Pass out as NULL on the first call, some
+ * backends use that to tell the AAD pass apart from a payload one.
  *
  * The length of the optional arg is always 16 if used, regardless of the mode.
  *

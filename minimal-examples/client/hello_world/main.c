@@ -25,11 +25,13 @@
 
 enum {
 	LWS_SW_URL,
+	LWS_SW_POLICY_FILE,
 	LWS_SW_HELP,
 };
 
 static const struct lws_switches switches[] = {
-	[LWS_SW_URL]	= { "--url",           "Enable --url feature" },
+	[LWS_SW_URL]	= { "--url",           "URL to fetch from the default streamtype" },
+	[LWS_SW_POLICY_FILE]	= { "-c",      "Policy JSON file path, overrides the default policy" },
 	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
 };
 
@@ -63,6 +65,12 @@ main(int argc, const char **argv)
 	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	signal(SIGINT, sigint_handler);
 
+	/* if given, -c overrides the default policy with a policy from a
+	 * file, so the same binary can be pointed at a locally-generated
+	 * policy targeting a local test server */
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_POLICY_FILE].sw)))
+		info.pss_policies_json = p;
+
 	p = lws_cmdline_option(argc, argv, switches[LWS_SW_URL].sw);
 	if (p)
 		url = p;
@@ -75,13 +83,12 @@ main(int argc, const char **argv)
 
 	lwsl_cx_user(cx, "LWS hello_world example [-d<verb>]\n");
 
-	if (lws_ss_create(cx, 0, &ssi_hello_world_t, NULL, &h, NULL, NULL)) {
+	/* the url is given to the SS as its opaque user data, so the stream
+	 * can set it as the endpoint metadata in LWSSSCS_CREATING, before its
+	 * first tx request tries to connect */
+	if (lws_ss_create(cx, 0, &ssi_hello_world_t, (void *)url, &h, NULL,
+			  NULL)) {
 		lwsl_cx_err(cx, "failed to create SS");
-		goto bail;
-	}
-
-	if (lws_ss_set_metadata(h, "endpoint", url, strlen(url))) {
-		lwsl_err("%s: failed to use metadata %s\n", __func__, url);
 		goto bail;
 	}
 

@@ -182,7 +182,7 @@ lws_struct_sq3_deserialize(sqlite3 *pdb, const char *filter, const char *order,
 			   struct lwsac **ac, int start, int _limit)
 {
 	int limit = _limit < 0 ? -_limit : _limit;
-	char s[768], results[512], where[250];
+	char s[768], results[512], where[512];
 	lws_struct_args_t a;
 	int n, m;
 
@@ -207,7 +207,13 @@ lws_struct_sq3_deserialize(sqlite3 *pdb, const char *filter, const char *order,
 	m = 0;
 	for (n = 0; n < (int)schema->child_map_size; n++)
 		if (!schema->child_map[n].json_only) {
-			if (sizeof(results) - (unsigned int)n - 1 > 3 && m) {
+			/*
+			 * The headroom test has to be against the write offset
+			 * m, not the map index n: lws_snprintf() saturates m at
+			 * sizeof(results) - 1 when it truncates, and n stayed
+			 * small, so these three stores went past results[].
+			 */
+			if (sizeof(results) - (unsigned int)m > 3 && m) {
 				results[m++] = ',';
 				results[m++] = ' ';
 				results[m] = '\0';
@@ -217,13 +223,30 @@ lws_struct_sq3_deserialize(sqlite3 *pdb, const char *filter, const char *order,
 			}
 
 	where[0] = '\0';
-	if (filter)
-		lws_snprintf(where, sizeof(where), " WHERE 1=1 %s", filter);
+	if (filter &&
+	    lws_snprintf(where, sizeof(where), " WHERE 1=1 %s", filter) ==
+							(int)sizeof(where)) {
+		lwsl_err("%s: filter too long\n", __func__);
 
-	lws_snprintf(s, sizeof(s) - 1, "select %s "
+		return -1;
+	}
+
+	/*
+	 * results[] + where[] can exceed s[]; lws_snprintf() truncates
+	 * silently, and a statement truncated at a clause boundary is still
+	 * valid SQL with the row restriction quietly removed.  Never run a
+	 * statement we could not write in full.
+	 */
+
+	if (lws_snprintf(s, sizeof(s) - 1, "select %s "
 		     "from %s %s order by %s %slimit %d OFFSET %d;", results,
 		     schema->colname, where, order,
-		     _limit < 0 ? "desc " : "", limit, start);
+		     _limit < 0 ? "desc " : "", limit, start) ==
+						(int)sizeof(s) - 1) {
+		lwsl_err("%s: statement too long\n", __func__);
+
+		return -1;
+	}
 
 	if (sqlite3_exec(pdb, s, lws_struct_sq3_deser_cb, &a, NULL) != SQLITE_OK) {
 		lwsl_err("%s: %s: fail %s\n", __func__, sqlite3_errmsg(pdb), s);
@@ -497,7 +520,7 @@ lws_struct_sq3_serialize(sqlite3 *pdb, const lws_struct_map_t *schema,
 {
 	uint32_t idx = manual_idx;
 
-	lws_start_foreach_dll(struct lws_dll2 *, p, owner->head) {
+	lws_start_foreach_dll(struct lws_dll2 *, p, lws_dll2_get_head(owner)) {
 		void *item = (void *)((uint8_t *)p - schema->ofs_clist);
 		if (_lws_struct_sq3_ser_one(pdb, schema, idx++, item))
 			return 1;
@@ -556,6 +579,21 @@ lws_struct_sq3_update(sqlite3 *pdb, const char *table,
 			ls_sq3_serialize_col(memb, &map[i], &p, end);
 			break;
 		}
+	}
+
+	/*
+	 * lws_snprintf() saturates p at end when it truncates, so once the
+	 * buffer filled every later append became a silent no-op.  The SET
+	 * list is emitted before the WHERE, so an oversized SET list drops
+	 * the WHERE entirely and what is left can still be valid SQL -- an
+	 * UPDATE that applies to every row in the table.  Fail instead.
+	 */
+
+	if (p >= end - 1) {
+		lwsl_err("%s: statement too long for buffer\n", __func__);
+		free(q);
+
+		return 1;
 	}
 
 	if (sqlite3_exec(pdb, q, NULL, NULL, NULL) != SQLITE_OK) {
@@ -637,6 +675,15 @@ lws_struct_sq3_upsert(sqlite3 *pdb, const char *table,
 		subsequent = 1;
 		p += lws_snprintf(p, lws_ptr_diff_size_t(end, p), "%s=", map[i].colname);
 		ls_sq3_serialize_col((const uint8_t *)data + map[i].ofs, &map[i], &p, end);
+	}
+
+	/* same truncation hazard as lws_struct_sq3_update() above */
+
+	if (p >= end - 1) {
+		lwsl_err("%s: statement too long for buffer\n", __func__);
+		free(q);
+
+		return 1;
 	}
 
 	if (sqlite3_exec(pdb, q, NULL, NULL, NULL) != SQLITE_OK) {

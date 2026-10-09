@@ -61,7 +61,6 @@ struct per_session_data__minimal_pmd_bulk {
 };
 
 struct vhd_minimal_pmd_bulk {
-        int *interrupted;
         /*
          * b0 = 1: test compressible text, = 0: test uncompressible binary
          * b1 = 1: send as a single blob, = 0: send as fragments
@@ -87,7 +86,8 @@ callback_minimal_pmd_bulk(struct lws *wsi, enum lws_callback_reasons reason,
         struct vhd_minimal_pmd_bulk *vhd = (struct vhd_minimal_pmd_bulk *)
                         lws_protocol_vh_priv_get(lws_get_vhost(wsi),
                                 lws_get_protocol(wsi));
-	uint8_t buf[LWS_PRE + MESSAGE_SIZE], *start = &buf[LWS_PRE], *p;
+	uint8_t buf[LWS_PRE + MESSAGE_CHUNK_SIZE];
+	uint8_t *start = &buf[LWS_PRE], *p;
 	enum lws_write_protocol flags;
 	int n, m, olen, amount;
 
@@ -99,10 +99,15 @@ callback_minimal_pmd_bulk(struct lws *wsi, enum lws_callback_reasons reason,
                 if (!vhd)
                         return -1;
 
-                /* get the pointer to "interrupted" we were passed in pvo */
-                vhd->interrupted = (int *)lws_pvo_search(
-                        (const struct lws_protocol_vhost_options *)in,
-                        "interrupted")->value;
+                /*
+                 * Other vhosts than ours also instantiate us with no pvo
+                 * (eg, Secure Streams' "_ss_default" vhost gets all the
+                 * context protocols).  Only our own vhost has the pvo.
+                 */
+
+                if (!in)
+                        break;
+
                 vhd->options = (int *)lws_pvo_search(
                         (const struct lws_protocol_vhost_options *)in,
                         "options")->value;
@@ -122,6 +127,21 @@ callback_minimal_pmd_bulk(struct lws *wsi, enum lws_callback_reasons reason,
 		if ((*vhd->options) & 2) {
 			amount = MESSAGE_SIZE;
 			lwsl_user("(writing as one blob of %d)\n", amount);
+
+			/*
+			 * For the whole-message-in-one-call case, show the
+			 * lws_write() contract explicitly: the buffer only
+			 * has to stay valid until lws_write() returns.  With
+			 * permessage-deflate the library may still be
+			 * deflating the tail of it in later service
+			 * iterations, so it takes its own copy of anything it
+			 * still needs.
+			 */
+
+			start = malloc((size_t)(LWS_PRE + MESSAGE_SIZE));
+			if (!start)
+				return -1;
+			start += LWS_PRE;
 		}
 
 		/* fill up one chunk's worth of message content */
@@ -161,6 +181,8 @@ callback_minimal_pmd_bulk(struct lws *wsi, enum lws_callback_reasons reason,
 		n = lws_ptr_diff(p, start);
 		m = lws_write(wsi, start, (unsigned int)n, flags);
 		lwsl_user("LWS_CALLBACK_SERVER_WRITEABLE: wrote %d\n", n);
+		if (start != &buf[LWS_PRE])
+			free(start - LWS_PRE);
 		if (m < n) {
 			lwsl_err("ERROR %d / %d writing ws\n", m, n);
 			return -1;
@@ -173,6 +195,22 @@ callback_minimal_pmd_bulk(struct lws *wsi, enum lws_callback_reasons reason,
 		lwsl_user("LWS_CALLBACK_RECEIVE: %4d (pss->pos=%d, rpp %5d, last %d)\n",
 				(int)len, (int)pss->position_rx, (int)lws_remaining_packet_payload(wsi),
 				lws_is_final_fragment(wsi));
+
+		/*
+		 * The final fragment indication has to agree with where the
+		 * message content actually ends... with compression, one ws
+		 * frame may be delivered to us in several callbacks and the
+		 * final indication must only appear on the last one
+		 */
+
+		if (lws_is_final_fragment(wsi) !=
+		    !!(pss->position_rx + (int)len == MESSAGE_SIZE)) {
+			lwsl_user("final fragment indicated %s the message end\n",
+				  lws_is_final_fragment(wsi) ?
+					  "before" : "without reaching");
+			return -1;
+		}
+
 		olen = (int)len;
 
 		if (*vhd->options & 1) {

@@ -27,7 +27,7 @@
 #include <tchar.h>
 #include <stdio.h>
 #include <strsafe.h>
-#include <Psapi.h>
+#include <psapi.h>
 
 #ifndef EXTENDED_STARTUPINFO_PRESENT
 #define EXTENDED_STARTUPINFO_PRESENT 0x00080000
@@ -35,6 +35,10 @@
 
 #ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
 #define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 0x00020016
+#endif
+
+#ifndef PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+#define PROC_THREAD_ATTRIBUTE_HANDLE_LIST 0x00020002
 #endif
 
 typedef VOID* HPCON;
@@ -84,7 +88,7 @@ lws_create_basic_wsi(struct lws_context *context, int tsi,
 	struct lws_context_per_thread *pt = &context->pt[tsi];
 	struct lws *new_wsi;
 
-	if (!context->vhost_list)
+	if(lws_dll2_is_empty(&context->vhost_list_owner))
 		return NULL;
 
 	if ((unsigned int)context->pt[tsi].fds_count ==
@@ -105,10 +109,9 @@ lws_create_basic_wsi(struct lws_context *context, int tsi,
 
 	/* initialize the instance struct */
 
-	lws_role_transition(new_wsi, 0, LRS_ESTABLISHED, ops);
+	lws_wsi_event_role(new_wsi, LWS_WSIEV_ADOPTED, ops);
 
-	new_wsi->hdr_parsing_completed = 0;
-	new_wsi->position_in_fds_table = LWS_NO_FDS_POS;
+	new_wsi->io->position_in_fds_table = LWS_NO_FDS_POS;
 
 	/*
 	 * these can only be set once the protocol is known
@@ -118,7 +121,7 @@ lws_create_basic_wsi(struct lws_context *context, int tsi,
 	 */
 
 	new_wsi->user_space = NULL;
-	new_wsi->desc.sockfd = LWS_SOCK_INVALID;
+	new_wsi->io->desc.sockfd = LWS_SOCK_INVALID;
 
 	return new_wsi;
 }
@@ -132,6 +135,21 @@ lws_spawn_piped_destroy(struct lws_spawn_piped **_lsp)
 
 	if (!lsp)
 		return;
+
+	/*
+	 * Take the caller's pointer away and mark us underway before doing
+	 * anything.  The stdwsi closes below are synchronous, and freeing the
+	 * last stdwsi can complete a deferred vhost destruction re-entrantly,
+	 * issuing PROTOCOL_DESTROY and with it a nested destroy attempt on
+	 * this same lsp; it must see this stuff already cleared and leave the
+	 * outer call to finish and free lsp
+	 */
+	*_lsp = NULL;
+
+	if (lsp->destroying)
+		return;
+
+	lsp->destroying = 1;
 
 	if (lsp->hJob) {
 		CloseHandle(lsp->hJob);
@@ -149,32 +167,47 @@ lws_spawn_piped_destroy(struct lws_spawn_piped **_lsp)
 		lsp->hPC = NULL;
 	}
 
-	for (n = 0; n < 3; n++) {
-		if (lsp->pipe_fds[n][!!(n == 0)]) {
+	/* close our side of the pipes: stdin:w, stdout:r, stderr:r */
+
+	for (n = 0; n < 3; n++)
+		if (lsp->pipe_fds[n][n == 0]) {
 			CloseHandle(lsp->pipe_fds[n][n == 0]);
 			lsp->pipe_fds[n][n == 0] = NULL;
 		}
 
-		for (n = 0; n < 3; n++) {
-			if (lsp->stdwsi[n]) {
-				lwsl_notice("%s: closing stdwsi %d\n", __func__, n);
-				wsi = lsp->stdwsi[n];
-				lsp->stdwsi[n]->desc.filefd = NULL;
-				lsp->stdwsi[n] = NULL;
-				lws_set_timeout(wsi, 1, LWS_TO_KILL_SYNC);
-			}
-		}
+	for (n = 0; n < 3; n++) {
+		if (!lsp->stdwsi[n])
+			continue;
+
+		lwsl_notice("%s: closing stdwsi %d\n", __func__, n);
+		wsi = lsp->stdwsi[n];
+		/* we closed the pipe above; stop the wsi close doing it again */
+		wsi->io->desc.filefd = NULL;
+		/*
+		 * Close synchronously; lws_spawn_stdwsi_closed() is called
+		 * back during this and clears lsp->stdwsi[n] itself if it
+		 * identifies us
+		 */
+		lws_set_timeout(wsi, 1, LWS_TO_KILL_SYNC);
+		if (lsp->stdwsi[n] == wsi)
+			lsp->stdwsi[n] = NULL;
 	}
 
 	lws_dll2_remove(&lsp->dll);
 
+	/* in case anything got scheduled again during the closes above */
 	lws_sul_cancel(&lsp->sul);
 	lws_sul_cancel(&lsp->sul_reap);
 	lws_sul_cancel(&lsp->sul_poll);
 
+	if (lsp->child_pid) {
+		CloseHandle(lsp->child_pid);
+		lsp->child_pid = NULL;
+	}
+
 	lwsl_warn("%s: deleting lsp\n", __func__);
 
-	lws_free_set_NULL((*_lsp));
+	lws_free(lsp);
 }
 
 int
@@ -269,6 +302,7 @@ lws_spawn_reap(struct lws_spawn_piped *lsp)
 
 	lsi.retcode = 0x10000 | (int)ex;
 	lwsl_notice("%s: process exit 0x%x\n", __func__, lsi.retcode);
+	CloseHandle(lsp->child_pid);
 	lsp->child_pid = NULL;
 
 	if (lsp->info.res)
@@ -299,13 +333,33 @@ lws_spawn_piped_kill_child_process(struct lws_spawn_piped *lsp)
 
 	lsp->ungraceful = 1; /* don't wait for flushing, just kill it */
 
-	lwsl_warn("%s: calling TerminateProcess on child pid\n", __func__);
+	lwsl_info("%s: calling TerminateProcess on child pid\n", __func__);
        if (!TerminateProcess(lsp->child_pid, 252)) {
                lwsl_warn("%s: TerminateProcess failed: 0x%lx\n", __func__, (unsigned long)GetLastError());
                return 0;
        }
 
 	return 0;
+}
+
+/*
+ * The stdwsi have a pipe HANDLE rather than a POSIX fd, so the protocol
+ * callback cannot read the data himself on Windows.  We are the only one
+ * who knows the handle, so read what is available (the pipes are
+ * PIPE_NOWAIT) and pass it to the protocol callback in `in` / `len`, the
+ * same shape as an LWS_CALLBACK_RAW_RX delivery.
+ */
+static void
+spawn_pipe_deliver(struct lws *wsi, HANDLE h)
+{
+	char buf[4096];
+	DWORD br = 0;
+
+	if (!ReadFile(h, buf, (DWORD)sizeof(buf), &br, NULL) || !br)
+		return;
+
+	wsi->a.protocol->callback(wsi, LWS_CALLBACK_RAW_RX_FILE,
+				  wsi->user_space, buf, (size_t)br);
 }
 
 static void
@@ -325,73 +379,220 @@ windows_pipe_poll_hack(lws_sorted_usec_list_t *sul)
 	lws_sul_schedule(lsp->context, 0, &lsp->sul_poll,
 			 windows_pipe_poll_hack, 50 * LWS_US_PER_MS);
 
+	if (lsp->child_pid) {
+		DWORD ex = STILL_ACTIVE;
+		if (GetExitCodeProcess(lsp->child_pid, &ex) && ex != STILL_ACTIVE) {
+			if (lsp->hPC) {
+				HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+				PFN_CLOSE_PSEUDO_CONSOLE pClosePseudoConsole = NULL;
+				if (hKernel32) {
+					pClosePseudoConsole = (PFN_CLOSE_PSEUDO_CONSOLE)GetProcAddress(hKernel32, "ClosePseudoConsole");
+					if (pClosePseudoConsole)
+						pClosePseudoConsole(lsp->hPC);
+				}
+				lsp->hPC = NULL;
+			}
+		}
+	}
+
 	wsi = lsp->stdwsi[LWS_STDOUT];
 	wsi1 = lsp->stdwsi[LWS_STDERR];
 	if (wsi && lsp->pipe_fds[LWS_STDOUT][0] != NULL) {
 		if (!PeekNamedPipe(lsp->pipe_fds[LWS_STDOUT][0], &c, 1, &br,
 				   NULL, NULL)) {
+			struct lws *wsi2 = lsp->stdwsi[LWS_STDIN];
 
 			// lwsl_notice("%s: stdout pipe errored\n", __func__);
-			CloseHandle(lsp->stdwsi[LWS_STDOUT]->desc.filefd);
-			lsp->pipe_fds[LWS_STDOUT][0] = NULL;
-			lsp->stdwsi[LWS_STDOUT]->desc.filefd = NULL;
-			lsp->stdwsi[LWS_STDOUT] = NULL;
-			lws_set_timeout(wsi, 1, LWS_TO_KILL_SYNC);
-
-			if (lsp->stdwsi[LWS_STDIN]) {
-                               lwsl_info("%s: closing stdin from stdout close\n",
-						__func__);
-				CloseHandle(lsp->stdwsi[LWS_STDIN]->desc.filefd);
-				wsi = lsp->stdwsi[LWS_STDIN];
-				lsp->stdwsi[LWS_STDIN]->desc.filefd = NULL;
-				lsp->stdwsi[LWS_STDIN] = NULL;
-				lsp->pipe_fds[LWS_STDIN][1] = NULL;
-				lws_set_timeout(wsi, 1, LWS_TO_KILL_SYNC);
-			}
 
 			/*
-			 * lsp may be destroyed by here... if we wanted to
-			 * handle a still-extant stderr we'll get it next time
+			 * Everything that touches lsp has to happen before
+			 * the synchronous closes, since those reach user code
+			 * that is entitled to destroy the lsp
+			 */
+
+			CloseHandle(wsi->io->desc.filefd);
+			wsi->io->desc.filefd = NULL;
+			lsp->pipe_fds[LWS_STDOUT][0] = NULL;
+			lsp->stdwsi[LWS_STDOUT] = NULL;
+
+			if (wsi2) {
+				lwsl_info("%s: closing stdin from stdout close\n",
+					  __func__);
+				CloseHandle(wsi2->io->desc.filefd);
+				wsi2->io->desc.filefd = NULL;
+				lsp->stdwsi[LWS_STDIN] = NULL;
+				lsp->pipe_fds[LWS_STDIN][1] = NULL;
+			}
+
+			lws_set_timeout(wsi, 1, LWS_TO_KILL_SYNC);
+			if (wsi2)
+				lws_set_timeout(wsi2, 1, LWS_TO_KILL_SYNC);
+
+			/*
+			 * lsp is very possibly destroyed by here... a
+			 * still-extant stderr is handled on the next tick
 			 */
 
 			return;
-		} else
-			if (br)
-				wsi->a.protocol->callback(wsi,
-							LWS_CALLBACK_RAW_RX_FILE,
-							NULL, NULL, 0);
-	}
+		}
 
-	/*
-	 * lsp may have been destroyed above
-	 */
+		if (br) {
+			/*
+			 * This dispatches LWS_CALLBACK_RAW_RX_FILE into user
+			 * or plugin code synchronously, which very commonly
+			 * responds by destroying the lsp (freeing it, and
+			 * closing wsi1 with it).  So it must be the last thing
+			 * we do with either this tick... stderr, if any, is
+			 * picked up on the next one.
+			 */
+
+			spawn_pipe_deliver(wsi, lsp->pipe_fds[LWS_STDOUT][0]);
+
+			return;
+		}
+	}
 
 	if (wsi1 && lsp->pipe_fds[LWS_STDERR][0]) {
 		if (!PeekNamedPipe(lsp->pipe_fds[LWS_STDERR][0], &c, 1, &br,
 				   NULL, NULL)) {
 
                        lwsl_info("%s: stderr pipe errored\n", __func__);
-			CloseHandle(wsi1->desc.filefd);
-			/*
-			 * Assume is stderr still extant on entry, lsp can't
-			 * have been destroyed by stdout/stdin processing
-			 */
-			lsp->stdwsi[LWS_STDERR]->desc.filefd = NULL;
+			CloseHandle(wsi1->io->desc.filefd);
+			wsi1->io->desc.filefd = NULL;
 			lsp->stdwsi[LWS_STDERR] = NULL;
 			lsp->pipe_fds[LWS_STDERR][0] = NULL;
+
 			lws_set_timeout(wsi1, 1, LWS_TO_KILL_SYNC);
+
 			/*
-			 * lsp may have been destroyed above
+			 * lsp may have been destroyed above... nothing may
+			 * touch it after this point
 			 */
-		} else
-			if (br)
-				wsi1->a.protocol->callback(wsi1,
-							LWS_CALLBACK_RAW_RX_FILE,
-							NULL, NULL, 0);
+		} else if (br)
+			spawn_pipe_deliver(wsi1, lsp->pipe_fds[LWS_STDERR][0]);
 	}
 }
 
 
+
+/*
+ * CreateProcess() takes a single command-line string and re-splits it, so the
+ * argv vector has to be re-quoted here or an element containing a space
+ * silently becomes several arguments.  Worse, with lpApplicationName NULL
+ * Windows also guesses at where the program name ends, so an unquoted
+ * "C:\Program Files\x\y.exe" makes it try "C:\Program.exe" first (CWE-428).
+ *
+ * Quote per the CommandLineToArgvW() rules that the CRT's argv parser uses:
+ * everything is wrapped in "", an embedded " becomes \", and a run of
+ * backslashes is doubled only when it is followed by a " (including the
+ * closing one we add).  Returns a heap buffer (CreateProcessA may write to
+ * it), or NULL.
+ */
+
+static char *
+lws_spawn_cmdline(const char * const *argv)
+{
+	size_t size = 1;
+	char *cli, *p;
+	int n;
+
+	for (n = 0; argv[n]; n++)
+		/* worst case: every char doubled, plus "" and a separator */
+		size += (2 * strlen(argv[n])) + 3;
+
+	if (!n)
+		return NULL;
+
+	cli = lws_malloc(size, __func__);
+	if (!cli)
+		return NULL;
+
+	p = cli;
+
+	for (n = 0; argv[n]; n++) {
+		const char *s = argv[n];
+
+		if (n)
+			*p++ = ' ';
+
+		*p++ = '"';
+
+		while (1) {
+			size_t bs = 0;
+
+			while (*s == '\\') {
+				bs++;
+				s++;
+			}
+
+			if (!*s) {
+				/* they precede the closing quote */
+				while (bs--) {
+					*p++ = '\\';
+					*p++ = '\\';
+				}
+				break;
+			}
+
+			if (*s == '"') {
+				while (bs--) {
+					*p++ = '\\';
+					*p++ = '\\';
+				}
+				*p++ = '\\';
+				*p++ = '"';
+			} else {
+				while (bs--)
+					*p++ = '\\';
+				*p++ = *s;
+			}
+
+			s++;
+		}
+
+		*p++ = '"';
+	}
+
+	*p = '\0';
+
+	return cli;
+}
+
+/*
+ * lpEnvironment wants a single block of NUL-separated "NAME=value" strings
+ * terminated by an additional NUL.  Returns NULL if there is no env_array, in
+ * which case the child inherits ours.
+ */
+
+static char *
+lws_spawn_envblock(const char * const *env_array)
+{
+	size_t size = 1;
+	char *eb, *p;
+	int n;
+
+	if (!env_array || !env_array[0])
+		return NULL;
+
+	for (n = 0; env_array[n]; n++)
+		size += strlen(env_array[n]) + 1;
+
+	eb = lws_malloc(size, __func__);
+	if (!eb)
+		return NULL;
+
+	p = eb;
+	for (n = 0; env_array[n]; n++) {
+		size_t l = strlen(env_array[n]) + 1;
+
+		memcpy(p, env_array[n], l);
+		p += l;
+	}
+
+	*p = '\0';
+
+	return eb;
+}
 
 /*
  * Deals with spawning a subprocess and executing it securely with stdin/out/err
@@ -401,20 +602,49 @@ windows_pipe_poll_hack(lws_sorted_usec_list_t *sul)
 struct lws_spawn_piped *
 lws_spawn_piped(const struct lws_spawn_piped_info *i)
 {
-	const struct lws_protocols *pcol = i->vh->context->vhost_list->protocols;
+	const struct lws_protocols *pcol = NULL;
 	struct lws_context *context = i->vh->context;
 	struct lws_spawn_piped *lsp;
+	char *cli = NULL, *envb = NULL;
 	PROCESS_INFORMATION pi;
 	SECURITY_ATTRIBUTES sa;
-	char cli[300], *p;
 	STARTUPINFO si;
 	int n;
 
+	if (i->chroot_path) {
+		/*
+		 * There is no equivalent on this platform; silently ignoring
+		 * a confinement request would be worse than refusing it
+		 */
+		lwsl_err("%s: chroot_path is not supported on windows\n",
+			 __func__);
+
+		return NULL;
+	}
+
 	if (i->protocol_name)
 		pcol = lws_vhost_name_to_protocol(i->vh, i->protocol_name);
+
+	if (!pcol && i->ops)
+		/*
+		 * Spawns that bring their own role ops (eg, CGI) service
+		 * POLLIN themselves and never dispatch through
+		 * wsi->a.protocol->callback, so the first protocol on the
+		 * first vhost is usable for those
+		 */
+		pcol = lws_vhost_first(i->vh->context)->protocols;
+
 	if (!pcol) {
-		lwsl_err("%s: unknown protocol %s\n", __func__,
-			 i->protocol_name ? i->protocol_name : "default");
+		/*
+		 * The first vhost is the internal system vhost, whose [0]
+		 * protocol is async-dns; a callback that ignores
+		 * LWS_CALLBACK_RAW_RX_FILE.  Binding it silently means the
+		 * first thing the child writes to stdout or stderr leaves
+		 * the pipe permanently POLLIN, spinning the event loop at
+		 * 100% CPU forever.
+		 */
+		lwsl_err("%s: no usable protocol for stdio pipes (%s)\n", __func__,
+			 i->protocol_name ? i->protocol_name : "none given");
 
 		return NULL;
 	}
@@ -463,11 +693,19 @@ lws_spawn_piped(const struct lws_spawn_piped_info *i)
 			if (n != LWS_STDIN)
 				SetNamedPipeHandleState(lsp->pipe_fds[n][0], &waitmode, NULL, NULL);
 
-			/* don't inherit the pipe side that belongs to the parent */
+			/*
+			 * Don't inherit the pipe side that belongs to the
+			 * parent.  If this does not take effect, the child
+			 * holds the write end of its own stdin and so never
+			 * sees EOF on it, and hangs forever.
+			 */
 
-			if (!SetHandleInformation(&lsp->pipe_fds[n][!n],
+			if (!SetHandleInformation(lsp->pipe_fds[n][!n],
 						  HANDLE_FLAG_INHERIT, 0)) {
-				// lwsl_info("%s: SetHandleInformation() failed\n", __func__);
+				lwsl_err("%s: SetHandleInformation() failed "
+					 "0x%lx\n", __func__,
+					 (unsigned long)GetLastError());
+				goto bail1;
 			}
 		}
 	}
@@ -485,7 +723,7 @@ lws_spawn_piped(const struct lws_spawn_piped_info *i)
                 __lws_lc_tag(i->vh->context, &i->vh->context->lcg[LWSLCG_WSI],
                 	     &lsp->stdwsi[n]->lc, "nspawn-stdwsi-%d", n);
 
-		lsp->stdwsi[n]->lsp_channel = n;
+		lsp->stdwsi[n]->io->lsp_channel = n;
 		lws_vhost_bind_wsi(i->vh, lsp->stdwsi[n]);
 		lsp->stdwsi[n]->a.protocol = pcol;
 		lsp->stdwsi[n]->a.opaque_user_data = i->opaque;
@@ -493,8 +731,7 @@ lws_spawn_piped(const struct lws_spawn_piped_info *i)
 		if (!lsp->pipe_fds[n][!n])
 			continue;
 
-		lsp->stdwsi[n]->desc.filefd = lsp->pipe_fds[n][!n];
-		lsp->stdwsi[n]->file_desc = 1;
+		lsp->stdwsi[n]->io->desc.filefd = lsp->pipe_fds[n][!n];
 
 		lws_dll2_remove(&lsp->stdwsi[n]->pre_natal);
 
@@ -507,7 +744,7 @@ lws_spawn_piped(const struct lws_spawn_piped_info *i)
 
 		/* read side is 0, stdin we want the write side, others read */
 
-		lsp->stdwsi[n]->desc.filefd = lsp->pipe_fds[n][!!(n == 0)];
+		lsp->stdwsi[n]->io->desc.filefd = lsp->pipe_fds[n][!!(n == 0)];
 		if (fcntl(lsp->pipe_fds[n][!!(n == 0)], F_SETFL, O_NONBLOCK) < 0) {
 			lwsl_err("%s: setting NONBLOCK failed\n", __func__);
 			goto bail2;
@@ -515,17 +752,10 @@ lws_spawn_piped(const struct lws_spawn_piped_info *i)
 #endif
 	}
 
-	for (n = 0; n < 3; n++)
-		if (i->opt_parent) {
-			lsp->stdwsi[n]->parent = i->opt_parent;
-			lsp->stdwsi[n]->sibling_list = i->opt_parent->child_list;
-			i->opt_parent->child_list = lsp->stdwsi[n];
-		}
-
 	// lwsl_notice("%s: pipe handles in %p, out %p, err %p\n", __func__,
-	//	   lsp->stdwsi[LWS_STDIN]->desc.sockfd,
-	//	   lsp->stdwsi[LWS_STDOUT]->desc.sockfd,
-	//	   lsp->stdwsi[LWS_STDERR]->desc.sockfd);
+	//	   lsp->stdwsi[LWS_STDIN]->io->desc.sockfd,
+	//	   lsp->stdwsi[LWS_STDOUT]->io->desc.sockfd,
+	//	   lsp->stdwsi[LWS_STDERR]->io->desc.sockfd);
 
 	/*
 	 * Windows nonblocking pipe handling is a mess that is unable
@@ -539,24 +769,22 @@ lws_spawn_piped(const struct lws_spawn_piped_info *i)
 
 
 	/*
-	 * Windows wants a single string commandline
+	 * Windows wants a single string commandline... quote it properly and
+	 * size the buffer from the arguments, rather than truncate into a
+	 * fixed one (which would hand CreateProcess a mangled program name)
 	 */
-	p = cli;
-	n = 0;
-	while (i->exec_array[n]) {
-		lws_strncpy(p, i->exec_array[n],
-			    sizeof(cli) - lws_ptr_diff(p, cli));
-		if (sizeof(cli) - lws_ptr_diff(p, cli) < 4)
-			break;
-		p += strlen(p);
-		*p++ = ' ';
-		*p = '\0';
-		n++;
+
+	cli = lws_spawn_cmdline(i->exec_array);
+	if (!cli) {
+		lwsl_err("%s: unable to create command line\n", __func__);
+		goto bail3;
 	}
 
-	if (p > cli && p[-1] == ' ')
-		*(--p) = '\0';
-	// puts(cli);
+	envb = lws_spawn_envblock(i->env_array);
+	if (i->env_array && i->env_array[0] && !envb) {
+		lwsl_err("%s: unable to create environment block\n", __func__);
+		goto bail3;
+	}
 
 	STARTUPINFOEXA siex;
 	STARTUPINFOA *psi;
@@ -573,15 +801,15 @@ lws_spawn_piped(const struct lws_spawn_piped_info *i)
 	memset(&si, 0, sizeof(si));
 	memset(&siex, 0, sizeof(siex));
 
-	if (i->pty_mode) {
-		hKernel32 = GetModuleHandleW(L"kernel32.dll");
-		if (hKernel32) {
-			pCreatePseudoConsole = (PFN_CREATE_PSEUDO_CONSOLE)GetProcAddress(hKernel32, "CreatePseudoConsole");
-			pInitializeProcThreadAttributeList = (PFN_INITIALIZE_PROC_THREAD_ATTRIBUTE_LIST)GetProcAddress(hKernel32, "InitializeProcThreadAttributeList");
-			pUpdateProcThreadAttribute = (PFN_UPDATE_PROC_THREAD_ATTRIBUTE)GetProcAddress(hKernel32, "UpdateProcThreadAttribute");
-			pDeleteProcThreadAttributeList = (PFN_DELETE_PROC_THREAD_ATTRIBUTE_LIST)GetProcAddress(hKernel32, "DeleteProcThreadAttributeList");
-		}
+	hKernel32 = GetModuleHandleW(L"kernel32.dll");
+	if (hKernel32) {
+		pCreatePseudoConsole = (PFN_CREATE_PSEUDO_CONSOLE)GetProcAddress(hKernel32, "CreatePseudoConsole");
+		pInitializeProcThreadAttributeList = (PFN_INITIALIZE_PROC_THREAD_ATTRIBUTE_LIST)GetProcAddress(hKernel32, "InitializeProcThreadAttributeList");
+		pUpdateProcThreadAttribute = (PFN_UPDATE_PROC_THREAD_ATTRIBUTE)GetProcAddress(hKernel32, "UpdateProcThreadAttribute");
+		pDeleteProcThreadAttributeList = (PFN_DELETE_PROC_THREAD_ATTRIBUTE_LIST)GetProcAddress(hKernel32, "DeleteProcThreadAttributeList");
+	}
 
+	if (i->pty_mode) {
 		if (pCreatePseudoConsole && pInitializeProcThreadAttributeList && pUpdateProcThreadAttribute && pDeleteProcThreadAttributeList) {
 			COORD size;
 			size.X = 80;
@@ -606,26 +834,100 @@ lws_spawn_piped(const struct lws_spawn_piped_info *i)
 		psi = (STARTUPINFOA *)&si;
 	}
 
-	psi->hStdInput	= lsp->pipe_fds[LWS_STDIN][0];
-	psi->hStdOutput	= lsp->pipe_fds[LWS_STDOUT][1];
-	psi->hStdError	= lsp->pipe_fds[LWS_STDERR][1];
-	psi->dwFlags	= STARTF_USESTDHANDLES | CREATE_NO_WINDOW;
+	if (!pty_active) {
+		/*
+		 * bInheritHandles must be TRUE for the stdio handles below to
+		 * reach the child, but on its own that duplicates *every*
+		 * inheritable handle in the process into him... including the
+		 * parent ends of any other spawn that is live at the same
+		 * time, letting one child read or corrupt another's stdio.
+		 *
+		 * Restrict the inheritance to just this child's three handles.
+		 */
+
+		if (pInitializeProcThreadAttributeList &&
+		    pUpdateProcThreadAttribute &&
+		    pDeleteProcThreadAttributeList) {
+			HANDLE hl[3];
+
+			hl[0] = lsp->pipe_fds[LWS_STDIN][0];
+			hl[1] = lsp->pipe_fds[LWS_STDOUT][1];
+			hl[2] = lsp->pipe_fds[LWS_STDERR][1];
+
+			pInitializeProcThreadAttributeList(NULL, 1, 0,
+							   &attr_list_size);
+			siex.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)
+					lws_malloc(attr_list_size, "hlattr");
+			if (siex.lpAttributeList &&
+			    pInitializeProcThreadAttributeList(
+					siex.lpAttributeList, 1, 0,
+					&attr_list_size) &&
+			    pUpdateProcThreadAttribute(siex.lpAttributeList, 0,
+					PROC_THREAD_ATTRIBUTE_HANDLE_LIST, hl,
+					sizeof(hl), NULL, NULL)) {
+				siex.StartupInfo.cb = sizeof(siex);
+				psi = (STARTUPINFOA *)&siex;
+				creation_flags |= EXTENDED_STARTUPINFO_PRESENT;
+			} else {
+				lwsl_warn("%s: no handle list: 0x%lx\n",
+					  __func__,
+					  (unsigned long)GetLastError());
+				if (siex.lpAttributeList) {
+					lws_free(siex.lpAttributeList);
+					siex.lpAttributeList = NULL;
+				}
+			}
+		}
+
+		psi->hStdInput	= lsp->pipe_fds[LWS_STDIN][0];
+		psi->hStdOutput	= lsp->pipe_fds[LWS_STDOUT][1];
+		psi->hStdError	= lsp->pipe_fds[LWS_STDERR][1];
+		psi->dwFlags	= STARTF_USESTDHANDLES;
+		creation_flags |= CREATE_NO_WINDOW;
+	}
 	psi->wShowWindow	= TRUE;
 
-	if (!CreateProcessA(NULL, cli, NULL, NULL, TRUE, creation_flags, NULL, NULL, psi, &pi)) {
+	/*
+	 * lpEnvironment NULL would give the child the whole server
+	 * environment (secrets included) and none of the variables the caller
+	 * prepared; lpCurrentDirectory NULL would ignore i->wd
+	 */
+
+	if (!CreateProcessA(NULL, cli, NULL, NULL, TRUE, creation_flags, envb,
+			    i->wd, psi, &pi)) {
 		lwsl_err("%s: CreateProcess failed 0x%lx\n", __func__,
 				(unsigned long)GetLastError());
-		if (pty_active && siex.lpAttributeList) {
+		if (siex.lpAttributeList) {
 			pDeleteProcThreadAttributeList(siex.lpAttributeList);
 			lws_free(siex.lpAttributeList);
+			siex.lpAttributeList = NULL;
 		}
 		goto bail3;
 	}
 
-	if (pty_active && siex.lpAttributeList) {
+	if (siex.lpAttributeList) {
 		pDeleteProcThreadAttributeList(siex.lpAttributeList);
 		lws_free(siex.lpAttributeList);
+		siex.lpAttributeList = NULL;
 	}
+
+	lws_free_set_NULL(cli);
+	if (envb)
+		lws_free_set_NULL(envb);
+
+	/*
+	 * Only now there is a child can the stdwsi become children of the
+	 * opt_parent wsi: the unwinding below frees them directly, and so must
+	 * never find them on its list of children, where its close would walk
+	 * over them after they were freed.
+	 */
+
+	if (i->opt_parent)
+		for (n = 0; n < 3; n++) {
+			lsp->stdwsi[n]->parent = i->opt_parent;
+			lws_dll2_add_head(&lsp->stdwsi[n]->sibling_list,
+					  &i->opt_parent->child_list_owner);
+		}
 
 	lsp->child_pid = pi.hProcess;
 	lsp->hJob = CreateJobObjectW(NULL, NULL);
@@ -642,7 +944,7 @@ lws_spawn_piped(const struct lws_spawn_piped_info *i)
 	ResumeThread(pi.hThread);
 	CloseHandle(pi.hThread);
 
-	lwsl_notice("%s: lsp %p spawned PID %d\n", __func__, lsp, lsp->child_pid);
+	lwsl_notice("%s: lsp %p spawned PID %d\n", __func__, lsp, (int)(intptr_t)lsp->child_pid);
 
 	lws_sul_schedule(context, i->tsi, &lsp->sul, lws_spawn_timeout,
 			 i->timeout_us ? i->timeout_us : 300 * LWS_US_PER_SEC);
@@ -674,20 +976,50 @@ bail3:
 
 	lws_sul_cancel(&lsp->sul_poll);
 
-	while (--n >= 0)
-		__remove_wsi_socket_from_fds(lsp->stdwsi[n]);
+	/*
+	 * Unlike unix, the stdwsi are never inserted into pt->fds here, so
+	 * there is nothing to remove from there; bail2 frees them.  (The old
+	 * code indexed the 3-entry stdwsi[] with the argv element count and
+	 * so passed adjacent pipe HANDLEs as struct lws *.)
+	 */
+
 bail2:
+	/*
+	 * __lws_free_wsi() unbinds the vhost, under the context lock.  The
+	 * stdwsi are nobody's children yet, that waits for the process to
+	 * have been created, so nothing else can be holding on to them.
+	 */
+
+	lws_context_lock(context, __func__);
 	for (n = 0; n < 3; n++)
 		if (lsp->stdwsi[n])
 			__lws_free_wsi(lsp->stdwsi[n]);
+	lws_context_unlock(context);
 
 bail1:
+	/*
+	 * These are HANDLEs, ie pointers: unset ones are NULL, and "NULL >= 0"
+	 * is true, so the old test closed handles that were never created.
+	 * In pty mode, stderr's write end is an alias of stdout's and must not
+	 * be closed twice, the same way the success path above already avoids.
+	 */
+
 	for (n = 0; n < 3; n++) {
-		if (lsp->pipe_fds[n][0] >= 0)
+		if (lsp->pipe_fds[n][0]) {
 			CloseHandle(lsp->pipe_fds[n][0]);
-		if (lsp->pipe_fds[n][1] >= 0)
+			lsp->pipe_fds[n][0] = NULL;
+		}
+		if (lsp->pipe_fds[n][1] &&
+		    (!i->pty_mode || n != LWS_STDERR)) {
 			CloseHandle(lsp->pipe_fds[n][1]);
+			lsp->pipe_fds[n][1] = NULL;
+		}
 	}
+
+	if (cli)
+		lws_free(cli);
+	if (envb)
+		lws_free(envb);
 
 	lws_free(lsp);
 
@@ -717,10 +1049,23 @@ lws_spawn_stdwsi_closed(struct lws_spawn_piped *lsp, struct lws *wsi)
 {
 	int n;
 
-	assert(lsp);
+	/*
+	 * A protocol handler that finds its lsp through the pointer it gave
+	 * as info.plsp gets NULL here when the close is the one issued by
+	 * lws_spawn_piped_destroy() itself: that clears the pointer before
+	 * closing the stdwsi synchronously, and clears lsp->stdwsi[] itself
+	 * afterwards.  Nothing to do then.
+	 *
+	 * (A wsi not found in lsp->stdwsi[] below is a different case and
+	 * must still count: the pipe poll hack clears the slot before it
+	 * closes the wsi, and the reap depends on pipes_alive reaching 0.)
+	 */
+	if (!lsp)
+		return 0;
+
 	lsp->pipes_alive--;
        lwsl_wsi_warn(wsi, "stdxxx down: pipes alive %d\n", lsp->pipes_alive);
-       if (!lsp->pipes_alive) {
+       if (!lsp->pipes_alive && !lsp->destroying) {
                lwsl_wsi_warn(wsi, "Scheduling reap");
 		lws_sul_schedule(lsp->info.vh->context, lsp->info.tsi,
 				&lsp->sul_reap, lws_spawn_sul_reap, 1);
@@ -747,15 +1092,15 @@ lws_spawn_cgroup_admin_init(const char *toplevel_name, const char *username, con
 int
 lws_spawn_get_stdfd(struct lws *wsi)
 {
-	return wsi->lsp_channel;
+	return wsi->io->lsp_channel;
 }
 
-int
+lws_filefd_type
 lws_spawn_get_fd_stdxxx(struct lws_spawn_piped *lsp, int std_idx)
 {
 	assert(std_idx >= 0 && std_idx < 3);
 
-	return (int)(intptr_t)lsp->pipe_fds[std_idx][!!(std_idx == 0)];
+	return (lws_filefd_type)lsp->pipe_fds[std_idx][!!(std_idx == 0)];
 }
 
 int

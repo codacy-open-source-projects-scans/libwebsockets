@@ -67,8 +67,9 @@ struct vhd_minimal_pmd_bulk {
 
 	lws_sorted_usec_list_t sul;
 
-	int *interrupted;
+	int *result;
 	int *options;
+	int port;
 };
 
 static uint64_t rng(uint64_t *r)
@@ -90,7 +91,7 @@ sul_connect_attempt(struct lws_sorted_usec_list *sul)
 	memset(&i, 0, sizeof(i));
 
 	i.context = vhd->context;
-	i.port = 7681;
+	i.port = vhd->port;
 	i.address = "localhost";
 	i.path = "/";
 	i.host = i.address;
@@ -127,16 +128,41 @@ callback_minimal_pmd_bulk(struct lws *wsi, enum lws_callback_reasons reason,
 		if (!vhd)
 			return -1;
 
+		vhd->port = 7681;
+
+		/*
+		 * Other vhosts than ours also instantiate us with no pvo
+		 * (eg, Secure Streams' "_ss_default" vhost gets all the
+		 * context protocols).  Only our own vhost has the pvo.
+		 */
+
+		if (!in)
+			break;
+
 		vhd->context = lws_get_context(wsi);
 		vhd->vhost = lws_get_vhost(wsi);
 
-		/* get the pointer to "interrupted" we were passed in pvo */
-		vhd->interrupted = (int *)lws_pvo_search(
+		/* get the pointer to "result" we were passed in pvo */
+		vhd->result = (int *)lws_pvo_search(
 			(const struct lws_protocol_vhost_options *)in,
-			"interrupted")->value;
+			"result")->value;
 		vhd->options = (int *)lws_pvo_search(
 			(const struct lws_protocol_vhost_options *)in,
 			"options")->value;
+
+		/*
+		 * the port we were passed in pvo, if given
+		 */
+
+		{
+			const struct lws_protocol_vhost_options *pv =
+				lws_pvo_search(
+				 (const struct lws_protocol_vhost_options *)in,
+				 "port");
+
+			if (pv)
+				vhd->port = *(int *)pv->value;
+		}
 
 		sul_connect_attempt(&vhd->sul);
 		break;
@@ -204,8 +230,10 @@ callback_minimal_pmd_bulk(struct lws *wsi, enum lws_callback_reasons reason,
 			lws_callback_on_writable(wsi);
 		else
 			/* if we sent and received everything */
-			if (pss->position_rx == MESSAGE_SIZE)
-				*vhd->interrupted = 2;
+			if (pss->position_rx == MESSAGE_SIZE) {
+				*vhd->result = 2;
+				lws_default_loop_exit(lws_get_context(wsi));
+			}
 		break;
 
 	case LWS_CALLBACK_CLIENT_RECEIVE:
@@ -217,6 +245,21 @@ callback_minimal_pmd_bulk(struct lws *wsi, enum lws_callback_reasons reason,
 		lwsl_user("LWS_CALLBACK_CLIENT_RECEIVE: %4d (rpp %5d, last %d)\n",
 			(int)len, (int)lws_remaining_packet_payload(wsi),
 			lws_is_final_fragment(wsi));
+
+		/*
+		 * The final fragment indication has to agree with where the
+		 * message content actually ends... with compression, one ws
+		 * frame may be delivered to us in several callbacks and the
+		 * final indication must only appear on the last one
+		 */
+
+		if (lws_is_final_fragment(wsi) !=
+		    !!(pss->position_rx + (int)len == MESSAGE_SIZE)) {
+			lwsl_user("final fragment indicated %s the message end\n",
+				  lws_is_final_fragment(wsi) ?
+					  "before" : "without reaching");
+			return -1;
+		}
 
 		if (*vhd->options & 1) {
 			while (len) {
@@ -247,8 +290,10 @@ callback_minimal_pmd_bulk(struct lws *wsi, enum lws_callback_reasons reason,
 		/* if we sent and received everything */
 
 		if (pss->position_rx == MESSAGE_SIZE &&
-		    pss->position_tx == MESSAGE_SIZE)
-			*vhd->interrupted = 2;
+		    pss->position_tx == MESSAGE_SIZE) {
+			*vhd->result = 2;
+			lws_default_loop_exit(lws_get_context(wsi));
+		}
 
 		break;
 

@@ -12,7 +12,8 @@
 extern int
 avs_example_start(struct lws_context *context);
 
-int interrupted, tests_bad = 1;
+int tests_bad = 1;
+static struct lws_context *context;
 static lws_state_notify_link_t nl;
 
 static const char *canned_root_token_payload =
@@ -76,7 +77,7 @@ app_system_state_nf(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 static lws_state_notify_link_t * const app_notifier_list[] = {
@@ -86,17 +87,15 @@ static lws_state_notify_link_t * const app_notifier_list[] = {
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	struct lws_context *context;
 	int n = 0;
 
 	signal(SIGINT, sigint_handler);
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	lws_context_info_defaults(&info, NULL);lws_cmdline_option_handle_builtin(argc, argv, &info);
 
 	lwsl_user("LWS secure streams - AVS test client [-d<verb>]\n");
 
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
-	info.fd_limit_per_thread = 1 + 6 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 6;
 	info.protocols = lws_sspc_protocols;
 	info.port = CONTEXT_PORT_NO_LISTEN;
 
@@ -113,7 +112,7 @@ int main(int argc, const char **argv)
 
 	/* the event loop */
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

@@ -28,16 +28,30 @@
 static const uint32_t botable[] = { 300, 500, 700, 1250, 5000
 				/* in case everything just dog slow */ };
 static const lws_retry_bo_t retry_policy = {
-	botable, LWS_ARRAY_SIZE(botable), LWS_RETRY_CONCEAL_ALWAYS,
-	/* don't conceal after the last table entry */ 0, 0, 20 };
+	botable, LWS_ARRAY_SIZE(botable),
+	/*
+	 * conceal_count: don't conceal after the last table entry, ie, the
+	 * query fails once we have been through the backoff table.
+	 * LWS_RETRY_CONCEAL_ALWAYS here (which is what this used to say) makes
+	 * lws_retry_get_delay_ms() conceal forever, since the try counter
+	 * saturates at the same 0xffff it compares against... a query that is
+	 * never answered then retransmits every 5s for the life of the
+	 * process, and a standalone (wsi-less) one is never failed at all.
+	 */
+	LWS_ARRAY_SIZE(botable), 0, 0, 20 };
 
 void
 lws_adns_q_destroy(lws_adns_q_t *q)
 {
 	lws_metrics_caliper_report(q->metcal, (char)q->go_nogo);
 
+#if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
+	lws_adns_dnssec_q_destroy(q);
+#endif
+
 	lws_sul_cancel(&q->sul);
 	lws_sul_cancel(&q->write_sul);
+	lws_sul_cancel(&q->deadline_sul);
 	lws_dll2_remove(&q->list);
 
 	if (q->wsi_tcp) {
@@ -55,6 +69,8 @@ lws_adns_q_destroy(lws_adns_q_t *q)
 		q->firstcache->refcount--;
 		q->firstcache = NULL;
 	}
+
+	lws_free(q);
 }
 
 lws_adns_q_t *
@@ -75,11 +91,28 @@ lws_adns_get_query(lws_async_dns_t *dns, adns_query_type_t qtype,
 		}
 
 		if (name) {
-			int type_match = 0;
-			if (q->qtype == LWS_ADNS_RECORD_A || q->qtype == LWS_ADNS_RECORD_AAAA)
-				type_match = (q->qtype == ((tid & 1) ? LWS_ADNS_RECORD_AAAA : LWS_ADNS_RECORD_A));
+			/* q->qtype only ever holds the RR type, not the
+			 * LWS_ADNS_* option flags the caller may pass */
+			adns_query_type_t qt = (adns_query_type_t)
+							(qtype & 0xffff);
+			int type_match;
+
+			/*
+			 * An address lookup is one query object issuing both
+			 * an A and an AAAA question, so either of those can be
+			 * served by a pending address lookup... but anything
+			 * else must match the type that is actually pending,
+			 * or eg a DNSKEY requester rides on an A query and is
+			 * handed addresses (or, with no wsi to attach, is
+			 * never called back at all).
+			 */
+
+			if (qt == LWS_ADNS_RECORD_A ||
+			    qt == LWS_ADNS_RECORD_AAAA)
+				type_match = q->qtype == LWS_ADNS_RECORD_A ||
+					     q->qtype == LWS_ADNS_RECORD_AAAA;
 			else
-				type_match = (q->qtype == qtype) || (qtype == 0);
+				type_match = !qt || q->qtype == qt;
 
 			if (type_match && !strcasecmp(name, (const char *)&q[1]))
 				return q;
@@ -106,46 +139,101 @@ lws_async_dns_drop_server(lws_async_dns_server_t *dsrv)
 lws_async_dns_retcode_t
 lws_async_dns_complete(lws_adns_q_t *q, lws_adns_cache_t *c)
 {
+	int rc;
 	lws_async_dns_retcode_t ret = LADNS_RET_FOUND;
+	struct lws_dll2 *d;
 
-	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
-				   lws_dll2_get_head(&q->wsi_adns)) {
-		struct lws *w = lws_container_of(d, struct lws, adns);
+	/*
+	 * The requester callbacks are user code (they run the connect flow,
+	 * CLIENT_CONNECTION_ERROR etc); any of them may synchronously close
+	 * a *different* requester wsi piggybacked on this query.  That close
+	 * cancels the wsi's dns wait, which would destroy q outright when it
+	 * sees the last requester go, while we are still iterating q and our
+	 * caller still uses q afterwards.
+	 *
+	 * So: while completing, cancel() detaches the closing wsi but leaves
+	 * q alive; and we never cache a "next" pointer across a callback.
+	 * Each serviced requester is removed from q first, so q's head is
+	 * always an unserviced, still-interested wsi, and wsis freed by other
+	 * callbacks were unlinked from q by their own cancel path.
+	 */
+	/*
+	 * NXDOMAIN is an authoritative statement that the name does not exist,
+	 * tell the requester so distinctly from the resolver having failed to
+	 * answer (LADNS_RET_FAILED), which is what its dns retry budget is for
+	 */
+
+	if (!c)
+		rc = LADNS_RET_FAILED;
+	else if (!c->results && !c->rr_results && c->nxdomain)
+		rc = LADNS_RET_NXDOMAIN;
+	else
+		rc = LADNS_RET_FOUND;
+#if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
+	if (rc >= 0 && q->dnssec_valid) {
+		rc |= LWS_ADNS_DNSSEC_VALID;
+		/* so a later requester served from the cache is told too */
+		if (c) {
+			uint32_t now = (uint32_t)lws_now_secs();
+			lws_usec_t until = 0;
+
+			c->dnssec_valid = 1;
+
+			/*
+			 * ... but only for as long as what we validated is
+			 * valid: the entry's life so far came from the TTL on
+			 * the wire, which no signature covers
+			 */
+			if ((int32_t)(q->dnssec_expires - now) > 0)
+				until = (lws_usec_t)(q->dnssec_expires - now) *
+								LWS_US_PER_SEC;
+			if (c->sul.us - lws_now_usecs() > until)
+				lws_sul_schedule(q->context, 0, &c->sul,
+						 sul_cb_expire, until);
+		}
+	}
+#endif
+
+	q->completing = 1;
+
+	while ((d = lws_dll2_get_head(&q->wsi_adns))) {
+		struct lws *w = lws_container_of(d, struct lws_io_adjunct, adns)->wsi;
 
 		lws_dll2_remove(d);
+
 		if (c && c->results) {
 			lwsl_wsi_debug(w, "q: %p, c: %p, refcount %d -> %d",
-				    q, c, c->refcount, c->refcount + 1);
+				    q, c, (int)c->refcount,
+				    (int)c->refcount + 1);
 			c->refcount++;
 		}
 		lws_set_timeout(w, NO_PENDING_TIMEOUT, 0);
-		if (w->adns_cb(w, (const char *)&q[1], c ? c->results : NULL,
-#if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
-				(c ? 0 : LADNS_RET_FAILED) | (q->dnssec_valid ? LWS_ADNS_DNSSEC_VALID : 0),
-#else
-				(c ? 0 : LADNS_RET_FAILED),
-#endif
-				q->opaque) == NULL) {
+		if (w->io->adns_cb(w, (const char *)&q[1], c ? c->results : NULL,
+			       rc, q->opaque) == NULL) {
 			lwsl_info("%s: failed\n", __func__);
 			ret = LADNS_RET_FAILED_WSI_CLOSED;
 		}
+	}
 
-	} lws_end_foreach_dll_safe(d, d1);
+	/*
+	 * The completing state has to extend over the standalone callback as
+	 * well: it runs user code that may legitimately try to cancel and
+	 * destroy this very query (eg, lws_async_dns_cancel_by_opaque() from
+	 * an opaque that is being freed by the callback itself).  Our caller
+	 * still uses q after we return, so it must stay protected until the
+	 * whole completion is over.
+	 */
 
 	if (q->standalone_cb) {
 		if (c && c->results)
 			c->refcount++;
 
 		if (q->standalone_cb(NULL, (const char *)&q[1],
-				 c ? c->results : NULL,
-#if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
-				 (c ? 0 : LADNS_RET_FAILED) | (q->dnssec_valid ? LWS_ADNS_DNSSEC_VALID : 0),
-#else
-				 (c ? 0 : LADNS_RET_FAILED),
-#endif
-				 q->opaque) == NULL)
+				 c ? c->results : NULL, rc, q->opaque) == NULL)
 			ret = LADNS_RET_FAILED_WSI_CLOSED;
 	}
+
+	q->completing = 0;
 
 	lws_adns_dump(q->dns);
 
@@ -164,6 +252,31 @@ lws_async_dns_sul_cb_retry(struct lws_sorted_usec_list *sul)
 		q->is_retry = 1;
 		lws_callback_on_writable(q->dsrv->wsi);
 	}
+}
+
+static void
+lws_async_dns_sul_cb_deadline(struct lws_sorted_usec_list *sul)
+{
+	lws_adns_q_t *q = lws_container_of(sul, lws_adns_q_t, deadline_sul);
+
+	/*
+	 * Hard backstop on the query lifetime: however it got stuck (a
+	 * resolver that answers nothing, a DNSSEC sub-lookup that never
+	 * completes, a retry policy that conceals more than we expected), it
+	 * may not live forever.  A standalone (wsi-less) query has no
+	 * requester wsi whose own timeout would eventually reap it.
+	 */
+
+	lwsl_cx_notice(q->context, "async dns query %s timed out",
+		       (const char *)&q[1]);
+
+	if (q->firstcache) {
+		lws_adns_cache_destroy(q->firstcache);
+		q->firstcache = NULL;
+	}
+
+	lws_async_dns_complete(q, NULL);
+	lws_adns_q_destroy(q);
 }
 
 static void
@@ -221,14 +334,30 @@ lws_async_dns_writeable(struct lws *wsi, lws_adns_q_t *q)
 	memset(p, 0, DHO_SIZEOF);
 
 #if defined(LWS_WITH_IPV6)
+	/*
+	 * This covers both dual-stack and IPv6-only builds: we want results
+	 * for A and AAAA before we consider the query complete (asked = 3).
+	 * In an IPv6-only build, A results are normalized to v4-mapped IPv6
+	 * addresses later, so they remain usable on dual-stack hosts.
+	 */
 	if (q->qtype != LWS_ADNS_RECORD_A && q->qtype != LWS_ADNS_RECORD_AAAA) {
 		which = 0;
 		q->sent[0]++;
 		q->sent[1]++; /* match states to avoid ipv6 duplicate writeable loop */
 		q->asked = 1;
+	} else if (q->ipv4_only && q->qtype == LWS_ADNS_RECORD_A) {
+		which = 0;
+		q->sent[0]++;
+		q->sent[1]++; /* also mark ipv6 state sent to avoid AAAA query */
+		q->asked = 1;
+	} else if (q->ipv6_only && q->qtype == LWS_ADNS_RECORD_A) {
+		which = 1;
+		q->sent[0]++; /* also mark ipv4 state sent to avoid A query */
+		q->sent[1]++;
+		q->asked = 2; /* b1 = the AAAA response is the whole query */
 	} else if (!q->responded) {
 		/* must pick between ipv6 and ipv4 */
-		which = q->sent[0] >= q->sent[1];
+		which = q->sent[0] > q->sent[1];
 		q->sent[which]++;
 		q->asked = 3; /* want results for 4 & 6 before done */
 	} else
@@ -265,6 +394,13 @@ lws_async_dns_writeable(struct lws *wsi, lws_adns_q_t *q)
 	/* start of label-formatted qname */
 
 	pl = p++;
+	*pl = 0; /* terminal length: also covers the empty/root-name case,
+		  * where the do/while below breaks on the first iteration
+		  * (l == 0) before ever writing *pl.  For a non-empty name
+		  * this is overwritten with the first label's length when that
+		  * label completes; for "." / "" it stays 0, which is exactly
+		  * the DNS root label, and avoids sending an uninitialised
+		  * byte in the query (oss-fuzz / valgrind). */
 
 	do {
 		if (*name == '.' || !*name) {
@@ -305,7 +441,7 @@ lws_async_dns_writeable(struct lws *wsi, lws_adns_q_t *q)
 		*p++ = 0; /* Name: root */
 		lws_ser_wu16be(p, 41); /* Type: OPT (41) */
 		p += 2;
-		lws_ser_wu16be(p, LWS_PRE + DNS_PACKET_LEN); /* UDP payload size */
+		lws_ser_wu16be(p, DNS_PACKET_LEN); /* UDP payload size */
 		p += 2;
 		*p++ = 0; /* Extended RCODE */
 		*p++ = 0; /* Version */
@@ -320,13 +456,13 @@ lws_async_dns_writeable(struct lws *wsi, lws_adns_q_t *q)
 	n = lws_ptr_diff(p, pkt + LWS_PRE);
 
 	if (q->broadsiding) {
-		m = wsi->udp ? n : n + 2; /* assume success unless primary fails */
+		m = wsi->io->udp ? n : n + 2; /* assume success unless primary fails */
 		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
 				   lws_dll2_get_head(&q->dns->nameservers)) {
 			lws_async_dns_server_t *s = lws_container_of(d, lws_async_dns_server_t, list);
 			if (s->wsi) {
 				int m2;
-				if (!s->wsi->udp) {
+				if (!s->wsi->io->udp) {
 					lws_ser_wu16be(pkt + LWS_PRE - 2, (uint16_t)n);
 					m2 = lws_write(s->wsi, pkt + LWS_PRE - 2, (unsigned int)n + 2, 0);
 				} else
@@ -337,14 +473,14 @@ lws_async_dns_writeable(struct lws *wsi, lws_adns_q_t *q)
 			}
 		} lws_end_foreach_dll_safe(d, d1);
 	} else {
-		if (!wsi->udp) {
+		if (!wsi->io->udp) {
 			lws_ser_wu16be(pkt + LWS_PRE - 2, (uint16_t)n);
 			m = lws_write(wsi, pkt + LWS_PRE - 2, (unsigned int)n + 2, 0);
 		} else
 			m = lws_write(wsi, pkt + LWS_PRE, (unsigned int)n, 0);
 	}
 
-	if (m != (wsi->udp ? n : n + 2)) {
+	if (m != (wsi->io->udp ? n : n + 2)) {
 		lwsl_wsi_notice(wsi, "dns write failed %d %d errno %d",
 			    m, n, errno);
 		goto qfail;
@@ -384,7 +520,31 @@ callback_async_dns(struct lws *wsi, enum lws_callback_reasons reason,
 {
 	struct lws_async_dns *dns = &(lws_get_context(wsi)->async_dns);
 
-	if (!wsi->udp) {
+	/*
+	 * Only the reasons about one of our own connections, the nameserver's
+	 * UDP wsi or a query's TCP fallback wsi, may look past wsi->a.  The
+	 * others, like PROTOCOL_INIT or EVENT_WAIT_CANCELLED, come with a
+	 * wsi made up for the callback, which on freertos is only a
+	 * struct lws_a on the stack: it has no wsi->io at all.
+	 */
+
+	switch (reason) {
+	case LWS_CALLBACK_RAW_ADOPT:
+	case LWS_CALLBACK_RAW_CONNECTED:
+	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+	case LWS_CALLBACK_RAW_CLOSE:
+	case LWS_CALLBACK_RAW_RX:
+	case LWS_CALLBACK_RAW_WRITEABLE:
+		break;
+	default:
+		return 0;
+	}
+
+	/* a direct query's own socket: its opaque is not a dsrv or a q */
+	if (lws_adns_direct_callback(wsi, reason, in, len))
+		return 0;
+
+	if (!wsi->io->udp) {
 		lws_adns_q_t *q = (lws_adns_q_t *)wsi->a.opaque_user_data;
 
 		if (!q)
@@ -394,8 +554,21 @@ callback_async_dns(struct lws *wsi, enum lws_callback_reasons reason,
 		case LWS_CALLBACK_RAW_CONNECTED:
 			lws_callback_on_writable(wsi);
 			break;
+		case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+			/*
+			 * The TCP fallback attempt could not connect (eg, the
+			 * DNS server doesn't accept TCP).  This is reliably
+			 * delivered to us on the wsi's connect failure path,
+			 * before the wsi is freed; without it q->wsi_tcp would
+			 * dangle at the freed wsi.
+			 */
 		case LWS_CALLBACK_RAW_CLOSE:
+			if (q->wsi_tcp != wsi)
+				/* stale notification for a wsi we already
+				 * disowned */
+				break;
 			q->wsi_tcp = NULL;
+			wsi->a.opaque_user_data = NULL;
 			if (q->go_nogo != METRES_GO) {
 				lws_async_dns_complete(q, NULL);
 				lws_adns_q_destroy(q);
@@ -418,7 +591,7 @@ callback_async_dns(struct lws *wsi, enum lws_callback_reasons reason,
 						}
 						q->has_tcp_len = 1;
 						q->tcp_rx_pos = 0;
-						q->tcp_rx_buf = lws_malloc(q->tcp_rx_len + 1, "adns tcp");
+						q->tcp_rx_buf = lws_malloc((size_t)q->tcp_rx_len + 1, "adns tcp");
 						if (!q->tcp_rx_buf) {
 							lwsl_wsi_err(wsi, "OOM");
 							return -1;
@@ -479,13 +652,41 @@ callback_async_dns(struct lws *wsi, enum lws_callback_reasons reason,
 	case LWS_CALLBACK_RAW_RX:
 		//lwsl_wsi_user(wsi, "LWS_CALLBACK_RAW_RX (%d)", (int)len);
 		// lwsl_hexdump_wsi_notice(wsi, in, len);
+	{
+		/*
+		 * recvfrom() left the datagram's source in wsi->io->udp->sa46,
+		 * which is also where we send to... put the nameserver we
+		 * chose back first, so a foreign datagram cannot redirect our
+		 * queries to whoever sent it.
+		 */
+
+		lws_sockaddr46 src = wsi->io->udp->sa46;
+
+		wsi->io->udp->sa46 = dsrv->sa46;
+
+		/*
+		 * An answer only means anything if it came from the server we
+		 * asked.  The socket is connect()ed to the nameserver on most
+		 * platforms, so the kernel already dropped everything else...
+		 * but that is compiled out on Apple platforms, where without
+		 * this an off-path attacker who can reach our ephemeral port
+		 * only has to guess the tid to poison any name.
+		 */
+
+		if (src.sa4.sin_port != dsrv->sa46.sa4.sin_port ||
+		    lws_sa46_compare_ads(&src, &dsrv->sa46)) {
+			lwsl_wsi_notice(wsi, "dns answer from unexpected source");
+			break;
+		}
+
 		lws_adns_parse_udp(dns, in, len, dsrv);
 		break;
+	}
 
 	case LWS_CALLBACK_RAW_WRITEABLE:
 		//lwsl_wsi_user(wsi, "LWS_CALLBACK_RAW_WRITEABLE");
 		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
-					   dns->waiting.head) {
+					   lws_dll2_get_head(&dns->waiting)) {
 			lws_adns_q_t *q = lws_container_of(d, lws_adns_q_t,
 							   list);
 
@@ -509,7 +710,7 @@ callback_async_dns(struct lws *wsi, enum lws_callback_reasons reason,
 lws_async_dns_server_t *
 __lws_async_dns_server_find_wsi(lws_async_dns_t *dns, struct lws *wsi)
 {
-	lws_start_foreach_dll(struct lws_dll2 *, d, dns->nameservers.head) {
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&dns->nameservers)) {
 		lws_async_dns_server_t *s = lws_container_of(d,
 						lws_async_dns_server_t, list);
 
@@ -523,7 +724,7 @@ __lws_async_dns_server_find_wsi(lws_async_dns_t *dns, struct lws *wsi)
 lws_async_dns_server_t *
 __lws_async_dns_server_find(lws_async_dns_t *dns, const lws_sockaddr46 *sa46)
 {
-	lws_start_foreach_dll(struct lws_dll2 *, d, dns->nameservers.head) {
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&dns->nameservers)) {
 		lws_async_dns_server_t *s = lws_container_of(d,
 						lws_async_dns_server_t, list);
 
@@ -574,7 +775,7 @@ __lws_async_dns_server_destroy(lws_async_dns_server_t *dsrv)
 	if (dsrv->refcount)
 		return;
 
-	dns = (lws_async_dns_t *)dsrv->list.owner;
+	dns = (lws_async_dns_t *)lws_dll2_owner(&dsrv->list);
 
 	if (dns) {
 		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
@@ -648,7 +849,7 @@ lws_async_dns_create_server_wsi(struct lws_context *context)
 	lws_async_dns_t *dns = &context->async_dns;
 	char ads[48];
 
-	if (!context->vhost_list) { /* coverity... system vhost always present */
+	if(lws_dll2_is_empty(&context->vhost_list_owner)) { /* coverity... system vhost always present */
 		lwsl_cx_err(context, "no system vhost");
 		return 1;
 	}
@@ -659,13 +860,18 @@ lws_async_dns_create_server_wsi(struct lws_context *context)
 						lws_async_dns_server_t, list);
 
 		if (!dsrv->wsi) {
-			dsrv->sa46.sa4.sin_port = htons(53);
+			uint16_t port = 53;
+			const char *env_port = getenv("LWS_ASYNCDNS_PORT");
+			if (env_port)
+				port = (uint16_t)atoi(env_port);
+
+			dsrv->sa46.sa4.sin_port = htons(port);
 			lws_sa46_write_numeric_address(&dsrv->sa46,
 						       ads, sizeof(ads));
 
 			/* wsi opaque is the dsrv */
 			dsrv->wsi = lws_create_adopt_udp(
-					context->vhost_list, ads, 53, 0,
+					lws_vhost_first(context), ads, port, 0,
 					lws_async_dns_protocol.name, NULL,
 					NULL, dsrv, &retry_policy, "asyncdns");
 			if (!dsrv->wsi) {
@@ -673,7 +879,19 @@ lws_async_dns_create_server_wsi(struct lws_context *context)
 				return 1;
 			}
 
-			dsrv->wsi->udp->sa46 = dsrv->sa46;
+			/*
+			 * lws_create_adopt_udp() only allocates wsi->io->udp once
+			 * the raw-skt adoption actually completes.  If adoption
+			 * did not complete (eg, the resolved nameserver address
+			 * produced no usable route and the wsi is pending close),
+			 * wsi->io->udp may still be NULL -- don't deref it blindly.
+			 */
+			if (!dsrv->wsi->io->udp) {
+				lwsl_cx_err(context, "adns wsi has no udp");
+				return 1;
+			}
+
+			dsrv->wsi->io->udp->sa46 = dsrv->sa46;
 		}
 
 	} lws_end_foreach_dll_safe(d, d1);
@@ -721,22 +939,57 @@ lws_plat_asyncdns_init(struct lws_context *context, lws_async_dns_t *dns)
 	return s;
 }
 
+#if defined(LWS_WITH_SYS_SMD)
+static int
+lws_adns_smd_cb(void *opaque, lws_smd_class_t _class, lws_usec_t timestamp,
+		void *buf, size_t len);
+static void
+lws_adns_watch_start(struct lws_context *cx);
+#endif
+
 int
 lws_async_dns_init(struct lws_context *context)
 {
 	lws_async_dns_t *dns = &context->async_dns;
 	int n;
 
-	dns->cx = context;
-	const lws_system_ops_t *ops = lws_system_get_ops(context);
-	if (ops) {
-		dns->dnssec_mode = ops->async_dns_dnssec_mode;
-	} else {
-		dns->dnssec_mode = 0;
+	/*
+	 * The lws_system_ops mode is only the default, taken the first time
+	 * we are initialized, which is during lws_create_context(), before
+	 * anyone can have called lws_async_dns_dnssec_set_mode().  We are
+	 * called again for every nameserver reload, including the one the
+	 * SMD watcher triggers on the first service pass, and one a peer can
+	 * provoke by making the servers look dead: taking the ops value again
+	 * then silently put a mode set with the setter, eg, REQUIRE, back to
+	 * OFF.
+	 */
+	if (!dns->cx) {
+		const lws_system_ops_t *ops = lws_system_get_ops(context);
+
+		dns->dnssec_mode = ops ? ops->async_dns_dnssec_mode : 0;
 	}
 
+	dns->cx = context;
+
+#if defined(LWS_WITH_SYS_SMD)
+	/*
+	 * Register the single lws-side SMD consumer of DNS server change
+	 * events before the watcher can produce any, including the gratuitous
+	 * initial report from lws_adns_watch_start() below.
+	 */
+	if (!dns->smd_peer)
+		dns->smd_peer = lws_smd_register(context, context, 0,
+						 LWSSMDCL_DNS,
+						 lws_adns_smd_cb);
+#endif
+
 	n = lws_plat_asyncdns_init(context, dns);
-	if (!dns->nameservers.count) {
+
+#if defined(LWS_WITH_SYS_SMD)
+	lws_adns_watch_start(context);
+#endif
+
+	if (!lws_dll2_count(&dns->nameservers)) {
 		lwsl_cx_warn(context, "no valid dns server, retry");
 
 		return 1;
@@ -756,8 +1009,373 @@ lws_async_dns_server_reload(struct lws_context *context)
 	return lws_async_dns_init(context);
 }
 
+#if defined(LWS_WITH_SYS_SMD)
+
+/*
+ * Platform DNS server change watching
+ *
+ * Platforms expose their effective DNS server list via
+ * lws_plat_asyncdns_get_server() (resolv.conf, android system properties,
+ * macOS dynamic store, windows GetNetworkParams...).  Some platforms can
+ * also tell us when it changed (macOS dynamic store notifications on a
+ * dispatch queue); everywhere else we poll on a sul.
+ *
+ * Either way it comes to the same place: flatten the platform list into a
+ * deterministic string and, if it differs from the last one we published,
+ * send it out on SMD class LWSSMDCL_DNS as JSON like {"ns":["1.1.1.1"]}.
+ *
+ * The SMD message is a trigger for lws_adns_smd_cb() to requery the
+ * platform for the authoritative list and apply it, and an event for user
+ * observers; it's deliberately not the payload the resolver itself consumes
+ * (SMD delivery is best-effort, so the control path must not depend on it).
+ * Equally, we only commit watch_last when we managed to publish, so a
+ * failed send is retried at the next acquisition pass.
+ */
+
+static lws_usec_t
+lws_adns_watch_interval(void)
+{
+#if defined(LWS_HAVE_GETENV)
+	const char *e = getenv("LWS_ASYNCDNS_WATCH_MS");
+#else
+	const char *e = NULL;
+#endif
+	/*
+	 * The interval only bounds worst-case detection latency on platforms
+	 * without push notifications (and retries of unpublished lists); the
+	 * default is set so it's negligible compared to a DNS round trip.
+	 * The LWS_ASYNCDNS_WATCH_MS env override (giving the poll interval in
+	 * ms) is for tests.
+	 */
+
+	if (e && atoi(e) > 0)
+		return (lws_usec_t)atoi(e) * LWS_US_PER_MS;
+
+	return 3 * LWS_US_PER_SEC;
+}
+
+/*
+ * Pull the platform's current effective server list into buf as a
+ * deterministic quoted, comma-separated string like
+ *
+ *   "192.168.1.1","1.1.1.1"
+ *
+ * truncated at entry boundaries if the whole list can't fit.
+ */
+
+static void
+lws_adns_watch_acquire(struct lws_context *cx, char *buf, size_t len)
+{
+	lws_sockaddr46 sa46;
+	size_t used = 0;
+	int idx = 0;
+
+	buf[0] = '\0';
+
+	while (lws_plat_asyncdns_get_server(cx, idx++, &sa46) == 0) {
+		char ads[48];
+		size_t al, need;
+
+		lws_sa46_write_numeric_address(&sa46, ads, sizeof(ads));
+		al = strlen(ads);
+		need = al + 4; /* quotes, comma, NUL */
+
+		if (used + need > len)
+			break;
+
+		if (used)
+			buf[used++] = ',';
+		buf[used++] = '"';
+		memcpy(buf + used, ads, al);
+		used += al;
+		buf[used++] = '"';
+		buf[used] = '\0';
+	}
+}
+
+void
+lws_adns_watch_trigger(struct lws_context *cx)
+{
+	lws_async_dns_t *dns = &cx->async_dns;
+	char buf[LWS_ASYNCDNS_WATCH_BUF];
+
+	if (!dns->watch_started)
+		return;
+
+	lws_adns_watch_acquire(cx, buf, sizeof(buf));
+
+	/*
+	 * On freertos, lws_mutex_lock() is an expression (it returns 0 for
+	 * OK), so the result has to be consumed like smd.c does
+	 */
+
+	if (lws_mutex_lock(dns->lock_watch))
+		return;
+
+	if (!strcmp(buf, dns->watch_last)) {
+		lws_mutex_unlock(dns->lock_watch);
+		return;
+	}
+
+	if (!lws_smd_msg_printf(cx, LWSSMDCL_DNS, "{\"ns\":[%s]}", buf)) {
+		lws_strncpy(dns->watch_last, buf, sizeof(dns->watch_last));
+		lwsl_cx_notice(cx, "platform DNS servers now: {\"ns\":[%s]}",
+				buf);
+	} else
+		lwsl_cx_notice(cx, "unable to publish DNS server list");
+
+	lws_mutex_unlock(dns->lock_watch);
+}
+
+static void
+lws_adns_sul_watch_cb(lws_sorted_usec_list_t *sul)
+{
+	lws_async_dns_t *dns = lws_container_of(sul, lws_async_dns_t, sul_watch);
+
+	lws_adns_watch_trigger(dns->cx);
+	lws_sul_schedule(dns->cx, 0, &dns->sul_watch, lws_adns_sul_watch_cb,
+			 lws_adns_watch_interval());
+}
+
+/*
+ * Boot gate retry: while the LWS_SYSTATE_DNS gate is denying, periodically
+ * run an acquisition pass AND re-attempt the state walk.  The re-attempt is
+ * the critical half: without it, the walk is only retried if a server ever
+ * appears (via the SMD path), so a platform that stays serverless would
+ * hold the context pre-OPERATIONAL forever.
+ */
+
+static void
+lws_adns_sul_gate_cb(lws_sorted_usec_list_t *sul)
+{
+	lws_async_dns_t *dns = lws_container_of(sul, lws_async_dns_t, sul_gate);
+
+	lws_adns_watch_trigger(dns->cx);
+
+#if defined(LWS_WITH_SYS_STATE)
+	if (dns->cx->mgr_system.state < LWS_SYSTATE_OPERATIONAL)
+		lws_state_transition_steps(&dns->cx->mgr_system,
+					   LWS_SYSTATE_OPERATIONAL);
+#endif
+}
+
+/*
+ * Called from the LWS_SYSTATE_DNS gate while it's denying the transition
+ * because we have no servers yet: make sure an acquisition pass and a
+ * transition re-attempt happen soon.
+ */
+
+void
+lws_adns_kick(struct lws_context *cx)
+{
+	if (cx->async_dns.watch_started)
+		lws_sul_schedule(cx, 0, &cx->async_dns.sul_gate,
+				 lws_adns_sul_gate_cb,
+				 250 * LWS_US_PER_MS);
+}
+
+static void
+lws_adns_watch_start(struct lws_context *cx)
+{
+	lws_async_dns_t *dns = &cx->async_dns;
+
+	if (dns->watch_started)
+		return;
+
+	dns->watch_started = 1;
+	lws_mutex_init(dns->lock_watch);
+
+	/*
+	 * Seed the compare cache with what init just acquired and publish the
+	 * initial list gratuitously, so observers get the current state at
+	 * context creation deterministically.
+	 */
+
+	lws_adns_watch_acquire(cx, dns->watch_last,
+			       sizeof(dns->watch_last));
+
+	if (!lws_smd_msg_printf(cx, LWSSMDCL_DNS, "{\"ns\":[%s]}",
+				dns->watch_last))
+		lwsl_cx_notice(cx, "platform DNS servers: {\"ns\":[%s]}",
+				dns->watch_last);
+
+#if defined(__APPLE__)
+	if (lws_plat_asyncdns_watch_start(cx))
+		lwsl_cx_notice(cx, "native DNS watch unavailable, polling");
+#endif
+
+	lws_sul_schedule(cx, 0, &dns->sul_watch, lws_adns_sul_watch_cb,
+			 lws_adns_watch_interval());
+}
+
+/*
+ * Must be called before the context's SMD peers and locks are destroyed.
+ * Stops any platform push watcher, stops the poll sul and drops our SMD
+ * peer registration.
+ */
+
+void
+lws_adns_smd_destroy(struct lws_context *cx)
+{
+	lws_async_dns_t *dns = &cx->async_dns;
+
+	if (!dns->watch_started)
+		return;
+
+	dns->watch_started = 0;
+
+	lws_sul_cancel(&dns->sul_watch);
+	lws_sul_cancel(&dns->sul_gate);
+
+#if defined(__APPLE__)
+	lws_plat_asyncdns_watch_stop(cx);
+#endif
+
+	if (dns->smd_peer) {
+		lws_smd_unregister(dns->smd_peer);
+		dns->smd_peer = NULL;
+	}
+
+	lws_mutex_destroy(dns->lock_watch);
+}
+
+/*
+ * The single lws-side SMD listener for DNS server change events.  The
+ * message body is informational (see lws_adns_watch_trigger()): treat the
+ * event as a trigger to requery the platform and apply whatever we find
+ * there.
+ */
+
+static int
+lws_adns_smd_cb(void *opaque, lws_smd_class_t _class, lws_usec_t timestamp,
+		void *buf, size_t len)
+{
+	struct lws_context *cx = (struct lws_context *)opaque;
+
+	(void)buf;
+	(void)len;
+	(void)timestamp;
+
+	if (_class != LWSSMDCL_DNS)
+		return 0;
+
+	lws_async_dns_server_reload(cx);
+
+#if defined(LWS_WITH_SYS_STATE)
+	/*
+	 * If we were holding the system state at LWS_SYSTATE_DNS waiting for
+	 * a server to appear, try to move on now.
+	 */
+	if (cx->mgr_system.state < LWS_SYSTATE_OPERATIONAL)
+		lws_state_transition_steps(&cx->mgr_system,
+					   LWS_SYSTATE_OPERATIONAL);
+#endif
+
+	return 0;
+}
+
+int
+lws_adns_servers_known(struct lws_context *cx)
+{
+	return !!lws_dll2_count(&cx->async_dns.nameservers);
+}
+
+/*
+ * The LWS_SYSTATE_DNS gate: hold transitions while we have no DNS servers,
+ * so user code waiting for OPERATIONAL can rely on lookups working... but
+ * only for a bounded time.  A platform that never produces a server (an
+ * offline device, a restricted daemon environment, or a discovery source
+ * we can't read) must not wedge the context pre-OPERATIONAL forever; after
+ * the wait we proceed with a notice and the watcher keeps fixing the
+ * server list in the background if one appears later.
+ */
+
+static lws_usec_t
+lws_adns_gate_max_us(void)
+{
+#if defined(LWS_HAVE_GETENV)
+	const char *e = getenv("LWS_ASYNCDNS_GATE_MAX_MS");
+#else
+	const char *e = NULL;
+#endif
+
+	if (e && atoi(e) > 0)
+		return (lws_usec_t)atoi(e) * LWS_US_PER_MS;
+
+	return 10 * LWS_US_PER_SEC;
+}
+
+int
+lws_adns_gate_ok(struct lws_context *cx)
+{
+	lws_async_dns_t *dns = &cx->async_dns;
+	lws_usec_t now;
+
+	if (lws_adns_servers_known(cx))
+		return 1;
+
+	now = lws_now_usecs();
+
+	if (!dns->time_gate_first) {
+		dns->time_gate_first = now;
+
+		return 0;
+	}
+
+	if (now - dns->time_gate_first > lws_adns_gate_max_us()) {
+		lwsl_cx_notice(cx,
+			"no platform DNS servers after %dms, proceeding",
+			(int)(lws_adns_gate_max_us() / LWS_US_PER_MS));
+
+		return 1;
+	}
+
+	return 0;
+}
+
+#else /* no SMD */
+
+int
+lws_adns_servers_known(struct lws_context *cx)
+{
+	(void)cx;
+
+	return 1;
+}
+
+int
+lws_adns_gate_ok(struct lws_context *cx)
+{
+	(void)cx;
+
+	return 1;
+}
+
+void
+lws_adns_kick(struct lws_context *cx)
+{
+	(void)cx;
+}
+
+void
+lws_adns_smd_destroy(struct lws_context *cx)
+{
+	(void)cx;
+}
+
+#endif
+
+/*
+ * Find a completed cache entry for \p name that holds records of \p qtype
+ * (for A or AAAA, addresses).  The cache may hold several entries for one
+ * name, eg, its A records and its DNSKEY RRset, or the same records from a
+ * query that validated them and from one that didn't; if \p need_valid, only
+ * an entry whose query validated it will do.
+ */
+
 lws_adns_cache_t *
-lws_adns_get_cache(lws_async_dns_t *dns, const char *name)
+lws_adns_get_cache(lws_async_dns_t *dns, const char *name, uint16_t qtype,
+		   int need_valid)
 {
 	lws_adns_cache_t *c;
 
@@ -768,11 +1386,28 @@ lws_adns_get_cache(lws_async_dns_t *dns, const char *name)
 
 	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
 				   lws_dll2_get_head(&dns->cached)) {
+		lws_adns_rr_t *rr;
+		int found = 0;
+
 		c = lws_container_of(d, lws_adns_cache_t, list);
 
-		// lwsl_wsi_notice(dns->wsi, "%s vs %s (inc %d)", name, c->name, c->incomplete);
+		if (c->incomplete || strcasecmp(name, c->name))
+			continue;
 
-		if (!c->incomplete && !strcasecmp(name, c->name)) {
+#if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
+		if (need_valid && !c->dnssec_valid)
+			continue;
+#else
+		(void)need_valid;
+#endif
+
+		if (qtype == LWS_ADNS_RECORD_A || qtype == LWS_ADNS_RECORD_AAAA)
+			found = !!c->results;
+		else
+			for (rr = c->rr_results; rr && !found; rr = rr->next)
+				found = rr->type == qtype;
+
+		if (found) {
 			/* Keep sorted by LRU: move to the head */
 			lws_dll2_remove(&c->list);
 			lws_dll2_add_head(&c->list, &dns->cached);
@@ -789,7 +1424,8 @@ lws_adns_get_cache(lws_async_dns_t *dns, const char *name)
 void
 lws_adns_server_dump(lws_async_dns_server_t *dsrv)
 {
-	lws_async_dns_t *dns = (lws_async_dns_t *)dsrv->list.owner;
+#if (_LWS_ENABLED_LOGS & LLL_INFO)
+	lws_async_dns_t *dns = (lws_async_dns_t *)lws_dll2_owner(&dsrv->list);
 	char ads[64];
 
 	lws_sa46_write_numeric_address(&dsrv->sa46, ads, sizeof(ads));
@@ -803,11 +1439,13 @@ lws_adns_server_dump(lws_async_dns_server_t *dsrv)
 				      (const char *)&q[1], q->sent[0], q->responded,
 				      q->broadsiding ? " (broadsiding)" : "");
 	} lws_end_foreach_dll(d);
+#endif
 }
 
 void
 lws_adns_dump(lws_async_dns_t *dns)
 {
+#if (_LWS_ENABLED_LOGS & LLL_INFO)
 	lws_async_dns_server_t *dsrv;
 	lws_adns_cache_t *c;
 
@@ -815,7 +1453,7 @@ lws_adns_dump(lws_async_dns_t *dns)
 		return;
 
 	lwsl_cx_info(dns->cx, "ADNS cache %u entries",
-			(unsigned int)dns->cached.count);
+			(unsigned int)lws_dll2_count(&dns->cached));
 
 	lws_start_foreach_dll(struct lws_dll2 *, d,
 			      lws_dll2_get_head(&dns->cached)) {
@@ -824,7 +1462,8 @@ lws_adns_dump(lws_async_dns_t *dns)
 		lwsl_cx_info(dns->cx, "cache: '%s', exp: %lldus, incomp %d, "
 			  "fl 0x%x, refc %d, res %p\n", c->name,
 			  (long long)(c->sul.us - lws_now_usecs()),
-			  c->incomplete, c->flags, c->refcount, c->results);
+			  c->incomplete, c->flags, (int)c->refcount,
+			  c->results);
 	} lws_end_foreach_dll(d);
 
 	lws_start_foreach_dll(struct lws_dll2 *, d,
@@ -832,6 +1471,7 @@ lws_adns_dump(lws_async_dns_t *dns)
 		dsrv = lws_container_of(d, lws_async_dns_server_t, list);
 		lws_adns_server_dump(dsrv);
 	} lws_end_foreach_dll(d);
+#endif
 }
 #endif
 
@@ -904,13 +1544,14 @@ lws_async_dns_freeaddrinfo(const struct addrinfo **pai)
 	if (c->firstcache)
 		c = c->firstcache;
 
-	lwsl_debug("%s: c %p, %s, refcount %d -> %d\n", __func__, c,
+	lwsl_debug("%s: c %p, %s, refcount %d\n", __func__, c,
 		   (c->results && c->results->ai_canonname) ?
 				c->results->ai_canonname : "none",
-						c->refcount, c->refcount - 1);
+						(int)c->refcount);
 
 	assert(c->refcount > 0);
-	c->refcount--;
+	if (c->refcount)
+		c->refcount--;
 	*pai = NULL;
 }
 
@@ -919,19 +1560,19 @@ lws_async_dns_trim_cache(lws_async_dns_t *dns)
 {
 	lws_adns_cache_t *c1;
 
-	if (dns->cached.count + 1< MAX_CACHE_ENTRIES)
+	if (lws_dll2_count(&dns->cached) + 1< MAX_CACHE_ENTRIES)
 		return;
 
 	/* we want to make space for one new one */
 
-	if (!dns->cached.count)
+	if (!lws_dll2_count(&dns->cached))
 		return;
 
 	c1 = lws_container_of(lws_dll2_get_tail(&dns->cached),
 						lws_adns_cache_t, list);
 	if (c1->refcount)
 		lwsl_cx_info(dns->cx, "acache %p: refcount %d on purge",
-				c1, c1->refcount);
+				c1, (int)c1->refcount);
 	else
 		lws_adns_cache_destroy(c1);
 }
@@ -950,7 +1591,7 @@ ns_clean(struct lws_dll2 *d, void *user)
 {
 	lws_async_dns_server_t *dsrv = lws_container_of(d,
 					lws_async_dns_server_t, list);
-	lws_async_dns_t *dns = (lws_async_dns_t *)dsrv->list.owner;
+	lws_async_dns_t *dns = (lws_async_dns_t *)lws_dll2_owner(&dsrv->list);
 
 	/* Since waiting queue is now on dns, we can't iterate dsrv->waiting. We should just let dns deinit handle the global queue. But we can clean up any queries specifically bound to this server if not broadsiding. */
 	lws_start_foreach_dll_safe(struct lws_dll2 *, dwait, dwait1,
@@ -969,15 +1610,14 @@ ns_clean(struct lws_dll2 *d, void *user)
 void
 lws_async_dns_deinit(lws_async_dns_t *dns)
 {
+	lws_adns_direct_deinit(dns);
 	lws_dll2_foreach_safe(&dns->waiting, NULL, clean);
 	lws_dll2_foreach_safe(&dns->nameservers, NULL, ns_clean);
 	lws_dll2_foreach_safe(&dns->cached, NULL, cache_clean);
-}
-
-void
-lws_async_dns_detach_query_wsi(struct lws *wsi)
-{
-
+#if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
+	/* after the queries: a zone being authenticated has one in flight */
+	lws_adns_dnssec_deinit(dns);
+#endif
 }
 
 static int
@@ -987,7 +1627,7 @@ cancel(struct lws_dll2 *d, void *user)
 
 	lws_start_foreach_dll_safe(struct lws_dll2 *, d3, d4,
 				   lws_dll2_get_head(&q->wsi_adns)) {
-		struct lws *w = lws_container_of(d3, struct lws, adns);
+		struct lws *w = lws_container_of(d3, struct lws_io_adjunct, adns)->wsi;
 
 		if (user == w) {
 			/*
@@ -999,7 +1639,7 @@ cancel(struct lws_dll2 *d, void *user)
 			 * currently, we can bail if we got a hit.
 			 */
 			lws_dll2_remove(d3);
-			if (!q->wsi_adns.count)
+			if (!lws_dll2_count(&q->wsi_adns) && !q->completing)
 				lws_adns_q_destroy(q);
 			return 1;
 		}
@@ -1017,6 +1657,37 @@ void
 lws_async_dns_cancel(struct lws *wsi)
 {
 	lws_dll2_foreach_safe(&wsi->a.context->async_dns.waiting, wsi, cancel);
+}
+
+static int
+cancel_by_opaque(struct lws_dll2 *d, void *user)
+{
+	lws_adns_q_t *q = lws_container_of(d, lws_adns_q_t, list);
+
+	if (q->standalone_cb && q->opaque == user) {
+		/*
+		 * The object the callback would be invoked on is going away,
+		 * so the callback and opaque are detached first; a resolver
+		 * reply for this query can no longer reach it.
+		 */
+		q->standalone_cb = NULL;
+		q->opaque = NULL;
+
+		/*
+		 * If wsi(s) piggybacked on this query, they still want the
+		 * answer... leave it to the last one out to destroy q.
+		 */
+		if (!lws_dll2_count(&q->wsi_adns) && !q->completing)
+			lws_adns_q_destroy(q);
+	}
+
+	return 0;
+}
+
+void
+lws_async_dns_cancel_by_opaque(struct lws_context *cx, void *opaque)
+{
+	lws_dll2_foreach_safe(&cx->async_dns.waiting, opaque, cancel_by_opaque);
 }
 
 
@@ -1067,17 +1738,29 @@ lws_async_dns_get_new_tid(struct lws_context *context, lws_adns_q_t *q)
 	return -1;
 }
 
+/* max matching addresses we will collect from the hosts file */
+
+#define LWS_ADNS_HOSTS_MAX_MATCHES 4
+
 #if !defined(LWS_PLAT_OPTEE) && !defined(LWS_PLAT_FREERTOS)
 
 /*
  * Search /etc/hosts or similar for the DNS name
+ *
+ * Collects up to max_ads matching addresses from any lines mentioning name,
+ * returning the number collected (0 if none).  lens[] gets the length of the
+ * corresponding address in ads (4 or 16).  This mirrors getaddrinfo()
+ * semantics for the hosts file, ie, a name with both v4 and v6 lines yields
+ * both addresses, so happy-eyeballs can race them.
  */
 
 int
-lws_adns_scan_hostsfile(const char *name, uint8_t *ads, size_t adslen)
+lws_adns_scan_hostsfile(const char *name, uint8_t *ads, uint8_t *lens,
+			int max_ads, int qtype)
 {
 	char had_ads = 0, buf[128], finalized = 0;
-	int fd, ret = 0, l = 0, ol = -1;
+	uint8_t t[16];
+	int fd, l = 0, ol = -1, count = 0;
 	size_t nl = strlen(name);
 	struct lws_tokenize ts;
 
@@ -1130,18 +1813,32 @@ lws_adns_scan_hostsfile(const char *name, uint8_t *ads, size_t adslen)
 			    nl == ts.token_len &&
 			    !memcmp(name, ts.token, ts.token_len)) {
 				/* it's a hit */
-				ret = (int)l;
-				break;
+				if ((qtype == LWS_ADNS_RECORD_A && l == 4) ||
+#if defined(LWS_WITH_IPV6)
+				    (qtype == LWS_ADNS_RECORD_A && l == 16) ||
+#endif
+				    (qtype == LWS_ADNS_RECORD_AAAA && l == 16) ||
+				    (qtype != LWS_ADNS_RECORD_A && qtype != LWS_ADNS_RECORD_AAAA)) {
+					if (count < max_ads) {
+						memcpy(ads + (size_t)count * 16, t,
+						       (size_t)l);
+						lens[count] = (uint8_t)l;
+						count++;
+					}
+				}
 			}
 			if (ts.e == LWS_TOKZE_TOKEN && !had_ads && ts.token_len < 50) {
 				/* we're getting an ipv4 or ipv6 numads */
-				l = lws_parse_numeric_address(ts.token, ads, adslen);
+				char temp_ads[64];
+				memcpy(temp_ads, ts.token, ts.token_len);
+				temp_ads[ts.token_len] = '\0';
+				l = lws_parse_numeric_address(temp_ads, t, sizeof(t));
 				had_ads = 1;
 			}
 
 		} while (ts.e > 0); /* no error yet */
 
-	} while (!ret && !finalized); /* no match yet */
+	} while (!finalized); /* whole file, so we get every matching line */
 
 #if defined(WIN32)
 	_close(fd);
@@ -1149,7 +1846,7 @@ lws_adns_scan_hostsfile(const char *name, uint8_t *ads, size_t adslen)
 	close(fd);
 #endif
 
-	return ret;
+	return count;
 }
 #endif
 
@@ -1186,31 +1883,27 @@ lws_async_dns_query(struct lws_context *context, int tsi, const char *name,
 	size_t nlen = strlen(name);
 	lws_sockaddr46 *sa46;
 	lws_adns_cache_t *c;
-	struct addrinfo *ai;
+	struct addrinfo *ai, *ai_prev = NULL;
 	struct temp_q tmq;
 	lws_adns_q_t *q;
-	uint8_t ads[16];
+	/* room for several hosts-file / numeric matches, 16B each */
+	uint8_t ads[LWS_ADNS_HOSTS_MAX_MATCHES * 16];
+	uint8_t ads_lens[LWS_ADNS_HOSTS_MAX_MATCHES];
+	int matches = 0;
 	char *p;
 	int m = 0;
 	uint8_t want_dnssec = (qtype & LWS_ADNS_WANT_DNSSEC) ? 1 : 0;
-	
+#if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
+	/* the same decision lws_adns_q_validates() makes for a new query */
+	int validates = (dns->dnssec_mode == LWS_ADNS_DNSSEC_REQUIRE ||
+			 want_dnssec) &&
+			!(qtype & LWS_ADNS_INDICATE_LACKS_DNSSEC);
+#endif
+
 	qtype = (adns_query_type_t)(qtype & ~(uint32_t)LWS_ADNS_WANT_DNSSEC);
 
 	lwsl_cx_info(context, "entry %s", name);
 	lws_adns_dump(dns);
-
-#if !defined(LWS_PLAT_OPTEE) && !defined(LWS_PLAT_FREERTOS) && !defined(WIN32)
-	{
-		struct stat st;
-		if (!stat("/etc/resolv.conf", &st)) {
-			if (dns->time_resolv_check && st.st_mtime > dns->time_resolv_check) {
-				lwsl_cx_notice(context, "/etc/resolv.conf updated, reloading");
-				lws_async_dns_server_reload(context);
-			}
-			dns->time_resolv_check = st.st_mtime;
-		}
-	}
-#endif
 
 #if !defined(LWS_WITH_IPV6)
 	if (qtype == LWS_ADNS_RECORD_AAAA) {
@@ -1223,44 +1916,56 @@ lws_async_dns_query(struct lws_context *context, int tsi, const char *name,
 		goto failed;
 
 	if (wsi) {
-		if (!lws_dll2_is_detached(&wsi->adns)) {
+		if (!lws_dll2_is_detached(&wsi->io->adns)) {
 			lwsl_cx_err(context, "%s already bound to query %p",
-					lws_wsi_tag(wsi), wsi->adns.owner);
+					lws_wsi_tag(wsi), lws_dll2_owner(&wsi->io->adns));
 			goto failed;
 		}
-		wsi->adns_cb = cb;
+		wsi->io->adns_cb = cb;
 	}
 
-	/* there's a done, cached query we can just reuse? */
+	/*
+	 * There's a done, cached query we can just reuse?
+	 *
+	 * A query that has to validate can't be served what some query that
+	 * didn't validate left in the cache: those records were handed out as
+	 * plain FOUND, which a requester not looking for LWS_ADNS_DNSSEC_VALID
+	 * takes as good.
+	 */
 
-	c = (qtype & LWS_ADNS_NOCACHE) ? NULL : lws_adns_get_cache(dns, name);
+	c = (qtype & LWS_ADNS_NOCACHE) ? NULL :
+		lws_adns_get_cache(dns, name, (uint16_t)(qtype & 0xffff),
+#if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
+				   validates
+#else
+				   0
+#endif
+				   );
 	qtype = (adns_query_type_t)(qtype & ~(uint32_t)LWS_ADNS_NOCACHE);
-	if (c && qtype != LWS_ADNS_RECORD_A && qtype != LWS_ADNS_RECORD_AAAA) {
-		lws_adns_rr_t *rr = c->rr_results;
-		int found = 0;
-		while (rr) {
-			if (rr->type == qtype) {
-				found = 1;
-				break;
-			}
-			rr = rr->next;
-		}
-		if (!found) {
-			lwsl_cx_info(context, "%s: cached but missing 0x%x, bypassing", name, qtype);
-			lws_dll2_remove(&c->list); /* Remove from cache list, let sul expire it */
-			c = NULL;
-		}
-	}
 
 	if (c) {
 		lwsl_cx_info(context, "%s: using cached, c->results %p, c->rr_results %p",
 			  name, c->results, c->rr_results);
-		m = (c->results || c->rr_results) ? LADNS_RET_FOUND : LADNS_RET_FAILED;
+		m = (c->results || c->rr_results) ? LADNS_RET_FOUND :
+		    (c->nxdomain ? LADNS_RET_NXDOMAIN : LADNS_RET_FAILED);
+#if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
+		/*
+		 * Served from the cache, a validated result is still validated:
+		 * without this, the second requester of a name within its TTL
+		 * never saw LWS_ADNS_DNSSEC_VALID and, failing closed, refused
+		 * what the first one had accepted
+		 */
+		if (m == LADNS_RET_FOUND && c->dnssec_valid)
+			m |= LWS_ADNS_DNSSEC_VALID;
+#endif
+		/*
+		 * The callback gets c->results and releases it with
+		 * lws_async_dns_freeaddrinfo(); with only rr_results it gets
+		 * NULL and has nothing to release, so taking a reference for
+		 * that case pinned the entry for ever and, once it reached the
+		 * LRU tail, stopped the cache trim freeing anything at all.
+		 */
 		if (c->results)
-			c->refcount++;
-		/* Note: c->rr_results relies on the same cache refcount, but to be
-		   consistent, we'll bump the refcount if rr_results exists too! */
-		else if (c->rr_results)
 			c->refcount++;
 
 #if defined(LWS_WITH_SYS_METRICS)
@@ -1286,46 +1991,121 @@ lws_async_dns_query(struct lws_context *context, int tsi, const char *name,
 	 * of any other result
 	 */
 
-	if (qtype == LWS_ADNS_RECORD_A || qtype == LWS_ADNS_RECORD_AAAA) {
-		m = lws_parse_numeric_address(name, ads, sizeof(ads));
+	if ((qtype & 0xff) == LWS_ADNS_RECORD_A || (qtype & 0xff) == LWS_ADNS_RECORD_AAAA) {
+		m = lws_parse_numeric_address(name, ads, 16);
+#if !defined(LWS_WITH_IPV6)
+		if (m == 16) {
+			/*
+			 * It's a valid ipv6 literal, but this build has no
+			 * ipv6... we cannot make a usable addrinfo for it and
+			 * the synthesis below would emit a zeroed one, with
+			 * ai_family 0 and ai_addr NULL, as a successful
+			 * result.  Fail the lookup instead.
+			 */
+			lwsl_cx_notice(context, "ipv6 literal in ipv4-only build");
+			goto failed;
+		}
+#endif
+		if (m == 4
+#if defined(LWS_WITH_IPV6)
+		    || m == 16
+#endif
+		) {
+			ads_lens[0] = (uint8_t)m;
+			matches = 1;
+		}
 
 #if !defined(LWS_PLAT_OPTEE) && !defined(LWS_PLAT_FREERTOS)
-		if (m < 4 && !(qtype & LWS_ADNS_IGNORE_HOSTS_FILE))
+		if (!matches && !(qtype & LWS_ADNS_IGNORE_HOSTS_FILE))
 			/*
 			 * Not directly numeric and not explicitly bypassing...
 			 * look through /etc/hosts
 			 */
-			m = lws_adns_scan_hostsfile(name, ads, sizeof(ads));
+			matches = lws_adns_scan_hostsfile(name, ads, ads_lens,
+					LWS_ADNS_HOSTS_MAX_MATCHES, qtype & 0xff);
+
+		if (!matches && !strcmp(name, "localhost")) {
+#if defined(LWS_WITH_IPV4)
+			if ((qtype & 0xff) == LWS_ADNS_RECORD_A) {
+				ads[0] = 127; ads[1] = 0; ads[2] = 0; ads[3] = 1;
+				ads_lens[0] = 4;
+				matches = 1;
+			}
+#endif
+#if defined(LWS_WITH_IPV6)
+			if (!matches &&
+#if defined(LWS_WITH_IPV4)
+			    (qtype & 0xff) == LWS_ADNS_RECORD_AAAA
+#else
+			    1
+#endif
+			) {
+				memset(ads, 0, 15); ads[15] = 1;
+				ads_lens[0] = 16;
+				matches = 1;
+			}
+#endif
+		}
 #endif
 	}
 
-	if (m == 4
-#if defined(LWS_WITH_IPV6)
-		|| m == 16
-#endif
-	) {
+	if (matches) {
 		lws_async_dns_trim_cache(dns);
 
+		/* compose an addrinfo chain with one node per match */
+
 		c = lws_zalloc(sizeof(lws_adns_cache_t) +
-			       sizeof(struct addrinfo) +
-			       sizeof(lws_sockaddr46) + nlen + 1, "adns-numip");
+			       (size_t)matches * adns_align_len(
+					sizeof(struct addrinfo) +
+					sizeof(lws_sockaddr46)) +
+			       nlen + 1, "adns-numip");
 		if (!c)
 			goto failed;
 
-		ai = (struct addrinfo *)&c[1];
-		sa46 = (lws_sockaddr46 *)&ai[1];
+		c->results = (struct addrinfo *)&c[1];
+		ai = c->results;
+		for (m = 0; m < matches; m++) {
+			sa46 = (lws_sockaddr46 *)&ai[1];
 
-		ai->ai_socktype = SOCK_STREAM;
-		c->name = (const char *)&sa46[1];
-		memcpy((char *)c->name, name, nlen + 1);
-		ai->ai_canonname = (char *)&sa46[1];
+			if (m)
+				ai_prev->ai_next = ai;
+			ai->ai_socktype = SOCK_STREAM;
+			if (!m) {
+				char *nm = (char *)c->results +
+					  (size_t)matches * adns_align_len(
+						sizeof(struct addrinfo) +
+						sizeof(lws_sockaddr46));
+				memcpy(nm, name, nlen + 1);
+				c->name = nm;
+				ai->ai_canonname = nm;
+			}
 
-		c->results = ai;
+			if (ads_lens[m] == 4) {
+				ai->ai_family = sa46->sa4.sin_family = AF_INET;
+				ai->ai_addrlen = sizeof(sa46->sa4);
+				ai->ai_addr = (struct sockaddr *)&sa46->sa4;
+				memcpy(&sa46->sa4.sin_addr,
+				       ads + (size_t)m * 16, 4);
+			}
+#if defined(LWS_WITH_IPV6)
+			else {
+				ai->ai_family = sa46->sa6.sin6_family = AF_INET6;
+				ai->ai_addrlen = sizeof(sa46->sa6);
+				ai->ai_addr = (struct sockaddr *)&sa46->sa6;
+				memcpy(&sa46->sa6.sin6_addr,
+				       ads + (size_t)m * 16, 16);
+			}
+#endif
+
+			ai_prev = ai;
+			ai = (struct addrinfo *)adns_align_ptr(&sa46[1]);
+		}
+
 		memset(&tmq.tq, 0, sizeof(tmq.tq));
 		tmq.tq.opaque = opaque;
 		if (wsi) {
-			wsi->adns_cb = cb;
-			lws_dll2_add_head(&wsi->adns, &tmq.tq.wsi_adns);
+			wsi->io->adns_cb = cb;
+			lws_dll2_add_head(&wsi->io->adns, &tmq.tq.wsi_adns);
 		} else
 			tmq.tq.standalone_cb = cb;
 		lws_strncpy(tmq.name, name, sizeof(tmq.name));
@@ -1335,35 +2115,15 @@ lws_async_dns_query(struct lws_context *context, int tsi, const char *name,
 				 3600ll * LWS_US_PER_SEC);
 
 		lws_adns_dump(dns);
-	}
-
-	if (m == 4) {
-		ai = (struct addrinfo *)&c[1];
-		sa46 = (lws_sockaddr46 *)&ai[1];
-		ai->ai_family = sa46->sa4.sin_family = AF_INET;
-		ai->ai_addrlen = sizeof(sa46->sa4);
-		ai->ai_addr = (struct sockaddr *)&sa46->sa4;
-		memcpy(&sa46->sa4.sin_addr, ads, (unsigned int)m);
 
 		return lws_async_dns_complete(&tmq.tq, c);
 	}
-
-#if defined(LWS_WITH_IPV6)
-	if (m == 16) {
-		ai->ai_family = sa46->sa6.sin6_family = AF_INET6;
-		ai->ai_addrlen = sizeof(sa46->sa6);
-		ai->ai_addr = (struct sockaddr *)&sa46->sa6;
-		memcpy(&sa46->sa6.sin6_addr, ads, (unsigned int)m);
-
-		return lws_async_dns_complete(&tmq.tq, c);
-	}
-#endif
 
 	/*
 	 * to try anything else we need a remote server configured...
 	 */
 
-	if (!context->async_dns.nameservers.head &&
+	if (!lws_dll2_get_head(&context->async_dns.nameservers) &&
 	    lws_async_dns_init(context)) {
 		lwsl_cx_notice(context, "init failed");
 		goto failed;
@@ -1375,29 +2135,72 @@ lws_async_dns_query(struct lws_context *context, int tsi, const char *name,
 
 	lws_async_dns_create_server_wsi(context);
 
-	/* there's an ongoing query we can share the result of? */
+	/*
+	 * There's an ongoing query we can share the result of?
+	 *
+	 * Only a wsi requester can ride on one: q holds exactly one
+	 * standalone_cb / opaque pair and it is already taken by whoever
+	 * created it.  Riding anyway used to drop a standalone caller's cb and
+	 * opaque on the floor, so it never heard back and, for the DNSSEC
+	 * DNSKEY sub-lookup, leaked its validation context.  A standalone
+	 * requester gets a separate query with its own tid instead.
+	 *
+	 * Like the cache above, a requester that has to validate can't be
+	 * served by a query that doesn't, eg, one made with
+	 * LWS_ADNS_INDICATE_LACKS_DNSSEC: it would be handed the unvalidated
+	 * answer as plain FOUND, which the connect path takes as good.
+	 */
 
 	q = lws_adns_get_query(dns, qtype, 0, name);
-	if (q) {
+#if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
+	if (q && validates && !lws_adns_q_validates(q))
+		q = NULL;
+#endif
+	if (q && wsi) {
 		lwsl_cx_debug(context, "dns piggybacking: %d:%s",
 				qtype, name);
-		if (wsi)
-			lws_dll2_add_head(&wsi->adns, &q->wsi_adns);
+		lws_dll2_add_head(&wsi->io->adns, &q->wsi_adns);
 
 		return LADNS_RET_CONTINUING;
 	}
 
-	q = lws_zalloc(sizeof(*q) + nlen + 1 + DNS_MAX + 1, "adns-q");
+	/*
+	 * Two DNS_MAX regions behind q: the working copy of the name at +0,
+	 * which lws_adns_iterate() may overwrite with a CNAME target of up to
+	 * DNS_MAX - 1 chars, and the pristine copy of the original name at
+	 * +DNS_MAX, which is what we create the cache entry against.  Sizing
+	 * the first one on the original name's length instead let a long
+	 * CNAME target run off the end of the allocation.
+	 */
+
+	q = lws_zalloc(sizeof(*q) + (DNS_MAX * 2), "adns-q");
 	if (!q) {
 		lwsl_cx_err(context, "OOM");
 		goto failed;
 	}
 
 	if (wsi)
-		lws_dll2_add_head(&wsi->adns, &q->wsi_adns);
+		lws_dll2_add_head(&wsi->io->adns, &q->wsi_adns);
 
 	q->qtype = (uint16_t)qtype;
 	q->want_dnssec = want_dnssec != 0;
+	if (wsi && wsi->a.vhost) {
+		/*
+		 * Don't ask for address families the wsi's vhost / context
+		 * disallows (runtime LWS_SERVER_OPTION_DISABLE_IPV[46], eg,
+		 * from the -4 / -6 commandline switches).  In an IPv6-only
+		 * build A results are normalized to v4-mapped and remain
+		 * usable, so those always keep asking for both.
+		 */
+#if defined(LWS_WITH_IPV6)
+		if (!LWS_IPV6_ENABLED(wsi->a.vhost))
+			q->ipv4_only = 1;
+#endif
+#if defined(LWS_WITH_IPV4) && defined(LWS_WITH_IPV6)
+		if (!LWS_IPV4_ENABLED(wsi->a.vhost))
+			q->ipv6_only = 1;
+#endif
+	}
 	if (qtype & LWS_ADNS_SYNTHETIC)
 		q->is_synthetic = 1;
 #if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
@@ -1432,7 +2235,8 @@ lws_async_dns_query(struct lws_context *context, int tsi, const char *name,
 			}
 		} lws_end_foreach_dll_safe(d, d1);
 
-		if (dns->nameservers.count && all_failed) {
+		if (lws_dll2_count(&dns->nameservers) && all_failed &&
+		    !dns->in_parse) {
 			if (lws_now_usecs() - dns->time_last_reload > 5000000) {
 				lwsl_cx_notice(context, "Async DNS fallback reload triggered");
 				lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
@@ -1449,22 +2253,37 @@ lws_async_dns_query(struct lws_context *context, int tsi, const char *name,
 
 		if (q->broadsiding)
 			/* Just peg it to the first for tracking purposes, but it will be skipped visually */
-			dsrv = lws_container_of(context->async_dns.nameservers.head, lws_async_dns_server_t, list);
+			dsrv = lws_container_of(lws_dll2_get_head(
+				&context->async_dns.nameservers), lws_async_dns_server_t, list);
 		else if (best_dsrv)
 			/* Pick servers near the 'best' round-robin style maybe, or just pick the best. For simplicity: best one */
 			dsrv = best_dsrv;
 		else
-			dsrv = lws_container_of(context->async_dns.nameservers.head, lws_async_dns_server_t, list);
+			dsrv = lws_container_of(lws_dll2_get_head(
+				&context->async_dns.nameservers), lws_async_dns_server_t, list);
 
 
 		q->dsrv = dsrv;
+	}
+
+	/*
+	 * If the chosen DNS server has no wsi (eg, its UDP listener could not
+	 * be created / bound, as happens in an IPv6-only build where the only
+	 * nameserver was discovered as an IPv4 literal that maps to an
+	 * unreachable ::ffff: address), we cannot actually issue the query.
+	 * Fail it cleanly rather than dereferencing the NULL wsi in the retry
+	 * scheduler / writable callback below.
+	 */
+	if (!dsrv || !dsrv->wsi) {
+		lwsl_cx_notice(context, "no usable async dns server wsi");
+		goto failed_unpublished_q;
 	}
 
 	q->issue_time = lws_now_usecs();
 
 	if (lws_async_dns_get_new_tid(context, q)) {
 		lwsl_cx_err(context, "tid fail");
-		goto failed;
+		goto failed_unpublished_q;
 	}
 
 	LADNS_MOST_RECENT_TID(q) &= 0xfffe;
@@ -1478,10 +2297,15 @@ lws_async_dns_query(struct lws_context *context, int tsi, const char *name,
 	/* schedule a retry according to the retry policy on the wsi */
 	if (lws_retry_sul_schedule_retry_wsi(dsrv->wsi, &q->sul,
 					 lws_async_dns_sul_cb_retry, &q->retry))
-		goto failed;
+		goto failed_unpublished_q;
 
 	/* fail us if we can't write by this timeout */
 	lws_sul_schedule(context, 0, &q->write_sul, sul_cb_write, LWS_US_PER_SEC);
+
+	/* ... and fail us if the whole query isn't done by this one */
+	lws_sul_schedule(context, 0, &q->deadline_sul,
+			 lws_async_dns_sul_cb_deadline,
+			 DNS_QUERY_TIMEOUT * LWS_US_PER_SEC);
 
 	/*
 	 * We may rewrite the copy at +sizeof(*q) for CNAME recursion.  Keep
@@ -1491,7 +2315,7 @@ lws_async_dns_query(struct lws_context *context, int tsi, const char *name,
 
 	p = (char *)&q[1];
 	while (nlen--) {
-		*p++ = (char)tolower(*name++);
+		*p++ = (char)tolower((uint8_t)*name++);
 		p[DNS_MAX - 1] = p[-1];
 	}
 	*p = '\0';
@@ -1511,6 +2335,25 @@ lws_async_dns_query(struct lws_context *context, int tsi, const char *name,
 
 	return LADNS_RET_CONTINUING;
 
+failed_unpublished_q:
+	/*
+	 * We are failing after q was allocated, but before it was published on
+	 * dns->waiting and before its metrics caliper was bound... so nothing
+	 * will ever find it again to destroy it.  The failed: path below only
+	 * does the user callback, so we have to take q down by hand here:
+	 * otherwise q leaks and, worse, the requester wsi stays linked into the
+	 * orphaned q->wsi_adns owner and can never issue another DNS query for
+	 * the rest of its life (it trips the "already bound" check above).
+	 */
+	if (wsi)
+		lws_dll2_remove(&wsi->io->adns);
+	lws_sul_cancel(&q->sul);
+	lws_sul_cancel(&q->write_sul);
+	lws_sul_cancel(&q->deadline_sul);
+	if (pq)
+		*pq = NULL;
+	lws_free(q);
+
 failed:
 	lwsl_cx_notice(context, "failed");
 	if (!cb(wsi, NULL, NULL, LADNS_RET_FAILED, opaque))
@@ -1522,6 +2365,7 @@ failed:
 int
 lws_async_dns_create_tcp_wsi(lws_adns_q_t *q)
 {
+#if defined(LWS_WITH_CLIENT)
 	struct lws_client_connect_info i;
 	char ads[48];
 
@@ -1530,10 +2374,16 @@ lws_async_dns_create_tcp_wsi(lws_adns_q_t *q)
 
 	memset(&i, 0, sizeof(i));
 	i.context = q->context;
+	i.vhost = q->context->vhost_system;
+
+	uint16_t port = 53;
+	const char *env_port = getenv("LWS_ASYNCDNS_PORT");
+	if (env_port)
+		port = (uint16_t)atoi(env_port);
 
 	lws_sa46_write_numeric_address(&q->dsrv->sa46, ads, sizeof(ads));
 	i.address = ads;
-	i.port = 53;
+	i.port = port;
 	i.ssl_connection = 0;
 	i.method = "RAW";
 	i.local_protocol_name = lws_async_dns_protocol.name;
@@ -1550,14 +2400,32 @@ lws_async_dns_create_tcp_wsi(lws_adns_q_t *q)
 	}
 
 	return 0;
+#else
+	return 1;
+#endif
 }
 
 void
 lws_async_dns_dnssec_set_mode(struct lws_context *context,
 			      lws_async_dns_dnssec_mode_t mode)
 {
+	/* nameserver reloads keep it, see lws_async_dns_init() */
 	context->async_dns.dnssec_mode = (uint8_t)mode;
 }
+
+#if !defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
+int
+lws_async_dns_dnssec_set_root_anchors(struct lws_context *context,
+				      const lws_adns_ds_anchor_t *anchors,
+				      size_t count)
+{
+	(void)context;
+	(void)anchors;
+	(void)count;
+
+	return 1; /* there is no DNSSEC validation in this build */
+}
+#endif
 
 const uint8_t *
 lws_async_dns_get_rr_cache(struct lws_context *context, const char *name,
@@ -1569,22 +2437,77 @@ lws_async_dns_get_rr_cache(struct lws_context *context, const char *name,
 	if (!context || !name)
 		return NULL;
 
-	lws_start_foreach_dll(struct lws_dll2 *, d,
-			      lws_dll2_get_head(&context->async_dns.cached)) {
-		c = lws_container_of(d, lws_adns_cache_t, list);
+	/*
+	 * The same records may be cached from a query that validated them and
+	 * from one that didn't; a caller acting on LWS_ADNS_DNSSEC_VALID wants
+	 * the ones that were validated
+	 */
 
-		if (!strcmp(c->name, name) && c->rr_results) {
-			rr = c->rr_results;
-			while (rr) {
-				if (rr->type == qtype) {
-					if (paylen)
-						*paylen = rr->paylen;
-					return (const uint8_t *)&rr[1];
-				}
-				rr = rr->next;
-			}
+	c = lws_adns_get_cache(&context->async_dns, name, (uint16_t)qtype, 1);
+#if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
+	if (!c)
+		c = lws_adns_get_cache(&context->async_dns, name,
+				       (uint16_t)qtype, 0);
+#endif
+	if (!c)
+		return NULL;
+
+	for (rr = c->rr_results; rr; rr = rr->next)
+		if (rr->type == qtype) {
+			if (paylen)
+				*paylen = rr->paylen;
+			return (const uint8_t *)&rr[1];
 		}
-	} lws_end_foreach_dll(d);
 
 	return NULL;
+}
+
+int
+lws_async_dns_get_alpn(struct lws_context *context, const char *name, const char *alpn)
+{
+	uint16_t paylen;
+	const uint8_t *rr = lws_async_dns_get_rr_cache(context, name, LWS_ADNS_RECORD_HTTPS, &paylen);
+	int pos = 2;
+	int limit;
+
+	if (!rr || paylen < 3)
+		return 0;
+
+	/* TargetName: sequence of labels ending in 0 */
+	limit = 128;
+	while (limit-- && pos < paylen && rr[pos]) {
+		if (pos + rr[pos] + 1 > paylen)
+			return 0;
+		pos += rr[pos] + 1;
+	}
+	if (pos >= paylen)
+		return 0;
+	pos++; /* Skip the 0 length label */
+
+	/* SvcParams */
+	limit = 128;
+	while (limit-- && pos + 4 <= paylen) {
+		uint16_t key = (uint16_t)((rr[pos] << 8) | rr[pos + 1]);
+		uint16_t len = (uint16_t)((rr[pos + 2] << 8) | rr[pos + 3]);
+		pos += 4;
+
+		if (pos + len > paylen)
+			break;
+
+		if (key == 1) { /* alpn */
+			uint16_t i = 0;
+			int limit2 = 128;
+			while (limit2-- && i < len) {
+				uint8_t slen = rr[pos + i];
+				if (i + 1 + slen > len)
+					break;
+				if (slen == strlen(alpn) && !strncmp((const char *)&rr[pos + i + 1], alpn, strlen(alpn)))
+					return 1;
+				i = (uint16_t)(i + slen + 1);
+			}
+		}
+		pos += len;
+	}
+
+	return 0;
 }

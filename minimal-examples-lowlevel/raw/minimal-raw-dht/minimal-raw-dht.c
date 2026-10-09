@@ -27,8 +27,10 @@ enum {
 	LWS_SW_TARGET_IP,
 	LWS_SW_TARGET_PORT,
 	LWS_SW_TEST_HANDSHAKE,
+	LWS_SW_ALLOW_PRIVATE,
 	LWS_SW_P,
 	LWS_SW_S,
+	LWS_SW_STATS_PORT,
 	LWS_SW_HELP,
 };
 
@@ -45,8 +47,10 @@ static const struct lws_switches switches[] = {
 	[LWS_SW_TARGET_IP]	= { "--target-ip",     "Bootstrapping UDP network node target IP" },
 	[LWS_SW_TARGET_PORT]	= { "--target-port",   "Bootstrapping UDP network node target port" },
 	[LWS_SW_TEST_HANDSHAKE]	= { "--test-handshake", "Enable --test-handshake feature" },
+	[LWS_SW_ALLOW_PRIVATE]	= { "--allow-private", "Admit DHT peers on private / loopback addresses (LAN or local testing)" },
 	[LWS_SW_P]	= { "-p",              "Port number to listen or connect on" },
 	[LWS_SW_S]	= { "-s",              "Use TLS / https" },
+	[LWS_SW_STATS_PORT] = { "--stats-port", "Port for HTTP stats vhost (default: dht-port + 100)" },
 	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
 };
 
@@ -62,23 +66,23 @@ static const struct lws_switches switches[] = {
 
 static lws_state_notify_link_t nl;
 int retcode = 1;
-int interrupted;
 int use_stdin;
 char port_buf[16];
+char stats_port_buf[16];
 const char *storage_path = "./dht-store";
 static struct lws_context *cx;
 
 static lws_state_notify_link_t *const app_notifier_list[] = {&nl, NULL};
-extern const struct lws_protocols lws_dht_object_store_protocols[];
-extern const struct lws_protocols lws_dht_stats_protocols[];
-extern const struct lws_protocols lws_dht_dnssec_protocols[];
+/*
+ * The lws-dht-object-store, lws-dht-stats and lws-dht-dnssec protocols
+ * are instantiated on the vhosts from the protocol plugins at runtime;
+ * nothing is linked statically from here.
+ */
 
 static void
 dht_completion_cb(void *closure, int result)
 {
-	int *p_interrupted = (int *)closure;
-
-	*p_interrupted = 1;
+	lws_default_loop_exit(*(struct lws_context **)closure);
 
 	// lwsl_user("dht_completion_cb called! result: %d\n", result);
 
@@ -117,7 +121,7 @@ struct lws_protocol_vhost_options pvos[] = {
 		.options	= NULL,
 		.next		= &pvos[5],
 		.name		= "completion-cb-arg",
-		.value		= (const char *)&interrupted
+		.value		= (const char *)&cx
 	},
 	{
 		.options	= NULL,
@@ -199,9 +203,15 @@ struct lws_protocol_vhost_options pvos[] = {
 	},
 	{
 		.options	= NULL,
-		.next		= NULL,
+		.next		= &pvos[19],
 		.name		= "domain",
 		.value		= ""
+	},
+	{
+		.options	= NULL,
+		.next		= NULL,
+		.name		= "dht-allow-private",
+		.value		= "0"
 	},
 };
 
@@ -234,9 +244,8 @@ app_system_state_nf(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 			NULL, NULL, "lws-dht-stats", ""
 		};
 
-		memset(&info, 0, sizeof(info));
-                info.vhost_name		= "http";
-                info.port		= atoi(port_buf) + 100;
+		lws_context_info_defaults(&info, NULL);info.vhost_name		= "http";
+                info.port		= atoi(stats_port_buf);
                 info.protocols		= app_protocols;
                 info.mounts		= &mount_stats;
                 info.pvo		= &pvo_stats;
@@ -244,44 +253,62 @@ app_system_state_nf(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
                 vh = lws_create_vhost(cx, &info);
                 if (!vh) {
 			lwsl_err("http vhost creation failed\n");
-			return 0;
+			goto fail;
 		}
 
 		if (!lws_vhost_name_to_protocol(vh, "lws-dht-stats")) {
 			lwsl_err("dht-stats protocol plugin not found\n");
-			return 0;
+			goto fail;
 		}
 
-		memset(&info, 0, sizeof(info));
-                info.vhost_name		= "dht";
+		lws_context_info_defaults(&info, NULL);info.vhost_name		= "dht";
                 info.pvo		= pvos;
-		info.port		= atoi(port_buf);
+		{
+			int __pt = atoi(port_buf);
+			if (__pt < 0 || __pt > 65535) {
+				lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+				goto fail;
+			}
+			info.port = __pt;
+		}
 		info.protocols		= app_protocols;
                 info.options		= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
                 vh = lws_create_vhost(cx, &info);
                 if (!vh) {
 			lwsl_err("vhost creation failed\n");
-			return 0;
+			goto fail;
 		}
 
 		if (!lws_vhost_name_to_protocol(vh, "lws-dht-dnssec")) {
 			lwsl_err("dht-dnssec protocol plugin not found\n");
-			return 0;
+			goto fail;
 		}
 		if (!lws_vhost_name_to_protocol(vh, "lws-dht-object-store")) {
 			lwsl_err("dht-object-store protocol plugin not found\n");
-			return 0;
+			goto fail;
 		}
 
                 lws_finalize_startup(cx, __func__);
 		break;
         }
 	return 0;
+
+fail:
+	/*
+	 * Nothing we need is going to exist: bring the event loop down now
+	 * with retcode still set, rather than sit in lws_service() until the
+	 * test harness' timeout, which reports the failure as a timeout and
+	 * buries the reason in the log.
+	 */
+	lws_default_loop_exit(cx);
+	lws_cancel_service(cx);
+
+	return 0;
 }
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(cx);
 }
 
 int main(int argc, const char **argv)
@@ -311,9 +338,21 @@ int main(int argc, const char **argv)
 	pvos[1].value = storage_path;
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_P].sw)))
-		dht_port = atoi(p);
+		{
+			int __pt = atoi(p);
+			if (__pt < 0 || __pt > 65535) {
+				lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+				return 1;
+			}
+			dht_port = __pt;
+		}
 
 	lws_snprintf(port_buf, sizeof(port_buf), "%d", dht_port);
+
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_STATS_PORT].sw)))
+		lws_snprintf(stats_port_buf, sizeof(stats_port_buf), "%d", atoi(p));
+	else
+		lws_snprintf(stats_port_buf, sizeof(stats_port_buf), "%d", dht_port + 100);
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_TARGET_IP].sw)))
 		pvos[5].value = p;
@@ -357,6 +396,9 @@ int main(int argc, const char **argv)
 	if (lws_cmdline_option(argc, argv, switches[LWS_SW_TEST_HANDSHAKE].sw))
 		pvos[16].value = "1";
 
+	if (lws_cmdline_option(argc, argv, switches[LWS_SW_ALLOW_PRIVATE].sw))
+		pvos[19].value = "1";
+
 
 #if defined(LWS_WITH_PLUGINS)
 	static const char * const d_plugin_dirs[] = { NULL };
@@ -386,7 +428,7 @@ int main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(cx, 0);
 
 	lws_context_destroy(cx);

@@ -64,6 +64,13 @@ static const char * const plugin_dirs[] = {
 	NULL
 };
 #else
+#if !defined(LWS_BUILTIN_PLUGIN_NAMES)
+/*
+ * When the plugins are compiled into the library itself, we must not
+ * also statically include their sources here: their symbols are already
+ * in the library and duplicating them fails the link.  We only need the
+ * vendored-in copies when there are no protocol plugins available at all.
+ */
 #if !defined (LWS_PLUGIN_STATIC)
 #define LWS_PLUGIN_STATIC
 #endif
@@ -73,6 +80,7 @@ static const char * const plugin_dirs[] = {
 #include "../plugins/protocol_dumb_increment/protocol_dumb_increment.c"
 #endif
 #include "../plugins/protocol_post_demo/protocol_post_demo.c"
+#endif
 #endif
 
 #if defined(LWS_WITH_EXTERNAL_POLL)
@@ -197,7 +205,7 @@ static struct lws_protocols protocols[] = {
 	/* first protocol must always be HTTP handler */
 
 	{ "http-only", lws_callback_http, 0, 0, 0, NULL, 0 },
-#if !defined(LWS_WITH_PLUGINS)
+#if !defined(LWS_WITH_PLUGINS) && !defined(LWS_BUILTIN_PLUGIN_NAMES)
 #if defined(LWS_ROLE_WS)
 	LWS_PLUGIN_PROTOCOL_DUMB_INCREMENT,
 	LWS_PLUGIN_PROTOCOL_MIRROR,
@@ -272,23 +280,26 @@ static const struct lws_extension exts[] = {
  * stuff from here is autoserved by the library
  */
 
-static const struct lws_http_mount mount_ziptest_uncomm = {
+static struct lws_http_mount mount_ziptest_uncomm = {
 	.mountpoint		= "/uncommziptest",		/* mountpoint in URL namespace on this vhost */
 	.origin			= LOCAL_RESOURCE_PATH"/candide-uncompressed.zip",	/* handler */
-	.origin_protocol	= LWSMPRO_FILE,			/* origin points to a file */
-	.mountpoint_len		= 14,				/* strlen("/ziptest"), ie length of the mountpoint */
+	.def			= "",
+	.origin_protocol	= LWSMPRO_FILE,	/* files in a dir */
+	.mountpoint_len		= 15,		/* char count */
 }, mount_ziptest = {
-	.mount_next		= (struct lws_http_mount *)&mount_ziptest_uncomm,			/* linked-list pointer to next*/
-	.mountpoint		= "/ziptest",			/* mountpoint in URL namespace on this vhost */
-	.origin			= LOCAL_RESOURCE_PATH"/candide.zip",			/* handler */
-	.origin_protocol	= LWSMPRO_FILE,			/* origin points to a file */
-	.mountpoint_len		= 8,				/* strlen("/ziptest"), ie length of the mountpoint */
-}, mount_post = 	{
-	.mount_next		= (struct lws_http_mount *)&mount_ziptest, /* linked-list pointer to next*/
-	.mountpoint		= "/formtest",			/* mountpoint in URL namespace on this vhost */
-	.protocol		= "protocol-post-demo",		/* handler */
-	.origin_protocol	= LWSMPRO_CALLBACK,		/* origin points to a callback */
-	.mountpoint_len		= 9,				/* strlen("/formtest"), ie length of the mountpoint */
+	.mount_next		= &mount_ziptest_uncomm,
+	.mountpoint		= "/ziptest",		/* mountpoint in URL namespace on this vhost */
+	.origin			= LOCAL_RESOURCE_PATH"/candide.zip",	/* handler */
+	.def			= "",
+	.origin_protocol	= LWSMPRO_FILE,	/* files in a dir */
+	.mountpoint_len		= 8,		/* char count */
+}, mount_post = {
+	.mount_next		= &mount_ziptest,	/* linked-list "next" */
+	.mountpoint		= "/formtest",		/* mountpoint URL */
+	.protocol		= "protocol-post-demo",	/* serve from dir */
+	.def			= "",			/* default filename */
+	.origin_protocol	= LWSMPRO_CALLBACK,	/* files in a dir */
+	.mountpoint_len		= 9,			/* char count */
 }, mount = {
 	.mount_next		= &mount_post,			/* linked-list "next" */
 	.mountpoint		= "/",				/* mountpoint URL */
@@ -372,6 +383,8 @@ static struct option options[] = {
 static void
 sigterm_catch(int sig)
 {
+	/* installed to swallow SIGTERM: shutdown is driven from the
+	 * service loop, not the signal */
 }
 
 int main(int argc, char **argv)
@@ -398,6 +411,8 @@ int main(int argc, char **argv)
 	 */
 	memset(&info, 0, sizeof info);
 	info.port = 7681;
+	info.max_http_header_data = 8192;
+	info.max_http_header_pool = 64;
 
 	while (n >= 0) {
 #if defined(LWS_HAS_GETOPT_LONG) || defined(WIN32)
@@ -502,7 +517,7 @@ int main(int argc, char **argv)
 	 * simplify getting started without having to take care about
 	 * permissions or running as root, set to /tmp/.lwsts-lock
 	 */
-	if (daemonize && lws_daemonize("/tmp/.lwsts-lock")) {
+	if (daemonize && lws_daemonize("/tmp/.lwsts-lock")) { // NOSONAR
 		fprintf(stderr, "Failed to daemonize\n");
 		return 10;
 	}
@@ -555,14 +570,14 @@ int main(int argc, char **argv)
 			return -1;
 		}
 		if (!cert_path[0])
-			sprintf(cert_path, "%s/libwebsockets-test-server.pem",
+			lws_snprintf(cert_path, sizeof(cert_path), "%s/libwebsockets-test-server.pem",
 								resource_path);
 		if (strlen(resource_path) > sizeof(key_path) - 32) {
 			lwsl_err("resource path too long\n");
 			return -1;
 		}
 		if (!key_path[0])
-			sprintf(key_path, "%s/libwebsockets-test-server.key.pem",
+			lws_snprintf(key_path, sizeof(key_path), "%s/libwebsockets-test-server.key.pem",
 								resource_path);
 #if defined(LWS_WITH_TLS)
 		info.ssl_cert_filepath = cert_path;
@@ -610,6 +625,9 @@ int main(int argc, char **argv)
 	if (use_ssl)
 		/* redirect guys coming on http */
 		info.options |= LWS_SERVER_OPTION_REDIRECT_HTTP_TO_HTTPS;
+
+	/* update the default mount origin to use the dynamic resource path */
+	mount.origin = resource_path;
 
 	context = lws_create_context(&info);
 	if (context == NULL) {

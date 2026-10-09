@@ -32,9 +32,9 @@ int
 main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	struct lws_context *context;
+	struct lws_context *context = NULL;
 	const char *p;
-	int result = 1, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE, n;
+	int result = 1, n;
 	uint8_t ib[2048], ob[1536], *eib = ib;
 	lws_backtrace_info_t si;
 	unsigned int m;
@@ -50,10 +50,7 @@ main(int argc, const char **argv)
 	}
 
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_STDIN].sw))) {
 		fdin = open(p, LWS_O_RDONLY, 0);
@@ -66,7 +63,8 @@ main(int argc, const char **argv)
 
 	lwsl_user("LWS Compressed Backtrace Decoder\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 #if defined(LWS_WITH_NETWORK)
 	info.port = CONTEXT_PORT_NO_LISTEN;
 #endif
@@ -136,7 +134,7 @@ main(int argc, const char **argv)
 
 	lwsl_hexdump_notice(ob, (size_t)n);
 
-	san = (ob[n - 2] << 8) | ob[n - 1];
+	san = (uint16_t)((ob[n - 2] << 8) | ob[n - 1]);
 	if (san != (unsigned int)n) {
 		lwsl_err("%s: compressed length wrong\n", __func__);
 		goto bail;

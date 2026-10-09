@@ -42,7 +42,7 @@ typedef enum {
 	LWS_SYSBLOB_TYPE_MQTT_USERNAME,
 	LWS_SYSBLOB_TYPE_MQTT_PASSWORD,
 
-#if defined(LWS_WITH_SECURE_STREAMS_AUTH_SIGV4)
+#if defined(LWS_WITH_SECURE_STREAMS_AUTH_SIGV4) || defined(LWS_WITH_JOSE)
 	/* extend 4 more auth blobs, each has 2 slots */
 	LWS_SYSBLOB_TYPE_EXT_AUTH1,
 	LWS_SYSBLOB_TYPE_EXT_AUTH2 = LWS_SYSBLOB_TYPE_EXT_AUTH1 + 2,
@@ -141,6 +141,12 @@ typedef enum { /* keep system_state_names[] in sync in context.c */
 					  * when a firmware needs to perform
 					  * one-time upgrades to state before
 					  * OPERATIONAL */
+
+	LWS_SYSTATE_DNS,		 /* async dns has acquired at least one
+					  * usable DNS server from the platform,
+					  * or user code pinned one.  With
+					  * LWS_WITH_SYS_ASYNC_DNS, transitions
+					  * hold here until that's true */
 
 	LWS_SYSTATE_OPERATIONAL,	 /* user code can operate normally */
 
@@ -503,7 +509,7 @@ enum {
 /**
  * lws_system_adopt_stdin(): add stdin to be a wsi handled by the event loop
  *
- * \param context: the lws_context
+ * \param cx: the lws_context
  *
  * The user code should call this after context creation.  It will add stdin
  * to the context event loop and handle it one of two ways

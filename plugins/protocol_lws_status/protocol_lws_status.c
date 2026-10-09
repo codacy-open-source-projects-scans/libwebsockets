@@ -44,38 +44,41 @@ typedef enum {
 } e_walk;
 
 struct per_session_data__lws_status {
-	struct per_session_data__lws_status *next;
+	lws_dll2_t list;	/* membership of vhd->live_pss_list */
 	struct lws *wsi;
 	time_t time_est;
 	char user_agent[256];
 
 	e_walk walk;
-	struct per_session_data__lws_status *walk_next;
+	lws_dll2_t *walk_next;
 	unsigned char subsequent:1;
 	unsigned char changed_partway:1;
 	unsigned char wss_over_h2:1;
 };
 
 struct per_vhost_data__lws_status {
-	struct per_session_data__lws_status *live_pss_list;
+	lws_dll2_owner_t live_pss_list;
 	struct lws_context *context;
 	struct lws_vhost *vhost;
 	const struct lws_protocols *protocol;
-	int count_live_pss;
 };
 
 static void
 trigger_resend(struct per_vhost_data__lws_status *vhd)
 {
-	lws_start_foreach_ll(struct per_session_data__lws_status *, pss,
-			     vhd->live_pss_list) {
+	lws_start_foreach_dll(struct lws_dll2 *, d,
+			      lws_dll2_get_head(&vhd->live_pss_list)) {
+		struct per_session_data__lws_status *pss =
+			lws_container_of(d, struct per_session_data__lws_status,
+					 list);
+
 		if (pss->walk == WALK_NONE) {
 			pss->subsequent = 0;
-			pss->walk_next = vhd->live_pss_list;
+			pss->walk_next = lws_dll2_get_head(&vhd->live_pss_list);
 			pss->walk = WALK_INITIAL;
 		} else
 			pss->changed_partway = 1;
-	} lws_end_foreach_ll(pss, next);
+	} lws_end_foreach_dll(d);
 
 	lws_callback_on_writable_all_protocol(vhd->context, vhd->protocol);
 }
@@ -92,15 +95,22 @@ callback_lws_status(struct lws *wsi, enum lws_callback_reasons reason,
 			(struct per_vhost_data__lws_status *)
 			lws_protocol_vh_priv_get(lws_get_vhost(wsi),
 					lws_get_protocol(wsi));
-	char buf[LWS_PRE + 384], ip[24], *start = buf + LWS_PRE - 1, *p = start,
+	char buf[LWS_PRE + 384], ip[24], *start = buf + LWS_PRE, *p = start,
 	     *end = buf + sizeof(buf) - 1;
 	int n, m;
 
 	switch (reason) {
 
 	case LWS_CALLBACK_PROTOCOL_INIT:
-		if (!in)
+		if (lws_cmdline_option_cx(lws_get_context(wsi), "--lws-stub"))
 			return 0;
+
+		/*
+		 * We take no pvos of our own, so `in` (which is the pvo's
+		 * child options, not the pvo itself) may well be NULL... we
+		 * must still create the vhd, since every per-connection
+		 * callback below needs it.
+		 */
 
 		vhd = lws_protocol_vh_priv_zalloc(lws_get_vhost(wsi),
 				lws_get_protocol(wsi),
@@ -122,9 +132,11 @@ callback_lws_status(struct lws *wsi, enum lws_callback_reasons reason,
 		 * memory needed to make the data vs time to send it.
 		 */
 
-		vhd->count_live_pss++;
-		pss->next = vhd->live_pss_list;
-		vhd->live_pss_list = pss;
+		if (!vhd)
+			/* we never got inited on this vhost... refuse him */
+			return -1;
+
+		lws_dll2_add_head(&pss->list, &vhd->live_pss_list);
 
 		pss->wss_over_h2 = !!len;
 
@@ -140,6 +152,9 @@ callback_lws_status(struct lws *wsi, enum lws_callback_reasons reason,
 		break;
 
 	case LWS_CALLBACK_SERVER_WRITEABLE:
+		if (!vhd)
+			return -1;
+
 		switch (pss->walk) {
 		case WALK_INITIAL:
 			n = LWS_WRITE_TEXT | LWS_WRITE_NO_FIN;
@@ -151,9 +166,9 @@ callback_lws_status(struct lws *wsi, enum lws_callback_reasons reason,
 				      lws_get_library_version(),
 				      pss->wss_over_h2,
 				      lws_canonical_hostname(vhd->context),
-				      vhd->count_live_pss);
+				      (int)lws_dll2_count(&vhd->live_pss_list));
 			pss->walk = WALK_LIST;
-			pss->walk_next = vhd->live_pss_list;
+			pss->walk_next = lws_dll2_get_head(&vhd->live_pss_list);
 			break;
 		case WALK_LIST:
 			n = LWS_WRITE_CONTINUATION | LWS_WRITE_NO_FIN;
@@ -164,30 +179,42 @@ callback_lws_status(struct lws *wsi, enum lws_callback_reasons reason,
 				*p++ = ',';
 			pss->subsequent = 1;
 
-			m = 0;
-			lws_start_foreach_ll(struct per_session_data__lws_status *,
-					     pss2, vhd->live_pss_list) {
-				if (pss2 == pss->walk_next) {
-					m = 1;
-					break;
-				}
-			} lws_end_foreach_ll(pss2, next);
+			/*
+			 * our cached next guy may have gone away... the check
+			 * only compares pointers against the live list, it
+			 * never dereferences the possibly-freed candidate
+			 */
 
-			if (!m) {
+			if (!lws_dll2_is_in_list(&vhd->live_pss_list,
+						 pss->walk_next)) {
 				/* our next guy went away */
 				pss->walk = WALK_FINAL;
 				pss->changed_partway = 1;
 				break;
 			}
 
-			strcpy(ip, "unknown");
-			lws_get_peer_simple(pss->walk_next->wsi, ip, sizeof(ip));
-			p += lws_snprintf(p, lws_ptr_diff_size_t(end, p),
-					"{\"peer\":\"%s\",\"time\":\"%ld\","
-					"\"ua\":\"%s\"}",
-					ip, (unsigned long)pss->walk_next->time_est,
-					pss->walk_next->user_agent);
-			pss->walk_next = pss->walk_next->next;
+			{
+				struct per_session_data__lws_status *walk_pss =
+					lws_container_of(pss->walk_next,
+							 struct per_session_data__lws_status,
+							 list);
+				char esc_ip[96];
+				char esc_ua[384];
+
+				strcpy(ip, "unknown");
+				lws_get_peer_simple(walk_pss->wsi, ip, sizeof(ip));
+				lws_json_purify(esc_ip, ip, sizeof(esc_ip), NULL);
+				lws_json_purify(esc_ua, walk_pss->user_agent,
+						sizeof(esc_ua), NULL);
+
+				p += lws_snprintf(p, lws_ptr_diff_size_t(end, p),
+						"{\"peer\":\"%s\",\"time\":\"%ld\","
+						"\"ua\":\"%s\"}",
+						esc_ip, (unsigned long)walk_pss->time_est,
+						esc_ua);
+			}
+
+			pss->walk_next = lws_dll2_get_next(pss->walk_next);
 			if (!pss->walk_next)
 				pss->walk = WALK_FINAL;
 			break;
@@ -198,7 +225,7 @@ walk_final:
 			if (pss->changed_partway) {
 				pss->changed_partway = 0;
 				pss->subsequent = 0;
-				pss->walk_next = vhd->live_pss_list;
+				pss->walk_next = lws_dll2_get_head(&vhd->live_pss_list);
 				pss->walk = WALK_INITIAL;
 			} else
 				pss->walk = WALK_NONE;
@@ -223,13 +250,10 @@ walk_final:
 
 	case LWS_CALLBACK_CLOSED:
 		// lwsl_debug("****** LWS_CALLBACK_CLOSED\n");
-		lws_start_foreach_llp(struct per_session_data__lws_status **,
-			ppss, vhd->live_pss_list) {
-			if (*ppss == pss) {
-				*ppss = pss->next;
-				break;
-			}
-		} lws_end_foreach_llp(ppss, next);
+		if (!vhd)
+			break;
+
+		lws_dll2_remove(&pss->list);
 
 		trigger_resend(vhd);
 		break;

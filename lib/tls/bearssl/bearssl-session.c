@@ -55,7 +55,7 @@ __lws_tls_session_destroy(lws_tls_scm_t *ts)
 static lws_tls_scm_t *
 __lws_tls_session_lookup_by_name(struct lws_vhost *vh, const char *name)
 {
-	lws_start_foreach_dll(struct lws_dll2 *, d, vh->tls_sessions.head) {
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&vh->tls_sessions)) {
 		lws_tls_scm_t *ts = lws_container_of(d, lws_tls_scm_t, list);
 
 		if (!strcmp(name, (const char *)&ts[1]))
@@ -100,7 +100,7 @@ lws_tls_reuse_session(struct lws *wsi)
 	lwsl_tlssess("%s: %s\n", __func__, (const char *)&ts[1]);
 	wsi->tls_session_reused = 1;
 
-	conn = (struct lws_tls_conn *)wsi->tls.ssl;
+	conn = (struct lws_tls_conn *)wsi->io->tls.ssl;
 	br_ssl_engine_set_session_parameters(&conn->u.client.eng, &ts->ser_data->data);
 
 	/* keep our session list sorted in lru -> mru order */
@@ -161,7 +161,7 @@ static void
 lws_tls_session_expiry_cb(lws_sorted_usec_list_t *sul)
 {
 	lws_tls_scm_t *ts = lws_container_of(sul, lws_tls_scm_t, sul_ttl);
-	struct lws_vhost *vh = lws_container_of(ts->list.owner,
+	struct lws_vhost *vh = lws_dll2_owner_container(&ts->list,
 						struct lws_vhost, tls_sessions);
 
 	lws_context_lock(vh->context, __func__); /* -------------- cx { */
@@ -188,7 +188,8 @@ lws_tls_session_new_bearssl(struct lws *wsi)
 #endif
 
 	vh = wsi->a.vhost;
-	if (vh->options & LWS_SERVER_OPTION_DISABLE_TLS_SESSION_CACHE)
+	if ((vh->options & LWS_SERVER_OPTION_DISABLE_TLS_SESSION_CACHE) ||
+	    vh->being_destroyed)
 		return 0;
 
 	if (lws_tls_session_tag_from_wsi(wsi, buf, sizeof(buf)))
@@ -196,7 +197,7 @@ lws_tls_session_new_bearssl(struct lws *wsi)
 
 	nl = strlen(buf);
 
-	conn = (struct lws_tls_conn *)wsi->tls.ssl;
+	conn = (struct lws_tls_conn *)wsi->io->tls.ssl;
 
 	lws_context_lock(vh->context, __func__); /* -------------- cx { */
 	lws_vhost_lock(vh); /* -------------- vh { */
@@ -208,13 +209,13 @@ lws_tls_session_new_bearssl(struct lws *wsi)
 		 * We have to make our own, new session
 		 */
 
-		if (vh->tls_sessions.count == vh->tls_session_cache_max) {
+		if (lws_dll2_count(&vh->tls_sessions) == vh->tls_session_cache_max) {
 
 			/*
 			 * We have reached the vhost's session cache limit,
 			 * prune the LRU / head
 			 */
-			ts = lws_container_of(vh->tls_sessions.head,
+			ts = lws_container_of(lws_dll2_get_head(&vh->tls_sessions),
 					      lws_tls_scm_t, list);
 
 			lwsl_tlssess("%s: pruning oldest session (hit max %u)\n",
@@ -274,7 +275,7 @@ lws_tls_session_new_bearssl(struct lws *wsi)
 
 	lwsl_tlssess("%s: %s: %s %s, (%s:%u)\n", __func__,
 		     wsi->lc.gutag, disposition, buf, vh->name,
-		     (unsigned int)vh->tls_sessions.count);
+		     (unsigned int)lws_dll2_count(&vh->tls_sessions));
 
 	return 1;
 
@@ -286,14 +287,17 @@ bail:
 }
 
 int
-lws_tls_session_dump_save(struct lws_vhost *vh, const char *host, uint16_t port,
-			  lws_tls_sess_cb_t cb_save, void *opq)
+lws_tls_session_dump_save_flags(struct lws_vhost *vh, const char *host,
+				uint16_t port, unsigned int flags,
+				lws_tls_sess_cb_t cb_save, void *opq)
 {
 	struct lws_tls_session_dump d;
 	lws_tls_scm_t *ts;
 	int ret = 1;
 
-	lws_tls_session_tag_discrete(vh->name, host, port, d.tag, sizeof(d.tag));
+	if (lws_tls_session_tag_dump(vh, host, port, flags, d.tag,
+				     sizeof(d.tag)))
+		return 1; /* there is no such tag */
 
 	lws_context_lock(vh->context, __func__); /* -------------- cx { */
 	lws_vhost_lock(vh); /* -------------- vh { */
@@ -320,8 +324,9 @@ bail:
 }
 
 int
-lws_tls_session_dump_load(struct lws_vhost *vh, const char *host, uint16_t port,
-			  lws_tls_sess_cb_t cb_load, void *opq)
+lws_tls_session_dump_load_flags(struct lws_vhost *vh, const char *host,
+				uint16_t port, unsigned int flags,
+				lws_tls_sess_cb_t cb_load, void *opq)
 {
 	struct lws_tls_session_dump d;
 	lws_tls_scm_t *ts;
@@ -329,7 +334,9 @@ lws_tls_session_dump_load(struct lws_vhost *vh, const char *host, uint16_t port,
 	size_t nl;
 	int n;
 
-	lws_tls_session_tag_discrete(vh->name, host, port, d.tag, sizeof(d.tag));
+	if (lws_tls_session_tag_dump(vh, host, port, flags, d.tag,
+				     sizeof(d.tag)))
+		return 1; /* there is no such tag */
 	nl = strlen(d.tag);
 
 	d.blob = NULL;

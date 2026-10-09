@@ -97,6 +97,7 @@ ota_write_sul_cb(lws_sorted_usec_list_t *sul)
 		}
 
 		g->state = LWSOS_FETCHING_INITED_GZ_HASH;
+		g->hash_inited = 1;
 
 		/* we don't want to create a dupe of ourselves while
 		 * we're busy doing the OTA */
@@ -237,12 +238,25 @@ update_impossible:
 
 		lws_upng_inflator_destroy(&g->inflate);
 		lws_genhash_destroy(&g->ctx, temp);
+		g->hash_inited = 0;
 
 		if (memcmp(temp, g->sha512, sizeof(temp))) {
 			lwsl_err("%s: payload hash differs\n", __func__);
 
 			goto fail;
 		}
+	}
+
+	/*
+	 * Never hand image data to the platform writer unless the platform
+	 * actually acknowledged ota_start() (eg, it may have declined for want
+	 * of a free partition)
+	 */
+
+	if (!g->ota_start_done) {
+		lwsl_ss_err(g->ss, "write without successful ota_start");
+
+		goto fail;
 	}
 
 	g->cx->system_ops->ota_ops.ota_queue(g, LWS_OTA_ASYNC_WRITE);
@@ -360,7 +374,15 @@ ota_rx(void *userobj, const uint8_t *in, size_t len, int flags)
 	size_t alen;
 	int n;
 
-	if (g->state >= LWSOS_FETCHING) {
+	/*
+	 * LWSOS_FAILED sorts above LWSOS_FETCHING in lws_ota_state_t, so it
+	 * must be excluded explicitly here: otherwise rx arriving after we
+	 * gave up (eg, in the ~1ms before the abort timeout fires) is treated
+	 * as an in-progress download and resets the state to LWSOS_WRITING,
+	 * resuming with a NULL inflator or an uninitialized hash context.
+	 */
+
+	if (g->state >= LWSOS_FETCHING && g->state != LWSOS_FAILED) {
 
 		lwsl_info("%s: fetching %u, fl 0x%02X\n", __func__, (unsigned int)len, flags);
 
@@ -461,7 +483,12 @@ fetch_fail:
 		goto bail1;
 	}
 
-	if (strncmp("ES512", p, alen)) {
+	/*
+	 * Compare the whole value, not just the manifest's alen bytes of it:
+	 * a length-blind strncmp() accepts any strict prefix of the string we
+	 * are checking against.
+	 */
+	if (alen != strlen("ES512") || memcmp("ES512", p, alen)) {
 		lwsl_err("%s: bad alg %.*s %d\n", __func__, (int)alen, p, (int)alen);
 		goto bail1;
 	}
@@ -480,7 +507,20 @@ fetch_fail:
 
 	p = lws_json_simple_find(map.buf[LJWS_PYLD], map.len[LJWS_PYLD],
 					 "\"variant\":", &alen);
-	if (!p || strncmp(lws_ota_variant, p, alen)) {
+	if (!p) {
+		lwsl_err("%s: no variant\n", __func__);
+		goto bail1;
+	}
+
+	/*
+	 * This is the anti-brick gate: a manifest that is validly signed but
+	 * for a different product variant must be refused.  It has to be an
+	 * exact match, since a strncmp() limited to the manifest's length
+	 * would accept any variant name that is a strict prefix of ours
+	 * ("myproduct" for a "myproduct2" build).
+	 */
+	if (alen != strlen(lws_ota_variant) ||
+	    memcmp(lws_ota_variant, p, alen)) {
 		lwsl_err("%s: wrong variant %.*s\n", __func__, (int)alen, p);
 		goto bail1;
 	}
@@ -494,6 +534,17 @@ fetch_fail:
 					 "\"path\":", &alen);
 	if (!p) {
 		lwsl_err("%s: no path\n", __func__);
+		goto bail1;
+	}
+
+	/*
+	 * lws_strnncpy() truncates to fit g->file, but the metadata below
+	 * is described by alen, so alen must fit too: refuse a path that
+	 * would not fit rather than describe bytes g->file does not hold.
+	 */
+	if (alen >= sizeof(g->file)) {
+		lwsl_err("%s: path too long (%u)\n", __func__,
+			 (unsigned int)alen);
 		goto bail1;
 	}
 
@@ -649,10 +700,19 @@ ota_state(void *userobj, void *h_src, lws_ss_constate_t state,
 		lws_ss_cx_from_user(g)->ota_ss = NULL;
 		lws_buflist_destroy_all_segments(&g->flow.bl);
 		lws_sul_cancel(&g->sul_drain);
-		if (g->state == LWSOS_FETCHING_INITED_GZ_HASH)
+
+		/*
+		 * Free whatever we still own, judged by ownership rather than
+		 * by g->state: the update_impossible path sets LWSOS_FAILED,
+		 * which sorts after LWSOS_FINALIZING, and the normal
+		 * completion path destroys both while still in the fetching
+		 * states, so state-range gates both leak and double-free.
+		 */
+		if (g->hash_inited) {
 			lws_genhash_destroy(&g->ctx, NULL);
-		if (g->state >= LWSOS_FETCHING_INITED_GZ &&
-		    g->state < LWSOS_FINALIZING)
+			g->hash_inited = 0;
+		}
+		if (g->inflate)
 			lws_upng_inflator_destroy(&g->inflate);
 
 		return LWSSSSRET_OK;

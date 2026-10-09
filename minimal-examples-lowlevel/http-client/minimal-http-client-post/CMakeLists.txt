@@ -28,10 +28,7 @@ if (requirements)
 	# instantiate the server per sai builder instance, they are running in the same
 	# machine context in parallel so they can tread on each other otherwise
 	#
-	set(PORT_HCP_SRV "7040")
-	if ("$ENV{SAI_INSTANCE_IDX}")
-		math(EXPR PORT_HCP_SRV "7041 + $ENV{SAI_INSTANCE_IDX}")
-	endif()
+	lws_get_free_port(PORT_HCP_SRV)
 
 # hack
 if (NOT WIN32 AND LWS_WITH_SERVER AND LWS_WITH_TLS)
@@ -47,7 +44,7 @@ else()
 	#
 	# mbedtls is too slow to keep up on some targets, when ctest is in parallel
 	#
-	if (VALGRIND AND NOT MBEDTLS)
+	if (VALGRIND AND NOT MBEDTLS AND NOT LWS_WITH_ASAN)
 		add_test(NAME st_hcp_srv COMMAND
 			${CMAKE_SOURCE_DIR}/scripts/ctest-background.sh
 					hcp_srv ${VALGRIND} --tool=memcheck 
@@ -78,13 +75,13 @@ endif()
 					     FIXTURES_CLEANUP hcp_srv)
 
 	add_test(NAME http-client-post COMMAND
-		lws-minimal-http-client-post -l https://localhost:${PORT_HCP_SRV}/formtest)
+		lws-minimal-http-client-post -l https://${LWS_CTEST_SERVER_URL_RESOLVE}:${PORT_HCP_SRV}/formtest)
 	add_test(NAME http-client-post-m COMMAND
-		lws-minimal-http-client-post -l -m https://localhost:${PORT_HCP_SRV}/formtest)
+		lws-minimal-http-client-post -l -m https://${LWS_CTEST_SERVER_URL_RESOLVE}:${PORT_HCP_SRV}/formtest)
 	add_test(NAME http-client-post-h1 COMMAND
-		lws-minimal-http-client-post -l --h1 https://localhost:${PORT_HCP_SRV}/formtest)
+		lws-minimal-http-client-post -l --h1 https://${LWS_CTEST_SERVER_URL_RESOLVE}:${PORT_HCP_SRV}/formtest)
 	add_test(NAME http-client-post-m-h1 COMMAND
-		lws-minimal-http-client-post -l -m --h1 https://localhost:${PORT_HCP_SRV}/formtest)
+		lws-minimal-http-client-post -l -m --h1 https://${LWS_CTEST_SERVER_URL_RESOLVE}:${PORT_HCP_SRV}/formtest)
 	set_tests_properties(http-client-post
 			     http-client-post-m
 			     http-client-post-h1

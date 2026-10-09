@@ -10,11 +10,13 @@ Because this plugin isolates the OAuth2 handshake from the application logic, it
 
 ## Mount Pattern
 
-This plugin only requires intercepting requests to:
-- `/oauth/login` (Starts the login process)
-- `/oauth/callback` (The callback URI registered with your OAuth server)
+This plugin intercepts requests to:
 
-You can mount this plugin statically in your JSON config or conditionally load it at runtime.
+- `/oauth/login` — Starts the login process (redirect to the Authority).
+- `/oauth/callback` — The callback URI registered with your OAuth server.
+
+You can mount this plugin statically in your JSON config or conditionally load
+it at runtime.
 
 ## Per-Vhost Options (PVOs)
 
@@ -24,7 +26,55 @@ This plugin handles the following PVO options:
 |---|---|
 | `remote-auth-url` | **Required.** The base URI of the central auth server (e.g. `https://auth.warmcat.com`). The plugin will target `/api/authorize` and `/api/token` under this root. |
 | `client-id` | **Required.** The globally unique identifier assigned to this client application by the Auth Server. |
-| `cookie-name` | Custom name emitted for holding the session token upon successful callback. Defaults to `"auth_session"`. |
+| `cookie-name` | Custom name emitted for holding the session token upon successful callback. Defaults to `"auth_session"`. Limited to 1..63 characters: the protocol refuses to initialize with a longer name, since the composed `Set-Cookie` buffers are sized for that cap (a cookie that could not be composed whole would otherwise have to be silently truncated or fail the login). |
+| `cookie-domain` | Optional `Domain=` attribute for the `auth_session` / `auth_csrf` / `auth_refresh_session` cookies minted at `/oauth/callback`. Set it to the same value as `lws-login`'s `cookie-domain` on the same deployment: otherwise the two plugins mint parallel host-only and `Domain=`-scoped cookies with different birthdays, and the `auth_csrf` sidecar can end up expiring on a different schedule from the `auth_refresh_session` it belongs with. Omit entirely (do not set it on just one of the plugins) to keep all cookies host-only. |
+| `cookie-max-age-secs` | Fallback `Max-Age` for the session cookie, in seconds. Defaults to `3600` (1h) for backwards compatibility, but the actual `expires_in` returned by `/api/token` is used in preference when present. Raise this (or the server's `jwt-validity-secs`) to lengthen the session. |
+| `max-pending-auths` | Cap on how many `/oauth/login` handshakes may be in flight at once on this vhost. Defaults to `512`. `/oauth/login` is unauthenticated and each pending entry holds ~8KB, so this is what stops a peer turning "ask to log in" into remote memory exhaustion. When the cap is reached a new login displaces the oldest pending entry that no `/oauth/callback` has yet claimed (a real login only needs its entry to survive the authorize round trip); only when every entry is mid-exchange is the newcomer refused with `503`. Set `0` to disable the cap (not recommended on a public listener). |
+| `max-pending-auths-per-peer` | Cap on pending `/oauth/login` entries from one peer address. Defaults to `32`. A peer at its cap displaces its own oldest unclaimed entry, so an address flooding `/oauth/login` ages out only its own logins and never anyone else's. The peer is the socket peer: behind a reverse proxy every login shares one address, so raise it or set `0` there. |
+
+## State handling
+
+The `state` minted at `/oauth/login` is **single-use** and **bound to the
+browser that started the login**:
+
+ - the pending entry is claimed by the first `/oauth/callback` that presents
+   its `state`; a second callback with the same `state` is answered `400`
+   ("Invalid or expired state").
+
+ - `/oauth/login` also sets a short-lived `__Host-auth_oauth_state` cookie
+   (host-only, `Path=/`, `HttpOnly`, `SameSite=Lax`, `Secure`, `Max-Age=300`)
+   carrying a random nonce, and `/oauth/callback` requires the browser to
+   present it.  This is the RFC 6749 s10.12 binding of the state to the user
+   agent: without it, a callback URL captured from an attacker's own authorize
+   round trip can be handed to a victim, silently signing the victim in as the
+   attacker.  The `__Host-` prefix is what makes the binding hold against a
+   sibling host: a browser only stores a `__Host-` cookie that is `Secure`,
+   has no `Domain` and has `Path=/`, and only from the host it is for, so a
+   page on another host under the same registrable domain cannot plant one
+   (a plain host-only cookie offered no such protection: a `Domain=`-scoped
+   copy of the same name set by a sibling is presented to this host too).
+   Only the first occurrence of the cookie is consulted.
+
+Because the binding cookie has a fixed name, only one login handshake per
+browser is in flight at a time: starting a second `/oauth/login` in another tab
+supersedes the first, whose callback is then refused and has to be restarted.
+Both cookies are `Secure`, like the session cookies this plugin mints, so the
+app origin must be https (or localhost).
+
+## Keeping the session alive (token renewal)
+
+This plugin handles only the **initial** OAuth/PKCE handshake: redirecting to
+the Authority, exchanging the code for a JWT, and dropping the short-lived
+`auth_session` (plus a matching `auth_csrf`) cookie.
+
+Ongoing **token renewal** — re-minting that short-lived cookie from the
+Authority's long-term `auth_refresh_session` cookie before it expires, without
+bouncing the user's main document to a login page — is handled by
+**`lws-login`**, the JWT bouncer mounted in front of your protected pages. See
+the `lws-login` README: it performs renewal both in the background (via its
+widget JS) and on a cold page load (server-side, before any redirect to the
+login form), so a valid session stays alive transparently and only a genuinely
+expired long-term login ever reaches the auth form.
 
 ## How to use alongside `lws-login`
 
@@ -35,7 +85,8 @@ If you are using `lws-login` as a JWT bouncer to protect an application endpoint
     "lws-oauth2-client": {
        "remote-auth-url": "https://auth.warmcat.com",
        "client-id": "monitor",
-       "cookie-name": "auth_session"
+       "cookie-name": "auth_session",
+       "cookie-max-age-secs": "1800"
     }
   }, {
     "lws-login": {
@@ -48,5 +99,13 @@ If you are using `lws-login` as a JWT bouncer to protect an application endpoint
 ```
 
 Upon attempting to access the protected URI, the `lws-login` plugin will natively bounce them to `/oauth/login?service_name=monitor&redirect_uri=...`. The OAuth client will take over, process the handshake securely via the backend, drop the local cookie, and automatically return the user to the protected URI. `lws-login` will see the new cookie and allow passage.
+
+Thereafter, `lws-login` keeps the session alive on its own — both in the
+background (its widget JS) and when a page is loaded with an already-expired
+short-lived cookie but a still-valid long-term login (it re-mints the cookie
+server-side before ever redirecting to the login form). No additional include or
+configuration on this plugin is required for renewal; see the `lws-login` README
+for the renewal requirements (notably `refresh-validity-secs > 0` on the auth
+server, so the long-term cookie is issued at login time).
 
 **Grant Forwarding**: Any `service_name=XYZ` URL parameter provided to `/oauth/login` (which is automatically appended by `lws-login` via its `service-name` PVO) will be seamlessly forwarded up the chain to the remote Authority node. This allows the backend `auth.warmcat.com` server to strictly cryptographically enforce user UI-blocking and privileges _before_ rendering the login screen or issuing an OAuth code back to your local client!

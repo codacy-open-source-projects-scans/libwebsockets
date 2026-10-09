@@ -7,29 +7,87 @@ let certCheckTimers = {};
 let concurrentChecks = 0;
 const MAX_CONCURRENT = 5;
 
+window.activeTls = [];
+window.allTlsCache = {};
+window.certStatusCache = {};
+
+/*
+ * Escape untrusted text before it reaches an innerHTML sink.  Quotes are
+ * escaped too, so this is equally correct for a value interpolated inside a
+ * quoted attribute; the browser decodes the entities again, so an id or
+ * data- attribute still compares equal to the raw string afterwards.
+ */
+function escapeHtml(s) {
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+/* Quote a server-supplied string for literal use inside a RegExp */
+function escapeRegExp(s) {
+    return String(s).replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+}
+
 function processCertQueue() {
     while (concurrentChecks < MAX_CONCURRENT && certCheckQueue.length > 0) {
         let task = certCheckQueue.shift();
         concurrentChecks++;
         let span = document.getElementById(`cert-status-${task.fqdn}`);
         if (span) span.innerText = 'Checking...';
-        sendReq({ req: 'check_cert', domain: currentDomain, subdomain: task.fqdn, port: task.port });
+        let reqDomain = task.domain || currentDomain;
+        sendReq({ req: 'check_cert', domain: reqDomain, subdomain: task.fqdn, port: task.port });
 
         certCheckTimers[task.fqdn] = setTimeout(() => {
+            console.log('[INSTRUMENT] TIMER FIRED for:', task.fqdn, 'port:', task.port);
+            let cacheKey = task.fqdn + ':' + task.port;
+            window.certStatusCache[cacheKey] = {
+                status: 'error',
+                msg: 'Connection Timeout',
+                local_msg: 'Unknown',
+                issuer: 'Unknown',
+                fqdn: task.fqdn,
+                port: task.port
+            };
+
             let s = document.getElementById(`cert-status-${task.fqdn}`);
-            if (s && s.innerText === 'Checking...') {
+            if (s) {
                 s.innerText = 'Timeout';
-                s.classList.remove('text-green', 'text-gray'); s.classList.add('text-red');
+                s.classList.remove('text-green', 'text-gray');
+                s.classList.add('text-red');
             }
             if (certCheckTimers[task.fqdn]) delete certCheckTimers[task.fqdn];
             concurrentChecks = Math.max(0, concurrentChecks - 1);
+
+            updateGlobalTlsTable();
+            if (typeof renderDomainDetails === 'function') renderDomainDetails();
             processCertQueue();
-        }, 5000);
+        }, 20000);
     }
 }
 
 function generateId() {
     return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+}
+
+/*
+ * The signer qualifies a relative owner name by appending $ORIGIN, and takes
+ * a name that already ends in the root dot to be absolute already.  An
+ * $ORIGIN missing that dot is therefore appended to names that already end
+ * in it, and the zone signs and NSEC3-hashes as "x.example.com.example.com".
+ * So give every $ORIGIN we emit its trailing dot.  The server normalises the
+ * zone it is handed as well; this just keeps the editor showing what will
+ * actually be stored.
+ */
+function normaliseOriginLine(line) {
+    const m = /^(\$ORIGIN[ \t]+)([^ \t;\r]+)(.*)$/.exec(line);
+
+    if (!m)
+        return line;
+
+    return m[1] + (m[2].endsWith('.') ? m[2] : m[2] + '.') + m[3];
 }
 
 class ZoneFile {
@@ -104,7 +162,7 @@ class ZoneFile {
         if (soaIdx !== -1) {
             record.parsed = {
                 name: tokens[0],
-                ttl: soaIdx > 2 && !isNaN(tokens[1]) ? tokens[1] : '',
+                ttl: soaIdx > 2 && !Number.isNaN(Number(tokens[1])) ? tokens[1] : '',
                 clazz: 'IN',
                 mname: tokens[soaIdx + 1] || '',
                 rname: tokens[soaIdx + 2] || '',
@@ -215,7 +273,8 @@ class ZoneFile {
     }
 
     serialize() {
-        return this.records.map(r => r.raw).join('\n');
+        return this.records.map(r =>
+            r.type === 'macro' ? normaliseOriginLine(r.raw) : r.raw).join('\n');
     }
 }
 
@@ -238,16 +297,42 @@ function connect() {
         sendReq({ req: 'get_domains' });
     };
 
+    /*
+     * The server frames one response per line and never emits a raw newline
+     * inside one, so anything before the last '\n' is a complete line: parse
+     * it and drop it whether or not it parsed.  Carrying an unparseable line
+     * forward instead would poison every later message and grow the buffer
+     * for ever, so cap what we are willing to hold as one incomplete line.
+     */
+    const WS_STREAM_BUFFER_MAX = 1024 * 1024;
+
     ws.onmessage = function(msg) {
-        console.log('[INSTRUMENT] WS onmessage: Raw payload: ', msg.data);
-        try {
-            const data = JSON.parse(msg.data);
-            console.log('[INSTRUMENT] WS onmessage: Parsed data: ', data);
-            handleResponse(data);
-        } catch(e) {
-            console.error('[INSTRUMENT] Failed to parse WS msg:', e);
-            console.log('[INSTRUMENT] Raw message fragment/broken:', msg.data);
+        window.wsStreamBuffer = (window.wsStreamBuffer || '') + msg.data;
+
+        if (window.wsStreamBuffer.length > WS_STREAM_BUFFER_MAX) {
+            console.warn('[INSTRUMENT] WS onmessage: reassembly buffer over cap, discarding');
+            window.wsStreamBuffer = '';
+            return;
         }
+
+        const parts = window.wsStreamBuffer.split('\n');
+
+        /* whatever follows the last newline is the incomplete remainder */
+        window.wsStreamBuffer = parts.pop();
+
+        parts.forEach(part => {
+            const p = part.trim();
+            if (!p) return;
+
+            let data;
+            try {
+                data = JSON.parse(p);
+            } catch(e) {
+                console.warn('[INSTRUMENT] WS onmessage: dropping unparseable line');
+                return;
+            }
+            handleResponse(data);
+        });
     };
 
     ws.onclose = function() {
@@ -261,8 +346,17 @@ function connect() {
     };
 }
 
-window.activeTls = [];
-window.certStatusCache = {};
+document.addEventListener('DOMContentLoaded', () => {
+    const btnDistReset = document.getElementById('btn-dist-reset');
+    if (btnDistReset) {
+        btnDistReset.addEventListener('click', () => {
+            if (confirm("Are you sure you want to completely wipe and regenerate the Distribution PKI? This action cannot be undone and will invalidate all existing certificates.")) {
+                sendReq({ req: "reset_dist_pki" });
+                showToast('Resetting Distribution PKI...');
+            }
+        });
+    }
+});
 
 function sendReq(obj) {
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -285,6 +379,16 @@ function showToast(msg, isError = false) {
 
 function handleResponse(data) {
     if (data.status === 'error') {
+        /* say inventory errors in the panel itself rather than leaving the
+         * table stuck at "Loading..." behind a transient toast */
+        if (data.req === 'get_ip_inventory') {
+            const tb = document.querySelector('#table-ip-inventory tbody');
+            if (tb) tb.innerHTML = `<tr><td colspan="4" class="loading">${escapeHtml(data.msg || 'Inventory unavailable')}</td></tr>`;
+            const cnt = document.getElementById('ip-inventory-count');
+            if (cnt) cnt.textContent = '';
+            window.ipInventory = [];
+            window.ipInventoryMore = false;
+        }
         showToast(data.msg || 'An error occurred', true);
         return;
     }
@@ -295,6 +399,7 @@ function handleResponse(data) {
             const inSuf = document.getElementById('input-ipv6-suffix');
             if (inSuf) inSuf.value = window.ipv6_suffix;
             if (window.last_extip_data) handleResponse({ status:'ok', req:'extip_update', data:window.last_extip_data });
+            sendReq({ req: 'get_acme_config' });
             break;
         case 'set_ipv6_suffix':
             showToast('IPv6 suffix preference saved successfully');
@@ -309,14 +414,9 @@ function handleResponse(data) {
                 let content = '<table class="extip-table">';
                 ips.forEach(ip => {
                     let type = ip.includes(':') ? 'Ext IPv6' : 'Ext IPv4';
-                    if (type === 'Ext IPv6' && window.ipv6_suffix) {
-                        let parts = ip.split(':');
-                        if (parts.length > 2) {
-                            parts.pop();
-                            ip = parts.join(':') + ':' + window.ipv6_suffix;
-                        }
-                    }
-                    content += `<tr><td>${type}:</td><td><b>${ip}</b></td></tr>`;
+                    if (type === 'Ext IPv6')
+                        ip = ipv6WithSuffix(ip);
+                    content += `<tr><td>${type}:</td><td><b>${escapeHtml(ip)}</b></td></tr>`;
                 });
                 content += '</table>';
                 bdg.classList.remove('hide'); bdg.classList.add('show-inline');
@@ -324,11 +424,50 @@ function handleResponse(data) {
                 if (typeof window.updateRawEditorSubstitutions === 'function') {
                     window.updateRawEditorSubstitutions();
                 }
+
+                /*
+                 * Dynamic-address zonefile records resolve against the
+                 * detected addresses; refresh the inventory grouping now
+                 * they are known (or changed).  Any fetch already made,
+                 * even one still in flight, went without them
+                 */
+                if (window.ipInventoryRequested)
+                    fetchIpInventory(0);
             }
             break;
         case 'get_domains':
+            console.log('[DEBUG] get_domains response received. data.domains:', data.domains);
             window.domainsCache = data.domains || [];
+            console.log('[DEBUG] Calling renderDomains with cache length:', window.domainsCache.length);
             renderDomains(window.domainsCache);
+            setTimeout(() => {
+                sendReq({ req: 'get_all_tls' });
+            }, 50);
+
+            setTimeout(() => {
+                sendReq({ req: 'get_dist_server_domain' });
+            }, 100);
+
+            /* the IP inventory is derived from the same zonefiles; fetch it
+             * once the other bootstrap requests have been sequenced out */
+            setTimeout(() => fetchIpInventory(0), 200);
+
+            let didSelect = false;
+            // Restore saved domain state if possible
+            if (!currentDomain) {
+                const saved = localStorage.getItem('lws-dnssec-monitor-selected-domain');
+                console.log('[DEBUG] No currentDomain. Found saved domain in localStorage:', saved);
+                if (saved && window.domainsCache.find(d => d.name === saved)) {
+                    console.log('[DEBUG] Restoring saved domain state:', saved);
+                    setTimeout(() => selectDomain(saved), 150);
+                    didSelect = true;
+                } else if (saved) {
+                    console.warn('[DEBUG] Saved domain not found in domainsCache:', saved);
+                }
+            } else {
+                console.log('[DEBUG] currentDomain is already set:', currentDomain);
+            }
+
             if (currentDomain) {
                 const domObj = window.domainsCache.find(d => d.name === currentDomain);
                 if (domObj) {
@@ -337,9 +476,37 @@ function handleResponse(data) {
                 }
             }
             // Bootstrap phase 2: now safe to fetch suffix config
-            sendReq({ req: 'get_ipv6_suffix' });
-            sendReq({ req: 'get_acme_config' });
-            sendReq({ req: 'get_acme_log' });
+            if (!didSelect) {
+                window.didBootstrapPhase2 = true;
+                setTimeout(() => sendReq({ req: 'get_ipv6_suffix' }), 150);
+            }
+            break;
+        case 'get_ip_inventory':
+            /*
+             * The server pages the rolled-up interface list; accumulate
+             * the pages in order and keep asking until it says there are
+             * no more.  A page always arrives as one newline-framed
+             * response.
+             */
+            if (data.status === 'ok') {
+                if (!data.cursor)
+                    window.ipInventory = [];
+                window.ipInventoryMore = !!data.more;
+                (data.ifaces || []).forEach(f => window.ipInventory.push(f));
+                renderIpInventory();
+                if (data.more && typeof data.next === 'number') {
+                    /*
+                     * A page can legitimately come back empty when the
+                     * server's tx buffer was nearly full; but only follow
+                     * a "next" that actually advances, so a stalled
+                     * sequence cannot spin
+                     */
+                    if (data.next > (data.cursor || 0) || (data.ifaces || []).length)
+                        fetchIpInventory(data.next);
+                    else
+                        window.ipInventoryMore = false;
+                }
+            }
             break;
         case 'create_domain':
             closeModal('modal-new-domain');
@@ -359,18 +526,33 @@ function handleResponse(data) {
                 showPopup('Error: ' + (data.msg || 'Action failed'), true);
             }
             break;
-        case 'get_zone':
-            currentZone = new ZoneFile(data.zone || '');
+        case 'get_zone': {
+            console.log('[DEBUG] get_zone response received for zone length:', data.zone ? data.zone.length : 0);
+            /*
+             * A new domain's zone is empty: offer a starter zone to edit.
+             * It is not saved, so not signed and published, until the
+             * user saves it
+             */
+            const isNewZone = !(data.zone || '').trim();
+            currentZone = new ZoneFile(isNewZone ? starterZone(currentDomain) : data.zone);
+            console.log('[DEBUG] Parsed ZoneFile records:', currentZone.records.length);
             renderZoneTable();
             updateRawEditor();
             document.getElementById('record-editor')?.classList.add('hidden-panel');
             // Sequence getting TLS after getting Zone to avoid UDS packet drops
+            console.log('[DEBUG] Dispatching get_tls for domain:', currentDomain);
             sendReq({ req: 'get_tls', domain: currentDomain });
-            document.getElementById('btn-save-zonefile').disabled = true;
+            document.getElementById('btn-save-zonefile').disabled = !isNewZone;
+            if (isNewZone)
+                showToast('New zone: edit the example records, then save it');
             break;
+        }
         case 'update_zone':
             showToast('Zonefile updated successfully');
             document.getElementById('btn-save-zonefile').disabled = true;
+            /* the inventory is rolled up from the zonefiles, so refresh it
+             * now this zone's contents have changed */
+            setTimeout(() => fetchIpInventory(0), 150);
             break;
         case 'get_acme_config':
             if (data.config) {
@@ -381,10 +563,49 @@ function handleResponse(data) {
                 document.getElementById('acme-country').value = data.config.country || '';
                 document.getElementById('acme-state').value = data.config.state || '';
                 document.getElementById('acme-locality').value = data.config.locality || '';
+                if (document.getElementById('acme-sign-validity')) {
+                    document.getElementById('acme-sign-validity').value = data.config.sign_validity_days || 21;
+                }
+                if (document.getElementById('acme-profile')) {
+                    document.getElementById('acme-profile').value = data.config.profile || '';
+                    window.currentAcmeProfile = data.config.profile || '';
+                }
+            }
+            sendReq({ req: 'get_acme_profiles' });
+            sendReq({ req: 'get_acme_log' });
+            break;
+        case 'get_acme_profiles':
+            if (data.profiles && typeof data.profiles === 'object') {
+                let select = document.getElementById('acme-profile');
+                if (select) {
+                    let currentValue = window.currentAcmeProfile || select.value || '';
+                    select.innerHTML = '';
+                    for (let p in data.profiles) {
+                        let opt = document.createElement('option');
+                        opt.value = p;
+                        opt.textContent = p.charAt(0).toUpperCase() + p.slice(1) + ' (' + p + ')';
+                        select.appendChild(opt);
+                    }
+                    if (currentValue && data.profiles[currentValue]) {
+                        select.value = currentValue;
+                    }
+                    select.onchange = function() {
+                        window.currentAcmeProfile = this.value;
+                    };
+                }
             }
             break;
         case 'set_acme_config':
             showToast('ACME configuration saved');
+            break;
+        case 'set_domain_acme':
+            showToast('Domain ACME preference saved');
+            break;
+        case 'force_cert_reissue':
+            if (data.status === 'ok')
+                showToast('Certificate reissue requested for ' + data.fqdn);
+            else
+                showToast('Certificate reissue failed: ' + data.msg, true);
             break;
         case 'get_acme_log':
             if (data.log) {
@@ -396,14 +617,86 @@ function handleResponse(data) {
             }
             break;
         case 'get_tls':
-            // Removed per-domain TLS fetch
+            console.log('[DEBUG] get_tls response received. data.domain:', data.domain, 'data.tls:', data.tls);
+            if (data.tls) {
+                if (data.domain === currentDomain) window.activeTls = data.tls;
+                window.allTlsCache[data.domain || currentDomain] = data.tls;
+
+                // Enqueue background cert checks for all these endpoints
+                data.tls.forEach(t => {
+                    let cacheKey = t.fqdn + ':' + t.port;
+                    if (!window.certStatusCache[cacheKey] && !certCheckTimers[t.fqdn] && !certCheckQueue.some(q => q.fqdn === t.fqdn && q.port === t.port)) {
+                        certCheckQueue.push({fqdn: t.fqdn, port: t.port, domain: data.domain});
+                    }
+                });
+            } else {
+                if (data.domain === currentDomain) window.activeTls = [];
+                window.allTlsCache[data.domain || currentDomain] = [];
+            }
+            console.log('[DEBUG] activeTls set. Length:', window.activeTls.length);
+            if (currentZone && data.domain === currentDomain) {
+                console.log('[DEBUG] Calling renderZoneTable from get_tls');
+                renderZoneTable();
+            } else if (data.domain === currentDomain) {
+                console.log('[DEBUG] No currentZone available in get_tls');
+            }
+            processCertQueue();
+
+            updateGlobalTlsTable();
+            updateDistClientsTable();
+
+            if (!window.didBootstrapPhase2) {
+                window.didBootstrapPhase2 = true;
+                sendReq({ req: 'get_ipv6_suffix' });
+            }
+            break;
+        case 'get_all_tls':
+            if (data.all_tls) {
+                data.all_tls.forEach(d => {
+                    window.allTlsCache[d.domain] = d.tls;
+                    if (d.domain === currentDomain) window.activeTls = d.tls;
+                    d.tls.forEach(t => {
+                        let cacheKey = t.fqdn + ':' + t.port;
+                        if (!window.certStatusCache[cacheKey] && !certCheckTimers[t.fqdn] && !certCheckQueue.some(q => q.fqdn === t.fqdn && q.port === t.port)) {
+                            certCheckQueue.push({fqdn: t.fqdn, port: t.port, domain: d.domain});
+                        }
+                    });
+                });
+            }
+            if (currentZone) {
+                renderZoneTable();
+            }
+            processCertQueue();
+            updateGlobalTlsTable();
+            updateDistClientsTable();
+            break;
+        case 'get_dist_server_domain':
+            if (data.status === 'ok' && data.domain) {
+                const domainInput = document.getElementById('dist-server-domain');
+                if (domainInput && !domainInput.value) {
+                    domainInput.value = data.domain;
+                }
+            }
+            break;
+        case 'create_tls':
+            showToast('TLS Port mapped successfully');
+            sendReq({ req: 'get_tls', domain: currentDomain });
+            break;
+        case 'delete_tls':
+            showToast('TLS Port mapping removed');
+            sendReq({ req: 'get_tls', domain: currentDomain });
+            break;
         case 'cert_status':
+            console.log('[INSTRUMENT] cert_status RECEIVED for:', data.subdomain, data.port, 'status:', data.status, 'msg:', data.msg);
             window.certStatusCache[data.subdomain + ':' + data.port] = data;
             let span = document.getElementById(`cert-status-${data.subdomain}`);
             if (certCheckTimers[data.subdomain]) {
+                console.log('[INSTRUMENT] CLEARING timer for:', data.subdomain);
                 clearTimeout(certCheckTimers[data.subdomain]);
                 delete certCheckTimers[data.subdomain];
                 concurrentChecks = Math.max(0, concurrentChecks - 1);
+            } else {
+                console.log('[INSTRUMENT] NO TIMER FOUND to clear for:', data.subdomain);
             }
             if (span) {
                 if (data.status === 'ok') {
@@ -414,22 +707,98 @@ function handleResponse(data) {
                     span.classList.remove('text-green', 'text-gray'); span.classList.add('text-red');
                 }
             }
-            updateTlsSummary();
-            if (!document.getElementById('modal-tls-details').classList.contains('hidden-panel') && document.getElementById('modal-tls-details').classList.contains('show')) {
-                renderTlsDetailsModal();
-            }
+            updateGlobalTlsTable();
+            renderZoneTable();
+
+            // Re-trigger the queue to process the next one
             processCertQueue();
+            break;
+        case 'download_dist_ca':
+            if (data.status === 'ok') {
+                const blob = new Blob([data.ca], { type: 'application/x-x509-ca-cert' });
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `distribution-ca.crt`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                window.URL.revokeObjectURL(url);
+                showToast('CA Certificate downloaded');
+            }
+            break;
+        case 'download_dist_server':
+            if (data.status === 'ok') {
+                const triggerDownload = (content, filename) => {
+                    const blob = new Blob([content], { type: 'application/x-pem-file' });
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = filename;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    window.URL.revokeObjectURL(url);
+                };
+
+                const srvPem = `${data.cert}\n${data.ca}\n`;
+                const filenameBase = data.domain ? `distribution-server-${data.domain}` : 'distribution-server';
+                triggerDownload(srvPem, `${filenameBase}.crt`);
+
+                setTimeout(() => {
+                    triggerDownload(`${data.key}\n`, `${filenameBase}.key`);
+                }, 100);
+
+                showToast('Server Certificate and Key downloaded');
+            } else if (data.status === 'error') {
+                showToast(data.msg || 'Error fetching server certificates', true);
+            }
+            break;
+        case 'provisioning_bundle':
+            if (data.status === 'ok') {
+                const triggerDownload = (content, filename) => {
+                    const blob = new Blob([content], { type: 'application/x-pem-file' });
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = filename;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    window.URL.revokeObjectURL(url);
+                };
+
+                triggerDownload(`${data.cert}\n`, `distribution-client-${data.subdomain}.crt`);
+
+                setTimeout(() => {
+                    triggerDownload(`${data.key}\n`, `distribution-client-${data.subdomain}.key`);
+                }, 100);
+
+                showToast('Provisioning keys downloaded');
+            }
+            break;
+        case 'reset_dist_pki':
+            if (data.status === 'ok') {
+                showToast('Distribution PKI successfully regenerated.', 'success');
+            } else {
+                showToast('Failed to reset PKI: ' + data.msg, true);
+            }
             break;
     }
 }
 
+function downloadProvisioningBundle(domain, subdomain) {
+    showToast('Preparing provisioning bundle...');
+    sendReq({ req: 'provisioning_bundle', domain: domain, subdomain: subdomain });
+}
+
 function renderDomains(domains) {
+    console.log('[DEBUG] renderDomains called with domains:', domains);
     const tbody = document.querySelector('#table-domains tbody');
     tbody.innerHTML = '';
     
-    console.log('Rendering domains:', domains);
-
     if (!domains.length) {
+        console.log('[DEBUG] No domains to render.');
         tbody.innerHTML = '<tr><td colspan="3" class="loading">No domains found. Add one to begin.</td></tr>';
         return;
     }
@@ -473,6 +842,690 @@ function renderDomains(domains) {
     });
 }
 
+/*
+ * The DHT-detected external addresses, as first-seen v4 / v6 literals,
+ * with the configured IPv6 interface suffix applied.  These are the
+ * values of the zonefiles' ${EXTIP4} / ${EXTIP6} macros: the zonefile
+ * editor previews them, the signer substitutes them, and the inventory
+ * grouping resolves dynamic records against them.
+ */
+function currentExtIps() {
+    const out = { ip4: '', ip6: '' };
+
+    if (!window.last_extip_data || !window.last_extip_data['ext-ips'])
+        return out;
+
+    const ips = Array.isArray(window.last_extip_data['ext-ips'])
+        ? window.last_extip_data['ext-ips']
+        : (window.last_extip_data['ext-ips'] + '').split(',');
+    ips.forEach(ip => {
+        if (ip.includes(':')) {
+            if (!out.ip6) out.ip6 = ipv6WithSuffix(ip);
+        } else if (!out.ip4)
+            out.ip4 = ip;
+    });
+
+    return out;
+}
+
+function ipv6WithSuffix(ip) {
+    if (!window.ipv6_suffix)
+        return ip;
+
+    const parts = ip.split(':');
+    if (parts.length <= 2)
+        return ip;
+
+    parts.pop();
+
+    return parts.join(':') + ':' + window.ipv6_suffix;
+}
+
+function fetchIpInventory(cursor) {
+    const ext = currentExtIps();
+
+    window.ipInventoryRequested = true;
+    sendReq({ req: 'get_ip_inventory', cursor: cursor || 0,
+              ip4: ext.ip4, ip6: ext.ip6 });
+}
+
+/*
+ * World map of the inventory interfaces.
+ *
+ * The land outline is vendored Natural Earth 1:110m TopoJSON (public
+ * domain, world-atlas packaging) decoded here; coordinates project with
+ * Web Mercator clamped to +/-85 degrees.  Zoom and pan only manipulate
+ * the svg viewBox, so the projected land path is built once.
+ */
+
+const GEO_W = 1000;
+const GEO_SVG_NS = 'http://www.w3.org/2000/svg';
+let geoMap = null;
+
+function geoMercator(lon, lat) {
+    const clamped = Math.max(-85, Math.min(85, lat));
+    const x = (lon + 180) / 360;
+    const rad = clamped * Math.PI / 180;
+    const y = (1 - Math.log(Math.tan(Math.PI / 4 + rad / 2)) / Math.PI) / 2;
+
+    return [x * GEO_W, y * GEO_W];
+}
+
+/* decode the topology's quantized delta arcs into absolute coordinates */
+
+function geoDecodeTopo(topo) {
+    const tr = topo.transform;
+    const abs = topo.arcs.map(arc => {
+        let x = 0, y = 0;
+
+        return arc.map(d => {
+            x += d[0];
+            y += d[1];
+
+            return [x, y];
+        });
+    });
+
+    const toGeo = tr
+        ? p => [p[0] * tr.scale[0] + tr.translate[0],
+                p[1] * tr.scale[1] + tr.translate[1]]
+        : p => p;
+
+    const ring = idxs => {
+        let pts = [];
+
+        idxs.forEach(ai => {
+            const rev = ai < 0;
+            let a = abs[rev ? ~ai : ai].map(toGeo);
+
+            if (rev) a = a.slice().reverse();
+            pts = pts.concat(a);
+        });
+
+        return pts;
+    };
+
+    /*
+     * The topology is cut at the antimeridian, so a ring whose land
+     * crosses it (Eurasia, the Diomede pair) has consecutive points at
+     * -180 and +180: projecting those straight to [0, 1000] draws a
+     * full-width horizontal line and inverts the fill around it.
+     * Unwrap each ring's longitudes to be continuous first, letting x
+     * leave [0, 1000]; the emit below shifts the wrapped parts back in.
+     */
+    const unwrap = pts => {
+        let prev = pts.length ? pts[0][0] : 0;
+
+        pts.forEach(pt => {
+            while (pt[0] - prev > 180)
+                pt[0] -= 360;
+            while (pt[0] - prev < -180)
+                pt[0] += 360;
+            prev = pt[0];
+        });
+
+        return pts;
+    };
+
+    /*
+     * Sutherland-Hodgman clip of a ring against one vertical half-plane:
+     * keep x >= edge, or x <= edge when keepGreater is false
+     */
+
+    const clipHalf = (pts, edge, keepGreater) => {
+        const out = [];
+
+        for (let i = 0; i < pts.length; i++) {
+            const a = pts[i], b = pts[(i + 1) % pts.length];
+            const ain = keepGreater ? a[0] >= edge : a[0] <= edge;
+            const bin = keepGreater ? b[0] >= edge : b[0] <= edge;
+
+            if (ain)
+                out.push(a);
+            if (ain !== bin) {
+                const t = (edge - a[0]) / (b[0] - a[0]);
+
+                out.push([edge, a[1] + (b[1] - a[1]) * t]);
+            }
+        }
+
+        return out;
+    };
+
+    /*
+     * Emit one unwrapped ring into the single world: at x, x - 1000 and
+     * x + 1000, each clipped into [0, 1000] so every painted point lies
+     * inside the one map.  The shifted copies only ever contribute the
+     * wrapped sliver of an outline that crosses the antimeridian, and
+     * nothing exists outside the viewBox that a browser with loose svg
+     * overflow clipping could show repeated
+     */
+
+    const emitRing = pts => {
+        const xy = pts.map(pt => geoMercator(pt[0], pt[1]));
+
+        [-GEO_W, 0, GEO_W].forEach(off => {
+            let p = xy.map(q => [q[0] + off, q[1]]);
+
+            p = clipHalf(p, 0, true);
+            p = clipHalf(p, GEO_W, false);
+            if (p.length < 3)
+                return;
+            p.forEach((q, i) => {
+                d += (i ? 'L' : 'M') + q[0].toFixed(1) + ' ' + q[1].toFixed(1);
+            });
+            d += 'Z';
+        });
+    };
+
+    let d = '';
+    const emit = polys => polys.forEach(poly =>
+            poly.forEach(ringIdxs => emitRing(unwrap(ring(ringIdxs)))));
+
+    (topo.objects.land.geometries || [topo.objects.land]).forEach(g => {
+        const arcs = g.arcs;
+
+        if (g.type === 'MultiPolygon')
+            emit(arcs);
+        else if (g.type === 'Polygon')
+            emit([arcs]);
+    });
+
+    return d;
+}
+
+function geoApplyVB() {
+    geoMap.svg.setAttribute('viewBox',
+        `${geoMap.vb.x} ${geoMap.vb.y} ${geoMap.vb.w} ${geoMap.vb.h}`);
+}
+
+/*
+ * The view is always clamped to exactly one world: you cannot zoom out
+ * past the whole map fitting the panel, nor pan past its edge, and all
+ * land is clipped into that one world at build time, so nothing ever
+ * repeats.  Zooming in reaches a small patch of a world much larger
+ * than the screen.
+ */
+
+function geoClampVB() {
+    if (geoMap.vb.w > GEO_W)
+        geoMap.vb.w = GEO_W;
+    if (geoMap.vb.h > GEO_W)
+        geoMap.vb.h = GEO_W;
+
+    geoMap.vb.x = Math.max(0, Math.min(GEO_W - geoMap.vb.w, geoMap.vb.x));
+    geoMap.vb.y = Math.max(0, Math.min(GEO_W - geoMap.vb.h, geoMap.vb.y));
+}
+
+/* zoom by factor > 1 in, keeping the point under (clientX, clientY) */
+
+function geoZoomAt(clientX, clientY, factor) {
+    const rect = geoMap.svg.getBoundingClientRect();
+    const mx = geoMap.vb.x + (clientX - rect.left) / rect.width * geoMap.vb.w;
+    const my = geoMap.vb.y + (clientY - rect.top) / rect.height * geoMap.vb.h;
+    const nw = Math.max(16, Math.min(GEO_W, geoMap.vb.w / factor));
+    const nh = nw;
+
+    geoMap.vb = {
+        x: mx - (mx - geoMap.vb.x) * (nw / geoMap.vb.w),
+        y: my - (my - geoMap.vb.y) * (nh / geoMap.vb.h),
+        w: nw, h: nh
+    };
+    geoClampVB();
+    geoApplyVB();
+}
+
+function geoInitMap() {
+    const svg = document.getElementById('geo-map');
+
+    if (!svg || geoMap)
+        return;
+
+    geoMap = { svg, vb: { x: 0, y: 0, w: GEO_W, h: GEO_W },
+               lands: [], markers: null };
+
+    /*
+     * All painted land lies inside the one [0, 1000] world after the
+     * clip at emit time, so a single path is enough and nothing can
+     * appear outside the viewBox.  Markers never unwrap, so they need
+     * only the one copy too.
+     */
+
+    const land = document.createElementNS(GEO_SVG_NS, 'path');
+
+    land.setAttribute('class', 'geo-land');
+    svg.appendChild(land);
+    geoMap.lands = [land];
+
+    const markers = document.createElementNS(GEO_SVG_NS, 'g');
+    markers.setAttribute('class', 'geo-markers');
+    svg.appendChild(markers);
+    geoMap.markers = markers;
+
+    geoApplyVB();
+
+    fetch('land-110m.json')
+        .then(r => {
+            if (!r.ok) throw new Error('map data ' + r.status);
+
+            return r.json();
+        })
+        .then(topo => {
+            const d = geoDecodeTopo(topo);
+
+            geoMap.lands.forEach(l => l.setAttribute('d', d));
+        })
+        .catch(e => {
+            console.warn('geo map: no land outline:', e);
+        });
+
+    /*
+     * Input model: scrolling pans in x and y exactly like dragging
+     * does; zooming is a pinch gesture (delivered as ctrl+wheel on
+     * trackpads), a two-finger touch pinch, ctrl + wheel, or the +/-
+     * buttons for devices with none of those
+     */
+    svg.addEventListener('wheel', e => {
+        const mult = e.deltaMode === 1 ? 16 : 1;
+
+        e.preventDefault();
+
+        if (e.ctrlKey) {
+            const k = Math.max(0.5, Math.min(2,
+                    Math.exp(-e.deltaY * mult * 0.01)));
+
+            geoZoomAt(e.clientX, e.clientY, k);
+
+            return;
+        }
+
+        const rect = svg.getBoundingClientRect();
+
+        geoMap.vb.x += e.deltaX * mult * (geoMap.vb.w / rect.width);
+        geoMap.vb.y += e.deltaY * mult * (geoMap.vb.h / rect.height);
+        geoClampVB();
+        geoApplyVB();
+    }, { passive: false });
+
+    /* one pointer drags; two pointers pinch */
+    const pointers = new Map();
+    let drag = null, pinchDist = 0;
+
+    svg.addEventListener('pointerdown', e => {
+        pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        svg.setPointerCapture(e.pointerId);
+
+        if (pointers.size === 1) {
+            drag = { x: e.clientX, y: e.clientY, vb: { ...geoMap.vb } };
+            pinchDist = 0;
+        } else if (pointers.size === 2) {
+            const [p1, p2] = [...pointers.values()];
+
+            drag = null;
+            pinchDist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
+        }
+    });
+
+    svg.addEventListener('pointermove', e => {
+        if (!pointers.has(e.pointerId))
+            return;
+        pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+        if (pointers.size === 2 && pinchDist > 0) {
+            const [p1, p2] = [...pointers.values()];
+            const d = Math.hypot(p1.x - p2.x, p1.y - p2.y);
+
+            if (d > 0)
+                geoZoomAt((p1.x + p2.x) / 2, (p1.y + p2.y) / 2,
+                          d / pinchDist);
+            pinchDist = d;
+
+            return;
+        }
+
+        if (drag) {
+            const rect = svg.getBoundingClientRect();
+
+            geoMap.vb.x = drag.vb.x -
+                    (e.clientX - drag.x) / rect.width * drag.vb.w;
+            geoMap.vb.y = drag.vb.y -
+                    (e.clientY - drag.y) / rect.height * drag.vb.h;
+            geoClampVB();
+            geoApplyVB();
+        }
+    });
+
+    const endPointer = e => {
+        pointers.delete(e.pointerId);
+
+        if (pointers.size < 2)
+            pinchDist = 0;
+        if (!pointers.size) {
+            drag = null;
+
+            return;
+        }
+
+        const p = [...pointers.values()][0];
+
+        drag = { x: p.x, y: p.y, vb: { ...geoMap.vb } };
+    };
+    svg.addEventListener('pointerup', endPointer);
+    svg.addEventListener('pointercancel', endPointer);
+
+    /* fallback zoom buttons for pointers that cannot pinch */
+    const wrap = document.getElementById('geo-map-wrap');
+    const zoomCenter = () => {
+        const r = wrap.getBoundingClientRect();
+
+        return [r.left + r.width / 2, r.top + r.height / 2];
+    };
+    const zin = document.getElementById('geo-zoom-in');
+    const zout = document.getElementById('geo-zoom-out');
+    if (zin)
+        zin.onclick = () => geoZoomAt(...zoomCenter(), 1.5);
+    if (zout)
+        zout.onclick = () => geoZoomAt(...zoomCenter(), 1 / 1.5);
+}
+
+/*
+ * One abstract server icon per interface: a small rack glyph, solid for
+ * LOC-placed servers and outlined for country-estimated ones.  Clicking
+ * it opens the zonefile editor of its first name.  A marker fanned out
+ * of a crowd (see geoSpread()) keeps a leader line back to where it
+ * really is.
+ */
+
+function geoMarker(ifc, x, y, dx, dy) {
+    const est = ifc.geo.src !== 'loc';
+    const g = document.createElementNS(GEO_SVG_NS, 'g');
+    g.setAttribute('class', est ? 'geo-mk geo-mk-est' : 'geo-mk geo-mk-loc');
+    g.setAttribute('transform',
+                   `translate(${(x + dx).toFixed(1)} ${(y + dy).toFixed(1)})`);
+
+    if (dx || dy) {
+        const lead = document.createElementNS(GEO_SVG_NS, 'line');
+        lead.setAttribute('class', 'geo-mk-lead');
+        lead.setAttribute('x1', (-dx).toFixed(1));
+        lead.setAttribute('y1', (-dy).toFixed(1));
+        lead.setAttribute('x2', 0);
+        lead.setAttribute('y2', 0);
+        g.appendChild(lead);
+    }
+
+    const body = document.createElementNS(GEO_SVG_NS, 'rect');
+    body.setAttribute('x', -5);
+    body.setAttribute('y', -6);
+    body.setAttribute('width', 10);
+    body.setAttribute('height', 12);
+    body.setAttribute('rx', 2);
+    g.appendChild(body);
+
+    [ -2, 2 ].forEach(oy => {
+        const slot = document.createElementNS(GEO_SVG_NS, 'line');
+        slot.setAttribute('x1', -3);
+        slot.setAttribute('y1', oy);
+        slot.setAttribute('x2', 3);
+        slot.setAttribute('y2', oy);
+        g.appendChild(slot);
+    });
+
+    const led = document.createElementNS(GEO_SVG_NS, 'circle');
+    led.setAttribute('cx', 0);
+    led.setAttribute('cy', 5);
+    led.setAttribute('r', 1.4);
+    g.appendChild(led);
+
+    const first = (ifc.names || [])[0];
+    const tip = [(ifc.names || []).map(n => n.name).join(', '),
+                 (ifc.ips || []).map(i => i.ip).join(', '),
+                 est ? `estimated: ${ifc.geo.cc || '?'}` : 'LOC record']
+        .filter(Boolean).join('\n');
+    const t = document.createElementNS(GEO_SVG_NS, 'title');
+    t.textContent = tip;
+    g.appendChild(t);
+
+    if (first) {
+        const z = (first.zones || [])[0];
+        if (z && z.z)
+            g.addEventListener('click', () => selectDomain(z.z));
+    }
+
+    return g;
+}
+
+/*
+ * Servers closer together than a marker is wide would hide each other;
+ * every country-estimated server in one country lands on exactly the
+ * same centroid.  Cluster them, and fan each crowd out on a ring around
+ * its middle, far enough apart that every marker (and its tooltip) can
+ * be seen.
+ */
+
+const GEO_MK_CROWD = 12;	/* map units: about a marker's width */
+
+function geoSpread(pts) {
+    const clusters = [];
+
+    pts.forEach(p => {
+        const c = clusters.find(c => c.some(q =>
+                Math.hypot(q.x - p.x, q.y - p.y) < GEO_MK_CROWD));
+        if (c)
+            c.push(p);
+        else
+            clusters.push([p]);
+    });
+
+    clusters.forEach(c => {
+        if (c.length < 2)
+            return;
+
+        const cx = c.reduce((a, p) => a + p.x, 0) / c.length;
+        const cy = c.reduce((a, p) => a + p.y, 0) / c.length;
+        /* ring circumference fits the markers side by side */
+        const r = Math.max(GEO_MK_CROWD,
+                           GEO_MK_CROWD * c.length / (2 * Math.PI));
+
+        c.forEach((p, i) => {
+            const a = -Math.PI / 2 + 2 * Math.PI * i / c.length;
+            p.dx = cx + r * Math.cos(a) - p.x;
+            p.dy = cy + r * Math.sin(a) - p.y;
+        });
+    });
+}
+
+function renderGeoMap() {
+    if (!geoMap)
+        return;
+
+    geoMap.markers.innerHTML = '';
+
+    const inv = window.ipInventory || [];
+    const pts = [];
+
+    inv.forEach(ifc => {
+        if (!ifc || !ifc.geo) return;
+        const [x, y] = geoMercator(ifc.geo.lon, ifc.geo.lat);
+        pts.push({ ifc, x, y, dx: 0, dy: 0 });
+    });
+
+    geoSpread(pts);
+    pts.forEach(p => geoMap.markers.appendChild(
+                        geoMarker(p.ifc, p.x, p.y, p.dx, p.dy)));
+
+    const placed = pts.length;
+
+    const st = document.getElementById('geo-status');
+    if (st)
+        st.textContent = placed
+            ? `${placed} of ${inv.length} servers placed`
+            : (inv.length ? 'no located servers yet' : '');
+}
+
+/*
+ * Render the accumulated get_ip_inventory pages.  Each entry is one
+ * network interface: a set of addresses proven to belong to the same
+ * interface because some name binds them together, with every name that
+ * points at any of them as evidence.  A name binding a v4 and a v6
+ * address is the usual proof; an address shared between names chains
+ * them onto the same interface.
+ *
+ * Everything shown here came out of a zonefile some admin last saved, so
+ * it all goes through textContent rather than innerHTML.
+ */
+function renderIpInventory() {
+    const tbody = document.querySelector('#table-ip-inventory tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+
+    const inv = window.ipInventory || [];
+
+    const cnt = document.getElementById('ip-inventory-count');
+    if (cnt) {
+        cnt.textContent = inv.length
+            ? `${inv.length} interface${inv.length > 1 ? 's' : ''}${window.ipInventoryMore ? '+' : ''}`
+            : '';
+    }
+
+    if (!inv.length) {
+        tbody.innerHTML = '<tr><td colspan="4" class="loading">No IP records found in any zonefile.</td></tr>';
+        renderGeoMap();
+        return;
+    }
+
+    inv.forEach(ifc => {
+        const tr = document.createElement('tr');
+
+        /* names cell: each name links to the zonefile editor it came from */
+        const tdNames = document.createElement('td');
+        tdNames.className = 'inv-names-cell';
+        (ifc.names || []).forEach(nm => {
+            const entry = document.createElement('div');
+            entry.className = 'inv-name-entry';
+
+            const line = document.createElement('div');
+            const a = document.createElement('a');
+            a.href = '#';
+            a.textContent = nm.name || '';
+            const zones = (nm.zones || []).map(z => z.z || z);
+            a.onclick = (e) => {
+                e.preventDefault();
+                if (zones.length) selectDomain(zones[0]);
+            };
+            line.appendChild(a);
+
+            if (nm.ns) {
+                line.appendChild(document.createTextNode(' '));
+                const nb = document.createElement('span');
+                nb.className = 'inv-badge inv-badge-ok';
+                nb.textContent = 'NS';
+                nb.title = 'Targeted by NS records in the zonefiles';
+                line.appendChild(nb);
+            }
+            entry.appendChild(line);
+
+            if (zones.length > 1) {
+                const zl = document.createElement('div');
+                zl.className = 'inv-zone-links';
+                zl.appendChild(document.createTextNode('in '));
+                zones.forEach((z, i) => {
+                    if (i) zl.appendChild(document.createTextNode(', '));
+                    const za = document.createElement('a');
+                    za.href = '#';
+                    za.className = 'ext-link';
+                    za.textContent = z;
+                    za.onclick = (e) => {
+                        e.preventDefault();
+                        selectDomain(z);
+                    };
+                    zl.appendChild(za);
+                });
+                entry.appendChild(zl);
+            }
+
+            if (nm.loc) {
+                const ll = document.createElement('div');
+                ll.className = 'inv-loc';
+                ll.textContent = nm.loc;
+                entry.appendChild(ll);
+            }
+
+            tdNames.appendChild(entry);
+        });
+        tr.appendChild(tdNames);
+
+        /* address columns, with what kinds of names point at each */
+        const cols = [[], []];
+        (ifc.ips || []).forEach(ip => cols[ip.v6 ? 1 : 0].push(ip));
+
+        cols.forEach(list => {
+            const td = document.createElement('td');
+            td.className = 'ext-mono';
+            if (!list.length) {
+                td.textContent = '—';
+            } else list.forEach(ip => {
+                const d = document.createElement('div');
+                d.textContent = ip.ip;
+                if (ip.ns) {
+                    d.appendChild(document.createTextNode(' '));
+                    const b = document.createElement('span');
+                    b.className = 'inv-badge ' +
+                        (ip.ns_only ? 'inv-badge-warn' : 'inv-badge-ok');
+                    b.textContent = ip.ns_only ? 'NS only' : 'NS';
+                    b.title = ip.ns_only
+                        ? 'Only referred to by NS records: may not be our infrastructure'
+                        : 'Referred to by NS records and by host records';
+                    d.appendChild(b);
+                }
+                td.appendChild(d);
+            });
+            tr.appendChild(td);
+        });
+
+        /* usage: the record kinds seen, and the NS classification */
+        const tdUse = document.createElement('td');
+        tdUse.className = 'inv-use-cell';
+        const ips = ifc.ips || [];
+        const kinds = [];
+        if (ips.some(ip => !ip.v6)) kinds.push('A');
+        if (ips.some(ip => ip.v6)) kinds.push('AAAA');
+        if ((ifc.names || []).some(nm => nm.ns) || ips.some(ip => ip.ns))
+            kinds.push('NS');
+
+        kinds.forEach(k => {
+            const b = document.createElement('span');
+            b.className = 'status-badge ext-badge inv-kind-badge';
+            b.textContent = k;
+            tdUse.appendChild(b);
+            tdUse.appendChild(document.createTextNode(' '));
+        });
+
+        const nsIps = ips.filter(ip => ip.ns);
+        if (nsIps.length) {
+            const allNsOnly = ips.length && ips.every(ip => ip.ns_only);
+            const n = document.createElement('div');
+            n.className = allNsOnly ? 'dns-fg-gray' : 'dns-fg-green';
+            n.textContent = allNsOnly
+                ? 'NS glue only: may not be our infrastructure'
+                : 'NS with host records: our infrastructure';
+            tdUse.appendChild(n);
+
+            const nz = (ifc.ns_zones || []).map(z => z.z || z);
+            if (nz.length) {
+                const d = document.createElement('div');
+                d.className = 'inv-zone-links';
+                d.appendChild(document.createTextNode('delegated from: ' + nz.join(', ')));
+                tdUse.appendChild(d);
+            }
+        }
+
+        tr.appendChild(tdUse);
+        tbody.appendChild(tr);
+    });
+
+    renderGeoMap();
+}
+
 function formatExpiry(unixtime) {
     if (!unixtime) return '---';
     const now = Math.floor(Date.now() / 1000);
@@ -506,12 +1559,33 @@ function formatExpiry(unixtime) {
 }
 
 function selectDomain(domain) {
+    console.log('[DEBUG] selectDomain called for:', domain);
     currentDomain = domain;
+    localStorage.setItem('lws-dnssec-monitor-selected-domain', domain);
     currentDomainObj = window.domainsCache ? window.domainsCache.find(d => d.name === domain) : null;
+    console.log('[DEBUG] currentDomainObj set to:', currentDomainObj);
     
+    const cbAcme = document.getElementById('cb-domain-acme-enable');
+    if (cbAcme && currentDomainObj) {
+        cbAcme.checked = currentDomainObj.acme_enabled === true;
+        cbAcme.onchange = function() {
+            sendReq({ req: 'set_domain_acme', domain: currentDomain, enabled: this.checked });
+            /*
+             * the TLS table's reissue buttons follow the domain's ACME
+             * state: the cache may have been refetched since selection
+             */
+            const domObj = window.domainsCache ? window.domainsCache.find(d => d.name === currentDomain) : null;
+            if (domObj)
+                domObj.acme_enabled = this.checked;
+            updateGlobalTlsTable();
+        };
+    }
+
     document.querySelector('#detail-title span').textContent = domain;
     document.getElementById('detail-panel')?.classList.remove('hidden-panel');
     document.getElementById('domain-panel')?.classList.add('hidden-panel');
+    document.getElementById('ip-inventory-panel')?.classList.add('hidden-panel');
+    document.getElementById('geo-panel')?.classList.add('hidden-panel');
     document.getElementById('record-editor')?.classList.add('hidden-panel');
 
     const rows = document.querySelectorAll('#table-domains tbody tr');
@@ -521,18 +1595,17 @@ function selectDomain(domain) {
     });
 
     renderWhoisHeader();
-    window.activeTls = [];
-    sendReq({ req: 'get_zone', domain: domain });
+    sendReq({ req: 'get_tls', domain: domain });
+    setTimeout(() => {
+        console.log('[DEBUG] dispatching get_zone from selectDomain');
+        sendReq({ req: 'get_zone', domain: domain });
+    }, 50);
 }
 
 function formatExpiryInterval(timestampSec) {
     if (!timestampSec) return 'Unknown';
     let diff = timestampSec - Math.floor(Date.now() / 1000);
-    if (diff > 0) {
-        return Math.floor(diff / 86400) + 'd';
-    } else {
-        return Math.floor(diff / 86400) + 'd';
-    }
+    return Math.floor(diff / 86400) + 'd';
 }
 
 function renderWhoisHeader() {
@@ -545,50 +1618,117 @@ function renderWhoisHeader() {
     }
     
     const w = currentDomainObj.whois;
-    const d = currentDomainObj.dns || {};
     const expiryDateStr = w.expiry_date ? new Date(w.expiry_date * 1000).toLocaleDateString() : 'Unknown';
     const expiryInterval = w.expiry_date ? formatExpiryInterval(w.expiry_date) : '';
     const expiryDate = w.expiry_date ? `${expiryDateStr} (${expiryInterval})` : 'Unknown';
-    const nsList = (w.nameservers || []).join('<br>') || 'None';
-    const dnsSerial = d.serial !== undefined ? d.serial : 'Unknown';
-    let isDnsExpired = false;
-    if (d.expiry) {
-        if (d.expiry < Math.floor(Date.now() / 1000)) {
-            isDnsExpired = true;
-        }
-    }
-    const dnsSignedOk = d.signed_ok === 1 && !isDnsExpired;
-    let dnsExpiryStr = formatExpiryInterval(d.expiry);
+    const nsList = (w.nameservers || []).map(escapeHtml).join('<br>') || 'None';
 
     let dsStatusHTML = '';
-    let isMatch = false;
     let isSigned = false;
+    let localMismatch = false;
+    let globalMismatch = false;
 
-    if (w.ds_data) {
-        const localDs = (currentDomainObj.local_ds || '').trim().toUpperCase();
-        const whoisDs = w.ds_data.trim().toUpperCase();
-        if (localDs && whoisDs) {
-            isMatch = whoisDs.includes(localDs) || localDs.includes(whoisDs);
+    const localDs = (currentDomainObj.local_ds || '').trim().toUpperCase();
+
+    if (currentDomainObj.dns_ds) {
+        const dnsDs = currentDomainObj.dns_ds.trim().toUpperCase();
+        if (localDs && dnsDs && !dnsDs.includes(localDs) && !localDs.includes(dnsDs)) {
+            localMismatch = true;
         }
-        dsStatusHTML = `DNSSEC: <span class="${isMatch ? 'dns-fg-green' : 'dns-fg-red'}">${isMatch ? '✔' : '✘'}</span>`;
-    } else {
-        let dnssecVal = w.dnssec ? w.dnssec.trim().toLowerCase() : '';
-        if (dnssecVal === 'signeddelegation' || dnssecVal === 'yes' || dnssecVal === 'signed' || dnssecVal === 'active') {
-            isSigned = true;
-        }
-        dsStatusHTML = `DNSSEC Delegation: <span class="${isSigned ? 'dns-fg-green' : 'dns-fg-gray'}">${isSigned ? '✔' : '⚠'}</span>`;
     }
 
-    if (currentDomainObj.alg) {
-        dsStatusHTML += `<br><span class="dns-fg-gray text-sm">Key: ${currentDomainObj.alg} &nbsp; <a href="#" id="link-regen-keys" class="ext-link">replace</a> &nbsp; <a href="#" id="link-info-keys" class="ext-link">info</a></span>`;
+    if (currentDomainObj.dns_ds_global) {
+        const dnsDsGlobal = currentDomainObj.dns_ds_global.trim().toUpperCase();
+        if (localDs && dnsDsGlobal && !dnsDsGlobal.includes(localDs) && !localDs.includes(dnsDsGlobal)) {
+            globalMismatch = true;
+        }
     }
 
-    let overallSigned = (w.ds_data ? isMatch : isSigned) && dnsSignedOk;
+    let dnssecVal = w.dnssec ? w.dnssec.trim().toLowerCase() : '';
+    if (dnssecVal === 'signeddelegation' || dnssecVal === 'yes' || dnssecVal === 'signed' || dnssecVal === 'active') {
+        isSigned = true;
+    }
+    dsStatusHTML = `DNSSEC Delegation: <span class="${isSigned ? 'dns-fg-green' : 'dns-fg-gray'}">${isSigned ? '✔' : '⚠'}</span>`;
+
+    /*
+     * dns_state.json is written outside this tree from DNS answers fetched
+     * off the public internet, so the key tag is untrusted markup until it
+     * has been escaped
+     */
+    const extractKeyTag = (dsStr) => {
+        if (!dsStr) return 'Missing';
+        const parts = dsStr.trim().split(/\s+/);
+        return escapeHtml(parts.length > 0 ? parts[0] : 'Unknown');
+    };
+
+    if (currentDomainObj.dns_ds || currentDomainObj.dns_ds_global) {
+        dsStatusHTML += `<div class="ds-status-details">`;
+        if (currentDomainObj.dns_ds_global) {
+            const globalTag = extractKeyTag(currentDomainObj.dns_ds_global);
+            dsStatusHTML += `<div>Global DNS Cache (8.8.8.8): <span class="${globalMismatch ? 'dns-fg-red' : 'dns-fg-green'}">${globalMismatch ? `✘ Disagrees with Local Keys (${globalTag})` : `✔ Matches Local Keys (${globalTag})`}</span></div>`;
+        }
+        if (currentDomainObj.dns_ds) {
+            const systemTag = extractKeyTag(currentDomainObj.dns_ds);
+            dsStatusHTML += `<div>System DNS Cache: <span class="${localMismatch ? 'dns-fg-red' : 'dns-fg-green'}">${localMismatch ? `✘ Disagrees with Local Keys (${systemTag})` : `✔ Matches Local Keys (${systemTag})`}</span></div>`;
+        }
+        dsStatusHTML += `</div>`;
+    }
+
+    if (localMismatch || globalMismatch) {
+        dsStatusHTML += `<br><b class="dns-fg-red text-sm">⚠ Registrar DNSSEC key differs</b>`;
+    }
+
+    const dnssecAlgNames = { 8: 'RSASHA256', 13: 'ECDSAP256SHA256', 14: 'ECDSAP384SHA384' };
+    const dsDigestNames = { 2: 'SHA-256', 4: 'SHA-384' };
+
+    if (currentDomainObj.ksk_alg)
+        dsStatusHTML += `<br><span class="text-sm"><a href="#" id="link-regen-keys" class="ext-link">replace</a></span>`;
+
+    /* what the registrar needs to publish our DS, all of it public */
+    let registrarHTML = '';
+    const dsParts = localDs.split(/\s+/);
+
+    if (dsParts.length === 4) {
+        const regRow = (label, value, note) => `
+            <span class="reg-ds-lbl">${label}</span>
+            <span class="reg-ds-val">${escapeHtml(value)}${note ? ` <span class="dns-fg-gray">(${escapeHtml(note)})</span>` : ''}</span>
+            <button class="btn hollow btn-sm reg-ds-copy" data-copy="${escapeHtml(value)}">Copy</button>`;
+
+        registrarHTML = `
+            <tr>
+                <td class="dns-layout-lbl">Registrar:</td>
+                <td colspan="2">
+                    <div class="reg-ds-grid">
+                        ${regRow('Key tag', dsParts[0])}
+                        ${regRow('Algorithm', dsParts[1], dnssecAlgNames[dsParts[1]])}
+                        ${regRow('Digest type', dsParts[2], dsDigestNames[dsParts[2]])}
+                        ${regRow('Digest', dsParts[3])}
+                    </div>
+                </td>
+            </tr>`;
+    }
+
+    let overallSigned = isSigned && !localMismatch && !globalMismatch;
     let overrideClass = overallSigned ? 'ok' : 'warn';
     let overrideText = overallSigned ? '✔ DNSSEC<br>OK' : '✘<br>INSECURE';
 
-    let sigsColor = !d.expiry ? 'dns-fg-gray' : (isDnsExpired ? 'dns-fg-gray' : (dnsSignedOk ? 'dns-fg-green' : 'dns-fg-red'));
-    let sigsTick = !d.expiry ? 'n/a' : (isDnsExpired ? '⚠' : (dnsSignedOk ? '✔' : '✘'));
+    let dnssecLookupsHTML = '';
+    if (localMismatch || globalMismatch) {
+        dnssecLookupsHTML = `
+            <tr>
+                <td colspan="3">
+                    <div class="dns-fg-red dns-lookup-failed-alert">
+                        ⚠ DNS Lookup Failed due to DNSSEC Error
+                    </div>
+                </td>
+            </tr>`;
+    } else if (isSigned) {
+        dnssecLookupsHTML = `
+            <tr>
+                <td class="dns-layout-lbl">DNS:</td>
+                <td colspan="2"><span class="dns-fg-green">✔ Lookup OK (Validated Local & Global)</span></td>
+            </tr>`;
+    }
 
     hdr.innerHTML = `
         <table class="dns-layout-container">
@@ -600,14 +1740,11 @@ function renderWhoisHeader() {
                     ${dsStatusHTML}
 		</td>
             </tr>
-            <tr>
-                <td class="dns-layout-lbl">DNS: ${dnsSerial}</td>
-                <td>Sigexp: ${dnsExpiryStr}</td>
-                <td>Sigs: <span class="${sigsColor}">${sigsTick}</span></td>
-            </tr>
+            ${registrarHTML}
+            ${dnssecLookupsHTML}
             <tr id="tls-summary-row" class="hide">
                 <td class="dns-layout-lbl">TLS:</td>
-                <td colspan="2"><span id="tls-summary-content">Loading...</span> &nbsp; <a href="#" id="link-tls-details" class="ext-link">View TLS Details</a></td>
+                <td colspan="2"><span id="tls-summary-content">Loading...</span></td>
             </tr>
         </table>
     `;
@@ -631,129 +1768,231 @@ function renderWhoisHeader() {
         };
     }
 
-    const lnkInfo = document.getElementById('link-info-keys');
-    if (lnkInfo) {
-        lnkInfo.onclick = (e) => {
-            e.preventDefault();
-            let ds = currentDomainObj.local_ds || '';
-            let dsText = '';
-            if (ds) {
-                let parts = ds.trim().split(/\s+/);
-                if (parts.length >= 4) {
-                    let keyId = parts[0];
-                    let alg = parts[1];
-                    let digestType = parts[2];
-                    let digest = parts.slice(3).join('');
+    hdr.querySelectorAll('.reg-ds-copy').forEach(btn => {
+        btn.onclick = () => {
+            const done = () => {
+                btn.textContent = 'Copied';
+                setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+            };
 
-                    let algName = alg;
-                    if (alg === '8') algName = '8 (RSA/SHA256)';
-                    else if (alg === '13') algName = '13 (ECDSA Curve P-256 with SHA-256)';
-                    else if (alg === '14') algName = '14 (ECDSA Curve P-384 with SHA-384)';
-
-                    let dTypeName = digestType;
-                    if (digestType === '1') dTypeName = '1 (SHA-1)';
-                    else if (digestType === '2') dTypeName = '2 (SHA-256)';
-                    else if (digestType === '4') dTypeName = '4 (SHA-384)';
-
-                    dsText = `DS KeyID: ${keyId},  Alg: ${algName}, Digest Type: ${dTypeName}, Digest: ${digest}`;
-                } else {
-                    dsText = ds;
-                }
-            } else {
-                dsText = "DS record not available yet.";
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(btn.dataset.copy).then(done);
+                return;
             }
-            document.getElementById('textarea-dnssec-info').value = dsText;
-            document.getElementById('modal-dnssec-info').classList.add('show');
+
+            /* no clipboard api: select the value, for ctrl-c */
+            const range = document.createRange();
+            range.selectNodeContents(btn.previousElementSibling);
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
         };
-    }
+    });
 
     const lnkDetails = document.getElementById('link-tls-details');
     if (lnkDetails) {
         lnkDetails.onclick = (e) => {
             e.preventDefault();
-            renderTlsDetailsModal();
-            document.getElementById('modal-tls-details').classList.add('show');
+            document.getElementById('tab-btn-tls').click();
         };
     }
 }
 
-function updateTlsSummary() {
-    const row = document.getElementById('tls-summary-row');
-    const content = document.getElementById('tls-summary-content');
-    if (!row || !content) return;
-
-    if (!window.activeTls || window.activeTls.length === 0) {
-        row.classList.add('hide');
-        return;
-    }
-
-    let minDays = null;
-    window.activeTls.forEach(t => {
-        let cached = window.certStatusCache[t.fqdn + ':' + t.port];
-        if (cached && cached.status === 'ok') {
-            // parse days from local_msg or msg
-            let parseDays = (str) => {
-                if (!str) return null;
-                let m = str.match(/(\d+)\s*days?/i);
-                return m ? parseInt(m[1], 10) : null;
-            };
-            let d1 = parseDays(cached.local_msg);
-            let d2 = parseDays(cached.msg);
-            let d = d1 !== null ? d1 : (d2 !== null ? d2 : null);
-            if (d !== null) {
-                if (minDays === null || d < minDays) minDays = d;
-            }
-        }
-    });
-
-    let expStr = minDays !== null ? `Min Expiry: ${minDays}d` : 'Checking...';
-    content.innerText = `TLS: ${window.activeTls.length} certs, ${expStr}`;
-    row.classList.remove('hide');
-}
-
-function renderTlsDetailsModal() {
-    document.getElementById('tls-summary-domain-name').textContent = currentDomain;
-    const tbody = document.querySelector('#table-tls-details tbody');
+function updateGlobalTlsTable() {
+    const tbody = document.querySelector('#table-all-tls tbody');
+    if (!tbody) return;
     tbody.innerHTML = '';
 
-    if (!window.activeTls || window.activeTls.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4" class="loading">No TLS subdomains configured.</td></tr>';
+    let allTlsList = [];
+    for (const [dom, tlsArr] of Object.entries(window.allTlsCache)) {
+        if (Array.isArray(tlsArr)) {
+            tlsArr.forEach(t => allTlsList.push({ domain: dom, ...t }));
+        }
+    }
+
+    if (allTlsList.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" class="loading">No TLS subdomains configured across any domain.</td></tr>';
+
+        const row = document.getElementById('tls-summary-row');
+        if (row) row.classList.add('hide');
         return;
     }
 
-    window.activeTls.forEach(t => {
+    allTlsList.forEach(t => {
         const tr = document.createElement('tr');
         let cached = window.certStatusCache[t.fqdn + ':' + t.port];
         let locExp = 'Checking...';
         let remExp = 'Checking...';
         let issuer = 'Checking...';
 
+        /*
+         * issuer / msg come from whatever answered the probe, and
+         * handle_req_check_cert deliberately connects with all certificate
+         * validation off: treat them as remote attacker text
+         */
         if (cached) {
             if (cached.status === 'ok') {
-                locExp = cached.local_msg || 'Unknown';
-                remExp = cached.msg || 'Unknown';
-                issuer = cached.issuer || 'Unknown';
+                locExp = escapeHtml(cached.local_msg || 'Unknown');
+                remExp = escapeHtml(cached.msg || 'Unknown');
+                issuer = escapeHtml(cached.issuer || 'Unknown');
             } else {
-                remExp = `<span class="text-red">${cached.msg}</span>`;
-                locExp = 'Error';
-                issuer = 'Error';
+                remExp = `<span class="text-red">${escapeHtml(cached.msg)}</span>`;
+                locExp = escapeHtml(cached.local_msg || 'Error');
+                issuer = escapeHtml(cached.issuer || 'Error');
             }
         }
 
         tr.innerHTML = `
-            <td>${t.fqdn}:${t.port}</td>
+            <td>${escapeHtml(t.fqdn)}:${escapeHtml(t.port)}</td>
             <td>${locExp}</td>
             <td>${remExp}</td>
             <td>${issuer}</td>
+            <td class="tls-actions"><button class="btn btn-sm secondary btn-provision">Provision</button><button class="btn btn-sm secondary btn-reissue" title="Have the ACME client reissue this certificate now, however long it has left">Force reissue</button></td>
         `;
+        const btn = tr.querySelector('.btn-provision');
+        if (btn) btn.addEventListener('click', () => document.getElementById('tab-btn-dist').click());
+
+        /* only while ACME is enabled for the cert's toplevel domain */
+        const btnReissue = tr.querySelector('.btn-reissue');
+        const domObj = window.domainsCache ? window.domainsCache.find(d => d.name === t.domain) : null;
+        btnReissue.disabled = !(domObj && domObj.acme_enabled === true);
+        btnReissue.addEventListener('click', () => {
+            if (confirm('Reissue the certificate for ' + t.fqdn +
+                        ' now, however long it has left?\n\n' +
+                        'Let\'s Encrypt allows only 5 identical certificates per week.'))
+                sendReq({ req: 'force_cert_reissue', domain: t.domain, fqdn: t.fqdn });
+        });
+        tbody.appendChild(tr);
+    });
+
+    const row = document.getElementById('tls-summary-row');
+    const content = document.getElementById('tls-summary-content');
+    if (row && content) {
+        let minDays = null;
+        let allChecked = true;
+        let anyError = false;
+
+        allTlsList.forEach(t => {
+            if (t.domain !== currentDomain) return;
+            let cached = window.certStatusCache[t.fqdn + ':' + t.port];
+            if (!cached) {
+                allChecked = false;
+                return;
+            }
+            if (cached.status === 'ok') {
+                let parseDays = (str) => {
+                    if (!str) return null;
+                    let m = str.match(/(\d+)\s*days?/i);
+                    return m ? Number.parseInt(m[1], 10) : null;
+                };
+                let d1 = parseDays(cached.local_msg);
+                let d2 = parseDays(cached.msg);
+                let d = d1 !== null ? d1 : (d2 !== null ? d2 : null);
+                if (d !== null) {
+                    if (minDays === null || d < minDays) minDays = d;
+                } else {
+                    anyError = true;
+                }
+            } else {
+                anyError = true;
+            }
+        });
+
+        let localTlsCount = allTlsList.filter(t => t.domain === currentDomain).length;
+        if (localTlsCount > 0) {
+            let expStr = 'Checking...';
+            if (minDays !== null) {
+                expStr = `Min Expiry: ${minDays}d`;
+                if (anyError) expStr += ' (Some Errors)';
+            } else if (allChecked) {
+                expStr = anyError ? 'Error/Timeout' : 'Unknown';
+            }
+
+            content.innerText = `TLS: ${localTlsCount} certs, ${expStr}`;
+            row.classList.remove('hide');
+        } else {
+            row.classList.add('hide');
+        }
+    }
+}
+
+function updateDistClientsTable() {
+    const tbody = document.querySelector('#table-dist-clients tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+
+    let allTlsList = [];
+    for (const [dom, tlsArr] of Object.entries(window.allTlsCache)) {
+        if (Array.isArray(tlsArr)) {
+            tlsArr.forEach(t => allTlsList.push({ domain: dom, ...t }));
+        }
+    }
+
+    if (allTlsList.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="3" class="loading">No TLS endpoints to provision.</td></tr>';
+        return;
+    }
+
+    allTlsList.forEach(t => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td>${escapeHtml(t.domain)}</td>
+            <td>${escapeHtml(t.fqdn)}:${escapeHtml(t.port)}</td>
+            <td><button class="btn btn-sm primary btn-dist-gen">Generate & Download</button></td>
+        `;
+        const btn = tr.querySelector('.btn-dist-gen');
+        if (btn) btn.addEventListener('click', () => downloadProvisioningBundle(t.domain, t.fqdn));
         tbody.appendChild(tr);
     });
 }
 
 function closeDetail() {
     currentDomain = '';
+    localStorage.removeItem('lws-dnssec-monitor-selected-domain');
     document.getElementById('detail-panel').classList.add('hidden-panel');
     document.getElementById('domain-panel').classList.remove('hidden-panel');
+    document.getElementById('ip-inventory-panel')?.classList.remove('hidden-panel');
+    document.getElementById('geo-panel')?.classList.remove('hidden-panel');
+}
+
+/*
+ * A minimal zone for a new domain, with example records for the apex and
+ * its nameservers on the documentation addresses, to be edited before it is
+ * first saved
+ */
+function starterZone(domain) {
+    const d = new Date();
+    const serial = String(d.getUTCFullYear()) +
+                   String(d.getUTCMonth() + 1).padStart(2, '0') +
+                   String(d.getUTCDate()).padStart(2, '0') + '01';
+
+    return [
+        `; ${domain}: replace the example records below with your own.`,
+        '; 192.0.2.x and 2001:db8:: are documentation addresses.  Records can',
+        "; also use the EXTIP4 / EXTIP6 macros for this host's external addresses.",
+        '',
+        `$ORIGIN ${domain}.`,
+        '$TTL 3600',
+        '',
+        `@	IN	SOA	ns1.${domain}. hostmaster.${domain}. (`,
+        `		${serial}	; serial`,
+        '		3600		; refresh',
+        '		900		; retry',
+        '		1209600		; expire',
+        '		3600 )		; negative caching TTL',
+        '',
+        `@	IN	NS	ns1.${domain}.`,
+        `@	IN	NS	ns2.${domain}.`,
+        '',
+        '@	IN	A	192.0.2.1',
+        '@	IN	AAAA	2001:db8::1',
+        '',
+        'ns1	IN	A	192.0.2.1',
+        'ns1	IN	AAAA	2001:db8::1',
+        'ns2	IN	A	192.0.2.2',
+        'ns2	IN	AAAA	2001:db8::2',
+        ''
+    ].join('\n');
 }
 
 function updateRawEditor() {
@@ -797,12 +2036,21 @@ function renderZoneTable() {
         let ttlStr = r.parsed?.ttl || '-';
         let valStr = r.parsed?.value;
 
-        if (r.type === 'SOA') {
+        if (r.type === 'SOA')
             valStr = `${r.parsed?.serial} (MNAME: ${r.parsed?.mname})`;
-        } else if (valStr && typeof window.getSubstitutions === 'function') {
+
+        /*
+         * The zone text is whatever some admin last stored: escape it into
+         * markup first, and only then splice the substitution preview spans
+         * into the escaped result
+         */
+        let valHtml = escapeHtml(valStr || '-');
+
+        if (r.type !== 'SOA' && valStr && typeof window.getSubstitutions === 'function') {
             window.getSubstitutions().forEach(sub => {
-                let regex = new RegExp(`\\$\\{${sub.key}\\}`, 'g');
-                valStr = valStr.replace(regex, `\$\{${sub.key}\}<span class="subst-preview">${sub.val}</span>`);
+                let regex = new RegExp(`\\$\\{${escapeRegExp(sub.key)}\\}`, 'g');
+                valHtml = valHtml.replace(regex, () =>
+                    `\$\{${escapeHtml(sub.key)}\}<span class="subst-preview">${escapeHtml(sub.val)}</span>`);
             });
         }
 
@@ -827,18 +2075,18 @@ function renderZoneTable() {
 
             tlsTd = `<td class="ext-tls-cell">
                          <div class="tls-port-wrapper">
-                             <input type="number" class="tls-port ext-port tls-port-input" data-fqdn="${fqdn}" value="${portVal}" maxlength="5" placeholder="Port">
+                             <input type="number" class="tls-port ext-port tls-port-input" data-fqdn="${escapeHtml(fqdn)}" value="${escapeHtml(portVal)}" maxlength="5" placeholder="Port">
                              <br>
-                             <span id="cert-status-${fqdn}" class="cert-status tls-cert-status ${initColorClass}">${initStatus}</span>
+                             <span id="cert-status-${escapeHtml(fqdn)}" class="cert-status tls-cert-status ${initColorClass}">${escapeHtml(initStatus)}</span>
                          </div>
                      </td>`;
         }
 
         tr.innerHTML = `
-            <td class="ext-mono">${nameStr}</td>
-            <td>${ttlStr}</td>
-            <td><span class="status-badge ext-badge">${typeStr}</span></td>
-            <td class="ext-value">${valStr || '-'}</td>
+            <td class="ext-mono">${escapeHtml(nameStr)}</td>
+            <td>${escapeHtml(ttlStr)}</td>
+            <td><span class="status-badge ext-badge">${escapeHtml(typeStr)}</span></td>
+            <td class="ext-value">${valHtml}</td>
             ${tlsTd}
         `;
 
@@ -847,8 +2095,8 @@ function renderZoneTable() {
             portInput.onclick = (e) => e.stopPropagation();
             portInput.onchange = (e) => {
                 let p = e.target.value.trim();
-                let pnum = parseInt(p, 10);
-                if (!p || isNaN(pnum) || pnum <= 0 || pnum > 65535) {
+                let pnum = Number.parseInt(p, 10);
+                if (!p || Number.isNaN(pnum) || pnum <= 0 || pnum > 65535) {
                     sendReq({ req: 'delete_tls', domain: currentDomain, subdomain: fqdn });
                     if (window.activeTls) window.activeTls = window.activeTls.filter(x => x.fqdn !== fqdn);
                     document.getElementById(`cert-status-${fqdn}`).innerText = '';
@@ -868,15 +2116,17 @@ function renderZoneTable() {
                         concurrentChecks = Math.max(0, concurrentChecks - 1);
                     }
                     delete window.certStatusCache[fqdn + ':' + pnum];
-                    certCheckQueue.push({fqdn: fqdn, port: pnum});
+                    if (!certCheckQueue.some(q => q.fqdn === fqdn && q.port === pnum)) {
+                        certCheckQueue.push({fqdn: fqdn, port: pnum, domain: currentDomain});
+                    }
                     processCertQueue();
                 }
             };
 
             if (portInput.value) {
-                let pnum = parseInt(portInput.value, 10);
-                if (!window.certStatusCache[fqdn + ':' + pnum] && !certCheckTimers[fqdn]) {
-                    certCheckQueue.push({fqdn: fqdn, port: pnum});
+                let pnum = Number.parseInt(portInput.value, 10);
+                if (!window.certStatusCache[fqdn + ':' + pnum] && !certCheckTimers[fqdn] && !certCheckQueue.some(q => q.fqdn === fqdn && q.port === pnum)) {
+                    certCheckQueue.push({fqdn: fqdn, port: pnum, domain: currentDomain});
                 }
             }
         }
@@ -912,15 +2162,16 @@ let editingRecordId = null;
 function renderFormFields(type, data) {
     const form = document.getElementById('editor-form');
 
+    /* every value below comes out of the stored zone file: escape it */
     let common = `
         <div class="ext-grid-1">
             <div>
                 <label>Name (e.g. @ or www)</label>
-                <input type="text" id="edit-name" value="${data.name || ''}" placeholder="@">
+                <input type="text" id="edit-name" value="${escapeHtml(data.name || '')}" placeholder="@">
             </div>
             <div>
                 <label>TTL</label>
-                <input type="text" id="edit-ttl" value="${data.ttl || ''}" placeholder="3600">
+                <input type="text" id="edit-ttl" value="${escapeHtml(data.ttl || '')}" placeholder="3600">
             </div>
         </div>
     `;
@@ -929,17 +2180,17 @@ function renderFormFields(type, data) {
         form.innerHTML = `
             ${common}
             <div class="ext-grid-2">
-                <div><label>MNAME (Primary NS)</label><input type="text" id="edit-mname" value="${data.mname || ''}"></div>
-                <div><label>RNAME (Admin Email)</label><input type="text" id="edit-rname" value="${data.rname || ''}"></div>
+                <div><label>MNAME (Primary NS)</label><input type="text" id="edit-mname" value="${escapeHtml(data.mname || '')}"></div>
+                <div><label>RNAME (Admin Email)</label><input type="text" id="edit-rname" value="${escapeHtml(data.rname || '')}"></div>
             </div>
             <div class="ext-grid-4">
-                <div><label>Serial</label><input type="number" id="edit-serial" value="${data.serial || ''}"></div>
-                <div><label>Refresh</label><input type="number" id="edit-refresh" value="${data.refresh || ''}"></div>
-                <div><label>Retry</label><input type="number" id="edit-retry" value="${data.retry || ''}"></div>
-                <div><label>Expire</label><input type="number" id="edit-expire" value="${data.expire || ''}"></div>
+                <div><label>Serial</label><input type="number" id="edit-serial" value="${escapeHtml(data.serial || '')}"></div>
+                <div><label>Refresh</label><input type="number" id="edit-refresh" value="${escapeHtml(data.refresh || '')}"></div>
+                <div><label>Retry</label><input type="number" id="edit-retry" value="${escapeHtml(data.retry || '')}"></div>
+                <div><label>Expire</label><input type="number" id="edit-expire" value="${escapeHtml(data.expire || '')}"></div>
             </div>
             <div class="ext-mt">
-                <label>Minimum TTL</label><input type="number" id="edit-minimum" value="${data.minimum || ''}">
+                <label>Minimum TTL</label><input type="number" id="edit-minimum" value="${escapeHtml(data.minimum || '')}">
             </div>
             <input type="hidden" id="edit-type" value="SOA">
         `;
@@ -964,7 +2215,7 @@ function renderFormFields(type, data) {
                 </div>
                 <div>
                     <label>${valueLabel}</label>
-                    <input type="text" id="edit-value" value="${(data.value || '').replace(/"/g, '&quot;')}" placeholder="...">
+                    <input type="text" id="edit-value" value="${escapeHtml(data.value || '')}" placeholder="...">
                 </div>
             </div>
         `;
@@ -992,11 +2243,51 @@ function openEditor(id) {
     }
 }
 
-    document.addEventListener('DOMContentLoaded', () => {
+function initApp() {
     if (typeof window.renderLwsLoginStatus === 'function') {
         window.renderLwsLoginStatus('user-info');
     }
+    geoInitMap();
     connect();
+
+    // Tab Switching Logic
+    const tabs = document.querySelectorAll('.tab-link');
+    const tabContents = document.querySelectorAll('.tab-content');
+    for (let i = 0; i < tabs.length; i++) {
+        let tab = tabs[i];
+        tab.addEventListener('click', () => {
+            console.log("Tab clicked: " + tab.getAttribute('data-tab'));
+            for (let j = 0; j < tabs.length; j++) tabs[j].classList.remove('active');
+            for (let j = 0; j < tabContents.length; j++) tabContents[j].classList.remove('active');
+
+            tab.classList.add('active');
+            const target = document.getElementById(tab.getAttribute('data-tab'));
+            if (target) target.classList.add('active');
+        });
+    }
+
+    const btnDownloadCa = document.getElementById('btn-dist-download-ca');
+    if (btnDownloadCa) btnDownloadCa.onclick = () => sendReq({ req: 'download_dist_ca' });
+
+    const btnDownloadServer = document.getElementById('btn-dist-download-server');
+    const domainInput = document.getElementById('dist-server-domain');
+    if (domainInput) {
+        const saveDomain = () => {
+            sendReq({ req: 'set_dist_server_domain', domain: domainInput.value.trim() });
+        };
+        domainInput.addEventListener('change', saveDomain);
+        domainInput.addEventListener('blur', saveDomain);
+    }
+    if (btnDownloadServer) {
+        btnDownloadServer.onclick = () => {
+            if (domainInput && domainInput.value.trim() !== '') {
+                sendReq({ req: 'set_dist_server_domain', domain: domainInput.value.trim() });
+                sendReq({ req: 'download_dist_server', domain: domainInput.value.trim() });
+            } else {
+                alert('Please enter a valid domain for the Distribution Server.');
+            }
+        };
+    }
 
     const rawEditor = document.getElementById('raw-zone-editor');
     
@@ -1007,28 +2298,32 @@ function openEditor(id) {
             console.log("getSubstitutions: window.last_extip_data is missing!");
             return subs;
         }
-        const ips = Array.isArray(window.last_extip_data['ext-ips']) ? window.last_extip_data['ext-ips'] : (window.last_extip_data['ext-ips'] + '').split(',');
-        let ext_ipv4 = '';
-        let ext_ipv6 = '';
-        ips.forEach(ip => {
-            if (ip.includes(':')) {
-                if (window.ipv6_suffix) {
-                    let parts = ip.split(':');
-                    if (parts.length > 2) {
-                        parts.pop();
-                        ext_ipv6 = parts.join(':') + ':' + window.ipv6_suffix;
-                    } else ext_ipv6 = ip;
-                } else ext_ipv6 = ip;
-            } else ext_ipv4 = ip;
-        });
-        if (ext_ipv4) subs.push({ key: 'EXTIP4', val: ext_ipv4 });
-        if (ext_ipv6) subs.push({ key: 'EXTIP6', val: ext_ipv6 });
+        const ext = currentExtIps();
+        if (ext.ip4) subs.push({ key: 'EXTIP4', val: ext.ip4 });
+        if (ext.ip6) subs.push({ key: 'EXTIP6', val: ext.ip6 });
         
         if (window.activeTls) {
+            console.log("getSubstitutions: window.activeTls has", window.activeTls.length, "items", window.activeTls);
             window.activeTls.forEach(t => {
-                if (t.dane0) subs.push({ key: `DANE0/${t.fqdn}`, val: t.dane0 });
-                if (t.dane1) subs.push({ key: `DANE1/${t.fqdn}`, val: t.dane1 });
+                console.log("getSubstitutions: checking TLS item:", t);
+                let fullFqdn = t.fqdn === '@' ? currentDomain : t.fqdn + '.' + currentDomain;
+                if (t.dane0) {
+                    subs.push({ key: `DANE0/${t.fqdn}`, val: t.dane0 });
+                    subs.push({ key: `DANE0/${fullFqdn}`, val: t.dane0 });
+                    console.log(`getSubstitutions: Added DANE0 for ${fullFqdn}`);
+                } else {
+                    console.log(`getSubstitutions: t.dane0 is falsy/missing for ${fullFqdn}`);
+                }
+                if (t.dane1) {
+                    subs.push({ key: `DANE1/${t.fqdn}`, val: t.dane1 });
+                    subs.push({ key: `DANE1/${fullFqdn}`, val: t.dane1 });
+                    console.log(`getSubstitutions: Added DANE1 for ${fullFqdn}`);
+                } else {
+                    console.log(`getSubstitutions: t.dane1 is falsy/missing for ${fullFqdn}`);
+                }
             });
+        } else {
+            console.log("getSubstitutions: window.activeTls is falsy/missing!");
         }
         
         console.log("getSubstitutions returning:", subs);
@@ -1038,9 +2333,14 @@ function openEditor(id) {
     window.padVariables = function(text) {
         let subs = window.getSubstitutions();
         subs.forEach(sub => {
-            let regex = new RegExp(`\\$\\{${sub.key}\\}`, 'g');
-            text = text.replace(regex, `\$\{${sub.key}\}` + '\u2007'.repeat(sub.val.length));
+            let regex = new RegExp(`\\$\\{${escapeRegExp(sub.key)}\\}`, 'g');
+            text = text.replace(regex, () => `\$\{${sub.key}\}` + '\u2007'.repeat(sub.val.length));
         });
+
+        // Unconditionally pad any DANE0/DANE1 macro with 70 chars if it hasn't been padded yet
+        // The DANE hash format is "3 1 1 <64_char_hex>" which is 70 characters.
+        text = text.replace(/(\$\{DANE[01]\/[^}]+?\})(?!\u2007)/g, '$1' + '\u2007'.repeat(70));
+
         return text;
     };
 
@@ -1058,10 +2358,12 @@ function openEditor(id) {
         
         let subs = window.getSubstitutions();
         subs.forEach(sub => {
-            let safeKey = sub.key.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+            let safeKey = escapeRegExp(sub.key);
             let padded = `\\$\\{${safeKey}\\}` + '\u2007'.repeat(sub.val.length);
             let regex = new RegExp(padded, 'g');
-            html = html.replace(regex, `\$\{${sub.key}\}<span class="subst-preview">${sub.val}</span>`);
+            /* html is already escaped: sub.val must be too before it joins it */
+            html = html.replace(regex, () =>
+                `\$\{${escapeHtml(sub.key)}\}<span class="subst-preview">${escapeHtml(sub.val)}</span>`);
         });
 
         if (text.endsWith('\n')) html += '<br>';
@@ -1173,8 +2475,10 @@ function openEditor(id) {
     };
 
     document.getElementById('btn-regen-cancel').onclick = () => closeModal('modal-regen-keys');
-    document.getElementById('btn-dnssec-info-close').onclick = () => closeModal('modal-dnssec-info');
-    // Legacy modal close handlers removed    document.getElementById('btn-regen-replace').onclick = () => {
+    let btnTlsClose = document.getElementById('btn-tls-details-close');
+    if (btnTlsClose) btnTlsClose.onclick = () => closeModal('modal-tls-details');
+    // Legacy modal close handlers removed
+    document.getElementById('btn-regen-replace').onclick = () => {
         const keyType = document.getElementById('select-regen-key-type').value;
         if (currentDomain) {
             sendReq({ req: 'regen_keys', domain: currentDomain, key_type: keyType });
@@ -1272,11 +2576,19 @@ function openEditor(id) {
                 organization: document.getElementById('acme-org').value.trim(),
                 country: document.getElementById('acme-country').value.trim(),
                 state: document.getElementById('acme-state').value.trim(),
-                locality: document.getElementById('acme-locality').value.trim()
+                locality: document.getElementById('acme-locality').value.trim(),
+                profile: document.getElementById('acme-profile') ? document.getElementById('acme-profile').value : '',
+                sign_validity_days: document.getElementById('acme-sign-validity') ? Number.parseInt(document.getElementById('acme-sign-validity').value, 10) || 21 : 21
             });
         };
     }
-});
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initApp);
+} else {
+    initApp();
+}
 
 function openModal(id) {
     document.getElementById(id).classList.add('show');

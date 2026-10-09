@@ -295,8 +295,8 @@ ssh_ops_is_pubkey_authorized(const char *username, const char *type,
 		goto bail;
 	}
 
-	if (peer_len > len) {
-		lwsl_notice("peer_len %d bigger than decoded len %d\n",
+	if (peer_len != len) {
+		lwsl_notice("peer_len %d different than decoded len %d\n",
 				peer_len, len);
 		goto bail;
 	}
@@ -305,7 +305,7 @@ ssh_ops_is_pubkey_authorized(const char *username, const char *type,
 	 * once we are past that, it's the same <len32>name
 	 * <len32>E<len32>N that the peer sends us
 	 */
-	if (memcmp(peer, ps, (unsigned int)peer_len)) {
+	if (lws_timingsafe_bcmp(peer, ps, (unsigned int)peer_len)) {
 		lwsl_info("%s: factors mismatch, rejecting key\n", __func__);
 		goto bail;
 	}
@@ -393,6 +393,8 @@ callback_lws_sshd_demo(struct lws *wsi, enum lws_callback_reasons reason,
 
 	switch (reason) {
 	case LWS_CALLBACK_PROTOCOL_INIT:
+		if (lws_cmdline_option_cx(lws_get_context(wsi), "--lws-stub"))
+			return 0;
 		if (!in)
 			return 0;
 		vhd = lws_protocol_vh_priv_zalloc(lws_get_vhost(wsi),

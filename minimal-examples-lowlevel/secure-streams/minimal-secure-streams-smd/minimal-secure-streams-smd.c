@@ -18,6 +18,7 @@ enum {
 	LWS_SW_EXPECTED_EXIT,
 	LWS_SW_INTERVAL,
 	LWS_SW_MULTI,
+	LWS_SW_POLICY_FILE,
 	LWS_SW_A,
 	LWS_SW_I,
 	LWS_SW_P,
@@ -29,6 +30,7 @@ static const struct lws_switches switches[] = {
 	[LWS_SW_EXPECTED_EXIT]	= { "--expected-exit", "Enable --expected-exit feature" },
 	[LWS_SW_INTERVAL]	= { "--interval",      "Enable --interval feature" },
 	[LWS_SW_MULTI]	= { "--multi",         "Enable --multi feature" },
+	[LWS_SW_POLICY_FILE]	= { "-c",              "Policy JSON file path, overrides the compiled-in policy" },
 	[LWS_SW_A]	= { "-a",              "Enable -a feature" },
 	[LWS_SW_I]	= { "-i",              "Interface to bind to" },
 	[LWS_SW_P]	= { "-p",              "Port number to listen or connect on" },
@@ -38,7 +40,8 @@ static const struct lws_switches switches[] = {
 #include <string.h>
 #include <signal.h>
 
-static int interrupted, bad = 1, count_p1, count_p2, count_tx, expected = 0;
+static int bad = 1, count_p1, count_p2, count_tx, expected = 0;
+static struct lws_context *context;
 static unsigned int how_many_msg = 100, usec_interval = 1000;
 static lws_sorted_usec_list_t sul_timeout;
 
@@ -248,7 +251,7 @@ direct_smd_cb(void *opaque, lws_smd_class_t _class, lws_usec_t timestamp,
 		if (lws_ss_create(*pctx, 0, &ssi_lws_smd, NULL, NULL, NULL, NULL)) {
 			lwsl_err("%s: failed to create secure stream\n",
 				 __func__);
-			interrupted = 1;
+			lws_default_loop_exit(context);
 			lws_cancel_service(*pctx);
 			return -1;
 		}
@@ -262,14 +265,14 @@ static void
 sul_timeout_cb(lws_sorted_usec_list_t *sul)
 {
 	lwsl_notice("%s: test finishing\n", __func__);
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 extern int smd_ss_multi_test(int argc, const char **argv);
@@ -277,7 +280,6 @@ extern int smd_ss_multi_test(int argc, const char **argv);
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	struct lws_context *context;
 	const char *p;
 	(void)switches;
 
@@ -289,8 +291,7 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	memset(&info, 0, sizeof info);
-
+	lws_context_info_defaults(&info, NULL);
 #if defined(LWS_SS_USE_SSPC)
 	if (lws_cmdline_option(argc, argv, switches[LWS_SW_MULTI].sw))
 		return smd_ss_multi_test(argc, argv);
@@ -307,17 +308,29 @@ int main(int argc, const char **argv)
 	lwsl_user("LWS Secure Streams SMD test client [-d<verb>]: "
 		  "%u msgs at %uus interval\n", how_many_msg, usec_interval);
 
-	info.fd_limit_per_thread	= 1 + 6 + 1;
 	info.port			= CONTEXT_PORT_NO_LISTEN;
 #if !defined(LWS_SS_USE_SSPC)
 	info.pss_policies_json		= default_ss_policy;
+
+	/* if given, -c overrides the compiled-in policy with a policy from
+	 * a file, so the same binary can be pointed at a locally-generated
+	 * policy targeting a local test server */
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_POLICY_FILE].sw)))
+		info.pss_policies_json = p;
 #else
 	info.protocols			= lws_sspc_protocols;
 	{
 		/* connect to ssproxy via UDS by default, else via
 		 * tcp connection to this port */
 		if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_P].sw)))
-			info.ss_proxy_port = (uint16_t)atoi(p);
+			{
+				int __pt = atoi(p);
+				if (__pt < 0 || __pt > 65535) {
+					lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+					return 1;
+				}
+				info.ss_proxy_port = (uint16_t)__pt;
+			}
 
 		/* UDS "proxy.ss.lws" in abstract namespace, else this socket
 		 * path; when -p given this can specify the network interface
@@ -361,7 +374,7 @@ int main(int argc, const char **argv)
 
 	/* the event loop */
 
-	while (lws_service(context, 0) >= 0 && !interrupted)
+	while (lws_service(context, 0) >= 0)
 		;
 
 	/* compare what happened with what we expect */

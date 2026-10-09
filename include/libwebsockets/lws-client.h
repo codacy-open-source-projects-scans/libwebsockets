@@ -111,6 +111,8 @@ enum lws_client_connect_ssl_connection_flags {
 	LCCSCF_CACHE_COOKIES			= (1 << 30),
 	/**< If built with -DLWS_WITH_CACHE_NSCOOKIEJAR, store and reapply
 	 * http cookies in a Netscape Cookie Jar on this connection */
+	LCCSCF_ALLOW_EARLY_DATA			= (int)(1u << 31),
+	/**< Allow 0-RTT early data for QUIC/TLS 1.3 connections */
 };
 
 /*
@@ -252,7 +254,11 @@ struct lws_client_connect_info {
 	uint16_t				keep_warm_secs;
 	/**< 0 means 5s.  If the client connection to the endpoint becomes idle,
 	 * defer closing it for this many seconds in case another outgoing
-	 * connection to the same endpoint turns up.
+	 * connection to the same endpoint turns up.  For h1 that is the
+	 * connection after its transaction completed; for h2 and h3 it is the
+	 * shared connection after its last stream closed.  A connection that
+	 * serves several requests in turn keeps warm for the time asked by the
+	 * request that last used it.
 	 */
 
 	lws_log_cx_t				*log_cx;
@@ -275,6 +281,26 @@ struct lws_client_connect_info {
 	 */
 #endif
 
+	uint8_t         disable_h3_fallback;
+	/**< non-zero to disable the Happy Eyeballs QUIC fallback timer.
+	 * When set, QUIC connections will wait for the full connect timeout
+	 * instead of falling back to TCP after the H3 grace period.
+	 */
+
+	const struct lws_transport_ops *transport;
+	/**< NULL, or a transport under IO in place of a socket
+	 * (lws_set_transport()): no dns lookup or connect is made, the
+	 * connection starts on the transport as if connected, and
+	 * transport_fd is its place in the poll set.  The fd is the
+	 * connection's from this call on, and is closed with it.  Such a
+	 * connection can't use LCCSCF_USE_SSL (the tls backends would read
+	 * and write the fd directly), and can't be restarted by a redirect
+	 * or a digest auth retry. */
+	void		*transport_opaque;
+	/**< handed to every op of transport */
+	lws_sockfd_type	transport_fd;
+	/**< with transport: the fd the event loop watches for the connection */
+
 	/* Add new things just above here ---^
 	 * This is part of the ABI, don't needlessly break compatibility
 	 *
@@ -283,7 +309,7 @@ struct lws_client_connect_info {
 	 * was not built against the newer headers.
 	 */
 
-	void *_unused[4]; /**< dummy */
+	void *_unused[3]; /**< dummy */
 };
 
 /**
@@ -395,6 +421,16 @@ lws_tls_client_vhost_extra_cert_mem(struct lws_vhost *vh,
  * next part of the http body payload, calling lws_callback_on_writable(wsi);
  * if there is more to come, or lws_client_http_body_pending(wsi, 0); to
  * let lws know the last part is sent and the connection can move on.
+ *
+ * The body must be framed for the server to know where it ends.  If you
+ * know its length, add a Content-Length header in the
+ * LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER callback and lws sends what
+ * you write as it is.  If you add neither that nor a Transfer-Encoding, lws
+ * adds "Transfer-Encoding: chunked" to the head (with a NOTICE saying so)
+ * and frames each lws_write() as one chunk, the one written with
+ * LWS_WRITE_HTTP_FINAL followed by the last-chunk; a write of length zero
+ * that is not final sends nothing.  Over h2 the stream frames the body and
+ * neither header is needed.
  */
 LWS_VISIBLE LWS_EXTERN void
 lws_client_http_body_pending(struct lws *wsi, int something_left_to_send);
@@ -534,14 +570,71 @@ lws_tls_client_connect(struct lws *wsi, char *errbuf, size_t len);
 /**
  * lws_tls_client_upgrade() - upgrade a non-TLS client connection to TLS
  *
- * \param wsi: client connection
- * \param ssl_flags: LCCSCF_ flags to apply
+ * \param wsi: established raw client connection with no tls yet
+ * \param ssl_flags: LCCSCF_ flags to apply, including LCCSCF_USE_SSL
  *
  * For STARTTLS type protocols, this can be called to transition a RAW
- * connection to TLS. It handles structure initialization and starts the
- * handshake.
+ * connection to TLS, eg, from LWS_CALLBACK_RAW_RX once the peer has agreed
+ * to it.  The peer certificate is checked against the connection's vhost
+ * client tls context and the host the connection was made to, according to
+ * \p ssl_flags, as for a connection that used tls from the start.
+ *
+ * The first step of the handshake is taken inside this call, and lws carries
+ * on with the rest.  When it has completed, the connection's protocol
+ * receives LWS_CALLBACK_RAW_CONNECTED again, and from then on its rx and tx
+ * are over the tls.  A handshake that fails or times out closes the
+ * connection with LWS_CALLBACK_RAW_CLOSE, since it was already connected.
+ *
+ * Any plaintext the peer sent after agreeing to start tls must be discarded,
+ * not acted on: it was not protected by the tls.  What the caller was given
+ * in the same RAW_RX, after the peer's agreement, is the caller's to refuse;
+ * lws refuses the connection if any more of it is buffered, rather than
+ * deliver it after the tls is up.
+ *
+ * Returns 0 if the handshake is under way, 1 if it completed already inside
+ * this call (no LWS_CALLBACK_RAW_CONNECTED will follow), or -1 if tls could
+ * not be started, in which case the caller should close the connection.
  */
 LWS_VISIBLE LWS_EXTERN int
 lws_tls_client_upgrade(struct lws *wsi, int ssl_flags);
+
+/**
+ * struct lws_alt_svc - result of parsing an Alt-Svc alternative (RFC 7838)
+ *
+ * \warning this is a fixed-size struct matched against sizeof in the api test,
+ * changing it is an ABI change
+ */
+struct lws_alt_svc {
+	char		host[64];
+	/**< alternative authority host, empty string means "same host as the
+	 * origin" */
+	uint32_t	ma_secs;
+	/**< max-age for the alternative in seconds, already capped at
+	 * 24h; 0 means "delete any existing alternative" */
+	uint16_t	port;
+	/**< the port the alternative is available on */
+};
+
+/**
+ * lws_client_alt_svc_parse() - parse an Alt-Svc header value for an h3
+ *				alternative
+ *
+ * \param val: the Alt-Svc header value
+ * \param len: length of \p val
+ * \param alt: lws_alt_svc struct to receive the result
+ *
+ * Parses header values like `h3=":443"; ma=86400`, looking for the first
+ * well-formed `h3` alternative.  This is a pure function of its inputs,
+ * suitable for unit testing.  The header value is untrusted input and
+ * anything malformed is ignored rather than partially trusted.
+ *
+ * Returns 1 if a well-formed h3 alternative was found and \p alt filled in
+ * (with \p host left empty for the same-host `":port"` form), or 0 if there
+ * is nothing usable for h3 in \p val.  The \p ma_secs field defaults to 24h
+ * capped when no explicit max-age was given.
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_client_alt_svc_parse(const char *val, size_t len,
+			 struct lws_alt_svc *alt);
 
 ///@}

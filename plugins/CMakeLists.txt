@@ -123,6 +123,7 @@ if ((LWS_WITH_PLUGINS AND LWS_WITH_SHARED) OR LWS_WITH_PLUGINS_BUILTIN)
 
 			source_group("Headers Private"   FILES ${PLUGIN_HDR})
 			source_group("Sources"   FILES ${PLUGIN_SRCS})
+			message("CREATING PLUGIN ${PLUGIN_NAME}")
 			add_library(${PLUGIN_NAME} SHARED ${PLUGIN_SRCS} ${PLUGIN_HDR})
 			target_link_libraries(${PLUGIN_NAME} websockets_shared)
 			add_dependencies(${PLUGIN_NAME} websockets_shared)
@@ -132,7 +133,7 @@ if ((LWS_WITH_PLUGINS AND LWS_WITH_SHARED) OR LWS_WITH_PLUGINS_BUILTIN)
 			target_include_directories(${PLUGIN_NAME} PRIVATE ${PLUGIN_INCLUDE}
 									  ${LWS_LIB_BUILD_INC_PATHS})
 			set_property(TARGET ${PLUGIN_NAME}
-				     PROPERTY COMPILE_DEFINITIONS
+				     APPEND PROPERTY COMPILE_DEFINITIONS
 				     INSTALL_DATADIR="${CMAKE_INSTALL_PREFIX}/plugins"
 			)
 
@@ -146,12 +147,25 @@ if ((LWS_WITH_PLUGINS AND LWS_WITH_SHARED) OR LWS_WITH_PLUGINS_BUILTIN)
 			list(APPEND LWS_BUILTIN_PLUGIN_NAMES "${PLUGIN_NAME}")
 			set(LWS_BUILTIN_PLUGIN_NAMES ${LWS_BUILTIN_PLUGIN_NAMES} PARENT_SCOPE)
 
+			#
+			# if the plugin needs extra libs when built into the
+			# library itself, the plugin sets PLUGIN_LINK_LIBS before
+			# calling us and we forward them to the lib's link list
+			#
+
+			if (NOT "${PLUGIN_LINK_LIBS}" STREQUAL "")
+				list(APPEND LWS_PLUGIN_BUILTIN_LIBS ${PLUGIN_LINK_LIBS})
+				set(LWS_PLUGIN_BUILTIN_LIBS ${LWS_PLUGIN_BUILTIN_LIBS} PARENT_SCOPE)
+			endif()
+
 			if (NOT "${PLUGIN_INCLUDE}" STREQUAL "")
-				if (IS_ABSOLUTE ${PLUGIN_INCLUDE})
-					list(APPEND LWS_LIB_BUILD_INC_PATHS ${PLUGIN_INCLUDE})
-				else()
-					list(APPEND LWS_LIB_BUILD_INC_PATHS ${CMAKE_CURRENT_SOURCE_DIR}/${PLUGIN_INCLUDE})
-				endif()
+				foreach(_inc ${PLUGIN_INCLUDE})
+					if (IS_ABSOLUTE ${_inc})
+						list(APPEND LWS_LIB_BUILD_INC_PATHS ${_inc})
+					else()
+						list(APPEND LWS_LIB_BUILD_INC_PATHS ${CMAKE_CURRENT_SOURCE_DIR}/${_inc})
+					endif()
+				endforeach()
 				set(LWS_LIB_BUILD_INC_PATHS ${LWS_LIB_BUILD_INC_PATHS} PARENT_SCOPE)
 			endif()
 
@@ -211,3 +225,4 @@ endif()
 
 export_to_parent_intermediate()
 set(LWS_BUILTIN_PLUGIN_NAMES ${LWS_BUILTIN_PLUGIN_NAMES} PARENT_SCOPE)
+set(LWS_PLUGIN_BUILTIN_LIBS ${LWS_PLUGIN_BUILTIN_LIBS} PARENT_SCOPE)

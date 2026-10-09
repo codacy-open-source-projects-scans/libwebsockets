@@ -434,12 +434,31 @@ HTTP Header information is managed by a pool of "ah" structs.  These are a
 limited resource so there is pressure to free the headers and return the ah to
 the pool for reuse.
 
-For that reason header information on HTTP connections that get upgraded to
-websockets is lost after the ESTABLISHED callback.  Anything important that
-isn't processed by user code before then should be copied out for later.
+For that reason the request headers are only guaranteed while the request is
+being dispatched to user code, and may be released as soon as that is done:
 
-For HTTP connections that don't upgrade, header info remains available the
-whole time.
+|request|the headers are available up to and including|
+|---|---|
+|GET / HEAD, and anything else with no request body|`LWS_CALLBACK_HTTP`|
+|POST / PUT / PATCH, or any request with a body|`LWS_CALLBACK_HTTP_BODY_COMPLETION` (`LWS_CALLBACK_HTTP` and `LWS_CALLBACK_HTTP_BODY` are also inside the window)|
+|ws upgrade|`LWS_CALLBACK_ESTABLISHED` (`LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION` is the callback guaranteed to see them on every path, eg, a proxied ws parent)|
+|WebTransport upgrade over h3|`LWS_CALLBACK_SERVER_NEW_CLIENT_INSTANTIATED`|
+
+An h2 or h3 stream gives its header allocation back at that point, so one
+stream out of many on a connection, or a download or upload that runs for
+minutes, does not pin an ah for its whole life.  An h1 connection currently
+keeps it until the transaction completes, because a pipelined request arriving
+behind the response needs a table; do not rely on that, the window above is the
+contract for every role.  Mounts that have their own lifetime, ie, cgi and the
+reverse proxy, release the headers even earlier, at spawn / proxy start.
+
+Anything important must be copied into your `pss` inside the window.  The
+accessors (`lws_hdr_copy()`, `lws_hdr_total_length()`,
+`lws_get_urlarg_by_name_safe()`, `lws_http_cookie_get()`, ...) do not fail
+loudly afterwards, they answer "not present", so a late read is a silently
+wrong answer rather than an error.  The same goes for the `in` pointer at
+`LWS_CALLBACK_HTTP`: it points into the headers, so copy it rather than storing
+the pointer.
 
 @section http2compat Code Requirements for HTTP/2 compatibility
 
@@ -566,6 +585,12 @@ the vhost SSL_CTX without any certificate, and allow you to use the callback
 LWS_CALLBACK_OPENSSL_LOAD_EXTRA_SERVER_VERIFY_CERTS to add your certificate to
 the SSL_CTX directly.  The vhost SSL_CTX * is in the user parameter in that
 callback.
+
+@section tls_cleanup Process-wide TLS library cleanup
+
+If you are using OpenSSL (>= 1.1.0) and you destroy the last `lws_context`, you may want to clean up the process-wide allocations made by the TLS library. You can call `lws_tls_cleanup_process()` to do this.
+
+However, be aware that if you call this, you cannot re-initialize the OpenSSL library in the same process. So only call it if you are completely finished with `libwebsockets` and the TLS library. If you plan to create a new `lws_context` later in the same process lifecycle, you must not call this API.
 
 @section clientasync Async nature of client connections
 
@@ -906,7 +931,26 @@ between the service threads; if you process was allowed 1024 fds overall then
 each thread is limited to 1024 / n.
 
 You can set fd_limit_per_thread to a nonzero number to control this manually, eg
-the overall supported fd limit is less than the process allowance.
+the overall supported fd limit is less than the process allowance.  A nonzero
+value also switches the fd -> wsi lookup to a small table that is searched,
+instead of one indexed by fd and sized to the process limit; that saves memory
+for a client with a few connections, and a server wants the default.
+
+The nonzero value is the whole per-thread table.  `LWS_FD_LIMIT_INTERNAL` is
+what lws holds itself in the build (event pipe, netlink, async DNS, ntp and
+dhcp sockets, and one slot kept free), and a smaller nonzero value is raised to
+it.  `LWS_FD_LIMIT_PER_THREAD_MIN` adds the overhead connections carry (h2 / h3
+network connection, redirects, listeners, closing connections), so set
+
+```
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + n;
+```
+
+for n connections open at once.  When a service thread's fds table is full, lws
+stops accepting on every listener until a connection on that thread closes
+(logged once per thread at WARN).  `lws_context_info_defaults()` sets
+`LWS_FD_LIMIT_PER_THREAD_MIN + 6`, sized for a client; a server built on it
+should set fd_limit_per_thread back to 0 for the process limit.
 
 You can control the context basic data allocation for multithreading from Cmake
 using -DLWS_MAX_SMP=, if not given it's set to 1.  The serv_buf allocation
@@ -1008,7 +1052,9 @@ named option changed.
 
 The extension may decide to alter or disallow the change, in the
 example above permessage-deflate restricts the size of his rx
-output buffer also considering the protocol's rx_buf_size member.
+output buffer also considering the protocol's rx_buf_size member;
+his tx output buffer is capped the same way, and out-of-range
+values are refused.
 
 
 @section httpsclient Client connections as HTTP[S] rather than WS[S]

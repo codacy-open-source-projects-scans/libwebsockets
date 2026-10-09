@@ -62,132 +62,149 @@ if (requirements)
 
 	find_program(VALGRIND "valgrind")
 
-	if (LWS_CTEST_INTERNET_AVAILABLE AND NOT WIN32)
+	if (NOT WIN32)
+
+		# Note: no fault-injection ctests here: these examples return
+		# nonzero directly when SS creation fails, so --expected-exit
+		# cannot be reported through them.  The equivalent coverage is
+		# in the minimal-secure-streams* examples' fi tests.
+
 	
 		#
-		# When running in CI, wait for a lease on the resources
-		# before starting this test, so the server does not get
-		# thousands of simultaneous tls connection attempts
+		# External-egress variant: the example's default policy points at
+		# libwebsockets.org, which needs real internet routing.  This is
+		# only registered for builds that can actually reach it
+		# (dual-stack / IPv4-capable); in an IPv6-only / no-egress CI
+		# build the test would hang on DNS / connect until the ctest
+		# timeout.  The -local variant below provides the IPv6 coverage
+		# instead.
 		#
-		# sai-resource holds the lease on the resources until
-		# the time given in seconds or the sai-resource instance
-		# exits, whichever happens first
-		#
-		# If running under Sai, creates a lock test called "res_sspcmin" 
-		#
-		
-		sai_resource(warmcat_conns 1 40 sspcmin-ws-echo)
-		
-		#
-		# simple test not via proxy
-		#
-	
-		if (VALGRIND)
-			message("testing via valgrind")
-			add_test(NAME mssws_echo-warmcat COMMAND
-				${VALGRIND} --tool=memcheck --leak-check=yes --num-callers=20
-				$<TARGET_FILE:${PROJECT_NAME}>)
-		else()
-			add_test(NAME mssws_echo-warmcat COMMAND ${PROJECT_NAME})
-		endif()
-
-		set_tests_properties(mssws_echo-warmcat
-				     PROPERTIES
-				     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/minimal-examples/client/ws-echo
-				     TIMEOUT 40)
-		if (DEFINED ENV{SAI_OVN})
-			set_tests_properties(mssws_echo-warmcat PROPERTIES FIXTURES_REQUIRED "res_msspcmin")		     
-		endif()
-
-		if (has_fault_injection)
-			if (VALGRIND)
-				add_test(NAME mssws_echo-warmcat-fi1 COMMAND
-					${VALGRIND} --tool=memcheck --leak-check=yes --num-callers=20
-					$<TARGET_FILE:${PROJECT_NAME}>
-					--fault-injection "ss/ss_create_destroy_me"
-					--expected-exit 1)
-				add_test(NAME mssws_echo-warmcat-fi2 COMMAND
-					${VALGRIND} --tool=memcheck --leak-check=yes --num-callers=20
-					$<TARGET_FILE:${PROJECT_NAME}>
-					--fault-injection "ss/ss_no_streamtype_policy"
-					--expected-exit 1)
-			else()
-				add_test(NAME mssws_echo-warmcat-fi1 COMMAND lws-minimal-secure-streams
-					 --fault-injection "ss/ss_create_destroy_me"
-					 --expected-exit 1)
-				add_test(NAME mssws_echo-warmcat-fi2 COMMAND lws-minimal-secure-streams
-					 --fault-injection "ss/ss_no_streamtype_policy"
-					 --expected-exit 1)
- 			 endif()
-
-			set_tests_properties(mssws_echo-warmcat-fi1
-					     mssws_echo-warmcat-fi2
-				     PROPERTIES
-				     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/minimal-examples/client/ws-echo
-				     TIMEOUT 5)
-
-		endif()
-
-
-		if (has_sys_state AND (HAS_LWS_WITH_SECURE_STREAMS_PROXY_API OR has_ss_proxy OR
-		    LWS_WITH_SECURE_STREAMS_PROXY_API))
+		if (LWS_IPV4)
 
 			#
-			# Define test dep to bring up and take down the test
-			# proxy
+			# When running in CI, wait for a lease on the resources
+			# before starting this test, so the server does not get
+			# thousands of simultaneous tls connection attempts
+			#
+			# sai-resource holds the lease on the resources until
+			# the time given in seconds or the sai-resource instance
+			# exits, whichever happens first
+			#
+			# If running under Sai, creates a lock test called "res_sspcmin"
 			#
 
-			if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-				# uds abstract namespace for linux
-				set(CTEST_SOCKET_PATH "@ctest-msspws_echo--$ENV{SAI_PROJECT}-$ENV{SAI_OVN}")
-			else()
-				# filesystem socket for others
-				string(SUBSTRING "$ENV{SAI_OVN}" 32 16 SHORT_HASH)
-				set(CTEST_SOCKET_PATH "/tmp/ctest-msspws_echo-$ENV{SAI_PROJECT}-${SHORT_HASH}")
-			endif()
-			add_test(NAME st_mssws_echo-proxy COMMAND
-				${CMAKE_SOURCE_DIR}/scripts/ctest-background.sh
-				mssws_echo-proxy $<TARGET_FILE:lws-minimal-secure-streams-proxy>
-				-i ${CTEST_SOCKET_PATH} )
-			set_tests_properties(st_mssws_echo-proxy PROPERTIES WORKING_DIRECTORY . FIXTURES_SETUP mssws_echo-proxy TIMEOUT 800)
-
-			add_test(NAME ki_mssws_echo-proxy COMMAND
-				${CMAKE_SOURCE_DIR}/scripts/ctest-background-kill.sh
-				mssws_echo-proxy $<TARGET_FILE:lws-minimal-secure-streams-proxy>
-				-i ${CTEST_SOCKET_PATH})
-			set_tests_properties(ki_mssws_echo-proxy PROPERTIES FIXTURES_CLEANUP mssws_echo-proxy)
-
 			#
-			# the client part that will connect to the proxy
+			# simple test not via proxy
 			#
 
-			if (VALGRIND)
-				message("testing via valgrind")
-				add_test(NAME msspcws-echo-minimal COMMAND
-					${VALGRIND} --tool=memcheck --leak-check=yes --num-callers=20
-					$<TARGET_FILE:${PROJECT_NAME}-client>
-					--ssproxy-iface +${CTEST_SOCKET_PATH})
-			else()
-				add_test(NAME msspcws-echo-minimal COMMAND
-					  ${PROJECT_NAME}-client
-					  --ssproxy-iface +${CTEST_SOCKET_PATH})
-			endif()
-			
-			set(fixlist "mssws_echo-proxy")
+
 			if (DEFINED ENV{SAI_OVN})
-				list(APPEND fixlist "res_mssws_echo-proxy")
 			endif()
-			
-			set_tests_properties(msspcws-echo-minimal PROPERTIES
-				WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/minimal-examples/client/ws-echo
-				FIXTURES_REQUIRED "${fixlist}"
-				TIMEOUT 40)
 
-		endif()
+		endif() # LWS_IPV4 (external-egress variant)
+
+
+
+
 
 	endif()
 
+		#
+		# Local-server variant: runs against a local test-server over TLS
+		# (serving the lws-mirror-protocol ws echo), so it does not need
+		# any external network egress.  Suitable for IPv6-only / no-egress CI.
+		# test-server is given the localhost-100y cert/key with -C/-K so the
+		# client can trust it via the same local_test trust store as the
+		# httpbin-based local tests.
+		#
+
+		if (NOT WIN32 AND LWS_WITH_SERVER AND NOT LWS_WITHOUT_TEST_SERVER)
+			lws_get_free_port(PORT_WS_SRV_TLS)
+
+			configure_file(policy-local.json.in policy-local.json @ONLY)
+
+			set(LOCAL_CERT_DIR ${CMAKE_SOURCE_DIR}/minimal-examples-lowlevel/http-server/minimal-http-server-tls)
+
+			add_test(NAME st_ws_srv
+				COMMAND ${CMAKE_SOURCE_DIR}/scripts/ctest-background.sh
+					ws_srv $<TARGET_FILE:test-server>
+					-s -p ${PORT_WS_SRV_TLS}
+					-C ${LOCAL_CERT_DIR}/localhost-100y.cert
+					-K ${LOCAL_CERT_DIR}/localhost-100y.key
+					-r ${CMAKE_BINARY_DIR}/share/libwebsockets-test-server)
+			add_test(NAME ki_ws_srv
+				COMMAND ${CMAKE_SOURCE_DIR}/scripts/ctest-background-kill.sh
+					ws_srv $<TARGET_FILE_NAME:test-server> -p ${PORT_WS_SRV_TLS})
+			set_tests_properties(st_ws_srv PROPERTIES
+					WORKING_DIRECTORY .
+					FIXTURES_SETUP ws_srv
+					TIMEOUT 800
+					ENVIRONMENT "SAI_LIST_PORT=${PORT_WS_SRV_TLS}")
+			set_tests_properties(ki_ws_srv PROPERTIES FIXTURES_CLEANUP ws_srv)
+
+			add_test(NAME mssws_echo-local
+				COMMAND ${PROJECT_NAME}
+					-c ${CMAKE_CURRENT_BINARY_DIR}/policy-local.json)
+			set_tests_properties(mssws_echo-local PROPERTIES
+					WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/minimal-examples/client/ws-echo
+					FIXTURES_REQUIRED "ws_srv"
+					TIMEOUT 40)
+		endif()
+
+
 	### <--- related to ctest / CI END
+
+
+	#
+	# Local-proxy variant: the proxy uses the local policy and the local
+	# peer instead of fetching a policy from warmcat.com, so this needs no
+	# external network egress.  Deliberately outside the
+	#
+
+	if (NOT WIN32 AND (HAS_LWS_WITH_SECURE_STREAMS_PROXY_API OR
+			   LWS_WITH_SECURE_STREAMS_PROXY_API) AND LWS_WITH_SERVER AND NOT LWS_WITHOUT_TEST_SERVER)
+
+		if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+			# uds abstract namespace for linux
+			set(CTEST_LOCAL_SOCKET_PATH "@ctest-sspwse-local-$ENV{SAI_PROJECT}-$ENV{SAI_OVN}")
+		else()
+			# filesystem socket for others
+			if (DEFINED ENV{SAI_OVN})
+				string(SUBSTRING "$ENV{SAI_OVN}" 32 16 SHORT_HASH)
+			else()
+				set(SHORT_HASH "0")
+			endif()
+			set(CTEST_LOCAL_SOCKET_PATH "/tmp/ctest-sspwse-local-$ENV{SAI_PROJECT}-${SHORT_HASH}")
+		endif()
+
+		configure_file(policy-local.json.in policy-local.json @ONLY)
+
+		add_test(NAME st_wse_proxy_local COMMAND
+			${CMAKE_SOURCE_DIR}/scripts/ctest-background.sh
+			wse_proxy_local $<TARGET_FILE:lws-minimal-secure-streams-proxy>
+			-i ${CTEST_LOCAL_SOCKET_PATH}
+			-c ${CMAKE_CURRENT_BINARY_DIR}/policy-local.json)
+		set_tests_properties(st_wse_proxy_local PROPERTIES
+			WORKING_DIRECTORY .
+			FIXTURES_SETUP wse_proxy_local
+			FIXTURES_REQUIRED "ws_srv"
+			TIMEOUT 800)
+
+		add_test(NAME ki_wse_proxy_local COMMAND
+			${CMAKE_SOURCE_DIR}/scripts/ctest-background-kill.sh
+			wse_proxy_local $<TARGET_FILE:lws-minimal-secure-streams-proxy>
+			-i ${CTEST_LOCAL_SOCKET_PATH}
+			-c ${CMAKE_CURRENT_BINARY_DIR}/policy-local.json)
+		set_tests_properties(ki_wse_proxy_local PROPERTIES FIXTURES_CLEANUP wse_proxy_local)
+
+		add_test(NAME msspcws-echo-minimal-local COMMAND
+			${PROJECT_NAME}-client --ssproxy-iface +${CTEST_LOCAL_SOCKET_PATH})
+		set_tests_properties(msspcws-echo-minimal-local PROPERTIES
+			WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/minimal-examples/client/ws-echo
+			FIXTURES_REQUIRED "wse_proxy_local;ws_srv"
+			TIMEOUT 40)
+
+	endif()
 
 endif()
 

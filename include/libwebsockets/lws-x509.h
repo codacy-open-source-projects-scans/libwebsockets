@@ -109,7 +109,7 @@ lws_x509_create(struct lws_x509_cert **x509);
  * \param key_bits: Key strength (e.g. 2048 for RSA)
  *
  * Creates a self-signed certificate and private key in memory (DER format).
- * The caller is responsible for freeing *cert_buf and *key_buf using lws_free().
+ * The caller is responsible for freeing *cert_buf and *key_buf using free().
  *
  * Returns 0 on success.
  */
@@ -118,6 +118,43 @@ lws_x509_create_self_signed(struct lws_context *context,
 			    uint8_t **cert_buf, size_t *cert_len,
 			    uint8_t **key_buf, size_t *key_len,
 			    const char *san, int key_bits);
+
+struct lws_x509_cert_gen_info {
+	const char *san;             /* Subject Alt Name / CN: a single DNS
+				      * name or IP address literal */
+	const char *ca_cert_pem;     /* Optional CA cert to sign with */
+	const char *ca_key_pem;      /* Optional CA key to sign with */
+	const char *curve_name;      /* e.g., "P-521" or "P-384" for ECDSA */
+	int key_bits;                /* If curve_name is NULL, use RSA with these bits */
+	int is_ca;                   /* 1 = CA:TRUE (Basic Constraints) */
+	int is_server;               /* 1 = serverAuth, 0 = clientAuth */
+	int validity_days;           /* If non-zero, sets validity to this many days instead of default (365) */
+};
+
+/**
+ * lws_x509_create_cert() - Create a certificate (self-signed or CA-signed)
+ *
+ * \param context: lws_context
+ * \param cert_buf: pointer to pointer to be set to allocated DER cert
+ * \param cert_len: pointer to size_t to be set to length of allocated cert
+ * \param key_buf: pointer to pointer to be set to allocated DER private key
+ * \param key_len: pointer to size_t to be set to length of allocated key
+ * \param info: struct containing generation parameters
+ *
+ * Creates a certificate and private key in memory (DER format).
+ * The caller is responsible for freeing *cert_buf and *key_buf using free().
+ *
+ * The private key is SEC1 ("EC PRIVATE KEY") DER for EC, or PKCS#1
+ * ("RSA PRIVATE KEY") DER for RSA.  info->ca_key_pem may be any of those, or
+ * PKCS#8 ("PRIVATE KEY"), in PEM.
+ *
+ * Returns 0 on success.
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_x509_create_cert(struct lws_context *context,
+		     uint8_t **cert_buf, size_t *cert_len,
+		     uint8_t **key_buf, size_t *key_len,
+		     const struct lws_x509_cert_gen_info *info);
 
 /**
  * lws_x509_parse_from_pem() - Read one or more x509 certs in PEM format from memory
@@ -149,6 +186,9 @@ lws_x509_parse_from_pem(struct lws_x509_cert *x509, const void *pem, size_t len)
  * Returns 0 if the cert or certs in \p x509 represent a complete chain that is
  * ultimately signed by the cert in \p trusted.  Returns nonzero if that's not
  * the case.
+ *
+ * Every signature on the way to \p trusted is checked, and the certs in \p x509
+ * must also be within their validity period at the current time.
  */
 LWS_VISIBLE LWS_EXTERN int
 lws_x509_verify(struct lws_x509_cert *x509, struct lws_x509_cert *trusted,
@@ -207,6 +247,20 @@ lws_x509_destroy(struct lws_x509_cert **x509);
 LWS_VISIBLE LWS_EXTERN int
 lws_x509_info(struct lws_x509_cert *x509, enum lws_tls_cert_info type,
 	      union lws_tls_cert_info_results *buf, size_t len);
+
+/**
+ * lws_x509_cert_fingerprint() - Calculate the fingerprint of a certificate
+ *
+ * \param x509: the certificate to fingerprint
+ * \param type: the hash type (e.g., LWS_GENHASH_TYPE_SHA256)
+ * \param buf: buffer to receive the binary hash
+ * \param len: max length of the buffer
+ *
+ * Returns the hash length on success, or -1 on failure.
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_x509_cert_fingerprint(struct lws_x509_cert *x509, int type,
+			  uint8_t *buf, size_t len);
 
 /**
  * lws_tls_peer_cert_info() - get information from the peer's TLS cert

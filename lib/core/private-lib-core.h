@@ -28,8 +28,15 @@
 #include "lws_config.h"
 #include "lws_config_private.h"
 
-#if !defined(LHP_URL_LEN)
-#define LHP_URL_LEN			240
+/*
+ * Protocol plugins are available at runtime: either dlopenable .so files
+ * (LWS_WITH_PLUGINS) or compiled into the library (LWS_BUILTIN_PLUGIN_NAMES,
+ * ie, LWS_WITH_PLUGINS_BUILTIN).  Code paths that bind plugin protocols into
+ * vhosts should gate on this rather than on LWS_WITH_PLUGINS alone, so
+ * builtin-only builds work identically.
+ */
+#if defined(LWS_WITH_PLUGINS) || defined(LWS_BUILTIN_PLUGIN_NAMES)
+#define LWS_WITH_PROTOCOL_PLUGINS 1
 #endif
 
 
@@ -73,7 +80,7 @@
  #include <sys/stat.h>
 #endif
 
-#if LWS_MAX_SMP > 1 || defined(LWS_WITH_SYS_SMD)
+#if LWS_MAX_SMP > 1 || (defined(LWS_WITH_SYS_SMD) && defined(LWS_HAVE_PTHREAD_H))
  /* https://stackoverflow.com/questions/33557506/timespec-redefinition-error */
  #define HAVE_STRUCT_TIMESPEC
  #include <pthread.h>
@@ -331,13 +338,24 @@ struct lws;
 #include "private-lib-system-metrics.h"
 
 struct lws_foreign_thread_pollfd {
-	struct lws_foreign_thread_pollfd *next;
+	/* member of pt->foreign_pfd_owner, under pt lock both sides */
+	lws_dll2_t list;
 	int fd_index;
 	int _and;
 	int _or;
 };
 
 #include "private-lib-core-net.h"
+/*
+ * The IO half's private prototypes are hidden from the sansIO sources, which
+ * compile with LWS_SANSIO_CHECK, so a sansIO file calling into IO past the
+ * seam fails to compile.  The seam, sansIO's spelling of its requests of
+ * IO, is included at the end, once the context is complete.  See
+ * READMEs/README.sans-io-split.md.
+ */
+#if !defined(LWS_SANSIO_CHECK)
+#include "private-lib-io.h"
+#endif
 #endif /* network */
 
 struct lws_system_blob {
@@ -371,7 +389,7 @@ enum {
 
 	LWSLCG_WSI_SERVER,		/* server wsi */
 
-#if defined(LWS_ROLE_H2) || defined(LWS_ROLE_MQTT)
+#if defined(LWS_ROLE_H2) || defined(LWS_ROLE_MQTT) || defined(LWS_ROLE_QUIC)
 	LWSLCG_WSI_MUX,			/* a mux child wsi */
 #endif
 
@@ -426,6 +444,15 @@ typedef struct lws_ss_sinks {
 } lws_ss_sinks_t;
 #endif
 
+/*
+ * This is a deliberate hand-rolled singly-linked FIFO, not an lws_dll2
+ * conversion candidate: segments are only ever appended at the tail and
+ * consumed/destroyed at the head, so the mid-list mutation and stale
+ * cached-iterator problems lws_dll2 exists to prevent cannot arise here.
+ * An lws_dll2_t would add prev + owner pointers to every rx segment on
+ * the hot buffering path for features a FIFO queue does not use; see
+ * buflist2 for the dll2-backed variant used by newer code.
+ */
 typedef struct lws_buflist {
 	struct lws_buflist			*next;
 	size_t					len;
@@ -435,6 +462,21 @@ typedef struct lws_buflist {
 	void					*heap_alloc;
 } lws_buflist_t;
 
+typedef enum {
+	LWS_H3_STATE_UNKNOWN,
+	LWS_H3_STATE_HTTPS_RECORD_EXISTS,
+	LWS_H3_STATE_ALTSVC_EXISTS,
+	LWS_H3_STATE_KNOWN_GOOD,
+	LWS_H3_STATE_FAILED_IGNORE
+} lws_h3_state_t;
+
+#define LWS_QUIC_GRACE_DEFAULT_US 2000000
+#define LWS_QUIC_GRACE_MARGIN_US  200000
+
+typedef struct {
+	lws_h3_state_t state;
+	uint32_t latency_us;
+} lws_h3_cap_info_t;
 
 /*
  * the rest is managed per-context, that includes
@@ -444,11 +486,21 @@ typedef struct lws_buflist {
  */
 
 struct lws_context {
+	const lws_io_ops_t		*io_ops; /* the requests of IO */
+	const struct lws_io_plumbing	*io_plumbing;
+	/**< requests of lws' own IO's features (the cgi, jit trust), which
+	 * are not part of io_ops' contract */
+	size_t				wsi_io_size;
+	/**< IO's half of each wsi, allocated after it: the adjunct and the
+	 * event library's per-wsi block */
+	struct lws_io_adjunct		*fake_io;
+	/**< the IO half of a wsi made up for a callback that has no real
+	 * one: no socket, no place in the poll set (rides after the context) */
  #if defined(LWS_WITH_SERVER)
 	char canonical_hostname[96];
  #endif
-#if defined(LWS_HAVE_SSL_CTX_set_keylog_callback) && \
-	defined(LWS_WITH_TLS) && (!defined(LWS_WITHOUT_CLIENT) || !defined(LWS_WITHOUT_SERVER))
+#if defined(LWS_WITH_TLS_KEYLOG) && defined(LWS_WITH_TLS) && \
+	(defined(LWS_WITH_CLIENT) || defined(LWS_WITH_SERVER))
 	char					keylog_file[96];
 #endif
 
@@ -475,6 +527,9 @@ struct lws_context {
 	lws_dll2_owner_t			dlo_file;
 #if defined(LWS_WITH_SECURE_STREAMS)
 	lws_dll2_owner_t			active_assets; /* dloss_t */
+	lws_dll2_owner_t			pending_assets; /* dloss_t, queued for a slot */
+	lws_sorted_usec_list_t			sul_assets_kick; /* retry starting
+						* queued assets when fds are short */
 #endif
 #endif
 
@@ -490,7 +545,7 @@ struct lws_context {
         const struct lws_extension		*extensions;
 #endif
 
-#if defined(LWS_WITH_NETLINK)
+#if defined(LWS_WITH_ROUTING)
 	lws_sorted_usec_list_t			sul_nl_coldplug;
 	/* process can only have one netlink socket, have to do it in ctx */
 	lws_dll2_owner_t			routing_table;
@@ -498,7 +553,11 @@ struct lws_context {
 #endif
 
 #if defined(LWS_PLAT_FREERTOS)
+#if defined(LWS_WITH_IPV4)
 	struct sockaddr_in			frt_pipe_si;
+#else
+	struct sockaddr_in6			frt_pipe_si;
+#endif
 #endif
 
 #if defined(LWS_WITH_HTTP2)
@@ -522,6 +581,12 @@ struct lws_context {
  */
 
 	lws_dll2_owner_t		owner_vh_being_destroyed;
+
+#if defined(LWS_WITH_STUB)
+	lws_dll2_owner_t		owner_stub_mgrs;
+	/**< lws_stub_manager tracking, so stubs can never outlive the
+	 *   context or the vhost they were spawned on */
+#endif
 
 	lws_metric_t			*mt_service; /* doing service */
 	const lws_metric_policy_t	*metrics_policies;
@@ -580,10 +645,29 @@ struct lws_context {
 #if defined(LWS_WITH_SYS_FAULT_INJECTION)
 	lws_fi_ctx_t			fic;
 	/**< Toplevel Fault Injection ctx */
+	struct lws_xos			random_xos;
+	/**< lws_get_random()'s seeded PRNG, when random_prng is set: its own
+	 * stream, so other faults consuming fic.xos do not move it */
+#if defined(LWS_WITH_NETWORK) && LWS_MAX_SMP > 1
+	pthread_mutex_t			random_lock;
+	/**< a leaf lock for random_xos: callers may hold any other */
+#endif
+	uint8_t				random_prng;
+	/**< lws_get_random() comes from random_xos, not the platform */
 #endif
 
 #if defined(LWS_WITH_CACHE_NSCOOKIEJAR) && defined(LWS_WITH_CLIENT)
 	struct lws_cache_ttl_lru *l1, *nsc;
+#endif
+
+#if defined(LWS_WITH_CACHE_BLOB)
+	struct lws_cache_ttl_lru *dlo_asset_cache_blob, *dlo_asset_l1;
+#endif
+
+#if defined(LWS_WITH_CLIENT)
+	struct lws_cache_ttl_lru *alpn_cache;
+	struct lws_cache_ttl_lru *h3_cap_cache;
+	struct lws_cache_ttl_lru *altsvc_cache;
 #endif
 
 #if defined(LWS_WITH_SYS_NTPCLIENT)
@@ -610,13 +694,24 @@ struct lws_context {
 	lws_dll2_owner_t		dhcpc_owner;
 					/**< list of ifaces with dhcpc */
 #endif
+#if defined(LWS_WITH_SYS_WHOIS)
+	lws_dll2_owner_t		whois_owner;
+					/**< whois queries in flight */
+#endif
 
 	/* pointers */
 
-	struct lws_vhost		*vhost_list;
-	struct lws_vhost		*no_listener_vhost_list;
-	struct lws_vhost		*vhost_pending_destruction_list;
 	struct lws_vhost		*vhost_system;
+
+	/* dll2 owners: the vhost_list node on struct lws_vhost is used for
+	 * the main list and, after removal from it, the pending-destruction
+	 * list; the no_listener_vlist node covers the independent
+	 * awaiting-a-listener list.  Use lws_vhost_first()/lws_vhost_next()
+	 * helpers to walk the main list.
+	 */
+	lws_dll2_owner_t		vhost_list_owner;
+	lws_dll2_owner_t		no_listener_vhost_owner;
+	lws_dll2_owner_t		vhost_pending_destruction_owner;
 
 #if defined(LWS_WITH_SERVER)
 	const char			*server_string;
@@ -629,9 +724,14 @@ struct lws_context {
 	const struct lws_tls_ops	*tls_ops;
 #endif
 
-#if defined(LWS_WITH_PLUGINS)
+#if defined(LWS_WITH_PROTOCOL_PLUGINS)
 	struct lws_plugin		*plugin_list;
 #endif
+	const struct lws_plugin_protocol * const *plugins_composed;
+	/* from info->plugins */
+	int				plugins_inited;
+	/* how many plugins, in lws_plugins_protocol_init() order, had their
+	 * .init done, so destroy deinits exactly those */
 #ifdef _WIN32
 /* different implementation between unix and windows */
 	struct lws_fd_hashtable fd_hashtable[FD_HASHTABLE_MODULUS];
@@ -646,6 +746,7 @@ struct lws_context {
 #endif
 
 	const char			*wol_if;
+	const char			*lws_stub;
 
 /*
  * <====== LWS_WITH_NETWORK end
@@ -659,6 +760,7 @@ struct lws_context {
 #if defined(LWS_WITH_SECURE_STREAMS_PROXY_API)
 	const char				*ss_proxy_bind;
 	const char				*ss_proxy_address;
+	const char				*ss_proxy_perms;
 
 	lws_txp_path_proxy_t			txp_ppath;
 	lws_txp_path_client_t			txp_cpath;
@@ -688,7 +790,7 @@ struct lws_context {
 	const char *username, *groupname;
 #endif
 
-#if defined(LWS_WITH_MBEDTLS)
+#if defined(LWS_WITH_MBEDTLS) && !defined(LWS_MBEDTLS_PSA_RNG)
 	mbedtls_entropy_context mec;
 	mbedtls_ctr_drbg_context mcdc;
 #endif
@@ -708,8 +810,8 @@ struct lws_context {
 #endif
 
 #if defined(LWS_WITH_PEER_LIMITS)
-	struct lws_peer			**pl_hash_table;
-	struct lws_peer			*peer_wait_list;
+	lws_dll2_owner_t		*pl_hash_table; /* peer limits hash buckets */
+	lws_dll2_owner_t		peer_wait_owner;
 	lws_peer_limits_notify_t	pl_notify_cb;
 	time_t				next_cull;
 #endif
@@ -802,7 +904,7 @@ struct lws_context {
 	uint16_t smd_queue_depth;
 #endif
 
-#if defined(LWS_WITH_NETLINK) && defined(LWS_WITH_NETWORK)
+#if defined(LWS_WITH_ROUTING) && defined(LWS_WITH_NETWORK)
 	lws_route_uidx_t			route_uidx;
 #endif
 
@@ -821,9 +923,11 @@ struct lws_context {
 	unsigned int evlib_finalize_destroy_after_int_loops_stop:1;
 	unsigned int max_fds_unrelated_to_ulimit:1;
 	unsigned int policy_updated:1;
-#if defined(LWS_WITH_NETLINK)
+#if defined(LWS_WITH_ROUTING)
 	unsigned int nl_initial_done:1;
 #endif
+	/* some interface has acquired an IP, via SMD "ipacq" */
+	unsigned int ipacq_seen:1;
 
 	unsigned short count_threads;
 	unsigned short undestroyed_threads;
@@ -842,9 +946,48 @@ struct lws_context {
 	uint8_t captive_portal_detect_type;
 
 	uint8_t		destroy_state; /* enum lws_context_destroy */
+
+	lws_quic_tx_credit_cb_t quic_tx_credit_cb;
+	const struct lws_cc_ops *quic_cc_ops;
+	uint32_t quic_initial_cwnd;
+	uint32_t quic_0rtt_max_size;
+
+	uint8_t quic_retry_secret[16];
 };
 
-#define lws_get_context_protocol(ctx, x) ctx->vhost_list->protocols[x]
+#if defined(LWS_WITH_NETWORK)
+/*
+ * vhost list helpers (dll2-backed; see the owners on struct lws_context).
+ * Both are NULL-safe: NULL in / NULL out.
+ */
+static LWS_INLINE struct lws_vhost *
+lws_vhost_first(const struct lws_context *cx)
+{
+	struct lws_dll2 *d = lws_dll2_get_head(&cx->vhost_list_owner);
+
+	return d ? lws_container_of(d, struct lws_vhost, vhost_list) : NULL;
+}
+
+static LWS_INLINE struct lws_vhost *
+lws_vhost_next(const struct lws_vhost *vh)
+{
+	struct lws_dll2 *d = lws_dll2_get_next(&vh->vhost_list);
+
+	return d ? lws_container_of(d, struct lws_vhost, vhost_list) : NULL;
+}
+
+#define lws_start_foreach_vhost(___vh, ___cx) \
+	lws_start_foreach_dll(struct lws_dll2 *, ___vh ## _dll, \
+			      lws_dll2_get_head(&(___cx)->vhost_list_owner)) { \
+		struct lws_vhost *___vh = lws_container_of(___vh ## _dll, \
+					struct lws_vhost, vhost_list);
+
+#define lws_end_foreach_vhost(___vh) \
+	} lws_end_foreach_dll(___vh ## _dll)
+
+#define lws_get_context_protocol(ctx, x) lws_vhost_first(ctx)->protocols[x]
+#endif
+
 #define lws_get_vh_protocol(vh, x) vh->protocols[x]
 
 int
@@ -875,6 +1018,9 @@ lws_system_do_attach(struct lws_context_per_thread *pt);
 
 char *
 lws_strdup(const char *s);
+
+int
+lws_environment_untrusted(void);
 
 int
 lws_b64_selftest(void);
@@ -1044,16 +1190,30 @@ void lwsl_emit_stderr(int level, const char *line);
  #define lws_ssl_close(_a) (0)
  #define lws_ssl_context_destroy(_a)
  #define lws_ssl_SSL_CTX_destroy(_a)
+ #define lws_tls_ctx_ref_destroy_all(_a)
  #define lws_ssl_remove_wsi_from_buffered_list(_a)
  #define __lws_ssl_remove_wsi_from_buffered_list(_a)
  #define lws_context_init_ssl_library(_a, _b)
  #define lws_context_deinit_ssl_library(_a)
  #define lws_tls_check_all_cert_lifetimes(_a)
  #define lws_tls_acme_sni_cert_destroy(_a)
+ #define lws_tls_cert_watch_destroy(_a)
 #endif
 
 
 
+/*
+ * Lock order, when LWS_MAX_SMP > 1 makes these real: the context lock, then
+ * a pt lock, then a vhost lock.  A thread holding a pt lock never takes the
+ * context lock, and holds the locks of two pts only while it also holds the
+ * context lock, taking them in ascending order (vhost destroy does this).
+ * Every event loop services its pt's sul list under the context lock and
+ * then the pt lock, so a sul callback that closes a wsi or destroys a vhost
+ * (both context, then pt) is in order; a sul on another pt's list (eg, the
+ * vhost idle grace, kept on pt 0) is scheduled or cancelled under the
+ * context lock.  The mutexes are recursive, so taking one already held, in
+ * order, is fine (C-131).
+ */
 #if defined(LWS_WITH_NETWORK) && LWS_MAX_SMP > 1
 #define lws_context_lock(c, reason) lws_mutex_refcount_lock(&c->mr, reason)
 #define lws_context_unlock(c) lws_mutex_refcount_unlock(&c->mr)
@@ -1113,6 +1273,13 @@ lws_find_mount(struct lws *wsi, const char *uri_ptr, int uri_len);
 
 #ifdef LWS_WITH_HTTP2
 int lws_wsi_is_h2(struct lws *wsi);
+#else
+#define lws_wsi_is_h2(wsi) (0)
+#endif
+#ifdef LWS_ROLE_H3
+int lws_wsi_is_h3(struct lws *wsi);
+#else
+#define lws_wsi_is_h3(wsi) (0)
 #endif
 /*
  * custom allocator
@@ -1133,6 +1300,10 @@ void lws_free(void *p);
 #define lws_free_set_NULL(P)	do { lws_realloc(P, 0, "free"); (P) = NULL; } while(0)
 #endif
 
+/* replay and free anything a log spew left retained, eg, at context destroy */
+void
+lws_log_spew_flush(lws_log_cx_t *cx);
+
 int
 __lws_create_event_pipes(struct lws_context *context);
 
@@ -1143,8 +1314,29 @@ const struct lws_plat_file_ops *
 lws_vfs_select_fops(const struct lws_plat_file_ops *fops, const char *vfs_path,
 		    const char **vpath);
 
+#if defined(LWS_WITH_FILE_OPS) && (defined(WIN32) || defined(__APPLE__))
+/*
+ * The platform's filesystems find a file by more names than its own: case
+ * folds, and on windows trailing dots and spaces are dropped and 8.3 short
+ * names alias long ones.  So a path can only be compared with another after
+ * it is canonical: the file or directory's own name for every component,
+ * symlinks resolved.  0 and that in buf, or nonzero if it can't be had.
+ */
+#define LWS_PLAT_FS_FOLDS_NAMES
+int
+lws_plat_path_canonical(const char *path, char *buf, size_t len);
+#endif
+
 /* lws_plat_ */
 
+/* the platform's random source, behind lws_get_random() */
+size_t
+lws_plat_get_random(struct lws_context *context, void *buf, size_t len);
+#if defined(LWS_WITH_SYS_FAULT_INJECTION)
+/* the seeded PRNG in place of it goes with the context */
+void
+lws_fi_random_destroy(struct lws_context *cx);
+#endif
 int
 lws_plat_context_early_init(void);
 void
@@ -1161,6 +1353,14 @@ lws_plat_drop_app_privileges(struct lws_context *context, int actually_drop);
 #if defined(LWS_WITH_UNIX_SOCK) && !defined(WIN32)
 int
 lws_plat_user_colon_group_to_ids(const char *u_colon_g, uid_t *puid, gid_t *pgid);
+
+/*
+ * The uid and gid of the process at the other end of a connected Unix Domain
+ * Socket, as the kernel recorded them at connect time.  Returns 0 if it could
+ * find them, nonzero if not, including on platforms where it's not supported.
+ */
+int
+lws_plat_unix_peer_ids(lws_sockfd_type fd, uid_t *puid, gid_t *pgid);
 #endif
 
 int
@@ -1193,6 +1393,11 @@ void lws_msleep(unsigned int);
 void
 lws_context_destroy2(struct lws_context *context);
 
+#if defined(LWS_WITH_SYS_WHOIS)
+void
+lws_whois_destroy_all(struct lws_context *cx);
+#endif
+
 /* it's public extern const lws_transport_client_ops_t lws_txp_inside_sspc; */
 
 lws_transport_mux_ch_t *
@@ -1202,7 +1407,8 @@ lws_transport_mux_ch_t *
 lws_transport_mux_add_channel(lws_transport_mux_t *tm, lws_transport_priv_t priv);
 
 void
-lws_transport_mux_destroy_channel(lws_transport_mux_ch_t **_mc);
+lws_transport_mux_destroy_channel(lws_transport_mux_t *tm,
+				  lws_transport_mux_ch_t **_mc);
 
 lws_transport_mux_ch_t *
 lws_transport_mux_get_channel(lws_transport_mux_t *tm, lws_mux_ch_idx_t i);
@@ -1227,13 +1433,16 @@ int
 lws_plugins_handle_builtin(struct lws_plugin **pplugin,
 			   each_plugin_cb_t each, void *each_user);
 
+#if defined(LWS_WITH_NETWORK)
+/*
+ * The sansIO half's requests of IO, as sansIO spells them: calls through the
+ * context's lws_io_ops_t, which need the context complete
+ */
+#include "private-lib-sansio-seam.h"
+#endif
 
 #if !defined(PRIu64)
 #define PRIu64 "llu"
-#endif
-
-#if defined(LWS_WITH_ABSTRACT)
-#include "private-lib-abstract.h"
 #endif
 
 #ifdef __cplusplus

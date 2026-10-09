@@ -50,14 +50,29 @@ lws_ss_deserialize_tx_payload(struct lws_dsh *dsh, struct lws *wsi,
 	 * and strip it so we just forward the payload
 	 */
 
-	if (*len <= si - 23 || si < 23) {
+	if (si < 23) {
+		/* everything we queue has the 23-byte header */
+		assert(0);
+		return 1;
+	}
+
+	if (si - 23 > *len) {
 		/*
 		 * What comes out of the dsh needs to fit in the tx buffer...
 		 * we have arrangements at the proxy rx of the client UDS to
-		 * chop chunks larger than 1380 into seuqential lumps of 1380
+		 * chop chunks larger than 1380 into sequential lumps of 1380,
+		 * which fit onward protocols and local sinks exactly.  But a
+		 * consumer with a smaller buffer, eg, _lws_smd with its
+		 * 400-byte messages, can still meet a bigger chunk from the
+		 * client.  That's the client's doing, so drop the chunk.
 		 */
-		lwsl_err("%s: *len = %d, si = %d\n", __func__, (int)*len, (int)si);
-		assert(0);
+		lwsl_warn("%s: dropping %d-byte chunk, too big for %d\n",
+			  __func__, (int)(si - 23), (int)*len);
+#if !defined(__COVERITY__)
+		lws_dsh_free((void **)&p);
+#endif
+		*len = 0;
+
 		return 1;
 	}
 	if (p[0] != LWSSS_SER_TXPRE_TX_PAYLOAD) {
@@ -108,19 +123,36 @@ lws_ss_deserialize_tx_payload(struct lws_dsh *dsh, struct lws *wsi,
  *	LWSSSSRET_DESTROY_ME
  */
 
-/* convert userdata ptr _pss to handle pointer, allowing for any layout in
- * userdata */
-#define client_pss_to_sspc_h(_pss, _ssi) (*((lws_sspc_handle_t **) \
-				     ((uint8_t *)_pss) + _ssi->handle_offset))
-/* client pss to sspc userdata */
-#define client_pss_to_userdata(_pss) ((void *)_pss)
-/* proxy convert pss to ss handle */
-#define proxy_pss_to_ss_h(_pss) (*_pss)
+/*
+ * The 32-bit fields arrive MSB first, a byte at a time, from the client.
+ * Accumulate them unsigned: shifting client bits into the sign bit of an
+ * int32_t is undefined behaviour.
+ */
+static int32_t
+ser_acc32(int32_t acc, uint8_t c)
+{
+	return (int32_t)(((uint32_t)acc << 8) | c);
+}
+
+/*
+ * Tx credit is how much the onward peer may send us before we give it more,
+ * and all of it can end up waiting in the proxied stream's dsh for the
+ * client to take it.  So we never let the client grant the peer more
+ * outstanding credit than the dsh can hold.
+ */
+static int32_t
+proxy_txcr_cap(const lws_ss_policy_t *pol)
+{
+	size_t s = lws_ss_proxy_dsh_size(pol);
+
+	return s > INT32_MAX ? INT32_MAX : (int32_t)s;
+}
 
 /* convert userdata ptr _pss to handle pointer, allowing for any layout in
- * userdata */
-#define client_pss_to_sspc_h(_pss, _ssi) (*((lws_sspc_handle_t **) \
-				     ((uint8_t *)_pss) + _ssi->handle_offset))
+ * userdata.  handle_offset is a *byte* offset (that's how lws_sspc_create()
+ * stores the handle), so the addition must be done on the uint8_t * */
+#define client_pss_to_sspc_h(_pss, _ssi) (*(lws_sspc_handle_t **) \
+				     (((uint8_t *)(_pss)) + (_ssi)->handle_offset))
 /* client pss to sspc userdata */
 #define client_pss_to_userdata(_pss) ((void *)_pss)
 /* proxy convert pss to ss handle */
@@ -163,7 +195,11 @@ lws_ss_proxy_deserialize_parse(struct lws_ss_serialization_parser *par,
 
 			case LWSSS_SER_TXPRE_TX_PAYLOAD:
 
-				if (*state != LPCSPROX_OPERATIONAL)
+				/*
+				 * Payload is only for a created stream, whose
+				 * dsh we queue it on
+				 */
+				if (*state != LPCSPROX_OPERATIONAL || !dsh)
 					goto hangup;
 
 				par->ps = RPAR_FLAG_B3;
@@ -318,7 +354,7 @@ lws_ss_proxy_deserialize_parse(struct lws_ss_serialization_parser *par,
 				/* fallthru - handle 0-length payload */
 
 				if (!(par->flags & LWSSS_FLAG_RIDESHARE))
-					goto payload_ff;
+					goto payload_ff_l;
 				goto hangup;
 
 			/*
@@ -332,7 +368,14 @@ lws_ss_proxy_deserialize_parse(struct lws_ss_serialization_parser *par,
 			par->ps++;
 			if (par->rem-- < par->slen)
 				goto hangup;
-			if (par->slen >= sizeof(par->rideshare)) {
+			/*
+			 * slen must leave room for the NUL, and it must not be
+			 * zero: RPAR_RIDESHARE terminates on ctr reaching slen,
+			 * and ctr only ever counts up from 1, so a zero slen
+			 * would never terminate inside the buffer
+			 */
+			if (!par->slen ||
+			    par->slen >= sizeof(par->rideshare)) {
 				lwsl_err("%s: rideshare slen %d >= buffer %zu\n",
 					 __func__, (unsigned)par->slen, sizeof(par->rideshare));
 				goto hangup;
@@ -355,11 +398,19 @@ lws_ss_proxy_deserialize_parse(struct lws_ss_serialization_parser *par,
 			break;
 
 		case RPAR_RIDESHARE:
+			/*
+			 * Bound the store itself, and terminate on >= rather
+			 * than != , so no combination of slen and ctr can walk
+			 * past the end of the buffer.  Leave room for the NUL.
+			 */
+			if (par->ctr >= (int)sizeof(par->rideshare) - 1)
+				goto hangup;
 			par->rideshare[par->ctr++] = (char)*cp++;
 			if (!par->rem--)
 				goto hangup;
-			if (par->ctr != par->slen)
+			if (par->ctr < par->slen)
 				break;
+			par->rideshare[par->ctr] = '\0';
 			par->ps = RPAR_PAYLOAD;
 			if (par->rem)
 				break;
@@ -367,7 +418,7 @@ lws_ss_proxy_deserialize_parse(struct lws_ss_serialization_parser *par,
 			/* fallthru - handle 0-length payload */
 
 		case RPAR_PAYLOAD:
-payload_ff:
+payload_ff_l:
 			n = (int)len + 1;
 			if (n > par->rem)
 				n = par->rem;
@@ -509,7 +560,7 @@ payload_ff:
 			if (!--par->rem)
 				goto hangup;
 
-			par->temp32 = (par->temp32 << 8) | *cp++;
+			par->temp32 = ser_acc32(par->temp32, *cp++);
 			if (++par->ctr < 4)
 				break;
 
@@ -522,7 +573,7 @@ payload_ff:
 			if (!--par->rem)
 				goto hangup;
 
-			par->temp32 = (par->temp32 << 8) | *cp++;
+			par->temp32 = ser_acc32(par->temp32, *cp++);
 			if (++par->ctr < 4)
 				break;
 
@@ -538,7 +589,7 @@ payload_ff:
 
 		case RPAR_TXCR0:
 
-			par->temp32 = (par->temp32 << 8) | *cp++;
+			par->temp32 = ser_acc32(par->temp32, *cp++);
 			if (++par->ctr < 4) {
 				if (!--par->rem)
 					goto hangup;
@@ -548,6 +599,8 @@ payload_ff:
 			if (--par->rem)
 				goto hangup;
 
+			par->ps = RPAR_TYPE;
+
 			/*
 			 * We're the proxy, being told by the client
 			 * that it wants to allow more tx from the peer
@@ -556,25 +609,43 @@ payload_ff:
 #if defined(LWS_ROLE_H2) || defined(LWS_ROLE_MQTT)
 			if (proxy_pss_to_ss_h(pss) &&
 			    proxy_pss_to_ss_h(pss)->wsi) {
-				lws_wsi_tx_credit(
-					proxy_pss_to_ss_h(pss)->wsi,
-						  LWSTXCR_PEER_TO_US,
+				lws_ss_handle_t *h = proxy_pss_to_ss_h(pss);
+				int32_t cap = proxy_txcr_cap(h->policy),
+					est = h->wsi->txc.peer_tx_cr_est;
+
+				/*
+				 * Credit can only be added.  The peer's
+				 * outstanding credit on this stream must stay
+				 * within what we can buffer for it, which also
+				 * bounds what this stream adds to a shared h2
+				 * connection's window (it is bumped by the
+				 * same amount)
+				 */
+				if (par->temp32 <= 0 || est >= cap) {
+					lwsl_notice("%s: ignoring TXCR %d "
+						    "(est %d, cap %d)\n",
+						    __func__, par->temp32,
+						    est, cap);
+					break;
+				}
+				if (par->temp32 > cap - est)
+					par->temp32 = cap - est;
+
+				lws_wsi_tx_credit(h->wsi, LWSTXCR_PEER_TO_US,
 						  par->temp32);
 				lwsl_notice("%s: proxy RX_PEER_TXCR: +%d (est %d)\n",
 					 __func__, par->temp32,
-					 proxy_pss_to_ss_h(pss)->wsi->
-						 txc.peer_tx_cr_est);
-				_lws_ss_request_tx(proxy_pss_to_ss_h(pss));
+					 h->wsi->txc.peer_tx_cr_est);
+				_lws_ss_request_tx(h);
 			} else
 #endif
 				lwsl_info("%s: dropping TXCR\n", __func__);
 
-			par->ps = RPAR_TYPE;
 			break;
 
 		case RPAR_TIMEOUT0:
 
-			par->temp32 = (par->temp32 << 8) | *cp++;
+			par->temp32 = ser_acc32(par->temp32, *cp++);
 			if (++par->ctr < 4) {
 				if (!--par->rem)
 					goto hangup;
@@ -621,7 +692,7 @@ payload_ff:
 			 * It's the length from lws_ss_request_tx_len() being
 			 * passed up to the proxy
 			 */
-			par->temp32 = (par->temp32 << 8) | *cp++;
+			par->temp32 = ser_acc32(par->temp32, *cp++);
 			if (++par->ctr < 4) {
 				if (!--par->rem)
 					goto hangup;
@@ -649,7 +720,14 @@ payload_ff:
 			if (!--par->rem)
 				goto hangup;
 			par->slen = *cp++;
-			if (par->slen >= sizeof(par->metadata_name) - 1)
+			/*
+			 * A zero-length metadata name is meaningless, and
+			 * RPAR_METADATA_NAME can only terminate on ctr
+			 * reaching slen, where ctr counts up from 1... so a
+			 * zero slen would never terminate inside the buffer
+			 */
+			if (!par->slen ||
+			    par->slen >= sizeof(par->metadata_name) - 1)
 				goto hangup;
 			par->ctr = 0;
 			par->ps++;
@@ -659,8 +737,11 @@ payload_ff:
 			/* both client and proxy */
 			if (!--par->rem)
 				goto hangup;
+			/* bound the store, and terminate on >= not != */
+			if (par->ctr >= (int)sizeof(par->metadata_name) - 1)
+				goto hangup;
 			par->metadata_name[par->ctr++] = (char)*cp++;
-			if (par->ctr != par->slen)
+			if (par->ctr < par->slen)
 				break;
 			par->metadata_name[par->ctr] = '\0';
 			par->ps = RPAR_METADATA_VALUE;
@@ -689,31 +770,32 @@ payload_ff:
 				goto hangup;
 			}
 
-			par->ssmd = lws_ss_get_handle_metadata(
-					proxy_pss_to_ss_h(pss),
-					par->metadata_name);
+			/*
+			 * The value arrives a byte at a time, maybe over
+			 * several rx callbacks, and meanwhile the onward stream
+			 * may use, or replace, its metadata item (eg, from a
+			 * response header, or the mqtt shadow topic swap).  So
+			 * we must not hold a pointer to the item, or write into
+			 * its value, across rx callbacks: stage the value in a
+			 * buffer of our own, and install it on the item only
+			 * when it has all arrived.  Until then the item keeps
+			 * whatever complete value it had.
+			 */
 
-			if (par->ssmd) {
+			lws_free_set_NULL(par->mdstage);
 
-				if (par->ssmd->value_on_lws_heap)
-					lws_free_set_NULL(par->ssmd->value__may_own_heap);
-				par->ssmd->value_on_lws_heap = 0;
+			if (lws_ss_get_handle_metadata(proxy_pss_to_ss_h(pss),
+						       par->metadata_name)) {
+				if (!lws_fi(&proxy_pss_to_ss_h(pss)->fic,
+					    "ssproxy_rx_metadata_oom"))
+					par->mdstage = lws_zalloc(
+						(unsigned int)par->rem + 1,
+						"metadata");
 
-				if (proxy_pss_to_ss_h(pss) &&
-				    lws_fi(&proxy_pss_to_ss_h(pss)->fic, "ssproxy_rx_metadata_oom"))
-					par->ssmd->value__may_own_heap = NULL;
-				else
-					par->ssmd->value__may_own_heap =
-						lws_malloc((unsigned int)par->rem + 1, "metadata");
-
-				if (!par->ssmd->value__may_own_heap) {
+				if (!par->mdstage) {
 					lwsl_err("%s: OOM mdv\n", __func__);
 					goto hangup;
 				}
-				par->ssmd->length = par->rem;
-				((uint8_t *)par->ssmd->value__may_own_heap)[par->rem] = '\0';
-				/* mark it as needing cleanup */
-				par->ssmd->value_on_lws_heap = 1;
 			}
 			par->ctr = 0;
 			break;
@@ -721,7 +803,18 @@ payload_ff:
 		case RPAR_METADATA_VALUE:
 			/* both client and proxy */
 
-			if (!par->ssmd) {
+			/*
+			 * *pss may have gone away asynchronously since
+			 * RPAR_METADATA_NAME, possibly in an earlier rx
+			 * callback, so confirm the handle is still there
+			 */
+
+			if (!proxy_pss_to_ss_h(pss)) {
+				lws_free_set_NULL(par->mdstage);
+				goto hangup;
+			}
+
+			if (!par->mdstage) {
 				/* we don't recognize the name */
 
 				cp++;
@@ -733,22 +826,41 @@ payload_ff:
 				break;
 			}
 
-			((uint8_t *)(par->ssmd->value__may_own_heap))[par->ctr++] = *cp++;
+			/*
+			 * mdstage has room for the rem that was left after the
+			 * name, and we count rem down for each byte we store
+			 */
+			par->mdstage[par->ctr++] = *cp++;
 
 			if (--par->rem)
 				break;
 
-			/* we think we got all the value */
+			par->ps = RPAR_TYPE;
+
+			/*
+			 * We got all the value: look the item up afresh and
+			 * give it the completed value, freeing any heap value
+			 * it had before
+			 */
+
+			pm = lws_ss_get_handle_metadata(proxy_pss_to_ss_h(pss),
+							par->metadata_name);
+			if (!pm) {
+				lws_free_set_NULL(par->mdstage);
+				break;
+			}
+
+			_lws_ss_set_metadata(pm, pm->name, par->mdstage,
+					     (size_t)par->ctr);
+			pm->value_on_lws_heap = 1;
+			par->mdstage = NULL;
 
 			lwsl_ss_info(proxy_pss_to_ss_h(pss),
 				     "RPAR_METADATA_VALUE for %s (len %d)",
-				     par->ssmd->name,
-				     (int)par->ssmd->length);
+				     pm->name, (int)pm->length);
 			lwsl_hexdump_ss_info(proxy_pss_to_ss_h(pss),
-					par->ssmd->value__may_own_heap,
-					par->ssmd->length);
-
-			par->ps = RPAR_TYPE;
+					     pm->value__may_own_heap,
+					     pm->length);
 			break;
 
 		case RPAR_STREAMTYPE:
@@ -783,7 +895,32 @@ payload_ff:
 				    par->protocol_version, par->txcr_out);
 
 			ssi->streamtype = par->streamtype;
-			if (par->txcr_out) // !!!
+
+			/*
+			 * Except for _lws_smd, where it is the class mask, the
+			 * initial tx credit from the client is what the onward
+			 * peer may send before the client grants more, so it's
+			 * bound by what we can buffer for the stream, as in
+			 * RPAR_TXCR0.  Anything negative means no manual
+			 * credit.
+			 */
+			{
+				const lws_ss_policy_t *pol = lws_ss_policy_lookup(
+						context, par->streamtype);
+
+				if (pol
+#if defined(LWS_WITH_SYS_SMD)
+				    && pol != &pol_smd
+#endif
+				) {
+					if (par->txcr_out < 0)
+						par->txcr_out = 0;
+					if (par->txcr_out > proxy_txcr_cap(pol))
+						par->txcr_out = proxy_txcr_cap(pol);
+				}
+			}
+
+			if (par->txcr_out)
 				ssi->manual_initial_tx_credit = par->txcr_out;
 
 			/*

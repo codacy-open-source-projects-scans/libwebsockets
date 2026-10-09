@@ -68,13 +68,12 @@ typedef enum {
 	 * Proxied connection setup result
 	 *
 	 *   -  0: LWSSS_SER_RXPRE_CREATE_RESULT
-	 *   -  1: 2 byte MSB-first rest-of-frame length (usually 00, 03)
-	 *   -  3: 1 byte result, 0 = success.  On failure, proxy will close
-	 *   		connection.
-	 *   -  4: 4 byte client dsh allocation recommended for stream type,
-	 *   		from policy (introduced in SSSv1)
-	 *   -  8: 2 byte MSB-first initial tx credit
-	 *   - 10: if present, comma-sep list of rideshare types from policy
+	 *   -  1: 2 byte MSB-first rest-of-frame length (at least 00, 05)
+	 *   -  3: 1 byte result, 0 = success.  On failure, the client closes
+	 *   		the connection.
+	 *   -  4: 4 byte MSB-first client dsh allocation recommended for the
+	 *   		stream type, from policy (introduced in SSSv1)
+	 *   -  8: if present, comma-sep list of rideshare types from policy
 	 */
 	LWSSS_SER_RXPRE_CONNSTATE,
 	/*
@@ -544,6 +543,9 @@ typedef struct lws_transport_mux {
 	uint8_t					issue_pong:1;
 	uint8_t					issue_pongack:1;
 	uint8_t					awaiting_pong:1;
+	uint8_t					mp_discard:1;
+	/**< the payload of the mux frame we are parsing is being dropped,
+	 * because its channel was not open when the frame started */
 } lws_transport_mux_t;
 
 lws_transport_mux_t *
@@ -573,6 +575,8 @@ lws_transport_path_proxy_dump(lws_txp_path_proxy_t *path, const char *ctx);
 typedef struct lws_txp_mux_parse_cbs {
 	int (*payload)(lws_transport_mux_ch_t *tmc, const uint8_t *buf,
 			size_t len);
+	/**< len bytes of DATA arrived on the channel; nonzero means what is
+	 * bound to the channel can't go on, and the mux closes the channel */
 	int (*ch_opens)(lws_transport_mux_ch_t *tmc, int determination);
 	int (*ch_closes)(lws_transport_mux_ch_t *tmc);
 	void (*txp_req_write)(lws_transport_mux_t *tm);
@@ -583,7 +587,13 @@ int
 lws_transport_mux_rx_parse(lws_transport_mux_t *tm, const uint8_t *buf,
 			   size_t len, const lws_txp_mux_parse_cbs_t *cbs);
 
-int /* nonzero if the transport mux has filled buf and wants to write it */
+/*
+ * Returns nonzero if the transport mux has put something in buf and wants this
+ * write opportunity to send it; *len is always set to the amount to send, and
+ * is only nonzero when this returns nonzero.  A channel whose owner's
+ * txp_can_write() verdict is nonzero is closed by the mux itself.
+ */
+int
 lws_transport_mux_pending(lws_transport_mux_t *tm, uint8_t *buf, size_t *len,
 			  const lws_txp_mux_parse_cbs_t *cbs);
 

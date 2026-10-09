@@ -27,7 +27,7 @@
 #include <signal.h>
 #include <ctype.h>
 
-static int interrupted;
+static struct lws_context *cx;
 extern const struct lws_protocols lws_sspc_protocols[2];
 
 typedef struct range {
@@ -74,7 +74,7 @@ pennies(const char *s)
 {
 	uint64_t price = (uint64_t)atoll(s) * 100;
 
-	s = strchr(s, '.');
+	s = (char *)strchr(s, '.');
 
 	if (s && isdigit(s[1]) && isdigit(s[2]))
 		price = price + (uint64_t)((10 * (s[1] - '0')) + (s[2] - '0'));
@@ -222,26 +222,24 @@ static const struct lws_extension extensions[] = {
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(cx);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	struct lws_context *cx;
 	int n = 0;
 
 	signal(SIGINT, sigint_handler);
 
-	memset(&info, 0, sizeof info);
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	lws_context_info_defaults(&info, NULL);lws_cmdline_option_handle_builtin(argc, argv, &info);
 
 	lwsl_user("LWS minimal Secure Streams binance client\n");
 
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT |
 		       LWS_SERVER_OPTION_EXPLICIT_VHOSTS;
 	info.port = CONTEXT_PORT_NO_LISTEN; /* we do not run any server */
-	info.fd_limit_per_thread = 1 + 1 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 1;
 	info.extensions = extensions;
 	info.pss_policies_json = "policy.json"; /* literal JSON, or path */
 #if defined(LWS_SS_USE_SSPC)
@@ -256,10 +254,10 @@ int main(int argc, const char **argv)
 
 	if (lws_ss_create(cx, 0, &ssi_binance, NULL, NULL, NULL, NULL)) {
 		lwsl_cx_err(cx, "failed to create secure stream");
-		interrupted = 1;
+		lws_default_loop_exit(cx);
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(cx, 0);
 
 	lws_context_destroy(cx);

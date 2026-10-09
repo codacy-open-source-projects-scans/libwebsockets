@@ -6,7 +6,7 @@ const eventsVal = document.getElementById('events-val');
 const canvas = document.getElementById('latencyChart');
 const ctx = canvas.getContext('2d');
 
-let chartSecs = Array(60).fill(null).map(() => ({ sleep: 0, active: 0, events: 0, worst: 0 }));
+let chartSecs = new Array(60).fill(null).map(() => ({ sleep: 0, active: 0, events: 0, worst: 0 }));
 let maxEvents = 2000;
 let worstLatencies = []; // Table of worst latencies seen
 
@@ -16,8 +16,8 @@ let secondData = { active: 0, events: 0, worst: 0 };
 function resizeCanvas() {
     let p = canvas.parentElement;
     let s = window.getComputedStyle(p);
-    canvas.width = p.clientWidth - parseFloat(s.paddingLeft) - parseFloat(s.paddingRight);
-    canvas.height = p.clientHeight - parseFloat(s.paddingTop) - parseFloat(s.paddingBottom);
+    canvas.width = p.clientWidth - Number.parseFloat(s.paddingLeft) - Number.parseFloat(s.paddingRight);
+    canvas.height = p.clientHeight - Number.parseFloat(s.paddingTop) - Number.parseFloat(s.paddingBottom);
 }
 window.addEventListener('resize', resizeCanvas);
 resizeCanvas();

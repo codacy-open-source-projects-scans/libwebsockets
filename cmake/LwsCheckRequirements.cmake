@@ -37,6 +37,7 @@ MACRO(require_lws_config reqconfig _val result)
                        endif()
 		endif()
 		set(${result} 0)
+		set(MET 0)
 	else()
 		if (LWS_WITH_MINIMAL_EXAMPLES)
 			set(MET ${SAME})
@@ -59,6 +60,14 @@ MACRO(require_lws_config reqconfig _val result)
 			else()
 				message(FATAL_ERROR "Lws configuration of ${reqconfig} is incompatible with this project")
 			endif()
+		endif()
+
+		# for non-requirements result vars, export whether the requirement
+		# was met, so callers can gate optional features on it (eg, proxy
+		# api ctests).  "requirements" keeps its earlier-failed sticky 0.
+
+		if (NOT _cmp)
+			set(${result} ${MET})
 		endif()
 
 	endif()
@@ -114,7 +123,7 @@ MACRO(sai_resource SR_NAME SR_AMOUNT SR_LEASE SR_SCOPE)
 
 		set_tests_properties(st_res_${SR_SCOPE} PROPERTIES
 				     WORKING_DIRECTORY .
-				     FIXTURES_SETUP res_sspcmin
+				     FIXTURES_SETUP res_${SR_SCOPE}
 				     TIMEOUT 100)
 
 		add_test(NAME ki_res_${SR_SCOPE} COMMAND
@@ -127,3 +136,72 @@ MACRO(sai_resource SR_NAME SR_AMOUNT SR_LEASE SR_SCOPE)
 	endif()
 ENDMACRO()
 
+
+function(lws_get_free_port VAR_NAME)
+    if (WIN32)
+        set(COUNTER_FILE "$ENV{TEMP}/lws_port_counter_$ENV{USERNAME}")
+    else()
+        set(COUNTER_FILE "/tmp/lws_port_counter_$ENV{USER}")
+    endif()
+
+    file(LOCK "${COUNTER_FILE}.lock" GUARD PROCESS TIMEOUT 10)
+
+    if (EXISTS "${COUNTER_FILE}")
+        file(READ "${COUNTER_FILE}" port)
+        string(STRIP "${port}" port)
+    else()
+        set(port 15000)
+    endif()
+
+    if (port GREATER 30000)
+        set(port 15000)
+    endif()
+
+    math(EXPR next_port "${port} + 1")
+    file(WRITE "${COUNTER_FILE}" "${next_port}")
+
+    file(LOCK "${COUNTER_FILE}.lock" RELEASE)
+
+    set(${VAR_NAME} ${port} PARENT_SCOPE)
+endfunction()
+
+#
+# lws_get_free_ports(VAR_NAME COUNT)
+#
+# Like lws_get_free_port(), but reserves a contiguous block of COUNT adjacent
+# ports under the same counter lock, returning the base (lowest) port in
+# VAR_NAME.  Use this when a single test process listens on several ports at
+# once (eg, multi-stage tests that create a fresh vhost per stage), so the
+# block cannot be punched full of holes by sibling tests grabbing individual
+# ports between separate lws_get_free_port() calls in parallel CI.
+#
+function(lws_get_free_ports VAR_NAME COUNT)
+    if (WIN32)
+        set(COUNTER_FILE "$ENV{TEMP}/lws_port_counter_$ENV{USERNAME}")
+    else()
+        set(COUNTER_FILE "/tmp/lws_port_counter_$ENV{USER}")
+    endif()
+
+    file(LOCK "${COUNTER_FILE}.lock" GUARD PROCESS TIMEOUT 10)
+
+    if (EXISTS "${COUNTER_FILE}")
+        file(READ "${COUNTER_FILE}" port)
+        string(STRIP "${port}" port)
+    else()
+        set(port 15000)
+    endif()
+
+    if (port GREATER 30000)
+        set(port 15000)
+    endif()
+
+    set(${VAR_NAME} ${port} PARENT_SCOPE)
+
+    math(EXPR next_port "${port} + ${COUNT}")
+    if (next_port GREATER 30000)
+        set(next_port 15000)
+    endif()
+    file(WRITE "${COUNTER_FILE}" "${next_port}")
+
+    file(LOCK "${COUNTER_FILE}.lock" RELEASE)
+endfunction()

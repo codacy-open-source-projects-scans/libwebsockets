@@ -28,18 +28,20 @@
 #include <gnutls/x509.h>
 
 int
-lws_x509_create_self_signed(struct lws_context *context,
-			    uint8_t **cert_buf, size_t *cert_len,
-			    uint8_t **key_buf, size_t *key_len,
-			    const char *san, int key_bits)
+lws_x509_create_cert(struct lws_context *context,
+		     uint8_t **cert_buf, size_t *cert_len,
+		     uint8_t **key_buf, size_t *key_len,
+		     const struct lws_x509_cert_gen_info *info)
 {
-	gnutls_x509_privkey_t key;
-	gnutls_x509_crt_t crt;
+	gnutls_x509_privkey_t key = NULL, issuer_key = NULL;
+	gnutls_x509_crt_t crt = NULL, issuer_crt = NULL;
 	int ret = 1;
 	gnutls_datum_t data;
-	const char *cn = san ? san : "localhost";
 
 	(void)context;
+
+	if (!info || !info->san)
+		return 1;
 
 	if (gnutls_x509_privkey_init(&key))
 		return 1;
@@ -48,27 +50,71 @@ lws_x509_create_self_signed(struct lws_context *context,
 		return 1;
 	}
 
-	if (gnutls_x509_privkey_generate(key, GNUTLS_PK_RSA, (unsigned int)key_bits, 0))
-		goto bail;
+	if (info->curve_name) {
+		/*
+		 * gnutls_x509_privkey_generate() takes the key strength in
+		 * bits, not a gnutls_ecc_curve_t... for ECC, the bits select
+		 * the curve.  Passing the curve enum there makes gnutls
+		 * generate a legacy secp192r1 key whatever curve was asked
+		 * for.
+		 */
+		unsigned int curve_bits;
+
+		if (!strcmp(info->curve_name, "P-521")) curve_bits = 521;
+		else if (!strcmp(info->curve_name, "P-384")) curve_bits = 384;
+		else if (!strcmp(info->curve_name, "P-256")) curve_bits = 256;
+		else {
+			lwsl_err("%s: unknown curve %s\n", __func__, info->curve_name);
+			goto bail;
+		}
+
+		if (gnutls_x509_privkey_generate(key, GNUTLS_PK_ECC, curve_bits, 0))
+			goto bail;
+	} else {
+		if (gnutls_x509_privkey_generate(key, GNUTLS_PK_RSA, (unsigned int)(info->key_bits ? info->key_bits : 2048), 0))
+			goto bail;
+	}
 
 	gnutls_x509_crt_set_key(crt, key);
 	gnutls_x509_crt_set_version(crt, 3);
 	gnutls_x509_crt_set_serial(crt, "\x01", 1);
-	gnutls_x509_crt_set_activation_time(crt, time(NULL));
-	gnutls_x509_crt_set_expiration_time(crt, time(NULL) + (365 * 24 * 3600));
+	gnutls_x509_crt_set_activation_time(crt, time(NULL) - 86400);
+	gnutls_x509_crt_set_expiration_time(crt, time(NULL) + ((info->validity_days ? info->validity_days : 365) * 24 * 3600));
 
-	gnutls_x509_crt_set_dn_by_oid(crt, GNUTLS_OID_X520_COMMON_NAME, 0, cn, (unsigned int)strlen(cn));
-	gnutls_x509_crt_set_issuer_dn_by_oid(crt, GNUTLS_OID_X520_COMMON_NAME, 0, cn, (unsigned int)strlen(cn));
+	gnutls_x509_crt_set_dn_by_oid(crt, GNUTLS_OID_X520_COMMON_NAME, 0, info->san, (unsigned int)strlen(info->san));
+
+	if (info->ca_cert_pem && info->ca_key_pem) {
+		gnutls_datum_t d_cert = { (unsigned char *)info->ca_cert_pem, (unsigned int)strlen(info->ca_cert_pem) };
+		gnutls_datum_t d_key = { (unsigned char *)info->ca_key_pem, (unsigned int)strlen(info->ca_key_pem) };
+
+		if (gnutls_x509_crt_init(&issuer_crt) < 0) goto bail;
+		if (gnutls_x509_crt_import(issuer_crt, &d_cert, GNUTLS_X509_FMT_PEM) < 0) goto bail;
+
+		if (gnutls_x509_privkey_init(&issuer_key) < 0) goto bail;
+		if (gnutls_x509_privkey_import(issuer_key, &d_key, GNUTLS_X509_FMT_PEM) < 0) goto bail;
+
+	} else {
+		issuer_crt = crt;
+		issuer_key = key;
+	}
 
 	/* Extensions */
-	gnutls_x509_crt_set_basic_constraints(crt, 0, -1);
-	gnutls_x509_crt_set_key_usage(crt, GNUTLS_KEY_DIGITAL_SIGNATURE | GNUTLS_KEY_KEY_ENCIPHERMENT);
+	gnutls_x509_crt_set_basic_constraints(crt, info->is_ca ? 1 : 0, -1);
 
-	if (san)
-		gnutls_x509_crt_set_subject_alt_name(crt, GNUTLS_SAN_DNSNAME, san, (unsigned int)strlen(san), 0);
+	if (info->is_ca) {
+		gnutls_x509_crt_set_key_usage(crt, GNUTLS_KEY_KEY_CERT_SIGN | GNUTLS_KEY_CRL_SIGN);
+	} else {
+		gnutls_x509_crt_set_key_usage(crt, GNUTLS_KEY_DIGITAL_SIGNATURE | GNUTLS_KEY_KEY_ENCIPHERMENT);
+		if (info->is_server)
+			gnutls_x509_crt_set_key_purpose_oid(crt, GNUTLS_KP_TLS_WWW_SERVER, 0);
+		gnutls_x509_crt_set_key_purpose_oid(crt, GNUTLS_KP_TLS_WWW_CLIENT, 0);
+	}
 
-	/* Self-sign */
-	if (gnutls_x509_crt_sign2(crt, crt, key, GNUTLS_DIG_SHA256, 0))
+	if (info->san && info->is_server)
+		gnutls_x509_crt_set_subject_alt_name(crt, GNUTLS_SAN_DNSNAME, info->san, (unsigned int)strlen(info->san), 0);
+
+	/* Sign */
+	if (gnutls_x509_crt_sign2(crt, issuer_crt, issuer_key, GNUTLS_DIG_SHA256, 0))
 		goto bail;
 
 	/* Export Cert */
@@ -102,10 +148,28 @@ lws_x509_create_self_signed(struct lws_context *context,
 	ret = 0;
 
 bail:
-	gnutls_x509_crt_deinit(crt);
-	gnutls_x509_privkey_deinit(key);
+	if (issuer_crt && issuer_crt != crt) gnutls_x509_crt_deinit(issuer_crt);
+	if (issuer_key && issuer_key != key) gnutls_x509_privkey_deinit(issuer_key);
+	if (crt) gnutls_x509_crt_deinit(crt);
+	if (key) gnutls_x509_privkey_deinit(key);
 
 	return ret;
+}
+
+int
+lws_x509_create_self_signed(struct lws_context *context,
+			    uint8_t **cert_buf, size_t *cert_len,
+			    uint8_t **key_buf, size_t *key_len,
+			    const char *san, int key_bits)
+{
+	struct lws_x509_cert_gen_info info;
+
+	memset(&info, 0, sizeof(info));
+	info.san = san ? san : "localhost";
+	info.key_bits = key_bits;
+	info.is_server = 1;
+
+	return lws_x509_create_cert(context, cert_buf, cert_len, key_buf, key_len, &info);
 }
 
 int
@@ -169,6 +233,29 @@ lws_x509_verify(struct lws_x509_cert *x509, struct lws_x509_cert *trusted,
 
 #if defined(LWS_WITH_JOSE)
 
+/*
+ * Take a copy of a gnutls-exported bignum into a jwk keyelem... lws_malloc()
+ * can fail, and lws_malloc(0) deliberately returns NULL, so neither the
+ * pointer nor the length may be used without checking
+ */
+
+static int
+lws_gnutls_datum_to_keyelem(const gnutls_datum_t *in,
+			    struct lws_gencrypto_keyelem *el)
+{
+	if (!in->size || !in->data)
+		return 1;
+
+	el->buf = lws_malloc((size_t)in->size, "certjwk");
+	if (!el->buf)
+		return 1;
+
+	el->len = in->size;
+	memcpy(el->buf, in->data, in->size);
+
+	return 0;
+}
+
 int
 lws_x509_public_to_jwk(struct lws_jwk *jwk, struct lws_x509_cert *x509,
 		       const char *curves, int rsa_min_bits)
@@ -196,21 +283,32 @@ lws_x509_public_to_jwk(struct lws_jwk *jwk, struct lws_x509_cert *x509,
 
 	switch (pk_algo) {
 	case GNUTLS_PK_RSA:
+	{
+		int n;
+
 		jwk->kty = LWS_GENCRYPTO_KTY_RSA;
+
+		if (rsa_min_bits && bits < (unsigned int)rsa_min_bits) {
+			lwsl_err("%s: key bits %u less than minimum %d\n",
+				 __func__, bits, rsa_min_bits);
+			goto bail1;
+		}
+
 		if (gnutls_pubkey_export_rsa_raw(pubkey, &pk_m, &pk_e) < 0)
 			goto bail1;
 
-		jwk->e[LWS_GENCRYPTO_RSA_KEYEL_N].buf = lws_malloc((size_t)pk_m.size, "certjwk");
-		jwk->e[LWS_GENCRYPTO_RSA_KEYEL_N].len = pk_m.size;
-		memcpy(jwk->e[LWS_GENCRYPTO_RSA_KEYEL_N].buf, pk_m.data, pk_m.size);
-
-		jwk->e[LWS_GENCRYPTO_RSA_KEYEL_E].buf = lws_malloc((size_t)pk_e.size, "certjwk");
-		jwk->e[LWS_GENCRYPTO_RSA_KEYEL_E].len = pk_e.size;
-		memcpy(jwk->e[LWS_GENCRYPTO_RSA_KEYEL_E].buf, pk_e.data, pk_e.size);
+		n = lws_gnutls_datum_to_keyelem(&pk_m,
+					&jwk->e[LWS_GENCRYPTO_RSA_KEYEL_N]) ||
+		    lws_gnutls_datum_to_keyelem(&pk_e,
+					&jwk->e[LWS_GENCRYPTO_RSA_KEYEL_E]);
 
 		gnutls_free(pk_m.data);
 		gnutls_free(pk_e.data);
+
+		if (n)
+			goto bail1;
 		break;
+	}
 
 	case GNUTLS_PK_ECC:
 	{
@@ -236,22 +334,29 @@ lws_x509_public_to_jwk(struct lws_jwk *jwk, struct lws_x509_cert *x509,
 			goto bail1;
 		}
 
+		if (!curves) {
+			lwsl_err("%s: ec curves not allowed\n", __func__);
+			gnutls_free(pk_x.data);
+			gnutls_free(pk_y.data);
+			goto bail1;
+		}
+
 		if (lws_genec_confirm_curve_allowed_by_tls_id(curves, (int)curve, jwk)) {
 			gnutls_free(pk_x.data);
 			gnutls_free(pk_y.data);
 			goto bail1;
 		}
 
-		jwk->e[LWS_GENCRYPTO_EC_KEYEL_X].buf = lws_malloc((size_t)pk_x.size, "certjwk");
-		jwk->e[LWS_GENCRYPTO_EC_KEYEL_X].len = pk_x.size;
-		memcpy(jwk->e[LWS_GENCRYPTO_EC_KEYEL_X].buf, pk_x.data, pk_x.size);
-
-		jwk->e[LWS_GENCRYPTO_EC_KEYEL_Y].buf = lws_malloc((size_t)pk_y.size, "certjwk");
-		jwk->e[LWS_GENCRYPTO_EC_KEYEL_Y].len = pk_y.size;
-		memcpy(jwk->e[LWS_GENCRYPTO_EC_KEYEL_Y].buf, pk_y.data, pk_y.size);
+		n = lws_gnutls_datum_to_keyelem(&pk_x,
+					&jwk->e[LWS_GENCRYPTO_EC_KEYEL_X]) ||
+		    lws_gnutls_datum_to_keyelem(&pk_y,
+					&jwk->e[LWS_GENCRYPTO_EC_KEYEL_Y]);
 
 		gnutls_free(pk_x.data);
 		gnutls_free(pk_y.data);
+
+		if (n)
+			goto bail1;
 		break;
 	}
 
@@ -298,6 +403,7 @@ lws_x509_jwk_privkey_pem(struct lws_context *cx, struct lws_jwk *jwk,
 	case GNUTLS_PK_RSA:
 	{
 		gnutls_datum_t m, e, d, p, q, u, exp1, exp2;
+		int n;
 
 		if (jwk->kty != LWS_GENCRYPTO_KTY_RSA)
 			goto bail;
@@ -305,39 +411,43 @@ lws_x509_jwk_privkey_pem(struct lws_context *cx, struct lws_jwk *jwk,
 		if (gnutls_privkey_export_rsa_raw(pkey, &m, &e, &d, &p, &q, &u, &exp1, &exp2) < 0)
 			goto bail;
 
-		jwk->e[LWS_GENCRYPTO_RSA_KEYEL_D].buf = lws_malloc((size_t)d.size, "certjwk");
-		jwk->e[LWS_GENCRYPTO_RSA_KEYEL_D].len = d.size;
-		memcpy(jwk->e[LWS_GENCRYPTO_RSA_KEYEL_D].buf, d.data, d.size);
+		if (m.size != jwk->e[LWS_GENCRYPTO_RSA_KEYEL_N].len ||
+		    memcmp(m.data, jwk->e[LWS_GENCRYPTO_RSA_KEYEL_N].buf, m.size) ||
+		    e.size != jwk->e[LWS_GENCRYPTO_RSA_KEYEL_E].len ||
+		    memcmp(e.data, jwk->e[LWS_GENCRYPTO_RSA_KEYEL_E].buf, e.size)) {
+			lwsl_err("%s: privkey doesn't match jwk pubkey\n", __func__);
+			gnutls_free(m.data); gnutls_free(e.data); gnutls_free(d.data);
+			gnutls_free(p.data); gnutls_free(q.data); gnutls_free(u.data);
+			gnutls_free(exp1.data); gnutls_free(exp2.data);
+			goto bail;
+		}
 
-		jwk->e[LWS_GENCRYPTO_RSA_KEYEL_P].buf = lws_malloc((size_t)p.size, "certjwk");
-		jwk->e[LWS_GENCRYPTO_RSA_KEYEL_P].len = p.size;
-		memcpy(jwk->e[LWS_GENCRYPTO_RSA_KEYEL_P].buf, p.data, p.size);
-
-		jwk->e[LWS_GENCRYPTO_RSA_KEYEL_Q].buf = lws_malloc((size_t)q.size, "certjwk");
-		jwk->e[LWS_GENCRYPTO_RSA_KEYEL_Q].len = q.size;
-		memcpy(jwk->e[LWS_GENCRYPTO_RSA_KEYEL_Q].buf, q.data, q.size);
-
-		jwk->e[LWS_GENCRYPTO_RSA_KEYEL_QI].buf = lws_malloc((size_t)u.size, "certjwk");
-		jwk->e[LWS_GENCRYPTO_RSA_KEYEL_QI].len = u.size;
-		memcpy(jwk->e[LWS_GENCRYPTO_RSA_KEYEL_QI].buf, u.data, u.size);
-
-		jwk->e[LWS_GENCRYPTO_RSA_KEYEL_DP].buf = lws_malloc((size_t)exp1.size, "certjwk");
-		jwk->e[LWS_GENCRYPTO_RSA_KEYEL_DP].len = exp1.size;
-		memcpy(jwk->e[LWS_GENCRYPTO_RSA_KEYEL_DP].buf, exp1.data, exp1.size);
-
-		jwk->e[LWS_GENCRYPTO_RSA_KEYEL_DQ].buf = lws_malloc((size_t)exp2.size, "certjwk");
-		jwk->e[LWS_GENCRYPTO_RSA_KEYEL_DQ].len = exp2.size;
-		memcpy(jwk->e[LWS_GENCRYPTO_RSA_KEYEL_DQ].buf, exp2.data, exp2.size);
+		n = lws_gnutls_datum_to_keyelem(&d,
+				&jwk->e[LWS_GENCRYPTO_RSA_KEYEL_D]) ||
+		    lws_gnutls_datum_to_keyelem(&p,
+				&jwk->e[LWS_GENCRYPTO_RSA_KEYEL_P]) ||
+		    lws_gnutls_datum_to_keyelem(&q,
+				&jwk->e[LWS_GENCRYPTO_RSA_KEYEL_Q]) ||
+		    lws_gnutls_datum_to_keyelem(&u,
+				&jwk->e[LWS_GENCRYPTO_RSA_KEYEL_QI]) ||
+		    lws_gnutls_datum_to_keyelem(&exp1,
+				&jwk->e[LWS_GENCRYPTO_RSA_KEYEL_DP]) ||
+		    lws_gnutls_datum_to_keyelem(&exp2,
+				&jwk->e[LWS_GENCRYPTO_RSA_KEYEL_DQ]);
 
 		gnutls_free(m.data); gnutls_free(e.data); gnutls_free(d.data);
 		gnutls_free(p.data); gnutls_free(q.data); gnutls_free(u.data);
 		gnutls_free(exp1.data); gnutls_free(exp2.data);
+
+		if (n)
+			goto bail;
 		break;
 	}
 	case GNUTLS_PK_ECC:
 	{
 		gnutls_ecc_curve_t curve;
 		gnutls_datum_t x, y, k;
+		int n;
 
 		if (jwk->kty != LWS_GENCRYPTO_KTY_EC)
 			goto bail;
@@ -345,11 +455,34 @@ lws_x509_jwk_privkey_pem(struct lws_context *cx, struct lws_jwk *jwk,
 		if (gnutls_privkey_export_ecc_raw(pkey, &curve, &x, &y, &k) < 0)
 			goto bail;
 
-		jwk->e[LWS_GENCRYPTO_EC_KEYEL_D].buf = lws_malloc((size_t)k.size, "certjwk");
-		jwk->e[LWS_GENCRYPTO_EC_KEYEL_D].len = k.size;
-		memcpy(jwk->e[LWS_GENCRYPTO_EC_KEYEL_D].buf, k.data, k.size);
+		/*
+		 * The point of this check is to catch a private key that does
+		 * not belong to the certificate... comparing only the lengths
+		 * accepts any other key on the same curve, since every P-256
+		 * x is 32 bytes.  Compare both coordinates, the way the RSA
+		 * arm above compares m and e
+		 */
+
+		if (x.size != jwk->e[LWS_GENCRYPTO_EC_KEYEL_X].len ||
+		    !jwk->e[LWS_GENCRYPTO_EC_KEYEL_X].buf ||
+		    memcmp(x.data, jwk->e[LWS_GENCRYPTO_EC_KEYEL_X].buf,
+			   x.size) ||
+		    y.size != jwk->e[LWS_GENCRYPTO_EC_KEYEL_Y].len ||
+		    !jwk->e[LWS_GENCRYPTO_EC_KEYEL_Y].buf ||
+		    memcmp(y.data, jwk->e[LWS_GENCRYPTO_EC_KEYEL_Y].buf,
+			   y.size)) {
+			lwsl_err("%s: EC privkey doesn't match jwk pubkey\n", __func__);
+			gnutls_free(x.data); gnutls_free(y.data); gnutls_free(k.data);
+			goto bail;
+		}
+
+		n = lws_gnutls_datum_to_keyelem(&k,
+					&jwk->e[LWS_GENCRYPTO_EC_KEYEL_D]);
 
 		gnutls_free(x.data); gnutls_free(y.data); gnutls_free(k.data);
+
+		if (n)
+			goto bail;
 		break;
 	}
 	default:
@@ -374,10 +507,20 @@ lws_x509_info(struct lws_x509_cert *x509, enum lws_tls_cert_info type,
 {
 	size_t s = len;
 
+	/* zero len means the union's own 64-byte name field, as elsewhere */
+	if (!s)
+		s = len = sizeof(buf->ns.name);
+
 	switch (type) {
 	case LWS_TLS_CERT_INFO_COMMON_NAME:
 		if (gnutls_x509_crt_get_dn_by_oid(x509->cert, GNUTLS_OID_X520_COMMON_NAME,
 						  0, 0, buf->ns.name, &s) < 0)
+			return -1;
+		buf->ns.len = (int)s;
+		break;
+
+	case LWS_TLS_CERT_INFO_ISSUER_NAME:
+		if (gnutls_x509_crt_get_issuer_dn(x509->cert, buf->ns.name, &s) < 0)
 			return -1;
 		buf->ns.len = (int)s;
 		break;
@@ -478,7 +621,7 @@ _lws_tls_acme_sni_csr_create(struct lws_context *context, const char *elements[]
 	gnutls_x509_crq_t crq;
 	gnutls_x509_privkey_t key;
 	gnutls_datum_t der;
-	int ret = -1;
+	int ret = -1, csr_b64_len;
 	int i;
 
 	if (gnutls_x509_privkey_init(&key) < 0)
@@ -488,7 +631,14 @@ _lws_tls_acme_sni_csr_create(struct lws_context *context, const char *elements[]
 		if (gnutls_x509_privkey_generate(key, GNUTLS_PK_RSA, 4096, 0) < 0)
 			goto bail;
 	} else {
-		if (gnutls_x509_privkey_generate(key, GNUTLS_PK_ECC, GNUTLS_ECC_CURVE_SECP256R1, 0) < 0)
+		/*
+		 * gnutls_x509_privkey_generate() takes the key strength in
+		 * bits, not a gnutls_ecc_curve_t... passing the curve enum
+		 * (SECP256R1 == 2) asks for a 2-bit key and gets a legacy
+		 * secp192r1 one, the same trap lws_x509_create_cert() above
+		 * documents
+		 */
+		if (gnutls_x509_privkey_generate(key, GNUTLS_PK_ECC, 256, 0) < 0)
 			goto bail;
 	}
 
@@ -518,11 +668,17 @@ _lws_tls_acme_sni_csr_create(struct lws_context *context, const char *elements[]
 	if (gnutls_x509_crq_export2(crq, GNUTLS_X509_FMT_DER, &der) < 0)
 		goto bail_crq;
 
-	/* we have it in DER, we need it in b64URL */
-	ret = lws_jws_base64_enc((const char *)der.data, (size_t)der.size, (char *)csr, csr_len);
+	/*
+	 * we have it in DER, we need it in b64URL.  The length it returns is
+	 * the success return of this function, but it must not be allowed to
+	 * become the return code for a later failure: the caller reads
+	 * *privkey_pem on any nonnegative return
+	 */
+	csr_b64_len = lws_jws_base64_enc((const char *)der.data,
+					 (size_t)der.size, (char *)csr, csr_len);
 	gnutls_free(der.data);
 
-	if (ret < 0)
+	if (csr_b64_len < 0)
 		goto bail_crq;
 
 	if (gnutls_x509_privkey_export2(key, GNUTLS_X509_FMT_PEM, &der) < 0)
@@ -531,13 +687,14 @@ _lws_tls_acme_sni_csr_create(struct lws_context *context, const char *elements[]
 	*privkey_pem = malloc((size_t)der.size + 1);
 	if (!*privkey_pem) {
 		gnutls_free(der.data);
-		ret = -1;
 		goto bail_crq;
 	}
 	memcpy(*privkey_pem, der.data, der.size);
 	(*privkey_pem)[der.size] = '\0';
 	*privkey_len = der.size;
 	gnutls_free(der.data);
+
+	ret = csr_b64_len;
 
 bail_crq:
 	gnutls_x509_crq_deinit(crq);

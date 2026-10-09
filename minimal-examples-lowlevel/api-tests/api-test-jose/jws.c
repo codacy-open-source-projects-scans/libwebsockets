@@ -226,6 +226,100 @@ bail:
 	return 1;
 }
 
+/*
+ * Exercise the b64 map flavour of the confirm api with a real 3-block HS256
+ * compact serialization: the good signature must confirm, tampered or
+ * missing signature blocks must be cleanly rejected
+ */
+
+int
+test_jws_b64_map(struct lws_context *context)
+{
+	struct lws_jws_map map_b64;
+	struct lws_jwk jwk;
+	char temp[2048], cser[256];
+	int temp_len, n, ret = 1;
+
+	/* the RFC7515 A-1 HS256 elements from test_jws_HS256, as one cser */
+
+	n = lws_snprintf(cser, sizeof(cser), "%s.%s.%s", test1_enc, test2_enc,
+			 hash_enc);
+
+	if (lws_jwk_import(&jwk, NULL, NULL, key_jwk, strlen(key_jwk)) < 0) {
+		lwsl_notice("%s: Failed to decode JWK test key\n", __func__);
+		return 1;
+	}
+
+	/* the known-good signature must confirm via the b64 map api */
+
+	if (lws_jws_b64_compact_map(cser, n, &map_b64) != 3) {
+		lwsl_err("%s: b64 compact map failed\n", __func__);
+		goto bail;
+	}
+
+	temp_len = sizeof(temp);
+	if (lws_jws_sig_confirm_compact_b64_map(&map_b64, &jwk, context, temp,
+						&temp_len)) {
+		lwsl_notice("%s: confirm good sig failed\n", __func__);
+		goto bail;
+	}
+
+	/* a tampered signature block must fail the confirm */
+
+	cser[n - 1] = cser[n - 1] == 'k' ? 'j' : 'k';
+	if (lws_jws_b64_compact_map(cser, n, &map_b64) != 3) {
+		lwsl_err("%s: b64 compact map failed\n", __func__);
+		goto bail;
+	}
+
+	temp_len = sizeof(temp);
+	if (!lws_jws_sig_confirm_compact_b64_map(&map_b64, &jwk, context, temp,
+						 &temp_len)) {
+		lwsl_notice("%s: tampered sig confirmed\n", __func__);
+		goto bail;
+	}
+
+	/* a cser with no signature block at all must fail cleanly */
+
+	cser[strlen(test1_enc) + 1 + strlen(test2_enc)] = '\0';
+	if (lws_jws_b64_compact_map(cser, (int)strlen(cser), &map_b64) != 2) {
+		lwsl_err("%s: b64 compact map failed\n", __func__);
+		goto bail;
+	}
+
+	temp_len = sizeof(temp);
+	if (!lws_jws_sig_confirm_compact_b64_map(&map_b64, &jwk, context, temp,
+						 &temp_len)) {
+		lwsl_notice("%s: sig-less cser confirmed\n", __func__);
+		goto bail;
+	}
+
+	/* a 4-block cser is a JWE shape, not a valid JWS: must be rejected */
+
+	n = lws_snprintf(cser, sizeof(cser), "%s.%s.%s.x", test1_enc, test2_enc,
+			 hash_enc);
+	if (lws_jws_b64_compact_map(cser, n, &map_b64) != 4) {
+		lwsl_err("%s: b64 compact map failed\n", __func__);
+		goto bail;
+	}
+
+	temp_len = sizeof(temp);
+	if (!lws_jws_sig_confirm_compact_b64_map(&map_b64, &jwk, context, temp,
+						 &temp_len)) {
+		lwsl_notice("%s: 4-block cser confirmed\n", __func__);
+		goto bail;
+	}
+
+	ret = 0;
+
+bail:
+	lws_jwk_destroy(&jwk);
+
+	lwsl_notice("%s: selftest %s\n", __func__, ret ? "FAIL" : "OK");
+
+	return ret;
+}
+
 
 static const char
 	/* the key from worked example in RFC7515 A-2, as a JWK */
@@ -693,6 +787,9 @@ test_jws_ES512(struct lws_context *context)
 		unsigned long long ull = lws_now_secs();
 		char buf[8192];
 		size_t cml = 2048, cml2 = 2048;
+		/* compact token with a JOSE header that has no "alg" member */
+		static const char no_alg_jwt[] =
+				"eyJ0eXAiOiJKV1QifQ.e30.AQ";
 
 		if (lws_jwt_sign_compact(context, &jwk, "ES512",
 					(char *)buf, &cml2,
@@ -722,6 +819,19 @@ test_jws_ES512(struct lws_context *context)
 
 		lwsl_notice("%s: jwt valid, payload '%s'\n",
 				__func__, buf + 4096);
+
+		/*
+		 * A JOSE header with no "alg" must be cleanly rejected
+		 * here, not deref NULL
+		 */
+
+		if (lws_jwt_signed_validate(context, &jwk, "ES512",
+					    no_alg_jwt, strlen(no_alg_jwt),
+					    (char *)buf + 2048, 2048,
+					    (char *)buf + 4096, &cml) != 1) {
+			lwsl_err("%s: alg-less JWT not rejected\n", __func__);
+			goto bail1;
+		}
 	}
 
 	/* end */
@@ -758,12 +868,26 @@ static const char
 int
 test_jws_EdDSA(struct lws_context *context)
 {
+	struct lws_genec_ctx probe;
+	memset(&probe, 0, sizeof(probe));
 	struct lws_jws_map map;
 	struct lws_jose jose;
 	struct lws_jwk jwk;
 	struct lws_jws jws;
 	char temp[2048], *p;
 	int ret = -1, l, n, temp_len = sizeof(temp);
+
+	/*
+	 * Some TLS backends, eg GnuTLS, do not implement EdDSA at all...
+	 * detect it via the public api and skip the selftest cleanly
+	 */
+
+	if (lws_geneddsa_create(&probe, context, NULL)) {
+		lwsl_notice("%s: selftest skipped (unsupported algorithm)\n",
+			    __func__);
+		return 0;
+	}
+	lws_genec_destroy(&probe);
 
 	lws_jose_init(&jose);
 
@@ -1003,8 +1127,14 @@ test_jwt_RS256(struct lws_context *context)
 		goto bail;
 	}
 
-	while (ret_encode >= 1 /* cov */ && sha1_fingerprint[--ret_encode] == '=')
-		sha1_fingerprint[ret_encode] = '\0';
+	while (ret_encode >= 1 /* cov */) {
+		if (sha1_fingerprint[ret_encode - 1] == '=') {
+			ret_encode--;
+			sha1_fingerprint[ret_encode] = '\0';
+		} else {
+			break;
+		}
+	}
 
 	lwsl_notice("%s: cert fingerprint '%s'\n", __func__, sha1_fingerprint);
 
@@ -1068,6 +1198,71 @@ bail:
 	return ret;
 }
 
+/*
+ * C-634: RFC7517 4 says members of a JWK that are not understood are ignored.
+ * In a JOSE header "jwk", one that followed a known member used to be taken
+ * as that member, replacing its value (or failing the parse if not a string).
+ */
+
+#define JWK_UNK_X "MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4"
+#define JWK_UNK_Y "4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM"
+
+static const char * const jwk_unknown_member_hdrs[] = {
+	"{\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\","
+		"\"x\":\"" JWK_UNK_X "\",\"ext\":\"Zm9v\","
+		"\"y\":\"" JWK_UNK_Y "\"}}",
+	"{\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\","
+		"\"x\":\"" JWK_UNK_X "\",\"ext\":1,"
+		"\"y\":\"" JWK_UNK_Y "\"}}",
+	"{\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\","
+		"\"x\":\"" JWK_UNK_X "\",\"ext\":{\"x\":\"Zm9v\"},"
+		"\"y\":\"" JWK_UNK_Y "\"}}",
+};
+
+static int
+test_jws_jwk_unknown_member(void)
+{
+	char temp[2048], ex[512];
+	struct lws_jose jose;
+	int temp_len, l;
+	size_t n;
+
+	for (n = 0; n < LWS_ARRAY_SIZE(jwk_unknown_member_hdrs); n++) {
+		lws_jose_init(&jose);
+		temp_len = sizeof(temp);
+
+		if (lws_jws_parse_jose(&jose, jwk_unknown_member_hdrs[n],
+				       (int)strlen(jwk_unknown_member_hdrs[n]),
+				       temp, &temp_len) < 0) {
+			lwsl_err("%s: hdr %d: JOSE parse failed\n", __func__,
+				 (int)n);
+			goto bail;
+		}
+
+		l = (int)sizeof(ex);
+		if (lws_jwk_export(&jose.recipient[0].jwk,
+				   LWSJWKF_EXPORT_NOCRLF, ex, &l) < 0 ||
+		    !strstr(ex, "\"x\":\"" JWK_UNK_X "\"") ||
+		    !strstr(ex, "\"y\":\"" JWK_UNK_Y "\"")) {
+			lwsl_err("%s: hdr %d: jwk members wrong\n", __func__,
+				 (int)n);
+			goto bail;
+		}
+
+		lws_jose_destroy(&jose);
+	}
+
+	lwsl_notice("%s: selftest OK\n", __func__);
+
+	return 0;
+
+bail:
+	lws_jose_destroy(&jose);
+	lwsl_err("%s: selftest failed ++++++++++++++++++++\n", __func__);
+
+	return 1;
+}
+
 int
 test_jws(struct lws_context *context)
 {
@@ -1075,11 +1270,13 @@ test_jws(struct lws_context *context)
 
 	n |= test_jws_none(context);
 	n |= test_jws_HS256(context);
+	n |= test_jws_b64_map(context);
 	n |= test_jws_RS256(context);
 	n |= test_jws_ES256(context);
 	n |= test_jws_ES512(context);
 	n |= test_jws_EdDSA(context);
 	n |= test_jwt_RS256(context);
+	n |= test_jws_jwk_unknown_member();
 
 	return n;
 }

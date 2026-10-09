@@ -97,6 +97,20 @@ response there may look like
 		lws_ss_request_tx_len(m->ss, 128);
 ```
 
+For http servers, when `LWSSSCS_SERVER_TXN` is signalled, lws has set some of
+the stream's metadata from the request, if the policy declares it:
+
+ - `path`, `method` and `auth` (the Authorization header) are set from the
+   request itself
+
+ - metadata without an http header association, eg `{ "my_arg": "" }`, is set
+   from a URL argument of the same name, if the request has one.  A URL argument
+   can't set `path`, `method` or `auth`, or metadata associated with a header,
+   which the server emits as that response header (eg, `"mime": "Content-Type:"`)
+
+All of these are unset at the start of each request, so on a keep-alive
+connection nothing a previous request provided is seen as part of the next one.
+
 Otherwise the general api usage is very similar to client usage.
 
 ## Convention for rx and tx callback return
@@ -133,12 +147,12 @@ JSON.
 		}
 	}],
 	"certs": [{
-		"isrg_root_x1": "MIIFazCCA1OgAw...AnX5iItreGCc="
+		"isrg_root_x2": "MIIFazCCA1OgAw...AnX5iItreGCc="
 	}, {
-		"LEX3_isrg_root_x1": "MIIFjTCCA3WgAwIB...WEsikxqEt"
+		"LEX3_isrg_root_x2": "MIIFjTCCA3WgAwIB...WEsikxqEt"
 	}],
 	"trust_stores": [{
-		"le_via_isrg": ["isrg_root_x1", "LEX3_isrg_root_x1"]
+		"le_via_isrg": ["isrg_root_x2", "LEX3_isrg_root_x2"]
 	}],
 	"s": [{
 		"mintest": {
@@ -757,7 +771,12 @@ An example overlay fragment looks like this
 ie the overlay fragment completely follows the structure of the main policy,
 just misses out anything it doesn't override.
 
-Currently ONLY streamtypes may be overridden.
+Currently ONLY streamtypes may be overridden.  An overlay that defines
+anything of its own, a new streamtype, a cert, a trust store, an auth, a
+backoff scheme or metrics, is rejected at that point and the overlay fails;
+overrides earlier in the same fragment have already been applied to the live
+streamtypes, since they are written in place.  A completed overlay leaves no
+parse behind, so another may follow it.
 
 You can see an example of this in use in `minimal-secure-streams` example
 where `--force-portal` and `--force-no-internet` options cause the captive
@@ -804,6 +823,17 @@ onward proxying).
 
 Each Secure Stream that is created then in turn creates a private Unix Domain
 Socket connection to the proxy for each stream.
+
+Anything that can use the proxy can make connections as described by the
+proxy's policy, so the proxy restricts who may connect to its Unix Domain
+Socket.  By default that is processes running as the proxy's own user, or with
+the proxy's group as their primary group, or as root; the context creation
+info member `.ss_proxy_perms` can name a different `"user:group"`, or be `"*"`
+to allow any local process.  For a socket in the Linux abstract namespace (the
+default, `@proxy.ss.lws`), which has no filesystem permissions, the proxy
+checks each client's credentials when it connects.  For a socket path in the
+filesystem, the socket file's owner and mode control it.  A proxy listening on
+tcp has no such check and should be bound to a loopback address.
 
 In this case the proxy uses secure-streams.c and policy.c as before to fulfil
 the inbound proxy streams, but uses secure-streams-serialize.c to serialize and
@@ -918,6 +948,14 @@ state `LWSSSCS_SERVER_UPGRADE`, so subsequent rx and tx can be understood to
 have come from the upgraded protocol.  To allow separation of rx and tx
 handling between http and ws, there's a ss api `lws_ss_change_handlers()`
 which allows dynamically setting SS handlers.
+
+Each incoming connection (or h2 stream) gets its own accepted stream created
+from the server streamtype, and it's that accepted stream that sees
+`LWSSSCS_SERVER_UPGRADE`, over h1 and h2 alike... the server stream you created
+to bring up the listening vhost never does.  An accepted stream that is
+upgraded without an http transaction first sees `LWSSSCS_CREATING`,
+`LWSSSCS_CONNECTING`, `LWSSSCS_SERVER_UPGRADE`, then `LWSSSCS_CONNECTED` when
+the ws connection is established.
 
 Since the http and ws upgrade identity is encapsulated in one streamtype, the
 user object for the server streamtype should contain related user data for both

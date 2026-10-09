@@ -41,8 +41,17 @@ wsi_from_fd(const struct lws_context *context, int fd)
 	done = &p[context->max_fds];
 
 	while (p != done) {
-		if (*p && (*p)->desc.sockfd == fd)
-			return *p;
+		if (*p) {
+			if ((*p)->io->desc.sockfd == fd)
+				return *p;
+#if defined(LWS_WITH_CLIENT)
+			if ((*p)->io->parallel_conns)
+				for (int j = 0; j < (*p)->io->parallel_count; j++) {
+					if ((*p)->io->parallel_conns[j].is_valid && (*p)->io->parallel_conns[j].desc.sockfd == fd)
+						return *p;
+				}
+#endif
+		}
 		p++;
 	}
 
@@ -54,6 +63,23 @@ int
 sanity_assert_no_wsi_traces(const struct lws_context *context, struct lws *wsi)
 {
 	struct lws **p, **done;
+	int occurrences = 0;
+	int expected = 0;
+
+#if defined(LWS_WITH_CLIENT)
+	if (lws_socket_is_valid(wsi->io->desc.sockfd))
+		expected++;
+	/*
+	 * parallel_count is only ever nonzero while parallel_conns is
+	 * allocated, but we are also called from the client connect
+	 * failure paths, ie, from the OOM path where the racer array
+	 * allocation itself just failed
+	 */
+	if (wsi->io->parallel_conns)
+		for (int i = 0; i < wsi->io->parallel_count; i++)
+			if (wsi->io->parallel_conns[i].is_valid)
+				expected++;
+#endif
 
 	if (!context->max_fds_unrelated_to_ulimit)
 		/* can't tell */
@@ -64,15 +90,18 @@ sanity_assert_no_wsi_traces(const struct lws_context *context, struct lws *wsi)
 	p = context->lws_lookup;
 	done = &p[context->max_fds];
 
-	/* confirm the wsi doesn't already exist */
+	/* count occurrences of wsi in lookup table */
 
-	while (p != done && *p != wsi)
+	while (p != done) {
+		if (*p == wsi)
+			occurrences++;
 		p++;
+	}
 
-	if (p == done)
+	if (occurrences <= expected)
 		return 0;
 
-	assert(0); /* this wsi is still mentioned inside lws */
+	assert(0); /* this wsi is still mentioned inside lws too many times */
 
 	return 1;
 }
@@ -95,6 +124,13 @@ sanity_assert_no_sockfd_traces(const struct lws_context *context,
 
 	if (!context->max_fds_unrelated_to_ulimit &&
 	    context->lws_lookup[sfd - lws_plat_socket_offset()]) {
+		struct lws *w = context->lws_lookup[sfd -
+						    lws_plat_socket_offset()];
+
+		lwsl_err("%s: fd %d still in lws_lookup as %s (wsistate 0x%x, "
+			 "fds pos %d, its sockfd %d)\n", __func__, (int)sfd,
+			 lws_wsi_tag(w), (unsigned int)w->wsistate,
+			 w->io->position_in_fds_table, (int)w->io->desc.sockfd);
 		assert(0); /* the fd is still in use */
 		return 1;
 	}
@@ -106,12 +142,26 @@ sanity_assert_no_sockfd_traces(const struct lws_context *context,
 
 	/* confirm the sfd not already in use */
 
-	while (p != done && (!*p || (*p)->desc.sockfd != sfd))
+	while (p != done) {
+		if (*p && (*p)->io->desc.sockfd == sfd) {
+#if defined(LWS_WITH_CLIENT)
+			if ((*p)->io->parallel_count > 0) {
+				p++;
+				continue;
+			}
+#endif
+			break;
+		}
 		p++;
+	}
 
 	if (p == done)
 		return 0;
 
+	lwsl_err("%s: fd %d still in lws_lookup[%d] as %s (wsistate 0x%x, "
+		 "fds pos %d)\n", __func__, (int)sfd,
+		 (int)(p - context->lws_lookup), lws_wsi_tag(*p),
+		 (unsigned int)(*p)->wsistate, (*p)->io->position_in_fds_table);
 	assert(0); /* this fd is still in the tables */
 
 	return 1;
@@ -129,10 +179,10 @@ insert_wsi(const struct lws_context *context, struct lws *wsi)
 		return 0;
 
 	if (!context->max_fds_unrelated_to_ulimit) {
-		assert(context->lws_lookup[wsi->desc.sockfd -
+		assert(context->lws_lookup[wsi->io->desc.sockfd -
 		                           lws_plat_socket_offset()] == 0);
 
-		context->lws_lookup[wsi->desc.sockfd - \
+		context->lws_lookup[wsi->io->desc.sockfd - \
 				  lws_plat_socket_offset()] = wsi;
 
 		return 0;
@@ -145,7 +195,7 @@ insert_wsi(const struct lws_context *context, struct lws *wsi)
 
 	/* confirm fd isn't already in use by a wsi */
 
-	if (sanity_assert_no_sockfd_traces(context, wsi->desc.sockfd))
+	if (sanity_assert_no_sockfd_traces(context, wsi->io->desc.sockfd))
 		return 0;
 
 	p = context->lws_lookup;
@@ -191,7 +241,7 @@ delete_from_fd(const struct lws_context *context, int fd)
 
 	/* find the match */
 
-	while (p != done && (!*p || (*p)->desc.sockfd != fd))
+	while (p != done && (!*p || (*p)->io->desc.sockfd != fd))
 		p++;
 
 	if (p != done)
@@ -199,8 +249,18 @@ delete_from_fd(const struct lws_context *context, int fd)
 
 #if defined(_DEBUG)
 	p = context->lws_lookup;
-	while (p != done && (!*p || (*p)->desc.sockfd != fd))
+	while (p != done) {
+		if (*p && (*p)->io->desc.sockfd == fd) {
+#if defined(LWS_WITH_CLIENT)
+			if ((*p)->io->parallel_count > 0) {
+				p++;
+				continue;
+			}
+#endif
+			break;
+		}
 		p++;
+	}
 
 	if (p != done) {
 		lwsl_err("%s: fd %d in lws_lookup again at %d\n", __func__,
@@ -239,8 +299,8 @@ lws_plat_insert_socket_into_fds(struct lws_context *context, struct lws *wsi)
 {
 	struct lws_context_per_thread *pt = &context->pt[(int)wsi->tsi];
 
-	if (context->event_loop_ops->io)
-		context->event_loop_ops->io(wsi, LWS_EV_START | LWS_EV_READ);
+	if (context->event_loop_ops->io || context->event_loop_ops->io_parallel)
+		_lws_event_loop_ops_io(wsi, LWS_EV_START | LWS_EV_READ);
 
 	pt->fds[pt->fds_count++].revents = 0;
 }
@@ -251,8 +311,8 @@ lws_plat_delete_socket_from_fds(struct lws_context *context,
 {
 	struct lws_context_per_thread *pt = &context->pt[(int)wsi->tsi];
 
-	if (context->event_loop_ops->io)
-		context->event_loop_ops->io(wsi,
+	if (context->event_loop_ops->io || context->event_loop_ops->io_parallel)
+		_lws_event_loop_ops_io(wsi,
 				LWS_EV_STOP | LWS_EV_READ | LWS_EV_WRITE);
 
 	pt->fds_count--;

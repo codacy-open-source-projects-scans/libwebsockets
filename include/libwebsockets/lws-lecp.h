@@ -49,6 +49,21 @@
 #define LECP_STRING_CHUNK		254
 #endif
 
+/*
+ * These are tunable, but every index into the arrays they size is a uint8_t
+ * in struct lecp_ctx, so they are hard-capped: LECP_MAX_PATH, LECP_MAX_DEPTH,
+ * LECP_MAX_INDEX_DEPTH and LECP_MAX_PARSING_STACK_DEPTH must each be <= 255,
+ * and LECP_STRING_CHUNK <= 254.  Raising one past its cap does not overflow
+ * the array, but the bounds checks stop firing and the parser silently
+ * corrupts what it collected.
+ */
+
+#if LECP_MAX_PATH > 255 || LECP_MAX_DEPTH > 255 || \
+    LECP_MAX_INDEX_DEPTH > 255 || LECP_MAX_PARSING_STACK_DEPTH > 255 || \
+    LECP_STRING_CHUNK > 254
+#error "LECP_ size knob is larger than its uint8_t index can represent"
+#endif
+
 #define LECP_FLAG_CB_IS_VALUE 64
 
 /*
@@ -290,10 +305,12 @@ struct lecp_ctx {
 	uint8_t			pst_sp; /* parsing stack head */
 	uint8_t			outer_array;
 	uint8_t			cbor_pos;
+	uint8_t			cbor_len;
 	uint8_t			literal_cbor_report;
 	char			present; /* temp for cb reason to use */
 
 	uint8_t			be; /* big endian */
+	int8_t			failed; /* 0, or the LECP_... reject */
 
 	/* at end so we can memset the rest of it */
 

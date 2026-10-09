@@ -36,9 +36,23 @@ lws_genrsa_create(struct lws_genrsa_ctx *ctx,
 	ULONG bloblen;
 	uint8_t *p;
 
+	/* the caller must hand us a zeroed ctx; a still-live ctx is a misuse */
+	if (ctx->created_mark == LWS_GENRSA_CTX_CREATED_MARK)
+		return -1;
+
+	memset(ctx, 0, sizeof(*ctx));
 	ctx->context = context;
 	ctx->mode = mode;
-	ctx->u.hKey = NULL;
+
+	/*
+	 * OAEP needs a real hash... if the caller has no preference, use the
+	 * RFC8017 default of SHA-1
+	 */
+
+	ctx->oaep_hashid = oaep_hashid;
+	if (mode == LGRSAM_PKCS1_OAEP_PSS &&
+	    oaep_hashid == LWS_GENHASH_TYPE_UNKNOWN)
+		ctx->oaep_hashid = LWS_GENHASH_TYPE_SHA1;
 
 	/*
 	 * BCRYPT_RSAKEY_BLOB layout:
@@ -51,8 +65,10 @@ lws_genrsa_create(struct lws_genrsa_ctx *ctx,
 	 */
 
 	status = BCryptOpenAlgorithmProvider(&ctx->u.hAlg, BCRYPT_RSA_ALGORITHM, NULL, 0);
-	if (!BCRYPT_SUCCESS(status))
+	if (!BCRYPT_SUCCESS(status)) {
+		ctx->u.hAlg = NULL;
 		return -1;
+	}
 
 	/* Calculate total blob length */
 	bloblen = sizeof(BCRYPT_RSAKEY_BLOB);
@@ -74,6 +90,7 @@ lws_genrsa_create(struct lws_genrsa_ctx *ctx,
 	rsablob = (BCRYPT_RSAKEY_BLOB *)lws_malloc(bloblen, "genrsa blob");
 	if (!rsablob) {
 		BCryptCloseAlgorithmProvider(ctx->u.hAlg, 0);
+		ctx->u.hAlg = NULL;
 		return -1;
 	}
 
@@ -130,16 +147,13 @@ lws_genrsa_create(struct lws_genrsa_ctx *ctx,
 
 	if (!BCRYPT_SUCCESS(status)) {
 		BCryptCloseAlgorithmProvider(ctx->u.hAlg, 0);
+		ctx->u.hAlg = NULL;
 		return -1;
 	}
 
-	return 0;
-}
+	ctx->created_mark = LWS_GENRSA_CTX_CREATED_MARK;
 
-void
-lws_genrsa_destroy_elements(struct lws_gencrypto_keyelem *el)
-{
-	lws_gencrypto_destroy_elements(el, LWS_GENCRYPTO_RSA_KEYEL_COUNT);
+	return 0;
 }
 
 int
@@ -153,12 +167,19 @@ lws_genrsa_new_keypair(struct lws_context *context, struct lws_genrsa_ctx *ctx,
 	ULONG reslen = 0;
 	uint8_t *p;
 
+	/* the caller must hand us a zeroed ctx; a still-live ctx is a misuse */
+	if (ctx->created_mark == LWS_GENRSA_CTX_CREATED_MARK)
+		return -1;
+
+	memset(ctx, 0, sizeof(*ctx));
 	ctx->context = context;
 	ctx->mode = mode;
 
 	status = BCryptOpenAlgorithmProvider(&ctx->u.hAlg, BCRYPT_RSA_ALGORITHM, NULL, 0);
-	if (!BCRYPT_SUCCESS(status))
+	if (!BCRYPT_SUCCESS(status)) {
+		ctx->u.hAlg = NULL;
 		return -1;
+	}
 
 	status = BCryptGenerateKeyPair(ctx->u.hAlg, &ctx->u.hKey, bits, 0);
 	if (!BCRYPT_SUCCESS(status)) {
@@ -172,8 +193,21 @@ lws_genrsa_new_keypair(struct lws_context *context, struct lws_genrsa_ctx *ctx,
 		goto fail;
 	}
 
-	/* Export key to blob to fill 'el' */
-	status = BCryptExportKey(ctx->u.hKey, NULL, BCRYPT_RSAPRIVATE_BLOB, NULL, 0, &bloblen, 0);
+	/*
+	 * Export key to blob to fill 'el'.
+	 *
+	 * It has to be BCRYPT_RSAFULLPRIVATE_BLOB: BCRYPT_RSAPRIVATE_BLOB
+	 * stops after Prime2, so parsing dp / dq / qi (and d) out of it read
+	 * 3 prime-lengths of heap past the end of the allocation and wrote
+	 * that garbage into the generated key.
+	 *
+	 * FULLPRIVATE is
+	 *   header || e[cbPublicExp] || n[cbModulus] || p[cbPrime1] ||
+	 *   q[cbPrime2] || dp[cbPrime1] || dq[cbPrime2] || qi[cbPrime1] ||
+	 *   d[cbModulus]
+	 */
+
+	status = BCryptExportKey(ctx->u.hKey, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, NULL, 0, &bloblen, 0);
 	if (!BCRYPT_SUCCESS(status) && status != 0xC0000023) { /* STATUS_BUFFER_TOO_SMALL */
 		goto fail;
 	}
@@ -181,8 +215,21 @@ lws_genrsa_new_keypair(struct lws_context *context, struct lws_genrsa_ctx *ctx,
 	rsablob = (BCRYPT_RSAKEY_BLOB *)lws_malloc(bloblen, "genrsa export blob");
 	if (!rsablob) goto fail;
 
-	status = BCryptExportKey(ctx->u.hKey, NULL, BCRYPT_RSAPRIVATE_BLOB, (PUCHAR)rsablob, bloblen, &reslen, 0);
+	status = BCryptExportKey(ctx->u.hKey, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, (PUCHAR)rsablob, bloblen, &reslen, 0);
 	if (!BCRYPT_SUCCESS(status)) goto fail;
+
+	/*
+	 * Confirm CNG really gave us all of it before walking through it
+	 */
+
+	if (reslen > bloblen ||
+	    (size_t)reslen < sizeof(*rsablob) +
+			     (size_t)rsablob->cbPublicExp +
+			     (2 * (size_t)rsablob->cbModulus) +
+			     (2 * (size_t)rsablob->cbPrime1) +
+			     (2 * (size_t)rsablob->cbPrime2) +
+			     (size_t)rsablob->cbPrime1)
+		goto fail;
 
 	/* Parse blob into 'el' */
 	p = (uint8_t *)(rsablob + 1);
@@ -228,10 +275,17 @@ lws_genrsa_new_keypair(struct lws_context *context, struct lws_genrsa_ctx *ctx,
 	memcpy(el[LWS_GENCRYPTO_RSA_KEYEL_QI].buf, p, rsablob->cbPrime1);
 	p += rsablob->cbPrime1;
 
-	el[LWS_GENCRYPTO_RSA_KEYEL_D].len = 0;
-	el[LWS_GENCRYPTO_RSA_KEYEL_D].buf = NULL;
+	/* Private exponent */
+	LWS_GENRSA_ALLOC_EL(LWS_GENCRYPTO_RSA_KEYEL_D, rsablob->cbModulus);
+	memcpy(el[LWS_GENCRYPTO_RSA_KEYEL_D].buf, p, rsablob->cbModulus);
+	p += rsablob->cbModulus;
+
+	assert(p <= (uint8_t *)rsablob + reslen);
 
 	lws_free(rsablob);
+
+	ctx->created_mark = LWS_GENRSA_CTX_CREATED_MARK;
+
 	return 0;
 
 fail:
@@ -241,25 +295,50 @@ fail:
 	return -1;
 }
 
+static LPCWSTR
+oaep_hash_to_bcrypt_alg(enum lws_genhash_types oaep_hashid)
+{
+	switch (oaep_hashid) {
+	case LWS_GENHASH_TYPE_SHA256:
+		return BCRYPT_SHA256_ALGORITHM;
+	case LWS_GENHASH_TYPE_SHA384:
+		return BCRYPT_SHA384_ALGORITHM;
+	case LWS_GENHASH_TYPE_SHA512:
+		return BCRYPT_SHA512_ALGORITHM;
+	default:
+		return BCRYPT_SHA1_ALGORITHM;
+	}
+}
+
 int
 lws_genrsa_public_encrypt(struct lws_genrsa_ctx *ctx, const uint8_t *in,
 			  size_t in_len, uint8_t *out)
 {
 	NTSTATUS status;
-	ULONG result_len = 0;
+	ULONG result_len = 0, keylen = 0, reslen = 0;
 	BCRYPT_OAEP_PADDING_INFO oaepInfo;
 	void *pPaddingInfo = NULL;
 	DWORD dwFlags = BCRYPT_PAD_PKCS1;
 
 	if (ctx->mode == LGRSAM_PKCS1_OAEP_PSS) {
-		oaepInfo.pszAlgId = BCRYPT_SHA1_ALGORITHM; // Default or from ctx
+		oaepInfo.pszAlgId = oaep_hash_to_bcrypt_alg(ctx->oaep_hashid);
 		oaepInfo.pbLabel = NULL;
 		oaepInfo.cbLabel = 0;
 		pPaddingInfo = &oaepInfo;
 		dwFlags = BCRYPT_PAD_OAEP;
 	}
 
-	status = BCryptEncrypt(ctx->u.hKey, (PUCHAR)in, (ULONG)in_len, pPaddingInfo, NULL, 0, (PUCHAR)out, (ULONG)256 /* Should be keysize */, &result_len, dwFlags); // 256 is placeholder, needs real size
+	/*
+	 * The caller's out buffer is the modulus length by contract; ask the
+	 * key how long that is rather than assuming 2048 bits
+	 */
+
+	status = BCryptGetProperty(ctx->u.hKey, BCRYPT_BLOCK_LENGTH,
+				   (PUCHAR)&keylen, sizeof(keylen), &reslen, 0);
+	if (!BCRYPT_SUCCESS(status))
+		return -1;
+
+	status = BCryptEncrypt(ctx->u.hKey, (PUCHAR)in, (ULONG)in_len, pPaddingInfo, NULL, 0, (PUCHAR)out, keylen, &result_len, dwFlags);
 
 	if (!BCRYPT_SUCCESS(status))
 		return -1;
@@ -384,7 +463,7 @@ lws_genrsa_private_decrypt(struct lws_genrsa_ctx *ctx, const uint8_t *in,
 	DWORD dwFlags = BCRYPT_PAD_PKCS1;
 
 	if (ctx->mode == LGRSAM_PKCS1_OAEP_PSS) {
-		oaepInfo.pszAlgId = BCRYPT_SHA1_ALGORITHM;
+		oaepInfo.pszAlgId = oaep_hash_to_bcrypt_alg(ctx->oaep_hashid);
 		oaepInfo.pbLabel = NULL;
 		oaepInfo.cbLabel = 0;
 		pPaddingInfo = &oaepInfo;
@@ -420,7 +499,13 @@ lws_genrsa_hash_sig_verify(struct lws_genrsa_ctx *ctx, const uint8_t *in,
 
 	if (ctx->mode == LGRSAM_PKCS1_OAEP_PSS) {
 		pssInfo.pszAlgId = algId;
-		pssInfo.cbSalt = 0; // Depends on spec
+		/*
+		 * RFC7518 fixes the PS256 / PS384 / PS512 salt length at the
+		 * hash length, and CNG requires cbSalt to match exactly on
+		 * verify... a zero salt neither produces nor accepts standard
+		 * JWS PS* signatures
+		 */
+		pssInfo.cbSalt = (ULONG)lws_genhash_size(hash_type);
 		pPaddingInfo = &pssInfo;
 		dwFlags = BCRYPT_PAD_PSS;
 	} else {
@@ -456,7 +541,8 @@ lws_genrsa_hash_sign(struct lws_genrsa_ctx *ctx, const uint8_t *in,
 
 	if (ctx->mode == LGRSAM_PKCS1_OAEP_PSS) {
 		pssInfo.pszAlgId = algId;
-		pssInfo.cbSalt = 0;
+		/* RFC7518: the salt length is the hash length */
+		pssInfo.cbSalt = (ULONG)lws_genhash_size(hash_type);
 		pPaddingInfo = &pssInfo;
 		dwFlags = BCRYPT_PAD_PSS;
 	} else {
@@ -479,6 +565,7 @@ lws_genrsa_destroy(struct lws_genrsa_ctx *ctx)
 		BCryptCloseAlgorithmProvider(ctx->u.hAlg, 0);
 	ctx->u.hKey = NULL;
 	ctx->u.hAlg = NULL;
+	ctx->created_mark = 0;
 }
 
 /* ASN.1 helpers */

@@ -26,7 +26,27 @@
 #include "private-lib-event-libs-uloop.h"
 
 #define pt_to_priv_uloop(_pt) ((struct lws_pt_eventlibs_uloop *)(_pt)->evlib_pt)
-#define wsi_to_priv_uloop(_w) ((struct lws_wsi_eventlibs_uloop *)(_w)->evlib_wsi)
+#define wsi_to_priv_uloop(_w) ((struct lws_wsi_eventlibs_uloop *)(_w)->io->evlib_wsi)
+
+/*
+ * uloop_timeout_set() takes an int ms... a sul scheduled further out than
+ * INT_MAX ms (~24.8 days) would wrap negative and produce a deadline in the
+ * past, ie, an immediate-refire busy loop.  Clamp instead.
+ */
+
+static int
+lws_uloop_ms(lws_usec_t us)
+{
+	if (us < 1000)
+		return 1;
+
+	us /= 1000;
+
+	if (us > (lws_usec_t)INT_MAX)
+		return INT_MAX;
+
+	return (int)us;
+}
 
 static void
 lws_uloop_hrtimer_cb(struct uloop_timeout *ti)
@@ -36,13 +56,15 @@ lws_uloop_hrtimer_cb(struct uloop_timeout *ti)
 	struct lws_context_per_thread *pt = upt->pt;
 	lws_usec_t us;
 
+	lws_context_lock(pt->context, __func__); /* cx then pt */
 	lws_pt_lock(pt, __func__);
 	us = __lws_sul_service_ripe(pt->pt_sul_owner, LWS_COUNT_PT_SUL_OWNERS,
 				    lws_now_usecs());
 	if (us)
-		uloop_timeout_set(ti, us < 1000 ? 1 : (int)(us / 1000));
+		uloop_timeout_set(ti, lws_uloop_ms(us));
 
 	lws_pt_unlock(pt);
+	lws_context_unlock(pt->context);
 }
 
 static void
@@ -77,16 +99,17 @@ lws_uloop_idle_timer_cb(struct uloop_timeout *ti)
 
 	/* account for hrtimer */
 
+	lws_context_lock(pt->context, __func__); /* cx then pt */
 	lws_pt_lock(pt, __func__);
 	us = __lws_sul_service_ripe(pt->pt_sul_owner, LWS_COUNT_PT_SUL_OWNERS,
 				    lws_now_usecs());
 	if (us) {
 		uloop_timeout_cancel(&upt->hrtimer);
-		uloop_timeout_set(&upt->hrtimer,
-				  us < 1000 ? 1 : (int)(us / 1000));
+		uloop_timeout_set(&upt->hrtimer, lws_uloop_ms(us));
 	}
 
 	lws_pt_unlock(pt);
+	lws_context_unlock(pt->context);
 
 	if (pt->destroy_self)
 		lws_context_destroy(pt->context);
@@ -101,7 +124,7 @@ lws_uloop_cb(struct uloop_fd *ufd, unsigned int revents)
 	struct lws_context_per_thread *pt;
 	struct lws_pollfd eventfd;
 
-	eventfd.fd = wu->wsi->desc.sockfd;
+	eventfd.fd = ufd->fd;
 	eventfd.events = 0;
 	eventfd.revents = 0;
 
@@ -140,7 +163,7 @@ elops_listen_init_uloop(struct lws_dll2 *d, void *user)
 	struct lws_wsi_eventlibs_uloop *wu = wsi_to_priv_uloop(wsi);
 
 	wu->wsi = wsi;
-	wu->fd.fd = wsi->desc.sockfd;
+	wu->fd.fd = wsi->io->desc.sockfd;
 	wu->fd.cb = lws_uloop_cb;
 	uloop_fd_add(&wu->fd,  ULOOP_READ);
 	wu->actual_events = ULOOP_READ;
@@ -178,7 +201,7 @@ elops_accept_uloop(struct lws *wsi)
 	struct lws_wsi_eventlibs_uloop *wu = wsi_to_priv_uloop(wsi);
 
 	wu->wsi = wsi;
-	wu->fd.fd = wsi->desc.sockfd;
+	wu->fd.fd = wsi->io->desc.sockfd;
 	wu->fd.cb = lws_uloop_cb;
 	uloop_fd_add(&wu->fd, ULOOP_READ);
 	wu->actual_events = ULOOP_READ;
@@ -276,7 +299,7 @@ elops_init_vhost_listen_wsi_uloop(struct lws *wsi)
 
 	wu = wsi_to_priv_uloop(wsi);
 	wu->wsi = wsi;
-	wu->fd.fd = wsi->desc.sockfd;
+	wu->fd.fd = wsi->io->desc.sockfd;
 	wu->fd.cb = lws_uloop_cb;
 	uloop_fd_add(&wu->fd,  ULOOP_READ);
 
@@ -284,6 +307,81 @@ elops_init_vhost_listen_wsi_uloop(struct lws *wsi)
 
 	return 0;
 }
+
+#if defined(LWS_WITH_CLIENT)
+static int
+elops_sock_accept_parallel_uloop(struct lws *wsi, lws_sockfd_type fd, int pidx)
+{
+	struct lws_wsi_eventlibs_uloop *wu = wsi_to_priv_uloop(wsi);
+
+	wu->racing[pidx].wsi = wsi;
+	wu->racing[pidx].fd.fd = fd;
+	wu->racing[pidx].fd.cb = lws_uloop_cb;
+	uloop_fd_add(&wu->racing[pidx].fd, ULOOP_READ);
+	wu->racing[pidx].actual_events = ULOOP_READ;
+
+	return 0;
+}
+
+static void
+elops_io_parallel_uloop(struct lws *wsi, int pidx, unsigned int flags)
+{
+	struct lws_context_per_thread *pt = &wsi->a.context->pt[(int)wsi->tsi];
+	struct lws_wsi_eventlibs_uloop *wu = wsi_to_priv_uloop(wsi);
+	unsigned int ulf = (unsigned int)(((flags & LWS_EV_WRITE) ? ULOOP_WRITE : 0) |
+			    ((flags & LWS_EV_READ) ? ULOOP_READ : 0)), u;
+
+	if (wsi->a.context->being_destroyed || pt->is_destroyed)
+		return;
+
+	u = wu->racing[pidx].actual_events;
+	if (flags & LWS_EV_START)
+		u |= ulf;
+	if (flags & LWS_EV_STOP)
+		u &= ~ulf;
+
+	uloop_fd_add(&wu->racing[pidx].fd, u);
+	wu->racing[pidx].actual_events = u;
+}
+
+static void
+elops_close_handle_manually_parallel_uloop(struct lws *wsi, int pidx)
+{
+	struct lws_wsi_eventlibs_uloop *wu = wsi_to_priv_uloop(wsi);
+
+	uloop_fd_delete(&wu->racing[pidx].fd);
+	compatible_close(wsi->io->parallel_conns[pidx].desc.sockfd);
+}
+
+static int
+elops_promote_parallel_uloop(struct lws *wsi, int pidx)
+{
+	struct lws_wsi_eventlibs_uloop *wu = wsi_to_priv_uloop(wsi);
+	unsigned int ev = wu->racing[pidx].actual_events;
+
+	/*
+	 * uloop_fd_add() registers the *address* of the struct uloop_fd with
+	 * epoll and recovers the callback through it, so the racer's
+	 * registration cannot be moved into the primary slot by copying the
+	 * struct.  Deregister both and register the primary afresh on the
+	 * winner's fd.
+	 */
+
+	uloop_fd_delete(&wu->fd);
+	uloop_fd_delete(&wu->racing[pidx].fd);
+
+	wu->wsi = wsi;
+	wu->fd.fd = wsi->io->parallel_conns[pidx].desc.sockfd;
+	wu->fd.cb = lws_uloop_cb;
+
+	uloop_fd_add(&wu->fd, ev);
+	wu->actual_events = ev;
+
+	memset(&wu->racing[pidx], 0, sizeof(wu->racing[pidx]));
+
+	return 0;
+}
+#endif
 
 static const struct lws_event_loop_ops event_loop_ops_uloop = {
 	/* name */			"uloop",
@@ -302,6 +400,15 @@ static const struct lws_event_loop_ops event_loop_ops_uloop = {
 	/* destroy wsi */		elops_destroy_wsi_uloop,
 	/* foreign_thread */		NULL,
 	/* fake_POLLIN */		NULL,
+
+#if defined(LWS_WITH_CLIENT)
+	/* sock_accept_parallel */	elops_sock_accept_parallel_uloop,
+	/* io_parallel */		elops_io_parallel_uloop,
+	/* close_handle_manually_parallel */ elops_close_handle_manually_parallel_uloop,
+	/* promote_parallel */		elops_promote_parallel_uloop,
+#else
+	NULL, NULL, NULL, NULL,
+#endif
 
 	/* flags */			0,
 

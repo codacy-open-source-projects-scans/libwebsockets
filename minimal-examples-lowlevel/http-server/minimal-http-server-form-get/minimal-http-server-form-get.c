@@ -15,18 +15,20 @@
 
 enum {
 	LWS_SW_D,
+	LWS_SW_PORT,
 	LWS_SW_HELP,
 };
 
 static const struct lws_switches switches[] = {
 	[LWS_SW_D]	= { "-d",              "Debug logs (e.g. -d 15)" },
+	[LWS_SW_PORT]	= { "--port",          "Port to listen on (default 7681)" },
 	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
 };
 
 #include <string.h>
 #include <signal.h>
 
-static int interrupted;
+static struct lws_context *context;
 
 static const char * param_names[] = {
 	"text1",
@@ -100,21 +102,14 @@ static const struct lws_http_mount mount = {
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	struct lws_context *context;
 	const char *p;
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE
-			/* for LLL_ verbosity above NOTICE to be built into lws,
-			 * lws must have been configured and built with
-			 * -DCMAKE_BUILD_TYPE=DEBUG instead of =RELEASE */
-			/* | LLL_INFO */ /* | LLL_PARSER */ /* | LLL_HEADER */
-			/* | LLL_EXT */ /* | LLL_CLIENT */ /* | LLL_LATENCY */
-			/* | LLL_DEBUG */;
+	int n = 0;
 	(void)switches;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
@@ -125,14 +120,23 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal http server GET | visit http://localhost:7681\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	/* a server: size the fds tables to the process limit */
+	info.fd_limit_per_thread = 0;
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.port = 7681;
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_PORT].sw))) {
+		int pt = atoi(p);
+
+		if (pt <= 0 || pt > 65535) {
+			lwsl_err("Port %d is outside valid 16-bit range\n", pt);
+			return 1;
+		}
+		info.port = pt;
+	}
 	info.protocols = protocols;
 	info.mounts = &mount;
 	info.options =
@@ -144,7 +148,7 @@ int main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

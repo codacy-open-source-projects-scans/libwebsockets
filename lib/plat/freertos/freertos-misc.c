@@ -24,6 +24,12 @@
 
 #include "private-lib-core.h"
 
+/* the sockets use it too, so it can't live in the LWS_WITH_FILE_OPS file */
+int lws_plat_apply_FD_CLOEXEC(int n)
+{
+	return 0;
+}
+
 /*
  * Normally you don't want this, use lws_sul instead inside the event loop.
  * But sometimes for drivers it makes sense, so there's an internal-only
@@ -45,7 +51,7 @@ lws_now_usecs(void)
 }
 
 size_t
-lws_get_random(struct lws_context *context, void *buf, size_t len)
+lws_plat_get_random(struct lws_context *context, void *buf, size_t len)
 {
 #if defined(LWS_WITH_ESP32)
 	uint8_t *pb = buf;
@@ -67,6 +73,7 @@ lws_get_random(struct lws_context *context, void *buf, size_t len)
 	return pb - (uint8_t *)buf;
 #else
 #if defined(LWS_WITH_MBEDTLS)
+#if !defined(LWS_MBEDTLS_PSA_RNG)
 	int n;
 
 	n = mbedtls_ctr_drbg_random(&context->mcdc, buf, len);
@@ -76,6 +83,15 @@ lws_get_random(struct lws_context *context, void *buf, size_t len)
 	/* failed */
 
 	lwsl_err("%s: mbedtls_ctr_drbg_random returned 0x%x\n", __func__, n);
+#else
+	/* mbedTLS 4 removed ctr_drbg; PSA provides the RNG */
+	psa_status_t st = psa_generate_random((uint8_t *)buf, len);
+
+	if (st == PSA_SUCCESS)
+		return len;
+
+	lwsl_err("%s: psa_generate_random returned %d\n", __func__, (int)st);
+#endif
 #endif
 	return 0;
 #endif
@@ -91,6 +107,18 @@ int
 lws_plat_drop_app_privileges(struct lws_context *context, int actually_init)
 {
 	return 0;
+}
+
+int
+lws_plat_user_to_uid(const char *username, uid_t *puid)
+{
+	return 1;
+}
+
+int
+lws_plat_group_to_gid(const char *groupname, gid_t *pgid)
+{
+	return 1;
 }
 
 int

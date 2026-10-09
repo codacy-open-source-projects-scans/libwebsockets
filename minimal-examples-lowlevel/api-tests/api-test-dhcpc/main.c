@@ -21,7 +21,7 @@ static const struct lws_switches switches[] = {
 
 #include <signal.h>
 
-static int interrupted, ok, fail, expected = 1;
+static int ok, fail, expected = 1;
 struct lws_context *context;
 const char *nif;
 
@@ -50,13 +50,13 @@ lws_dhcpc_cb(void *opaque, lws_dhcpc_ifstate_t *is)
 	}
 
 	ok = 1;
-	interrupted = 1;
+	lws_default_loop_exit(context);
 	return 0;
 }
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int
@@ -77,8 +77,7 @@ main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	lws_context_info_defaults(&info, NULL);lws_cmdline_option_handle_builtin(argc, argv, &info);
 	lwsl_user("LWS API selftest: DHCP Client\n");
 
 	info.port = CONTEXT_PORT_NO_LISTEN;
@@ -100,13 +99,13 @@ main(int argc, const char **argv)
 		lws_dhcpc_request(context, nif, AF_INET, lws_dhcpc_cb, NULL);
 	} else {
 		lwsl_err("%s: use -i <network-interface> to select if\n", __func__);
-		interrupted = 1;
+		lws_default_loop_exit(context);
 	}
 
 	/* the usual lws event loop */
 
 	n = 1;
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

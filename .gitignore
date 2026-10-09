@@ -31,6 +31,10 @@ win32port/zlib/Release*/
 *.su
 *.m4
 *.a
+*.o
+*.so
+*.so.*
+*.dylib
 missing
 depcomp
 install-sh
@@ -49,6 +53,7 @@ build/
 doc
 /build2/
 /build3/
+/build-fuzz/
 /cov-int/
 /.vs/
 /build-mtls/
@@ -65,3 +70,11 @@ doc
 /bb1/
 /bb3/
 /bin/
+/scratch
+
+# local security audit working files, never in the tree
+security-audit/
+
+# in-source cmake leftovers
+CTestTestfile.cmake
+build-oauth-apitest

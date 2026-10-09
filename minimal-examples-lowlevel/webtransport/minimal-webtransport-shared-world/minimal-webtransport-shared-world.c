@@ -1,0 +1,98 @@
+/*
+ * lws-minimal-webtransport-shared-world
+ *
+ * Written in 2010-2026 by Andy Green <andy@warmcat.com>
+ *
+ * This file is made available under the Creative Commons CC0 1.0
+ * Universal Public Domain Dedication.
+ *
+ * This server mounts the assets for the WebTransport shared world UI and loads the
+ * `protocol_webtransport_shared_world` plugin.
+ */
+
+#include <libwebsockets.h>
+#include <string.h>
+#include <signal.h>
+
+static struct lws_context *context;
+
+static const struct lws_http_mount mount = {
+	.mount_next		= NULL,
+	.mountpoint		= "/",
+	.origin			= "../../../../plugins/protocol_webtransport_shared_world/assets",
+	.def			= "index.html",
+	.origin_protocol	= LWSMPRO_FILE,
+	.mountpoint_len		= 1,
+};
+
+extern const lws_plugin_protocol_t webtransport_shared_world;
+
+/*
+ * The browser offers "webtransport-shared-world" in wt-available-protocols,
+ * but a protocol is only given WebTransport sessions if its pvo on the vhost
+ * has a "webtransport" option
+ */
+
+static const struct lws_protocol_vhost_options pvo_wt_opt = {
+	NULL, NULL, "webtransport", ""
+};
+
+static const struct lws_protocol_vhost_options pvo = {
+	NULL, &pvo_wt_opt, "webtransport-shared-world", ""
+};
+
+static void
+sigint_handler(int sig)
+{
+	lws_default_loop_exit(context);
+}
+
+int main(int argc, const char **argv)
+{
+	struct lws_context_creation_info info;
+	const char *p;
+	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+
+	signal(SIGINT, sigint_handler);
+
+	if ((p = lws_cmdline_option(argc, argv, "-d")))
+		logs = atoi(p);
+
+	lws_set_log_level(logs, NULL);
+	lwsl_user("LWS minimal webtransport shared world | visit https://localhost:7681\n");
+
+	memset(&info, 0, sizeof info);
+	info.port = 7681;
+	info.mounts = &mount;
+	info.error_document_404 = "/404.html";
+	/*
+	 * The world protocol needs its vhost priv, which it can only create
+	 * from its own LWS_CALLBACK_PROTOCOL_INIT.  Ask for every protocol on
+	 * the vhost to be instantiated, so it does not depend on its pvo.
+	 */
+
+	info.options =
+		LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT |
+		LWS_SERVER_OPTION_VH_INSTANTIATE_ALL_PROTOCOLS |
+		LWS_SERVER_OPTION_HTTP_HEADERS_SECURITY_BEST_PRACTICES_ENFORCE;
+
+	info.pvo = &pvo;
+	info.protocols = webtransport_shared_world.protocols;
+
+	info.ssl_cert_filepath = "localhost-100y.cert";
+	info.ssl_private_key_filepath = "localhost-100y.key";
+	info.alpn = "h3,h2,http/1.1";
+
+	context = lws_create_context(&info);
+	if (!context) {
+		lwsl_err("lws init failed\n");
+		return 1;
+	}
+
+	while (n >= 0)
+		n = lws_service(context, 0);
+
+	lws_context_destroy(context);
+
+	return 0;
+}

@@ -40,9 +40,8 @@ static struct my_conn {
 } mco;
 
 static struct lws_context *context;
-static int interrupted;
 
-#if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL)
+#if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL) || defined(LWS_WITH_OPENHITLS)
 /*
  * OpenSSL uses the system trust store.  mbedTLS / WolfSSL have to be told which
  * CA to trust explicitly.
@@ -148,7 +147,7 @@ connect_client(lws_sorted_usec_list_t *sul)
 		if (lws_retry_sul_schedule(context, 0, sul, &retry,
 					   connect_client, &mco->retry_count)) {
 			lwsl_err("%s: connection attempts exhausted\n", __func__);
-			interrupted = 1;
+			lws_default_loop_exit(context);
 		}
 }
 
@@ -208,7 +207,7 @@ pennies(const char *s)
 {
 	uint64_t price = (uint64_t)atoll(s) * 100;
 
-	s = strchr(s, '.');
+	s = (char *)strchr(s, '.');
 
 	if (s && isdigit(s[1]) && isdigit(s[2]))
 		price = price + (uint64_t)((10 * (s[1] - '0')) + (s[2] - '0'));
@@ -319,7 +318,7 @@ do_retry:
 	if (lws_retry_sul_schedule_retry_wsi(wsi, &mco->sul, connect_client,
 					     &mco->retry_count)) {
 		lwsl_err("%s: connection attempts exhausted\n", __func__);
-		interrupted = 1;
+		lws_default_loop_exit(context);
 	}
 
 	return 0;
@@ -333,7 +332,7 @@ static const struct lws_protocols protocols[] = {
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
@@ -342,18 +341,17 @@ int main(int argc, const char **argv)
 	int n = 0;
 
 	signal(SIGINT, sigint_handler);
-	memset(&info, 0, sizeof info);
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	lws_context_info_defaults(&info, NULL);lws_cmdline_option_handle_builtin(argc, argv, &info);
 
 	lwsl_user("LWS minimal binance client\n");
 
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 	info.port = CONTEXT_PORT_NO_LISTEN; /* we do not run any server */
 	info.protocols = protocols;
-	info.fd_limit_per_thread = 1 + 1 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 1;
 	info.extensions = extensions;
 
-#if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL)
+#if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL) || defined(LWS_WITH_OPENHITLS)
 	/*
 	 * OpenSSL uses the system trust store.  mbedTLS / WolfSSL have to be
 	 * told which CA to trust explicitly.
@@ -371,7 +369,7 @@ int main(int argc, const char **argv)
 	/* schedule the first client connection attempt to happen immediately */
 	lws_sul_schedule(context, 0, &mco.sul, connect_client, 1);
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

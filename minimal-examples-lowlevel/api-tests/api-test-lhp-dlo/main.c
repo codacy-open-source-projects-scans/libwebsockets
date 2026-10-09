@@ -11,17 +11,41 @@
 
 enum {
 	LWS_SW_BMP,
-	LWS_SW_HELP,
+	LWS_SW_DUMP,
+		LWS_SW_W,
+		LWS_SW_H,
+		LWS_SW_FDLIMIT,
+		LWS_SW_CSS_FILTER,
+		LWS_SW_BLOCK_LIST,
+		LWS_SW_ASSET_CACHE,
+		LWS_SW_PRESEED,
+		LWS_SW_FONTS,
+		LWS_SW_HEAP_LIMIT,
+		LWS_SW_RECLAIM_LINES,
+		LWS_SW_HELP,
 };
 
 static const struct lws_switches switches[] = {
-	[LWS_SW_BMP]	= { "--bmp",           "Enable --bmp feature" },
-	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
+	[LWS_SW_BMP]	= { "--bmp",           "Render to the given .bmp file" },
+	[LWS_SW_DUMP]	= { "--dump",          "Write layout DLO tree as text to the given file (no render)" },
+	[LWS_SW_W]	= { "--w",             "Surface width in px (default 600)" },
+	[LWS_SW_H]	= { "--h",             "Surface height in px (default 448)" },
+	[LWS_SW_FDLIMIT]= { "--fd-limit",     "Context fd limit, to try layouts against small targets" },
+	[LWS_SW_CSS_FILTER]= { "--css-filter", "Filter css from file hides junk elements, eg .ad { display: none !important; }" },
+	[LWS_SW_BLOCK_LIST]= { "--block-list", "URL block rules from file: ||host.tld or substring per line" },
+	[LWS_SW_ASSET_CACHE]= { "--asset-cache", "Directory for the document asset cache, enables it" },
+	[LWS_SW_PRESEED]	= { "--preseed",    "Preseed the asset cache with url=file" },
+	[LWS_SW_FONTS]	= { "--fonts",         "Register the .mcufont files in this directory as file-backed faces, instead of the built-in ones" },
+	[LWS_SW_HEAP_LIMIT] = { "--heap-limit", "Simulate a heap of this many bytes above what is in use at the start, so fonts and images get reclaimed" },
+	[LWS_SW_RECLAIM_LINES] = { "--reclaim-lines", "Evict every reclaimable heap occupant after each N rendered lines, so they all get renewed mid-render on any allocator" },
+	[LWS_SW_HELP]	= { "--help",          "Show this help information" },
 };
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <signal.h>
 
 //#define SEVENCOL
@@ -75,6 +99,12 @@ static const uint8_t fira_c_b_16[] = {
 static const uint8_t fira_c_b_20[] = {
 #include "../contrib/mcufont/fonts/FiraSansCondensed-Bold20.mcufont.h"
 };
+static const uint8_t fira_c_b_24[] = {
+#include "../contrib/mcufont/fonts/FiraSansCondensed-Bold24.mcufont.h"
+};
+static const uint8_t fira_c_b_32[] = {
+#include "../contrib/mcufont/fonts/FiraSansCondensed-Bold32.mcufont.h"
+};
 
 #if defined(SEVENCOL)
 static const lws_display_colour_t palette[] = {
@@ -88,8 +118,9 @@ static const lws_display_colour_t palette[] = {
 };
 #endif
 
-static const lws_surface_info_t ic = {
-	.wh_px = { { 1600,0 },       { 2000,0 } },
+/* the 5.65" 600x448 ACEP epd the test page was written for */
+static lws_surface_info_t ic = {
+	.wh_px = { { 600,0 },        { 448,0 } },
 	.wh_mm = { { 114,5000000 }, {  82,5000000 } },
 #if defined(SEVENCOL)
         .palette                = palette,
@@ -101,7 +132,184 @@ static const lws_surface_info_t ic = {
 	.greyscale		= 0
 };
 
-int fdin = 0, fdout = 1;
+int fdin = 0, fdout = 1, result = 0;
+static const char *dump_path;
+static int reclaim_lines;
+
+/*
+ * Write the DLO tree as deterministic text (no pointers), so the layout
+ * result for a given html can be compared against a golden file by ctest.
+ */
+
+typedef struct {
+	int		fd;
+	char		err;	/* any write failed or line would truncate */
+} dump_t;
+
+static void
+dump_raw(dump_t *d, const char *p, size_t len)
+{
+	while (len && !d->err) {
+		ssize_t n = write(d->fd, p, LWS_POSIX_LENGTH_CAST(len));
+
+		if (n <= 0) {
+			d->err = 1;
+			return;
+		}
+		p += n;
+		len -= (size_t)n;
+	}
+}
+
+static void
+dump_printf(dump_t *d, const char *fmt, ...) LWS_FORMAT(2);
+
+static void
+dump_printf(dump_t *d, const char *fmt, ...)
+{
+	char buf[256];
+	va_list ap;
+	int n;
+
+	va_start(ap, fmt);
+	n = vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+
+	/* a truncated line would just be a confusing golden mismatch */
+	if (n < 0 || (size_t)n >= sizeof(buf)) {
+		d->err = 1;
+		return;
+	}
+
+	dump_raw(d, buf, (size_t)n);
+}
+
+static void
+dump_dlo(dump_t *f, lws_dlo_t *dlo, int depth)
+{
+	char b[4][22];
+	int i;
+
+	while (dlo) {
+		lws_fx_string(&dlo->box.x, b[0], sizeof(b[0]));
+		lws_fx_string(&dlo->box.y, b[1], sizeof(b[1]));
+		lws_fx_string(&dlo->box.w, b[2], sizeof(b[2]));
+		lws_fx_string(&dlo->box.h, b[3], sizeof(b[3]));
+
+		for (i = 0; i < depth; i++)
+			dump_raw(f, " ", 1);
+
+		if (dlo->_destroy == lws_display_dlo_text_destroy) {
+			lws_dlo_text_t *t = lws_container_of(dlo,
+							lws_dlo_text_t, dlo);
+
+			dump_printf(f, "text (%s,%s) [%s x %s] rgba=%08X f=%u/%u \"",
+				b[0], b[1], b[2], b[3], (unsigned int)dlo->dc,
+				(unsigned int)t->font->choice.fixed_height,
+				(unsigned int)t->font->choice.weight);
+			if (t->text)
+				dump_raw(f, t->text, t->text_len);
+			dump_raw(f, "\"\n", 2);
+		} else
+		if (dlo->render == lws_display_render_hit) {
+			lws_dlo_hit_t *h = lws_container_of(dlo,
+							lws_dlo_hit_t, dlo);
+
+			static const char * const cur[] = {
+				"default", "pointer", "text", "crosshair",
+				"move", "wait", "help", "not-allowed", "none"
+			};
+
+			dump_printf(f, "hit (%s,%s) [%s x %s]%s %s \"",
+				b[0], b[1], b[2], b[3], h->fill ? " fill" : "",
+				h->cursor < LWS_ARRAY_SIZE(cur) ?
+					cur[h->cursor] : "?");
+			if (h->url)
+				dump_raw(f, h->url, strlen(h->url));
+			dump_raw(f, "\"\n", 2);
+		} else
+#if defined(LWS_WITH_UPNG)
+		if (dlo->_destroy == lws_display_dlo_png_destroy)
+			dump_printf(f, "png (%s,%s) [%s x %s]\n",
+				b[0], b[1], b[2], b[3]);
+		else
+#endif
+#if defined(LWS_WITH_JPEG)
+		if (dlo->_destroy == lws_display_dlo_jpeg_destroy)
+			dump_printf(f, "jpeg (%s,%s) [%s x %s]\n",
+				b[0], b[1], b[2], b[3]);
+		else
+#endif
+#if defined(LWS_WITH_SVG)
+		if (dlo->_destroy == lws_display_dlo_svg_destroy)
+			dump_printf(f, "svg (%s,%s) [%s x %s]\n",
+				b[0], b[1], b[2], b[3]);
+		else
+#endif
+#if defined(LWS_WITH_GIF)
+		if (dlo->_destroy == lws_display_dlo_gif_destroy)
+			dump_printf(f, "gif (%s,%s) [%s x %s]\n",
+				b[0], b[1], b[2], b[3]);
+		else
+#endif
+		{
+			lws_dlo_rect_t *r = lws_container_of(dlo,
+							lws_dlo_rect_t, dlo);
+			int n, rad = 0;
+
+			for (n = 0; n < 4; n++)
+				rad |= r->c[n].r.whole || r->c[n].r.frac;
+
+			dump_printf(f, "rect (%s,%s) [%s x %s] rgba=%08X",
+				b[0], b[1], b[2], b[3], (unsigned int)dlo->dc);
+			if (rad) {
+				dump_raw(f, " radii=", 7);
+				for (n = 0; n < 4; n++) {
+					lws_fx_string(&r->c[n].r, b[0],
+						      sizeof(b[0]));
+					dump_printf(f, "%s%s", n ? "," : "", b[0]);
+				}
+			}
+			dump_raw(f, "\n", 1);
+		}
+
+		if (lws_dll2_get_head(&dlo->children))
+			dump_dlo(f, lws_container_of(
+					lws_dll2_get_head(&dlo->children),
+					lws_dlo_t, list), depth + 1);
+
+		if (!lws_dll2_get_next(&dlo->list))
+			break;
+
+		dlo = lws_container_of(lws_dll2_get_next(&dlo->list),
+				       lws_dlo_t, list);
+	}
+}
+
+static int
+dump_displaylist(const char *path, lws_displaylist_t *dl)
+{
+	dump_t f;
+	lws_dll2_t *d;
+
+	memset(&f, 0, sizeof(f));
+	f.fd = lws_open(path, LWS_O_WRONLY | LWS_O_CREAT | LWS_O_TRUNC, 0644);
+	if (f.fd < 0) {
+		lwsl_err("%s: unable to open %s\n", __func__, path);
+		return 1;
+	}
+
+	d = lws_dll2_get_head(&dl->dl);
+	if (d)
+		dump_dlo(&f, lws_container_of(d, lws_dlo_t, list), 0);
+
+	close(f.fd);
+
+	if (f.err)
+		lwsl_err("%s: unable to write all of %s\n", __func__, path);
+
+	return f.err;
+}
 
 static void
 write_bmp_header(int fd, int w, int h)
@@ -163,6 +371,14 @@ render(lws_sorted_usec_list_t *sul)
 	if (rs->html == 1)
 		return;
 
+	if (dump_path) {
+		if (dump_displaylist(dump_path, &rs->displaylist))
+			result = 1;
+		lws_display_list_destroy(cx, &rs->displaylist);
+		lws_default_loop_exit(cx);
+		return;
+	}
+
 	if (!rs->line) {
 
 		lws_display_get_ids_boxes(rs);
@@ -177,7 +393,12 @@ render(lws_sorted_usec_list_t *sul)
 			return;
 		}
 
-		memset(rs->line, 0, lbuflen);
+		/*
+		 * Start from white paper: areas of the surface no DLO covers
+		 * show the page background, not stale buffer contents
+		 */
+
+		memset(rs->line, 0xff, lbuflen);
 		rs->curr = 0;
 
 		if (fdout != 1)
@@ -185,13 +406,34 @@ render(lws_sorted_usec_list_t *sul)
 					 rs->ic->wh_px[1].whole);
 	}
 
-	while (rs->curr != rs->lowest_id_y) {
+	/*
+	 * Render every line of the surface, not only down to the lowest DLO:
+	 * the bmp header promises --h rows, and the canvas below any content
+	 * is the page background
+	 */
+
+	while (rs->curr != rs->ic->wh_px[1].whole) {
+
+		/*
+		 * --reclaim-lines: sound the bat signal ourselves every few
+		 * lines, so every tenant (fonts, images) is evicted and has
+		 * to renew itself mid-render, independent of the allocator
+		 */
+		if (reclaim_lines && !(rs->curr % reclaim_lines))
+			lws_reclaim((size_t)-1);
 
 		r = lws_display_list_render_line(rs);
 
 		if (r) {
-			/* eg, waiting for more jpg or whatever */
+			/*
+			 * eg, waiting for more jpg or whatever.  A yield
+			 * (a decoder couldn't get memory this time round)
+			 * has nothing else to wake us: come back shortly
+			 */
 			lwsl_notice("%s: leaving 0x%x\n", __func__, (unsigned int)r);
+			if (r & LWS_SRET_YIELD)
+				lws_sul_schedule(cx, 0, &rs->sul, render,
+						 20 * LWS_US_PER_MS);
 			return;
 		}
 
@@ -233,6 +475,10 @@ render(lws_sorted_usec_list_t *sul)
 		}
 
 		rs->curr++;
+
+		/* the next line starts from white paper again */
+
+		memset(rs->line, 0xff, lbuflen);
 	}
 
         free(rs->line);
@@ -249,11 +495,99 @@ sigint_handler(int sig)
 	lws_default_loop_exit(cx);
 }
 
+/*
+ * Read a whole file into a NUL-terminated heap buffer, or return NULL.  The
+ * caller frees it with free().
+ */
+#if defined(LWS_WITH_CACHE_BLOB)
+static uint8_t *
+read_raw_file(const char *path, size_t *len)
+{
+	uint8_t *buf = NULL;
+	struct stat s;
+	size_t done = 0;
+	ssize_t n;
+	int fd;
+
+	fd = open(path, LWS_O_RDONLY);
+	if (fd < 0)
+		return NULL;
+
+	if (fstat(fd, &s)) {
+		close(fd);
+
+		return NULL;
+	}
+
+	buf = malloc((size_t)s.st_size);
+	if (!buf) {
+		close(fd);
+
+		return NULL;
+	}
+
+	while (done < (size_t)s.st_size) {
+		n = read(fd, buf + done, (size_t)s.st_size - done);
+		if (n <= 0)
+			break;
+		done += (size_t)n;
+	}
+	close(fd);
+
+	if (done != (size_t)s.st_size) {
+		free(buf);
+
+		return NULL;
+	}
+
+	*len = done;
+
+	return buf;
+}
+#endif
+
+static char *
+read_file(const char *path)
+{
+	char *buf = NULL, *t;
+	size_t len = 0;
+	ssize_t n;
+	int fd;
+
+	fd = open(path, LWS_O_RDONLY);
+	if (fd < 0)
+		return NULL;
+
+	for (;;) {
+		t = realloc(buf, len + 1025);
+		if (!t)
+			goto bail;
+		buf = t;
+
+		n = read(fd, buf + len, 1024);
+		if (n < 0)
+			goto bail;
+		if (!n)
+			break;
+		len += (size_t)n;
+	}
+
+	buf[len] = '\0';
+	close(fd);
+
+	return buf;
+
+bail:
+	free(buf);
+	close(fd);
+
+	return NULL;
+}
+
 int
 main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	int result = 0;
 	const char *p;
 	(void)switches;
 
@@ -265,10 +599,25 @@ main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	memset(&info, 0, sizeof info);
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	lws_context_info_defaults(&info, NULL);lws_cmdline_option_handle_builtin(argc, argv, &info);
 
 	lwsl_user("LWS LHP DLO test tool - %s https://site.com [--bmp file.bmp]\n", argv[0]);
+
+	dump_path = lws_cmdline_option(argc, argv, switches[LWS_SW_DUMP].sw);
+
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_W].sw)))
+		ic.wh_px[0].whole = atoi(p);
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_H].sw)))
+		ic.wh_px[1].whole = atoi(p);
+
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_FDLIMIT].sw)))
+		info.fd_limit_per_thread = (unsigned int)atoi(p);
+
+#if defined(LWS_WITH_CACHE_BLOB)
+	if ((p = lws_cmdline_option(argc, argv,
+				     switches[LWS_SW_ASSET_CACHE].sw)))
+		info.dlo_asset_cache_dir = p;
+#endif
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_BMP].sw))) {
 		fdout = open(p, LWS_O_WRONLY | LWS_O_CREAT | LWS_O_TRUNC, 0600);
@@ -284,12 +633,36 @@ main(int argc, const char **argv)
 			LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT |
 			LWS_SERVER_OPTION_H2_JUST_FIX_WINDOW_UPDATE_OVERFLOW;
 
+	/*
+	 * Real sites can return a large block of response headers in one go,
+	 * eg a burst of set-cookie on a login redirect; the lws default of
+	 * 4096 is too small to survive some sites that otherwise work
+	 */
+
+	if (!info.max_http_header_data)
+		info.max_http_header_data = 16384;
+
 	cx = lws_create_context(&info);
 	if (!cx)
 		goto bail;
 
 	/* register the available fonts */
 
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_FONTS].sw))) {
+		/*
+		 * The same faces from files: the layout must come out
+		 * identical, with the dictionaries and glyphs coming and
+		 * going from the heap as the reclaim registry asks
+		 */
+		int n = lws_fonts_register_dir(cx, p);
+
+		if (n <= 0) {
+			lwsl_err("%s: no fonts found in %s\n", __func__, p);
+			goto bail;
+		}
+		lwsl_notice("%s: %d file-backed fonts from %s\n", __func__,
+			    n, p);
+	} else {
 	lws_font_register(cx, fira_c_r_10, sizeof(fira_c_r_10));
 	lws_font_register(cx, fira_c_r_12, sizeof(fira_c_r_12));
 	lws_font_register(cx, fira_c_r_14, sizeof(fira_c_r_14));
@@ -302,8 +675,62 @@ main(int argc, const char **argv)
 	lws_font_register(cx, fira_c_b_14, sizeof(fira_c_b_14));
 	lws_font_register(cx, fira_c_b_16, sizeof(fira_c_b_16));
 	lws_font_register(cx, fira_c_b_20, sizeof(fira_c_b_20));
+	lws_font_register(cx, fira_c_b_24, sizeof(fira_c_b_24));
+	lws_font_register(cx, fira_c_b_32, sizeof(fira_c_b_32));
+	}
+
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_HEAP_LIMIT].sw)))
+		lws_heap_limit_set(lws_get_allocated_heap() +
+				   (size_t)atoi(p));
+
+	if ((p = lws_cmdline_option(argc, argv,
+				    switches[LWS_SW_RECLAIM_LINES].sw)))
+		reclaim_lines = atoi(p);
 
 	drs.ic = &ic;
+
+#if defined(LWS_WITH_CACHE_BLOB)
+	/*
+	 * Optionally preseed the asset cache with a file payload under an
+	 * arbitrary url (--preseed url=file), so cache hits can be tested
+	 * without any network
+	 */
+
+	if (info.dlo_asset_cache_dir) {
+		struct lws_cache_ttl_lru *cache = lws_dlo_asset_cache(cx);
+		const char *ps = lws_cmdline_option(argc, argv,
+						switches[LWS_SW_PRESEED].sw);
+
+		if (ps && cache) {
+			char url[300], *file;
+			uint8_t *buf;
+			size_t len;
+
+			lws_strncpy(url, ps, sizeof(url));
+			file = strchr(url, '=');
+			if (file)
+				*file++ = '\0';
+
+			buf = file ? read_raw_file(file, &len) : NULL;
+			if (buf) {
+				if (lws_cache_write_through(cache, url, buf,
+						len,
+						lws_now_usecs() +
+							3600 * LWS_US_PER_SEC,
+						NULL))
+					lwsl_err("%s: preseed failed\n",
+						 __func__);
+				else
+					lwsl_notice("%s: preseeded %u bytes "
+						    "as %s\n", __func__,
+						    (unsigned int)len, url);
+				free(buf);
+			} else
+				lwsl_err("%s: unable to preseed from %s\n",
+					 __func__, ps);
+		}
+	}
+#endif
 
 	/* create the SS to the html using the URL on argv[1] */
 
@@ -313,9 +740,45 @@ main(int argc, const char **argv)
 		goto bail;
 	}
 
-	if (lws_lhp_ss_browse(cx, &drs, argv[1], render)) {
-		lws_context_destroy(cx);
-		goto bail;
+	{
+		const char *cssf = lws_cmdline_option(argc, argv,
+					switches[LWS_SW_CSS_FILTER].sw);
+		const char *bl = lws_cmdline_option(argc, argv,
+					switches[LWS_SW_BLOCK_LIST].sw);
+		lws_lhp_filter_t lf;
+		int r;
+
+		memset(&lf, 0, sizeof(lf));
+
+		if (cssf) {
+			lf.cosmetic_css = read_file(cssf);
+			if (!lf.cosmetic_css) {
+				lwsl_err("%s: unable to read %s\n", __func__, cssf);
+				result = 1;
+				goto bail;
+			}
+		}
+		if (bl) {
+			lf.block_rules = read_file(bl);
+			if (!lf.block_rules) {
+				lwsl_err("%s: unable to read %s\n", __func__, bl);
+				result = 1;
+				goto bail;
+			}
+		}
+
+		r = lws_lhp_ss_browse_filter(cx, &drs, argv[1], render,
+					      (cssf || bl) ? &lf : NULL);
+
+		/* the filter contents were copied by the browse call */
+
+		free((void *)lf.cosmetic_css);
+		free((void *)lf.block_rules);
+
+		if (r) {
+			lws_context_destroy(cx);
+			goto bail;
+		}
 	}
 
 	lws_context_default_loop_run_destroy(cx);

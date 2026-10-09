@@ -31,8 +31,17 @@ static const struct lws_switches switches[] = {
 
 #define THRESHOLD_PC 55
 
+/*
+ * If the service loop is gone (test timeout, SIGINT...), nothing drains the
+ * smd queue any more and every send is refused.  Spam threads that make no
+ * progress for this long bail out without setting completed[], so main's
+ * joins return and the test reports FAIL instead of hanging until ctest
+ * kills it.
+ */
+#define NO_PROGRESS_BAIL_US (5 * LWS_US_PER_SEC)
+
 static unsigned int how_many_msg = 5000, ok, fail, usec_interval = 200, _exp;
-static char interrupted, completed[2] = { 0, 0 };
+static char completed[2] = { 0, 0 };
 
 static lws_sorted_usec_list_t sul_timeout, sul_initial_drain;
 struct lws_context *context;
@@ -43,7 +52,7 @@ timeout_cb(lws_sorted_usec_list_t *sul)
 {
 	/* We should have completed the test before this fires */
 	lwsl_notice("%s: test period finished\n", __func__);
-	interrupted = 1;
+	lws_default_loop_exit(context);
 	lws_cancel_service(context);
 }
 
@@ -93,27 +102,69 @@ smd_cb3int(void *opaque, lws_smd_class_t _class, lws_usec_t timestamp,
 	return 0;
 }
 
+#if defined(WIN32)
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x2
+#endif
+
+/*
+ * Sleep() waits are quantized to the default ~15.6ms system timer tick, so
+ * pacing the spam threads with Sleep(3) actually takes ~78s for 5000
+ * messages and overruns the test's 50s window.  Wait on a per-thread high
+ * resolution waitable timer (Windows 10 1803+) instead: us-accurate waits
+ * without touching process-wide timer resolution.  With htimer NULL (older
+ * Windows), fall back to Sleep() and its tick quantization.
+ */
+static void
+win_wait_us(HANDLE htimer, unsigned int us)
+{
+	LARGE_INTEGER due;
+
+	due.QuadPart = -10 * (LONGLONG)us;
+	if (htimer && SetWaitableTimer(htimer, &due, 0, NULL, NULL, 0) &&
+	    WaitForSingleObject(htimer, INFINITE) == WAIT_OBJECT_0)
+		return;
+
+	Sleep(us / 1000 + 1);
+}
+#endif
+
 static void *
 _thread_spam(void *d)
 {
 #if defined(WIN32)
 	unsigned int mypid = 0;
+	HANDLE htimer = CreateWaitableTimerExW(NULL, NULL,
+			CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+			TIMER_ALL_ACCESS);
 #else
 	unsigned int mypid = (unsigned int)getpid();
 #endif
 	unsigned int n = 0, m = (unsigned int)(intptr_t)d;
+	lws_usec_t last_progress = lws_now_usecs();
 
-	while (!interrupted && n < how_many_msg) {
+	while (n < how_many_msg) {
 		if (lws_smd_msg_printf(context, LWSSMDCL_SYSTEM_STATE,
 					       "{\"s\":\"state\","
 						"\"pid\":%u,"
 						"\"msg\":%d}",
-					       mypid, (unsigned int)n))
+					       mypid, (unsigned int)n)) {
 			fail++;
-		else
+
+			if (lws_now_usecs() - last_progress > NO_PROGRESS_BAIL_US) {
+				lwsl_err("%s: t%u: no message accepted for %ds, "
+					 "giving up\n", __func__, m,
+					 (int)(NO_PROGRESS_BAIL_US / LWS_US_PER_SEC));
+				goto bail;
+			}
+		} else {
 			n++;
+			last_progress = lws_now_usecs();
+		}
 #if defined(WIN32)
-		Sleep(3);
+		if (usec_interval)
+			win_wait_us(htimer, usec_interval);
 #else
 		if (usec_interval)
 			usleep(usec_interval);
@@ -121,6 +172,12 @@ _thread_spam(void *d)
 	}
 
 	completed[m] = 1;
+
+bail:
+#if defined(WIN32)
+	if (htimer)
+		CloseHandle(htimer);
+#endif
 
 #if !defined(WIN32)
 	pthread_exit(NULL);
@@ -131,7 +188,7 @@ _thread_spam(void *d)
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 static void
@@ -175,7 +232,7 @@ system_notify_cb(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 	lwsl_notice("%s: overflow test added %u messages\n", __func__, n);
 	if (n == how_many_msg) {
 		lwsl_err("%s: didn't overflow\n", __func__);
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		return 1;
 	}
 
@@ -200,7 +257,7 @@ main(int argc, const char **argv)
 	lws_state_notify_link_t notifier = { { NULL, NULL, NULL },
 						system_notify_cb, "app" };
 	lws_state_notify_link_t *na[] = { &notifier, NULL };
-	int logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	
 	struct lws_context_creation_info info;
 	struct lws_smd_peer *userreg;
 	const char *p;
@@ -210,8 +267,6 @@ main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_COUNT].sw)))
 		how_many_msg = (unsigned int)atol(p);
@@ -221,11 +276,11 @@ main(int argc, const char **argv)
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_INTERVAL].sw)))
 		usec_interval = (unsigned int)atol(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS API selftest: lws_smd: %u msgs at %uus interval\n",
 			how_many_msg, usec_interval);
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.port = CONTEXT_PORT_NO_LISTEN;
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 	info.register_notifier_list = na;
@@ -313,7 +368,7 @@ main(int argc, const char **argv)
 
 	/* the usual lws event loop */
 
-	while (!interrupted && (!completed[0] || !completed[1]) &&
+	while ((!completed[0] || !completed[1]) &&
 			lws_service(context, 0) >= 0)
 		;
 

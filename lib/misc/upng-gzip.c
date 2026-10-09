@@ -607,7 +607,7 @@ _lws_upng_inflate_data(inflator_ctx_t *inf)
 			else
 				val = inf->bitlenD[inf->i - inf->hlit - 1];
 
-			goto fill;
+			goto fill_l;
 
 		case UPNS_ID_BL_GB_BTYPE_2_17: /*repeat "0" 3-10 times */
 			r = read_bits(inf, 3, &tu);
@@ -616,7 +616,7 @@ _lws_upng_inflate_data(inflator_ctx_t *inf)
 			count = tu + 3;
 
 			val = 0;
-			goto fill;
+			goto fill_l;
 
 		case UPNS_ID_BL_GB_BTYPE_2_18: /*repeat "0" 11-138 times */
 			r = read_bits(inf, 7, &tu);
@@ -624,7 +624,7 @@ _lws_upng_inflate_data(inflator_ctx_t *inf)
 				return r;
 			count = tu + 11;
 			val = 0;
-fill:
+fill_l:
 
 			if (inf->i + count > inf->hlit + inf->hdist) {
 				lwsl_err("%s: inf->i (%d) > %d\n", __func__,
@@ -730,10 +730,24 @@ fill:
 
 			inf->distance += tu;
 
-			if (inf->distance > inf->info_size) {
-				lwsl_err("%s: distance %lu\n", __func__,
-						(unsigned long)inf->distance);
-				assert(0);
+			/*
+			 * RFC1951: a match may not reference further back than
+			 * the number of bytes we already produced, ie, "invalid
+			 * distance too far back".  Without this, the first
+			 * bytes of the stream can copy out of the part of the
+			 * sliding window we never wrote, leaking uninitialized
+			 * heap into the decode output.  It must also not exceed
+			 * the sliding window itself, since anything older than
+			 * that has already been overwritten in the ring.
+			 */
+
+			if (inf->distance > inf->outpos_linear ||
+			    inf->distance > inf->info_size) {
+				lwsl_err("%s: distance %lu too far back\n",
+					 __func__,
+					 (unsigned long)inf->distance);
+
+				return LWS_SRET_FATAL + 12;
 			}
 
 			/*
@@ -853,14 +867,11 @@ fill:
 
 			if (inf->gz_flags & 4)
 				inf->state = UPNS_ID_BL_GB_GZIP_SKIP_EXTRA_C1;
-			else
-			if (inf->gz_flags & 8)
+			else if (inf->gz_flags & 8)
 				inf->state = UPNS_ID_BL_GB_GZIP_SKIP_FILENAME;
-			else
-			if (inf->gz_flags & 16)
+			else if (inf->gz_flags & 16)
 				inf->state = UPNS_ID_BL_GB_GZIP_SKIP_COMMENT;
-			else
-			if (inf->gz_flags & 2) {
+			else if (inf->gz_flags & 2) {
 				inf->state = UPNS_ID_BL_GB_GZIP_SKIP_CRC;
 				inf->ctr = 2;
 			} else
@@ -901,11 +912,9 @@ fill:
 
 			if (inf->gz_flags & 8)
 				inf->state = UPNS_ID_BL_GB_GZIP_SKIP_FILENAME;
-			else
-			if (inf->gz_flags & 16)
+			else if (inf->gz_flags & 16)
 				inf->state = UPNS_ID_BL_GB_GZIP_SKIP_COMMENT;
-			else
-			if (inf->gz_flags & 2) {
+			else if (inf->gz_flags & 2) {
 				inf->state = UPNS_ID_BL_GB_GZIP_SKIP_CRC;
 				inf->ctr = 2;
 			} else
@@ -923,8 +932,7 @@ fill:
 
 			if (inf->gz_flags & 16)
 				inf->state = UPNS_ID_BL_GB_GZIP_SKIP_COMMENT;
-			else
-			if (inf->gz_flags & 2) {
+			else if (inf->gz_flags & 2) {
 				inf->state = UPNS_ID_BL_GB_GZIP_SKIP_CRC;
 				inf->ctr = 2;
 			} else

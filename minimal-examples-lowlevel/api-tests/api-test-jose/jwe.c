@@ -245,14 +245,7 @@ bail:
  * AES_128_CBC_HMAC_SHA_256 for content encryption.
  */
 
-/* "Live long and prosper." */
-static uint8_t
-
-ex_a2_ptext[] = {
-	76, 105, 118, 101, 32, 108, 111, 110,
-	103, 32, 97, 110, 100, 32,  112, 114,
-	111, 115, 112, 101, 114, 46
-}, *lws_jwe_ex_a2_jwk_json = (uint8_t *)
+static const char *lws_jwe_ex_a2_jwk_json =
 	"{"
 	 "\"kty\":\"RSA\","
 	 "\"n\":\"sXchDaQebHnPiGvyDOAT4saGEUetSyo9MKLOoWFsueri23bOdgWp4Dy1Wl"
@@ -283,9 +276,9 @@ ex_a2_ptext[] = {
 	 "\"qi\":\"eNho5yRBEBxhGBtQRww9QirZsB66TrfFReG_CcteI1aCneT0ELGhYlRlC"
 		 "tUkTRclIfuEPmNsNDPbLoLqqCVznFbvdB7x-Tl-m0l_eFTj2KiqwGqE9PZ"
 		 "B9nNTwMVvH3VRRSLWACvPnSiwP8N5Usy-WRXS-V7TbpxIhvepTfE0NNo\""
-	"}",
+	"}";
 
-*ex_a2_compact = (uint8_t *)
+static uint8_t *ex_a2_compact = (uint8_t *)
 	"eyJhbGciOiJSU0ExXzUiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0"
 	"."
 	"UGhIOguC7IuEvf_NPVaXsGMoLOmwvc1GyqlIKOK1nN94nHPoltGRhWhw7Zx0-kFm"
@@ -311,8 +304,8 @@ test_jwe_a2(struct lws_context *context)
 
 	lws_jwe_init(&jwe, context);
 
-	if (lws_jwk_import(&jwe.jwk, NULL, NULL, (char *)lws_jwe_ex_a2_jwk_json,
-			   strlen((char *)lws_jwe_ex_a2_jwk_json)) < 0) {
+	if (lws_jwk_import(&jwe.jwk, NULL, NULL, lws_jwe_ex_a2_jwk_json,
+			   strlen(lws_jwe_ex_a2_jwk_json)) < 0) {
 		lwsl_notice("%s: Failed to decode JWK test key\n", __func__);
 		goto bail;
 	}
@@ -326,27 +319,16 @@ test_jwe_a2(struct lws_context *context)
 		goto bail;
 	}
 
+	/*
+	 * The A.2 example uses "RSA1_5" for key encryption.  RSA1_5 was
+	 * removed from lws for security reasons, so it must be rejected at
+	 * JOSE parsing time rather than decrypted
+	 */
+
 	n = lws_jwe_auth_and_decrypt(&jwe, lws_concat_temp(temp, temp_len),
 				     &temp_len);
-		if (n == -2) {
-		lwsl_notice("%s: selftest skipped (unsupported algorithm)\n", __func__);
-		ret = 0;
-		goto bail;
-	}
-	if (n < 0) {
-		lwsl_err("%s: lws_jwe_auth_and_decrypt failed\n",
-			 __func__);
-		goto bail;
-	}
-
-	/* allowing for trailing padding, confirm the plaintext */
-	if (jwe.jws.map.len[LJWE_CTXT] < sizeof(ex_a2_ptext) ||
-	    lws_timingsafe_bcmp(jwe.jws.map.buf[LJWE_CTXT], ex_a2_ptext,
-			        sizeof(ex_a2_ptext))) {
-		lwsl_err("%s: plaintext AES decrypt wrong\n", __func__);
-		lwsl_hexdump_notice(ex_a2_ptext, sizeof(ex_a2_ptext));
-		lwsl_hexdump_notice(jwe.jws.map.buf[LJWE_CTXT],
-				    jwe.jws.map.len[LJWE_CTXT]);
+	if (n >= 0) {
+		lwsl_err("%s: RSA1_5 JWE was accepted\n", __func__);
 		goto bail;
 	}
 
@@ -368,8 +350,15 @@ bail:
  * the test above, and AES_128_CBC_HMAC_SHA_256 for content encryption.
  */
 
+/* RSA1_5 was removed from lws for security reasons, only RSA-OAEP */
+
 static const char *rsa256a128_jose =
-		"{ \"alg\":\"RSA1_5\",\"enc\":\"A128CBC-HS256\"}";
+		"{ \"alg\":\"RSA-OAEP\",\"enc\":\"A128CBC-HS256\"}";
+
+/* same, but the CEK is wrapped using OAEP with SHA-256 / MGF1 SHA-256 */
+
+static const char *rsa_oaep256_jose =
+		"{ \"alg\":\"RSA-OAEP-256\",\"enc\":\"A128CBC-HS256\"}";
 
 static uint8_t
 
@@ -515,7 +504,9 @@ r256a128_cek[] = {
 ;
 
 static int
-test_jwe_ra_ptext_1024(struct lws_context *context, char *jwk_txt, int jwk_len)
+test_jwe_ra_ptext_1024(struct lws_context *context, const char *jwk_txt,
+		       int jwk_len,
+		       const char *jose_hdr)
 {
 	char temp[4096], compact[4096];
 	struct lws_jwe jwe;
@@ -551,8 +542,8 @@ test_jwe_ra_ptext_1024(struct lws_context *context, char *jwk_txt, int jwk_len)
 		goto bail;
 	}
 
-	jwe.jws.map.buf[LJWE_JOSE] = rsa256a128_jose;
-	jwe.jws.map.len[LJWE_JOSE] = (uint32_t)strlen(rsa256a128_jose);
+	jwe.jws.map.buf[LJWE_JOSE] = (char *)jose_hdr;
+	jwe.jws.map.len[LJWE_JOSE] = (uint32_t)strlen(jose_hdr);
 
 	n = lws_jwe_parse_jose(&jwe.jose, jwe.jws.map.buf[LJWE_JOSE],
 			       (int)jwe.jws.map.len[LJWE_JOSE],
@@ -649,7 +640,7 @@ bail:
 }
 
 static const char *rsa256a192_jose =
-		"{ \"alg\":\"RSA1_5\",\"enc\":\"A192CBC-HS384\"}";
+		"{ \"alg\":\"RSA-OAEP\",\"enc\":\"A192CBC-HS384\"}";
 
 static const uint8_t r256a192_cek[] = {
 		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
@@ -662,7 +653,8 @@ static const uint8_t r256a192_cek[] = {
 ;
 
 static int
-test_jwe_r256a192_ptext(struct lws_context *context, char *jwk_txt, int jwk_len)
+test_jwe_r256a192_ptext(struct lws_context *context, const char *jwk_txt,
+			  int jwk_len)
 {
 	struct lws_jwe jwe;
 	char temp[4096], compact[4096];
@@ -799,7 +791,7 @@ bail:
 
 
 static const char *rsa256a256_jose =
-		"{ \"alg\":\"RSA1_5\",\"enc\":\"A256CBC-HS512\"}";
+		"{ \"alg\":\"RSA-OAEP\",\"enc\":\"A256CBC-HS512\"}";
 
 static const uint8_t r256a256_cek[] = {
 		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
@@ -814,7 +806,8 @@ static const uint8_t r256a256_cek[] = {
 ;
 
 static int
-test_jwe_r256a256_ptext(struct lws_context *context, char *jwk_txt, int jwk_len)
+test_jwe_r256a256_ptext(struct lws_context *context, const char *jwk_txt,
+			  int jwk_len)
 {
 	struct lws_jwe jwe;
 	char temp[4096], compact[4096];
@@ -1136,8 +1129,8 @@ test_jwe_r256a128_jwe_openssl(struct lws_context *context)
 
 	lws_jwe_init(&jwe, context);
 
-	if (lws_jwk_import(&jwe.jwk, NULL, NULL, (char *)lws_jwe_ex_a2_jwk_json,
-			   strlen((char *)lws_jwe_ex_a2_jwk_json)) < 0) {
+	if (lws_jwk_import(&jwe.jwk, NULL, NULL, lws_jwe_ex_a2_jwk_json,
+			   strlen(lws_jwe_ex_a2_jwk_json)) < 0) {
 		lwsl_notice("%s: Failed to decode JWK test key\n", __func__);
 		goto bail;
 	}
@@ -1151,27 +1144,15 @@ test_jwe_r256a128_jwe_openssl(struct lws_context *context)
 		goto bail;
 	}
 
+	/*
+	 * This is a fixed RSA1_5 ciphertext... RSA1_5 was removed from lws
+	 * for security reasons, so it must be rejected rather than decrypted
+	 */
+
 	n = lws_jwe_auth_and_decrypt(&jwe, lws_concat_temp(temp, temp_len),
 				     &temp_len);
-		if (n == -2) {
-		lwsl_notice("%s: selftest skipped (unsupported algorithm)\n", __func__);
-		ret = 0;
-		goto bail;
-	}
-	if (n < 0) {
-		lwsl_err("%s: lws_jwe_auth_and_decrypt failed\n",
-			 __func__);
-		goto bail;
-	}
-
-	/* allowing for trailing padding, confirm the plaintext */
-	if (jwe.jws.map.len[LJWE_CTXT] < sizeof(ra_ptext_1024) ||
-	    lws_timingsafe_bcmp(jwe.jws.map.buf[LJWE_CTXT], ra_ptext_1024,
-			        sizeof(ra_ptext_1024))) {
-		lwsl_err("%s: plaintext RSA/AES decrypt wrong\n", __func__);
-		lwsl_hexdump_notice(ra_ptext_1024, sizeof(ra_ptext_1024));
-		lwsl_hexdump_notice(jwe.jws.map.buf[LJWE_CTXT],
-				    jwe.jws.map.len[LJWE_CTXT]);
+	if (n >= 0) {
+		lwsl_err("%s: RSA1_5 JWE was accepted\n", __func__);
 		goto bail;
 	}
 
@@ -1232,8 +1213,8 @@ test_jwe_r256a128_jwe_mbedtls(struct lws_context *context)
 
 	lws_jwe_init(&jwe, context);
 
-	if (lws_jwk_import(&jwe.jwk, NULL, NULL, (char *)lws_jwe_ex_a2_jwk_json,
-			   strlen((char *)lws_jwe_ex_a2_jwk_json)) < 0) {
+	if (lws_jwk_import(&jwe.jwk, NULL, NULL, lws_jwe_ex_a2_jwk_json,
+			   strlen(lws_jwe_ex_a2_jwk_json)) < 0) {
 		lwsl_notice("%s: Failed to decode JWK test key\n", __func__);
 		goto bail;
 	}
@@ -1247,27 +1228,15 @@ test_jwe_r256a128_jwe_mbedtls(struct lws_context *context)
 		goto bail;
 	}
 
+	/*
+	 * This is a fixed RSA1_5 ciphertext... RSA1_5 was removed from lws
+	 * for security reasons, so it must be rejected rather than decrypted
+	 */
+
 	n = lws_jwe_auth_and_decrypt(&jwe, lws_concat_temp(temp, temp_len),
 				     &temp_len);
-		if (n == -2) {
-		lwsl_notice("%s: selftest skipped (unsupported algorithm)\n", __func__);
-		ret = 0;
-		goto bail;
-	}
-	if (n < 0) {
-		lwsl_err("%s: lws_jwe_auth_and_decrypt failed\n",
-			 __func__);
-		goto bail;
-	}
-
-	/* allowing for trailing padding, confirm the plaintext */
-	if (jwe.jws.map.len[LJWE_CTXT] < sizeof(ra_ptext_1024) ||
-	    lws_timingsafe_bcmp(jwe.jws.map.buf[LJWE_CTXT], ra_ptext_1024,
-			        sizeof(ra_ptext_1024))) {
-		lwsl_err("%s: plaintext RSA/AES decrypt wrong\n", __func__);
-		lwsl_hexdump_notice(ra_ptext_1024, sizeof(ra_ptext_1024));
-		lwsl_hexdump_notice(jwe.jws.map.buf[LJWE_CTXT],
-				    jwe.jws.map.len[LJWE_CTXT]);
+	if (n >= 0) {
+		lwsl_err("%s: RSA1_5 JWE was accepted\n", __func__);
 		goto bail;
 	}
 
@@ -1294,6 +1263,7 @@ bail:
  */
 
 /* "Live long and prosper." */
+#if !defined(LWS_WITH_BEARSSL)
 static uint8_t
 
 ex_a3_ptext[] = {
@@ -1319,6 +1289,11 @@ ex_a3_ptext[] = {
 	"}"
 ;
 
+/*
+ * A3 uses RSA1_5 / AES Key Wrap, which have no BearSSL pieces (they
+ * fail with their own logs there); the subtest is compiled out on
+ * that backend
+ */
 static int
 test_jwe_a3(struct lws_context *context)
 {
@@ -1378,6 +1353,7 @@ bail:
 
 	return ret;
 }
+#endif /* !BEARSSL */
 
 /* JWA B.2.  Test Cases for AES_192_CBC_HMAC_SHA_384
  *
@@ -1880,6 +1856,13 @@ static const char
 
 *ecdhes_t1_jose_hdr_esakw128_128 =
 	"{\"alg\":\"ECDH-ES+A128KW\",\"enc\":\"A128CBC-HS256\"}",
+/*
+ * The same with PartyUInfo / PartyVInfo, which go into the Concat KDF on
+ * both sides: a KDF that mishandles them makes a CEK that decrypts nothing
+ */
+*ecdhes_t1_jose_hdr_esakw128_128_apuv =
+	"{\"alg\":\"ECDH-ES+A128KW\",\"enc\":\"A128CBC-HS256\","
+	 "\"apu\":\"QWxpY2U\",\"apv\":\"Qm9i\"}",
 
 *ecdhes_t1_jose_hdr_esakw192_192 =
 	"{\"alg\":\"ECDH-ES+A192KW\",\"enc\":\"A192CBC-HS384\"}",
@@ -1899,6 +1882,17 @@ test_ecdhes_t1(struct lws_context *context, const char *jose_hdr,
 	int n, ret = -1, temp_len = sizeof(temp);
 	struct lws_jwe jwe;
 
+#if defined(LWS_WITH_BEARSSL)
+	/*
+	 * ECDH-ES key wrap needs AES Key Wrap pieces BearSSL does not
+	 * provide (it fails with its own logs there)
+	 */
+	(void)context; (void)jose_hdr; (void)peer_pubkey; (void)peer_privkey;
+	lwsl_notice("%s: skipped on BearSSL (no AES Key Wrap pieces)\n",
+		    __func__);
+	return 0;
+#endif
+
 	lws_jwe_init(&jwe, context);
 
 	/* read and interpret our canned JOSE header, setting the algorithm */
@@ -1908,8 +1902,13 @@ test_ecdhes_t1(struct lws_context *context, const char *jose_hdr,
 				jose_hdr, strlen(jose_hdr), 0))
 		goto bail;
 
+	/*
+	 * The parse decodes b64 members (apu, apv) into the temp space it is
+	 * given: that has to be the free part of temp, not its start, where
+	 * the JOSE copy just made lives
+	 */
 	if (lws_jwe_parse_jose(&jwe.jose, jose_hdr, (int)strlen(jose_hdr),
-			       temp, &temp_len) < 0) {
+			       lws_concat_temp(temp, temp_len), &temp_len) < 0) {
 		lwsl_err("%s: JOSE parse failed\n", __func__);
 
 		goto bail;
@@ -2031,10 +2030,444 @@ bail:
 	return ret;
 }
 
+/*
+ * F-029: the KW branch of the ECDH-ES decrypt path used to unwrap an
+ * attacker-chosen EKEY of any length into a fixed 512-byte stack buffer
+ * before any authentication.  A JWE carrying an oversized encrypted_key must
+ * be rejected cleanly.
+ */
+
+static int
+test_ecdhes_ekey_oversize(struct lws_context *context)
+{
+	/* RFC3394 unwrap emits len - 8 bytes: this overflows shared_secret[] */
+	uint8_t big_ekey[LWS_JWE_LIMIT_KEY_ELEMENT_BYTES + 8 * 8];
+	char temp[4096], compact[2048], b64[1024], tampered[4096], *p1, *p2;
+	struct lws_jwe jwe;
+	int n, m, ret = -1, temp_len = sizeof(temp);
+
+	lws_jwe_init(&jwe, context);
+
+#if defined(LWS_WITH_BEARSSL)
+	/*
+	 * building the valid ECDH-ES + KW JWE this fence tampers with needs
+	 * AES Key Wrap pieces BearSSL does not provide
+	 */
+	(void)context;
+	lwsl_notice("%s: skipped on BearSSL (no AES Key Wrap pieces)\n",
+		    __func__);
+	return 0;
+#endif
+
+	/* create a valid ECDH-ES + AESKW JWE for the peer public key */
+
+	if (lws_jws_dup_element(&jwe.jws.map, LJWS_JOSE,
+				lws_concat_temp(temp, temp_len), &temp_len,
+				ecdhes_t1_jose_hdr_esakw128_128,
+				strlen(ecdhes_t1_jose_hdr_esakw128_128), 0))
+		goto bail;
+
+	if (lws_jwe_parse_jose(&jwe.jose, ecdhes_t1_jose_hdr_esakw128_128,
+			       (int)strlen(ecdhes_t1_jose_hdr_esakw128_128),
+			       temp, &temp_len) < 0) {
+		lwsl_err("%s: JOSE parse failed\n", __func__);
+
+		goto bail;
+	}
+
+	if (lws_jwk_import(&jwe.jwk, NULL, NULL, ecdhes_t1_peer_p256_public_key,
+			   strlen(ecdhes_t1_peer_p256_public_key)) < 0) {
+		lwsl_notice("%s: Failed to decode JWK test key\n", __func__);
+		goto bail;
+	}
+
+	if (lws_jws_dup_element(&jwe.jws.map, LJWE_CTXT,
+				lws_concat_temp(temp, temp_len), &temp_len,
+				ecdhes_t1_plaintext,
+				strlen(ecdhes_t1_plaintext),
+				lws_gencrypto_padded_length(LWS_AES_CBC_BLOCKLEN,
+						strlen(ecdhes_t1_plaintext)))) {
+		lwsl_notice("%s: Not enough temp space for ptext\n", __func__);
+		goto bail;
+	}
+
+	n = lws_jwe_encrypt(&jwe, lws_concat_temp(temp, temp_len), &temp_len);
+		if (n == -2) {
+			lwsl_notice("%s: selftest skipped (unsupported algorithm)\n", __func__);
+			ret = 0;
+			goto bail;
+		}
+		if (n < 0) {
+			lwsl_err("%s: lws_jwe_encrypt failed\n", __func__);
+			goto bail;
+		}
+
+	n = lws_jwe_render_compact(&jwe, compact, sizeof(compact));
+	if (n < 0) {
+		lwsl_err("%s: lws_jwe_render_compact failed: %d\n",
+			 __func__, n);
+		goto bail;
+	}
+
+	/*
+	 * Tamper with it the way an attacker would: swap the EKEY (the second
+	 * of the five compact elements) for an oversized one.  It doesn't need
+	 * to be a valid wrapped key, the attack is the attacker-controlled
+	 * unwrapped length.
+	 */
+
+	memset(big_ekey, 0xa5, sizeof(big_ekey));
+	if (lws_b64_encode_string_url((const char *)big_ekey,
+				      (int)sizeof(big_ekey), b64,
+				      (int)sizeof(b64)) < 0) {
+		lwsl_err("%s: b64 encode failed\n", __func__);
+		goto bail;
+	}
+
+	p1 = strchr(compact, '.');
+	p2 = p1 ? strchr(p1 + 1, '.') : NULL;
+	if (!p2) {
+		lwsl_err("%s: bad compact serialization\n", __func__);
+		goto bail;
+	}
+
+	m = lws_snprintf(tampered, sizeof(tampered), "%.*s.%s%s",
+			 (int)(p1 - compact), compact, b64, p2);
+
+	/* try to decrypt the tampered form as the recipient, with our privkey */
+
+	lws_jwe_destroy(&jwe);
+	temp_len = sizeof(temp);
+	lws_jwe_init(&jwe, context);
+
+	if (lws_jwk_import(&jwe.jwk, NULL, NULL,
+			   ecdhes_t1_peer_p256_private_key,
+			   strlen(ecdhes_t1_peer_p256_private_key)) < 0) {
+		lwsl_notice("%s: Failed to decode JWK test key\n", __func__);
+		goto bail;
+	}
+
+	if (lws_jws_compact_decode(tampered, m, &jwe.jws.map, &jwe.jws.map_b64,
+				   temp, &temp_len) != 5) {
+		lwsl_err("%s: lws_jws_compact_decode failed\n", __func__);
+		goto bail;
+	}
+
+	n = lws_jwe_auth_and_decrypt(&jwe, lws_concat_temp(temp, temp_len),
+				     &temp_len);
+	if (n >= 0) {
+		lwsl_err("%s: oversized EKEY accepted\n", __func__);
+		goto bail;
+	}
+
+	ret = 0;
+
+bail:
+	lws_jwe_destroy(&jwe);
+	if (ret)
+		lwsl_err("%s: selftest failed +++++++++++++++++++\n", __func__);
+	else
+		lwsl_notice("%s: selftest OK\n", __func__);
+
+	return ret;
+}
+
+/*
+ * F-030: every decrypt error path after the backend EC context is created
+ * used to leak that context (~5KB/attempt with the openssl backend).  An
+ * attacker-controlled malformed epk in the protected header is the cheapest
+ * way to reach those paths, so hammer three variants of it: the decrypt must
+ * fail cleanly each time and (in ASAN/LSan builds) leave nothing behind.
+ * F-040 adds the third variant: the epk element lengths were never checked
+ * against the curve, and the v4/PSA import read Y using X's length.
+ */
+
+static int
+test_ecdhes_malformed_epk(struct lws_context *context)
+{
+	/* valid EC shape, but 1 byte short of P-256's x length */
+	uint8_t bad_x[31];
+	/* F-040: full-length x with a 1-byte y */
+	uint8_t bad_y[1];
+	/* P-256-sized coordinates that are not a point on the curve */
+	uint8_t offcurve_xy[32];
+	char jose[384], x_b64[64], y_b64[64], jose_b64[512], compact[2048],
+	     tampered[2048], temp[4096], *p1;
+	struct lws_jwe jwe;
+	int n, m, ret = -1, temp_len = sizeof(temp), variant, nloops;
+	const uint8_t *xp, *yp;
+	size_t xl, yl;
+
+	lws_jwe_init(&jwe, context);
+
+#if defined(LWS_WITH_BEARSSL)
+	/*
+	 * building the valid ECDH-ES + KW JWE this fence tampers with
+	 * needs AES Key Wrap pieces BearSSL does not provide
+	 */
+	(void)context;
+	lwsl_notice("%s: skipped on BearSSL (no AES Key Wrap pieces)\n",
+		    __func__);
+	return 0;
+#endif
+
+	/* create a valid ECDH-ES + AESkw JWE for the peer public key */
+
+	if (lws_jws_dup_element(&jwe.jws.map, LJWS_JOSE,
+				lws_concat_temp(temp, temp_len), &temp_len,
+				ecdhes_t1_jose_hdr_esakw128_128,
+				strlen(ecdhes_t1_jose_hdr_esakw128_128), 0))
+		goto bail;
+
+	if (lws_jwe_parse_jose(&jwe.jose, ecdhes_t1_jose_hdr_esakw128_128,
+			       (int)strlen(ecdhes_t1_jose_hdr_esakw128_128),
+			       temp, &temp_len) < 0) {
+		lwsl_err("%s: JOSE parse failed\n", __func__);
+
+		goto bail;
+	}
+
+	if (lws_jwk_import(&jwe.jwk, NULL, NULL, ecdhes_t1_peer_p256_public_key,
+			   strlen(ecdhes_t1_peer_p256_public_key)) < 0) {
+		lwsl_notice("%s: Failed to decode JWK test key\n", __func__);
+		goto bail;
+	}
+
+	if (lws_jws_dup_element(&jwe.jws.map, LJWE_CTXT,
+				lws_concat_temp(temp, temp_len), &temp_len,
+				ecdhes_t1_plaintext,
+				strlen(ecdhes_t1_plaintext),
+				lws_gencrypto_padded_length(LWS_AES_CBC_BLOCKLEN,
+						strlen(ecdhes_t1_plaintext)))) {
+		lwsl_notice("%s: Not enough temp space for ptext\n", __func__);
+		goto bail;
+	}
+
+	n = lws_jwe_encrypt(&jwe, lws_concat_temp(temp, temp_len), &temp_len);
+		if (n == -2) {
+			lwsl_notice("%s: selftest skipped (unsupported algorithm)\n", __func__);
+			ret = 0;
+			goto bail;
+		}
+		if (n < 0) {
+			lwsl_err("%s: lws_jwe_encrypt failed\n", __func__);
+			goto bail;
+		}
+
+	n = lws_jwe_render_compact(&jwe, compact, sizeof(compact));
+	if (n < 0) {
+		lwsl_err("%s: lws_jwe_render_compact failed: %d\n",
+			 __func__, n);
+		goto bail;
+	}
+
+	/*
+	 * Keep the four compact elements after the protected header from the
+	 * valid JWE, and swap in our own protected header with the malformed
+	 * epk, the way an attacker would
+	 */
+
+	p1 = strchr(compact, '.');
+	if (!p1) {
+		lwsl_err("%s: bad compact serialization\n", __func__);
+		goto bail;
+	}
+
+	memset(bad_x, 0x11, sizeof(bad_x));
+	memset(offcurve_xy, 0xa5, sizeof(offcurve_xy));
+
+	for (variant = 0; variant < 3; variant++) {
+
+		/*
+		 * variant 0: x 1 byte short of the curve length
+		 * variant 1: full-length x and y, but not a curve point
+		 * variant 2 (F-040): full-length x with a 1-byte y
+		 */
+
+		xp = offcurve_xy;
+		xl = sizeof(offcurve_xy);
+		yp = offcurve_xy;
+		yl = sizeof(offcurve_xy);
+
+		if (!variant) {
+			xp = bad_x;
+			xl = sizeof(bad_x);
+		}
+		if (variant == 2) {
+			yp = bad_y;
+			yl = sizeof(bad_y);
+		}
+
+		if (lws_b64_encode_string_url((const char *)yp, (int)yl,
+					      y_b64, (int)sizeof(y_b64)) < 0 ||
+		    lws_b64_encode_string_url((const char *)xp, (int)xl,
+					      x_b64, (int)sizeof(x_b64)) < 0) {
+			lwsl_err("%s: b64 encode failed\n", __func__);
+			goto bail;
+		}
+
+		lws_snprintf(jose, sizeof(jose),
+			     "{\"alg\":\"ECDH-ES+A128KW\",\"enc\":\"A128CBC-HS256\","
+			     "\"epk\":{\"kty\":\"EC\",\"crv\":\"P-256\","
+			     "\"x\":\"%s\",\"y\":\"%s\"}}", x_b64, y_b64);
+
+		if (lws_b64_encode_string_url(jose, (int)strlen(jose), jose_b64,
+					      (int)sizeof(jose_b64)) < 0) {
+			lwsl_err("%s: b64 encode failed\n", __func__);
+			goto bail;
+		}
+
+		m = lws_snprintf(tampered, sizeof(tampered), "%s%s",
+				 jose_b64, p1);
+
+		/*
+		 * Repeatedly try to decrypt it as the recipient with our
+		 * private key: each attempt fails at epk import, and none
+		 * may leak the backend EC context on the way out
+		 */
+
+		for (nloops = 0; nloops < 8; nloops++) {
+
+			lws_jwe_destroy(&jwe);
+			temp_len = sizeof(temp);
+			lws_jwe_init(&jwe, context);
+
+			if (lws_jwk_import(&jwe.jwk, NULL, NULL,
+					   ecdhes_t1_peer_p256_private_key,
+					   strlen(ecdhes_t1_peer_p256_private_key)) < 0) {
+				lwsl_notice("%s: Failed to decode JWK test key\n",
+					    __func__);
+				goto bail;
+			}
+
+			if (lws_jws_compact_decode(tampered, m, &jwe.jws.map,
+						   &jwe.jws.map_b64, temp,
+						   &temp_len) != 5) {
+				lwsl_err("%s: lws_jws_compact_decode failed\n",
+					 __func__);
+				goto bail;
+			}
+
+			n = lws_jwe_auth_and_decrypt(&jwe,
+					lws_concat_temp(temp, temp_len),
+					&temp_len);
+			if (n >= 0) {
+				lwsl_err("%s: malformed epk accepted (variant %d)\n",
+					 __func__, variant);
+				goto bail;
+			}
+		}
+	}
+
+	ret = 0;
+
+bail:
+	lws_jwe_destroy(&jwe);
+	if (ret)
+		lwsl_err("%s: selftest failed +++++++++++++++++++\n", __func__);
+	else
+		lwsl_notice("%s: selftest OK\n", __func__);
+
+	return ret;
+}
+
+/*
+ * F-031: the create-side apis used to deref jose.alg / jose.enc_alg without
+ * confirming the JOSE parse had actually set them.  An app-supplied header
+ * missing "alg" (encrypt path) or "enc" (flattened render path) must be
+ * failed cleanly rather than dereferencing NULL.
+ */
+
+static const char
+	*jwe_cg_jose_no_alg = "{\"enc\":\"A128GCM\"}",
+	*jwe_cg_jose_no_enc = "{\"alg\":\"A128KW\"}",
+
+	/* Alice's ephemeral P-256 key from JWA appendix C, but no "alg" */
+	*jwe_cg_jose_no_alg_epk =
+		"{\"enc\":\"A128GCM\",\"epk\":{\"kty\":\"EC\",\"crv\":\"P-256\","
+		"\"x\":\"gI0GAILBdu7T53akrFmMyGcsF3n5dO7MmwNBHKW5SV0\","
+		"\"y\":\"SLW_xSffzlPWrHEVI30DHM_4egVwt3NQqeUD7nMFpps\"}}"
+;
+
+static int
+test_jwe_create_side_guards(struct lws_context *context)
+{
+	struct lws_jwe jwe;
+	char temp[2048], out[2048];
+	int n, ret = -1, temp_len = sizeof(temp);
+
+	lws_jwe_init(&jwe, context);
+
+	/* the parse accepts a header with no "alg": jose.alg stays NULL */
+
+	jwe.jws.map.buf[LJWS_JOSE] = (char *)jwe_cg_jose_no_alg;
+	jwe.jws.map.len[LJWS_JOSE] = (uint32_t)strlen(jwe_cg_jose_no_alg);
+
+	n = lws_jwe_encrypt(&jwe, lws_concat_temp(temp, temp_len), &temp_len);
+	if (n >= 0) {
+		lwsl_err("%s: alg-less JOSE header accepted by encrypt\n",
+			 __func__);
+		goto bail;
+	}
+
+	/* "alg" without "enc": jose.enc_alg stays NULL for the render */
+
+	lws_jwe_destroy(&jwe);
+	lws_jwe_init(&jwe, context);
+	temp_len = sizeof(temp);
+
+	if (lws_jwe_parse_jose(&jwe.jose, jwe_cg_jose_no_enc,
+			       (int)strlen(jwe_cg_jose_no_enc), temp,
+			       &temp_len) < 0) {
+		lwsl_err("%s: JOSE parse failed\n", __func__);
+		goto bail;
+	}
+
+	n = lws_jwe_render_flattened(&jwe, out, sizeof(out));
+	if (n >= 0) {
+		lwsl_err("%s: enc-less JOSE header accepted by render\n",
+			 __func__);
+		goto bail;
+	}
+
+	/*
+	 * Same as the first case but with an epk in the header: the parse
+	 * heap-allocates the ephemeral key elements, the reject must leave
+	 * them for the caller's lws_jwe_destroy() (no leak in LSan builds)
+	 */
+
+	lws_jwe_destroy(&jwe);
+	lws_jwe_init(&jwe, context);
+	temp_len = sizeof(temp);
+
+	jwe.jws.map.buf[LJWS_JOSE] = (char *)jwe_cg_jose_no_alg_epk;
+	jwe.jws.map.len[LJWS_JOSE] = (uint32_t)strlen(jwe_cg_jose_no_alg_epk);
+
+	n = lws_jwe_encrypt(&jwe, lws_concat_temp(temp, temp_len), &temp_len);
+	if (n >= 0) {
+		lwsl_err("%s: alg-less JOSE header with epk accepted\n",
+			 __func__);
+		goto bail;
+	}
+
+	ret = 0;
+
+bail:
+	lws_jwe_destroy(&jwe);
+	if (ret)
+		lwsl_err("%s: selftest failed +++++++++++++++++++\n", __func__);
+	else
+		lwsl_notice("%s: selftest OK\n", __func__);
+
+	return ret;
+}
+
 /* AES Key Wrap and AES_XXX_CBC_HMAC_SHA_YYY variations
  *
  * These were created using the node-jose node.js package
  */
+#if !defined(LWS_WITH_BEARSSL)
+/* AES Key Wrap needs pieces the BearSSL backend does not provide */
 static const char
 	*akw_ptext = "plaintext0123456",
 	*akw_ct_128_128 = "eyJhbGciOiJBMTI4S1ciLCJlbmMiOiJBMTI4Q0JDLUhTMjU2Ii"
@@ -2155,7 +2588,7 @@ test_akw_encrypt(struct lws_context *context, const char *test_name,
 		 const char *key, char *compact, int compact_len)
 {
 	struct lws_jwe jwe;
-	char temp[4096];
+	char temp[4096], flat[2048];
 	int ret = -1, n, temp_len = sizeof(temp);
 
 	lws_jwe_init(&jwe, context);
@@ -2218,6 +2651,23 @@ test_akw_encrypt(struct lws_context *context, const char *test_name,
 		goto bail;
 	}
 
+	/*
+	 * C-633: the flattened serialization's unprotected header must not
+	 * carry the key-encryption key, which is all a symmetric jwk is
+	 */
+
+	n = lws_jwe_render_flattened(&jwe, flat, sizeof(flat));
+	if (n < 0) {
+		lwsl_err("%s: lws_jwe_render_flattened failed: %d\n",
+			 __func__, n);
+		goto bail;
+	}
+	if (strstr(flat, "\"jwk\"") || strstr(flat, "\"k\"")) {
+		lwsl_err("%s: flattened JWE header carries the KEK\n",
+			 __func__);
+		goto bail;
+	}
+
 	n = lws_jwe_render_compact(&jwe, compact, (unsigned int)compact_len);
 		if (n == -2) {
 		lwsl_notice("%s: selftest skipped (unsupported algorithm)\n", __func__);
@@ -2241,6 +2691,7 @@ bail:
 
 	return ret;
 }
+#endif /* !BEARSSL */
 
 /*
  * Check we can handle multi-recipient JWE
@@ -2285,6 +2736,17 @@ test_jwe_json_complete(struct lws_context *context)
 	char temp[4096];
 	int ret = -1, temp_len = sizeof(temp);
 
+#if defined(LWS_WITH_BEARSSL)
+	/*
+	 * this uses ECDH-ES key wrap, which needs AES Key Wrap pieces
+	 * BearSSL does not provide
+	 */
+	(void)context; (void)temp; (void)temp_len;
+	lwsl_notice("%s: skipped on BearSSL (no AES Key Wrap pieces)\n",
+		    __func__);
+	return 0;
+#endif
+
 	lws_jwe_init(&jwe, context);
 
 	if (lws_jwe_parse_jose(&jwe.jose, complete, (int)strlen(complete),
@@ -2315,7 +2777,9 @@ bail:
 int
 test_jwe(struct lws_context *context)
 {
+#if !defined(LWS_WITH_BEARSSL)
 	char compact[4096];
+#endif
 	int n = 0;
 
 	n |= test_jwe_json_complete(context) < 0;
@@ -2333,6 +2797,9 @@ test_jwe(struct lws_context *context)
 	n |= test_ecdhes_t1(context, ecdhes_t1_jose_hdr_esakw128_128,
 			    ecdhes_t1_peer_p256_public_key,
 			    ecdhes_t1_peer_p256_private_key) < 0;
+	n |= test_ecdhes_t1(context, ecdhes_t1_jose_hdr_esakw128_128_apuv,
+			    ecdhes_t1_peer_p256_public_key,
+			    ecdhes_t1_peer_p256_private_key) < 0;
 	n |= test_ecdhes_t1(context, ecdhes_t1_jose_hdr_esakw192_192,
 			    ecdhes_t1_peer_p384_public_key,
 			    ecdhes_t1_peer_p384_private_key) < 0;
@@ -2340,35 +2807,67 @@ test_jwe(struct lws_context *context)
 			    ecdhes_t1_peer_p521_public_key,
 			    ecdhes_t1_peer_p521_private_key) < 0;
 
+	/* F-029: oversized attacker EKEY must be rejected on decrypt */
+
+	n |= test_ecdhes_ekey_oversize(context) < 0;
+
+	/* F-030: malformed attacker epk must fail cleanly without leaking */
+
+	n |= test_ecdhes_malformed_epk(context) < 0;
+
+	/* F-031: create-side headers missing alg / enc must fail cleanly */
+
+	n |= test_jwe_create_side_guards(context) < 0;
+
 	n |= test_jwe_a1(context) < 0;
 
 	n |= test_jwe_a2(context) < 0;
 
-	n |= test_jwe_ra_ptext_1024(context, (char *)lws_jwe_ex_a2_jwk_json,
-				    (int)strlen((char *)lws_jwe_ex_a2_jwk_json)) < 0;
-	n |= test_jwe_r256a192_ptext(context, (char *)lws_jwe_ex_a2_jwk_json,
-			(int)strlen((char *)lws_jwe_ex_a2_jwk_json)) < 0;
-	n |= test_jwe_r256a256_ptext(context, (char *)lws_jwe_ex_a2_jwk_json,
-			(int)strlen((char *)lws_jwe_ex_a2_jwk_json)) < 0;
-	n |= test_jwe_ra_ptext_1024(context, (char *)rsa_key_2048,
-			(int)strlen((char *)rsa_key_2048)) < 0;
-	n |= test_jwe_r256a192_ptext(context, (char *)rsa_key_2048,
-			(int)strlen((char *)rsa_key_2048)) < 0;
-	n |= test_jwe_r256a256_ptext(context, (char *)rsa_key_2048,
-			(int)strlen((char *)rsa_key_2048)) < 0;
-	n |= test_jwe_ra_ptext_1024(context, (char *)rsa_key_4096,
-			(int)strlen((char *)rsa_key_4096)) < 0;
-	n |= test_jwe_r256a192_ptext(context, (char *)rsa_key_4096,
-			(int)strlen((char *)rsa_key_4096)) < 0;
-	n |= test_jwe_r256a256_ptext(context, (char *)rsa_key_4096,
-			(int)strlen((char *)rsa_key_4096)) < 0;
-	n |= test_jwe_ra_ptext_1024(context, (char *)rsa_key_4096_no_optional,
-			(int)strlen((char *)rsa_key_4096_no_optional)) < 0;
-	n |= test_jwe_r256a192_ptext(context, (char *)rsa_key_4096_no_optional,
-			(int)strlen((char *)rsa_key_4096_no_optional)) < 0;
-	n |= test_jwe_r256a256_ptext(context, (char *)rsa_key_4096_no_optional,
-			(int)strlen((char *)rsa_key_4096_no_optional)) < 0;
+	n |= test_jwe_ra_ptext_1024(context, lws_jwe_ex_a2_jwk_json,
+				    (int)strlen(lws_jwe_ex_a2_jwk_json),
+				    rsa256a128_jose) < 0;
+	n |= test_jwe_r256a192_ptext(context, lws_jwe_ex_a2_jwk_json,
+			(int)strlen(lws_jwe_ex_a2_jwk_json)) < 0;
+	n |= test_jwe_r256a256_ptext(context, lws_jwe_ex_a2_jwk_json,
+			(int)strlen(lws_jwe_ex_a2_jwk_json)) < 0;
+	n |= test_jwe_ra_ptext_1024(context, rsa_key_2048,
+			(int)strlen(rsa_key_2048),
+			rsa256a128_jose) < 0;
+	n |= test_jwe_ra_ptext_1024(context, rsa_key_2048,
+			(int)strlen(rsa_key_2048),
+			rsa_oaep256_jose) < 0;
+	n |= test_jwe_r256a192_ptext(context, rsa_key_2048,
+			(int)strlen(rsa_key_2048)) < 0;
+	n |= test_jwe_r256a256_ptext(context, rsa_key_2048,
+			(int)strlen(rsa_key_2048)) < 0;
+	n |= test_jwe_ra_ptext_1024(context, rsa_key_4096,
+			(int)strlen(rsa_key_4096),
+			rsa256a128_jose) < 0;
+	n |= test_jwe_r256a192_ptext(context, rsa_key_4096,
+			(int)strlen(rsa_key_4096)) < 0;
+	n |= test_jwe_r256a256_ptext(context, rsa_key_4096,
+			(int)strlen(rsa_key_4096)) < 0;
+#if !defined(LWS_WITH_BEARSSL)
+	/*
+	 * this jwk omits the optional CRT elements; BearSSL private ops
+	 * are CRT-only and fail with their own logs there
+	 */
+	n |= test_jwe_ra_ptext_1024(context, rsa_key_4096_no_optional,
+			(int)strlen(rsa_key_4096_no_optional),
+			rsa256a128_jose) < 0;
+	n |= test_jwe_r256a192_ptext(context, rsa_key_4096_no_optional,
+			(int)strlen(rsa_key_4096_no_optional)) < 0;
+	n |= test_jwe_r256a256_ptext(context, rsa_key_4096_no_optional,
+			(int)strlen(rsa_key_4096_no_optional)) < 0;
+#else
+	(void)rsa_key_4096_no_optional;
+#endif
 
+	/*
+	 * AESKW needs AES Key Wrap pieces the BearSSL backend does not
+	 * provide (it fails with its own logs there)
+	 */
+#if !defined(LWS_WITH_BEARSSL)
 	/* AESKW decrypt all variations */
 
 	n |= test_akw_decrypt(context, "d-a128kw_128", akw_ct_128_128, akw_key_128) < 0;
@@ -2430,10 +2929,17 @@ test_jwe(struct lws_context *context)
 		n |= test_akw_decrypt(context, "ed-256kw_256", compact, akw_key_256) < 0;
 	else
 		n |= 1;
+#endif /* !BEARSSL */
 
 	n |= test_jwe_r256a128_jwe_openssl(context) < 0;
 	n |= test_jwe_r256a128_jwe_mbedtls(context) < 0;
+	/*
+	 * a3 uses RSA1_5 key wrap; the BearSSL backend provides no PKCS#1
+	 * v1.5 data encrypt pieces, and fails with its own logs there
+	 */
+#if !defined(LWS_WITH_BEARSSL)
 	n |= test_jwe_a3(context) < 0;
+#endif
 	n |= test_jwa_b2(context) < 0;
 	n |= test_jwa_b3(context) < 0;
 	n |= test_jwa_c(context) < 0;

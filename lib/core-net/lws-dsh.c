@@ -51,7 +51,7 @@ struct lws_dsh_search {
 
 static int
 _lws_dsh_alloc_tail(lws_dsh_t *dsh, int kind, const void *src1, size_t size1,
-		    const void *src2, size_t size2, lws_dll2_t *replace);
+		    const void *src2, size_t size2);
 
 static size_t
 lws_dsh_align(size_t length)
@@ -108,6 +108,20 @@ lws_dsh_create(lws_dll2_owner_t *owner, size_t buf_len, int _count_kinds)
 	assert(buf_len);
 	assert(count_kinds > 1);
 	assert(buf_len > sizeof(lws_dsh_t) + oha_len);
+
+	/*
+	 * buf_len may have come from a policy or, for the serialized SS
+	 * client, from the proxy... it must be able to hold the initial free
+	 * object that lws_dsh_empty() places at the start of the buffer, and
+	 * it must not be able to wrap either the + 64 below or the malloc
+	 * length.  The asserts above are compiled out in production, so this
+	 * has to be checked at runtime.
+	 */
+
+	if (buf_len < sizeof(lws_dsh_obj_t) ||
+	    buf_len > (size_t)-1 - (64 + sizeof(lws_dsh_t) + oha_len))
+		return NULL;
+
 	buf_len += 64;
 
 	dsh = lws_malloc(sizeof(lws_dsh_t) + buf_len + oha_len, __func__);
@@ -217,7 +231,7 @@ lws_dsh_get_size(struct lws_dsh *dsh, int kind)
 
 static int
 _lws_dsh_alloc_tail(lws_dsh_t *dsh, int kind, const void *src1, size_t size1,
-		    const void *src2, size_t size2, lws_dll2_t *replace)
+		    const void *src2, size_t size2)
 {
 	size_t asize = sizeof(lws_dsh_obj_t) + lws_dsh_align(size1 + size2);
 	struct lws_dsh_search s;
@@ -240,7 +254,7 @@ _lws_dsh_alloc_tail(lws_dsh_t *dsh, int kind, const void *src1, size_t size1,
 	s.coalesce		= 0;
 	s.natural_required	= 0;
 	/* list is at the very start, so we can cast */
-	s.tail_obj		= (lws_dsh_obj_t *)dsh->oha[kind].owner.tail;
+	s.tail_obj		= (lws_dsh_obj_t *)lws_dll2_get_tail(&dsh->oha[kind].owner);
 
 	if (s.tail_obj) {
 
@@ -367,20 +381,9 @@ _lws_dsh_alloc_tail(lws_dsh_t *dsh, int kind, const void *src1, size_t size1,
 		if (src2)
 			memcpy((uint8_t *)&s.best[1] + size1, src2, size2);
 
-		if (replace) {
-			s.best->list.prev = replace->prev;
-			s.best->list.next = replace->next;
-			s.best->list.owner = replace->owner;
-			if (replace->prev)
-				replace->prev->next = &s.best->list;
-			if (replace->next)
-				replace->next->prev = &s.best->list;
-		} else {
-			assert(!(((unsigned long)(intptr_t)(s.best)) &
-					(sizeof(int *) - 1)));
-			lws_dll2_add_tail(&s.best->list,
-					&dsh->oha[kind].owner);
-		}
+		assert(!(((unsigned long)(intptr_t)(s.best)) &
+				(sizeof(int *) - 1)));
+		lws_dll2_add_tail(&s.best->list, &dsh->oha[kind].owner);
 
 		assert(s.dsh->locally_free >= s.best->asize);
 		s.dsh->locally_free -= s.best->asize;
@@ -406,6 +409,7 @@ _lws_dsh_alloc_tail(lws_dsh_t *dsh, int kind, const void *src1, size_t size1,
 
 		/* unlink the entire original hole object at s.best */
 		lws_dll2_remove(&s.best->list);
+		assert(s.dsh->locally_free >= s.best->asize);
 		s.dsh->locally_free -= s.best->asize;
 		s.dsh->locally_in_use += asize;
 
@@ -421,7 +425,13 @@ _lws_dsh_alloc_tail(lws_dsh_t *dsh, int kind, const void *src1, size_t size1,
 		assert(((uint8_t *)nf) + nf->asize <= e);
 
 		lws_dll2_add_sorted(&nf->list, &s.dsh->oha[0].owner, buf_compare);
-		s.dsh->locally_free += s.best->asize;
+		/*
+		 * only the rump part went back on the free list... adding back
+		 * the pre-split s.best->asize (it is only reduced to asize
+		 * below) overstated locally_free by asize on every split, and
+		 * lws_dsh_free() then added the same bytes a second time
+		 */
+		s.dsh->locally_free += nf->asize;
 
 		/* take over s.best as the new allocated object, fill it in */
 
@@ -440,22 +450,10 @@ _lws_dsh_alloc_tail(lws_dsh_t *dsh, int kind, const void *src1, size_t size1,
 		if (src2)
 			memcpy((uint8_t *)&s.best[1] + size1, src2, size2);
 
-		if (replace) {
-			s.best->list.prev = replace->prev;
-			s.best->list.next = replace->next;
-			s.best->list.owner = replace->owner;
-			if (replace->prev)
-				replace->prev->next = &s.best->list;
-			if (replace->next)
-				replace->next->prev = &s.best->list;
-		} else {
-			assert(!(((unsigned long)(intptr_t)(s.best)) &
-					(sizeof(int *) - 1)));
-			lws_dll2_add_tail(&s.best->list,
-					  &dsh->oha[kind].owner);
-		}
+		assert(!(((unsigned long)(intptr_t)(s.best)) &
+				(sizeof(int *) - 1)));
+		lws_dll2_add_tail(&s.best->list, &dsh->oha[kind].owner);
 
-		assert(s.dsh->locally_free >= asize);
 		dsh->oha[kind].total_size += asize;
 		assert(s.dsh->locally_in_use <= s.dsh->buffer_size);
 	}
@@ -469,6 +467,9 @@ int
 lws_dsh_alloc_tail(lws_dsh_t *dsh, int kind, const void *src1, size_t size1,
 		   const void *src2, size_t size2)
 {
+	lws_dsh_obj_t *rb_tail = (lws_dsh_obj_t *)
+				lws_dll2_get_tail(&dsh->oha[kind + 1].owner);
+	size_t rb_size = rb_tail ? rb_tail->size : 0;
 	int r;
 
 	do {
@@ -485,9 +486,40 @@ lws_dsh_alloc_tail(lws_dsh_t *dsh, int kind, const void *src1, size_t size1,
 				if (s1 + s2 > dsh->splitat)
 					s2 = dsh->splitat - s1;
 			}
-		r =  _lws_dsh_alloc_tail(dsh, kind, src1, s1, src2, s2, NULL);
-		if (r)
+		r =  _lws_dsh_alloc_tail(dsh, kind, src1, s1, src2, s2);
+		if (r) {
+			/*
+			 * A split write is several allocations, but the caller
+			 * takes any nonzero return to mean nothing at all was
+			 * queued.  If a later chunk failed we have to undo the
+			 * chunks we already committed, else the reader sends a
+			 * frame onward whose serialized length prefix does not
+			 * match the payload that follows it.
+			 */
+
+			while (lws_dll2_get_tail(&dsh->oha[kind + 1].owner) !=
+					(rb_tail ? &rb_tail->list : NULL)) {
+				lws_dsh_obj_t *o = (lws_dsh_obj_t *)
+					lws_dll2_get_tail(&dsh->oha[kind + 1].owner);
+				void *p = (void *)&o[1];
+
+				lws_dsh_free(&p);
+			}
+
+			/*
+			 * The first chunk may instead have been coalesced on
+			 * to the object that was already the tail... shrink it
+			 * back to what it held before.  What we appended stays
+			 * as slack inside its existing asize, which is what
+			 * all the accounting is done in, so nothing else has
+			 * to be unwound.
+			 */
+
+			if (rb_tail)
+				rb_tail->size = rb_size;
+
 			return r;
+		}
 		src1 = (void *)((uint8_t *)src1 + s1);
 		src2 = (void *)((uint8_t *)src2 + s2);
 		size1 -= s1;
@@ -500,19 +532,32 @@ lws_dsh_alloc_tail(lws_dsh_t *dsh, int kind, const void *src1, size_t size1,
 void
 lws_dsh_consume(struct lws_dsh *dsh, int kind, size_t len)
 {
-	lws_dsh_obj_t *h = (lws_dsh_obj_t *)dsh->oha[kind + 1].owner.head;
+	lws_dsh_obj_t *h = (lws_dsh_obj_t *)lws_dll2_get_head(&dsh->oha[kind + 1].owner);
+
+	if (!h)
+		return;
 
 	assert(len <= h->size);
-	assert(h->pos + len <= h->size);
 
-	if (len == h->size || h->pos + len == h->size) {
-		lws_dsh_free((void **)&h);
+	if (len >= h->size) {
+		/* lws_dsh_free() takes the payload pointer, not the header */
+		void *p = (void *)&h[1];
+
+		lws_dsh_free(&p);
+
 		return;
 	}
 
-	assert(0);
+	/*
+	 * Partial consume... shuffle what is left down to the front of the
+	 * object rather than tracking an offset in the object header, so the
+	 * pointer lws_dsh_get_head() hands out stays the object pointer that
+	 * the caller may later pass to lws_dsh_free().  asize is unchanged, so
+	 * no accounting moves.
+	 */
 
-	h->pos += len;
+	memmove(&h[1], (uint8_t *)&h[1] + len, h->size - len);
+	h->size -= len;
 }
 
 void
@@ -553,7 +598,7 @@ lws_dsh_free(void **pobj)
 	 * Because the free list is sorted, if there is such a guy he is
 	 * already our list.next */
 
-	_o2 = (lws_dsh_obj_t *)_o->list.next;
+	_o2 = (lws_dsh_obj_t *)lws_dll2_get_next(&_o->list);
 	if (_o2 && (uint8_t *)_o + _o->asize == (uint8_t *)_o2) {
 		/*
 		 * since we are freeing _obj, we can coalesce with a
@@ -571,7 +616,7 @@ lws_dsh_free(void **pobj)
 	 * Because the free list is sorted, if there is such a guy he is
 	 * already our list.prev */
 
-	_o2 = (lws_dsh_obj_t *)_o->list.prev;
+	_o2 = (lws_dsh_obj_t *)lws_dll2_get_prev(&_o->list);
 	if (_o2 && (uint8_t *)_o2 + _o2->asize == (uint8_t *)_o) {
 		/*
 		 * since we are freeing obj, we can coalesce it with

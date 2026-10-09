@@ -71,20 +71,31 @@ lws_genecdh_create(struct lws_genec_ctx *ctx, struct lws_context *context,
 		   const struct lws_ec_curves *curve_table)
 {
 	int nid = 0;
+	NTSTATUS status;
+
+	/* the caller must hand us a zeroed ctx; a still-live ctx is a misuse */
+	if (ctx->created_mark == LWS_GENEC_CTX_CREATED_MARK)
+		return -1;
+
+	memset(ctx, 0, sizeof(*ctx));
 
 	ctx->context = context;
 	ctx->curve_table = curve_table;
 	ctx->genec_alg = LEGENEC_ECDH;
-	ctx->u.hAlg = NULL;
-	ctx->u.hKey = NULL;
-	ctx->u.hKeyPeer = NULL;
 
 	if (curve_table && curve_table->name)
 		nid = curve_table->tls_lib_nid;
 
 	/* Open specific algorithm provider based on curve if known */
-	NTSTATUS status = BCryptOpenAlgorithmProvider(&ctx->u.hAlg, lws_schannel_get_curve_alg(nid, 0), NULL, 0);
-	return BCRYPT_SUCCESS(status) ? 0 : -1;
+	status = BCryptOpenAlgorithmProvider(&ctx->u.hAlg, lws_schannel_get_curve_alg(nid, 0), NULL, 0);
+	if (!BCRYPT_SUCCESS(status)) {
+		ctx->u.hAlg = NULL;
+		return -1;
+	}
+
+	ctx->created_mark = LWS_GENEC_CTX_CREATED_MARK;
+
+	return 0;
 }
 
 int
@@ -150,7 +161,10 @@ lws_genecdh_set_key(struct lws_genec_ctx *ctx, const struct lws_gencrypto_keyele
 	}
 
 	/* Close previous key if any */
-	if (*target_key_handle) BCryptDestroyKey(*target_key_handle);
+	if (*target_key_handle) {
+		BCryptDestroyKey(*target_key_handle);
+		*target_key_handle = NULL;
+	}
 
 	status = BCryptImportKeyPair(ctx->u.hAlg, NULL,
 		el[LWS_GENCRYPTO_EC_KEYEL_D].len ? BCRYPT_ECCPRIVATE_BLOB : BCRYPT_ECCPUBLIC_BLOB,
@@ -172,9 +186,15 @@ lws_genecdh_new_keypair(struct lws_genec_ctx *ctx, enum enum_lws_dh_side side,
 	uint8_t *p;
 
 	if (curve_name) {
-		if (strstr(curve_name, "256")) bits = 256;
-		else if (strstr(curve_name, "384")) bits = 384;
-		else if (strstr(curve_name, "521")) bits = 521;
+		if ((char *)strstr(curve_name, "256")) bits = 256;
+		else if ((char *)strstr(curve_name, "384")) bits = 384;
+		else if ((char *)strstr(curve_name, "521")) bits = 521;
+	}
+
+	/* last-set-wins: destroy any key already in the slot */
+	if (ctx->u.hKey) {
+		BCryptDestroyKey(ctx->u.hKey);
+		ctx->u.hKey = NULL;
 	}
 
 	status = BCryptGenerateKeyPair(ctx->u.hAlg, &ctx->u.hKey, bits, 0);
@@ -256,19 +276,31 @@ lws_genecdsa_create(struct lws_genec_ctx *ctx, struct lws_context *context,
 		    const struct lws_ec_curves *curve_table)
 {
 	int nid = 0;
+	NTSTATUS status;
+
+	/* the caller must hand us a zeroed ctx; a still-live ctx is a misuse */
+	if (ctx->created_mark == LWS_GENEC_CTX_CREATED_MARK)
+		return -1;
+
+	memset(ctx, 0, sizeof(*ctx));
 
 	ctx->context = context;
 	ctx->curve_table = curve_table;
 	ctx->genec_alg = LEGENEC_ECDSA;
-	ctx->u.hKey = NULL;
-	ctx->u.hKeyPeer = NULL;
 
 	if (curve_table && curve_table->name)
 		nid = curve_table->tls_lib_nid;
 
 	/* Default to P256 alg provider or specific if known */
-	NTSTATUS status = BCryptOpenAlgorithmProvider(&ctx->u.hAlg, lws_schannel_get_curve_alg(nid, 1), NULL, 0);
-	return BCRYPT_SUCCESS(status) ? 0 : -1;
+	status = BCryptOpenAlgorithmProvider(&ctx->u.hAlg, lws_schannel_get_curve_alg(nid, 1), NULL, 0);
+	if (!BCRYPT_SUCCESS(status)) {
+		ctx->u.hAlg = NULL;
+		return -1;
+	}
+
+	ctx->created_mark = LWS_GENEC_CTX_CREATED_MARK;
+
+	return 0;
 }
 
 int
@@ -311,9 +343,21 @@ lws_genecdsa_hash_sign_jws(struct lws_genec_ctx *ctx, const uint8_t *in,
 void
 lws_genec_destroy(struct lws_genec_ctx *ctx)
 {
-	if (ctx->u.hKey) BCryptDestroyKey(ctx->u.hKey);
-	if (ctx->u.hKeyPeer) BCryptDestroyKey(ctx->u.hKeyPeer);
-	if (ctx->u.hAlg) BCryptCloseAlgorithmProvider(ctx->u.hAlg, 0);
+	if (ctx->u.hKey) {
+		BCryptDestroyKey(ctx->u.hKey);
+		ctx->u.hKey = NULL;
+	}
+	if (ctx->u.hKeyPeer) {
+		BCryptDestroyKey(ctx->u.hKeyPeer);
+		ctx->u.hKeyPeer = NULL;
+	}
+	if (ctx->u.hAlg) {
+		BCryptCloseAlgorithmProvider(ctx->u.hAlg, 0);
+		ctx->u.hAlg = NULL;
+	}
+
+	ctx->has_private = 0;
+	ctx->created_mark = 0;
 }
 /*
 void

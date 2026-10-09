@@ -10,9 +10,16 @@
                                 "cd build && SAI_CPACK=\"-G RPM\" ${cpack}"
                         ]
 		},
+		"rocky9-ca/aarch64-a72a55-rk3588/clang": {
+			"default": false,
+                        "build": [
+                                "mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib cmake .. ${cmake}",
+                                "cd build && scan-build -o ./scan-results make -j$SAI_PARALLEL"
+                        ]
+		},
 		"netbsd-OSX-bigsur/x86_64-intel-i3/llvm": {
                         "build": [
-				"mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib MACOSX_DEPLOYMENT_TARGET=15.7 cmake .. -DCMAKE_MAKE_PROGRAM=/usr/bin/make ${cmake}",
+				"mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib MACOSX_DEPLOYMENT_TARGET=15.7 cmake .. -DCMAKE_MAKE_PROGRAM=/usr/bin/make -DLWS_GNUTLS_INCLUDE_DIRS=/usr/local/include -DLWS_GNUTLS_LIBRARIES=/usr/local/lib/libgnutls.dylib ${cmake}",
                                 "cd build && make -j$SAI_PARALLEL && rm -rf ../destdir && make -j$SAI_PARALLEL DESTDIR=../destdir install",
 				"cd build ; export LD_LIBRARY_PATH=\"$HOME/jobs/$SAI_VN/src/build/lib\" ; ctest -j$SAI_PARALLEL --output-on-failure --repeat until-pass:3",
                                 "cd build && SAI_CPACK=\"-G ZIP\" ${cpack}"
@@ -20,7 +27,7 @@
 		},
 		"netbsd-OSX-tahoe/aarch64-apple-m1/llvm": {
                         "build": [
-				"mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib MACOSX_DEPLOYMENT_TARGET=26 cmake .. -DCMAKE_MAKE_PROGRAM=/usr/bin/make ${cmake}",
+				"mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib MACOSX_DEPLOYMENT_TARGET=26 cmake .. -DCMAKE_MAKE_PROGRAM=/usr/bin/make -DLWS_GNUTLS_INCLUDE_DIRS=/System/Volumes/Data/opt/homebrew/Cellar/gnutls/3.8.13_2/include -DLWS_GNUTLS_LIBRARIES=/System/Volumes/Data/opt/homebrew/Cellar/gnutls/3.8.13_2/lib/libgnutls.dylib ${cmake}",
                                 "cd build && make -j$SAI_PARALLEL && rm -rf ../destdir && make -j$SAI_PARALLEL DESTDIR=../destdir install",
 				"cd build ; export LD_LIBRARY_PATH=\"$HOME/jobs/$SAI_VN/src/build/lib\" ; ctest -j$SAI_PARALLEL --output-on-failure --repeat until-pass:3",
                                 "cd build && SAI_CPACK=\"-G ZIP\" ${cpack}"
@@ -42,6 +49,14 @@
                                 "cd build && SAI_CPACK=\"-G RPM\" ${cpack}"
 			]
 		},
+		"linux-fedora44/x86_64-amd/gcc": {
+			"build": [
+				"mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib cmake .. ${cmake}",
+				"cd build && make -j$SAI_PARALLEL && rm -rf ../destdir && make -j$SAI_PARALLEL DESTDIR=../destdir install",
+				"cd build && LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib ctest -j$SAI_PARALLEL --output-on-failure --repeat until-pass:3",
+				"cd build && SAI_CPACK=\"-G RPM\" ${cpack}"
+			]
+		},
 		"linux-ubuntu-2404/aarch64-a72-bcm2711-rpi4/gcc": {
                         "build": [
 				"mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib cmake .. ${cmake}",
@@ -50,14 +65,29 @@
                                 "cd build && SAI_CPACK=\"-G DEB\" ${cpack}"
 			]
 		},
-                "netbsd/aarch64BE-bcm2837-a53/gcc": {
-                        "default": false,
+
+		"linux-debian13/x86_64-amd/gcc": {
+			"default": false,
                         "build": [
-				"mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib cmake .. ${cmake}",
-                                "cd build && make -j$SAI_PARALLEL && rm -rf ../destdir && make -j$SAI_PARALLEL DESTDIR=../destdir install",
-				"cd build && LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib /usr/pkg/bin/ctest -j$SAI_PARALLEL --output-on-failure --repeat until-pass:3"
+				"${cmake}"
 			]
-                },
+		},
+		"fuzz-linux-debian13/x86_64-amd/gcc": {
+			"default": false,
+                        "build": [
+				"${cmake}"
+			]
+		},
+
+
+#                "netbsd/aarch64BE-bcm2837-a53/gcc": {
+#                        "default": false,
+#                        "build": [
+#				"mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib cmake .. ${cmake}",
+#                                "cd build && make -j$SAI_PARALLEL && rm -rf ../destdir && make -j$SAI_PARALLEL DESTDIR=../destdir install",
+#				"cd build && LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib /usr/pkg/bin/ctest -j$SAI_PARALLEL --output-on-failure --repeat until-pass:3"
+#			]
+#                },
 		"freebsd/aarch64/llvm": {
                         "default": false,
                         "build": [
@@ -69,11 +99,29 @@
 		"w11/x86_64-amd/msvc": {
 			"default": false,
 			"build": [
-				"\"C:\\Program Files\\CMake\\bin\\cmake.exe\" -S . -B build -DOPENSSL_ROOT_DIR=\"C:\\Users\\andy\\vcpkg\\packages\\openssl_x64-windows\" -DLWS_EXT_PTHREAD_INCLUDE_DIR=\"C:\\Program Files (x86)\\pthreads\\include\" -DLWS_EXT_PTHREAD_LIBRARIES=\"C:\\Program Files (x86)\\pthreads\\lib\\x64\\libpthreadGC2.a\" ${cmake}",
+				"\"C:\\Program Files\\CMake\\bin\\cmake.exe\" -S . -B build -DLWS_WITH_HTTP3=0 -DLWS_WITH_SCHANNEL=0 -DOPENSSL_ROOT_DIR=\"C:\\Users\\andy\\vcpkg\\packages\\openssl_x64-windows\" -DLWS_EXT_PTHREAD_INCLUDE_DIR=\"C:\\Program Files (x86)\\pthreads\\include\" -DLWS_EXT_PTHREAD_LIBRARIES=\"C:\\Program Files (x86)\\pthreads\\lib\\x64\\libpthreadGC2.a\" ${cmake}",
 				"\"C:\\Program Files\\CMake\\bin\\cmake.exe\" --build build --config DEBUG --parallel %SAI_PARALLEL%",
 				"\"C:\\Program Files\\CMake\\bin\\ctest.exe\" --test-dir build -C DEBUG -j%SAI_PARALLEL% --output-on-failure --repeat until-pass:3"
 			]
 		},
+		"w11/x86_64-amd/msvc-schannel": {
+			"default": false,
+			"build": [
+				"\"C:\\Program Files\\CMake\\bin\\cmake.exe\" -S . -B build -DLWS_WITH_SCHANNEL=1 ${cmake}",
+				"\"C:\\Program Files\\CMake\\bin\\cmake.exe\" --build build --config DEBUG --parallel %SAI_PARALLEL%",
+				"\"C:\\Program Files\\CMake\\bin\\ctest.exe\" --test-dir build -C DEBUG -j%SAI_PARALLEL% --output-on-failure --repeat until-pass:3"
+			]
+		},
+
+		"w11/x86_64-amd/msvc-mbedtls": {
+			"default": false,
+			"build": [
+		"\"C:\\Program Files\\CMake\\bin\\cmake.exe\" -S . -B build -DLWS_WITH_MBEDTLS=1 -DLWS_WITH_HTTP3=0 -DLWS_ROLE_QUIC=0 -DCMAKE_PREFIX_PATH=\"C:\\mbedtls\" ${cmake}",
+		"\"C:\\Program Files\\CMake\\bin\\cmake.exe\" --build build --config DEBUG --parallel %SAI_PARALLEL%",
+		"\"C:\\Program Files\\CMake\\bin\\ctest.exe\" --test-dir build -C DEBUG -j%SAI_PARALLEL% --output-on-failure --repeat until-pass:3"
+			]
+		},
+
 		"freertos-espidf/xl6-esp32/gcc": {
                         "default": false,
                         "build": [
@@ -82,6 +130,7 @@
 				". /opt/esp/esp-idf/export.sh && pwd && cd ebuild/${cpack}/build && /usr/local/bin/sai-device ${cpack} ESPPORT=0 ctest --output-on-failure"
 			]
 		},
+
 		"coverity/x86_64/gcc": {
 			"default": false,
                         "build": [
@@ -95,77 +144,111 @@
 	"configurations": {
 		"default": {
 			"cmake":	"",
-			"platforms":	"w11/x86_64-amd/msvc,netbsd/aarch64BE-bcm2837-a53/gcc,freebsd/aarch64/llvm"
+			"platforms":	"w11/x86_64-amd/msvc-schannel,freebsd/aarch64/llvm"
 		},
+		"default-noh3": {
+			"cmake":	"-DLWS_WITH_HTTP3=0",
+			"platforms":	"none, w11/x86_64-amd/msvc"
+		},
+
 		"default-noudp": {
 			"cmake":	"-DLWS_WITH_UDP=0"
 		},
+		"quic-off": {
+			"cmake":	"-DLWS_ROLE_QUIC=0"
+		},
 		"default-dht": {
 			"cmake":	"-DLWS_WITH_DHT=1",
-			"platforms":	"w11/x86_64-amd/msvc,netbsd/aarch64BE-bcm2837-a53/gcc,freebsd/aarch64/llvm"
+			"platforms":	"w11/x86_64-amd/msvc,freebsd/aarch64/llvm"
 		},
 		"fault-injection": {
 			"cmake":	"-DLWS_WITH_SYS_FAULT_INJECTION=1 -DLWS_WITH_MINIMAL_EXAMPLES=1 -DLWS_WITH_CBOR=1"
 		},
 		"esp32-heltec": {
-                        "cmake":        "-DLWS_IPV6=0",
+                        "cmake":        "-DLWS_WITH_JPEG=0 -DLWS_WITH_UPNG=0 -DLWS_WITH_DLO=0 -DLWS_WITH_LHP=0 -DLWS_WITH_GZINFLATE=0 -DLWS_WITH_STUB=0 ",
                         "cpack":        "esp-heltec-wb32",
                         "platforms":    "none, freertos-espidf/xl6-esp32/gcc"
                 },
+		"esp32-heltec-threadpool": {
+                        "cmake":        "-DLWS_WITH_JPEG=0 -DLWS_WITH_UPNG=0 -DLWS_WITH_DLO=0 -DLWS_WITH_LHP=0 -DLWS_WITH_GZINFLATE=0 -DLWS_WITH_STUB=0 -DLWS_WITH_THREADPOOL=1 ",
+                        "cpack":        "esp-heltec-wb32",
+                        "platforms":    "none, freertos-espidf/xl6-esp32/gcc"
+                },
+		"mbedtls4": {
+			"cmake":	"-DLWS_WITH_MBEDTLS=1 -DCMAKE_PREFIX_PATH=/opt/mbedtls -DLWS_WITH_MINIMAL_EXAMPLES=1",
+			"platforms":	"none, rocky9/aarch64-a72a55-rk3588/gcc"
+		},
 		"gnutls": {
-			"cmake":	"-DLWS_WITH_GNUTLS=1",
+			"cmake":	"-DLWS_WITH_GNUTLS=1 -DLWS_GNUTLS_INCLUDE_DIRS=\"/opt/gnutls/lib/includes\" -DLWS_GNUTLS_LIBRARIES=\"/opt/gnutls/lib/.libs/libgnutls.so\" -DLWS_ROLE_QUIC=1",
 			"platforms":	"none, rocky9/aarch64-a72a55-rk3588/gcc"
 		},
 		"bearssl": {
-			"cmake":	"-DLWS_WITH_BEARSSL=1 -DLWS_BEARSSL_INCLUDE_DIRS=/opt/BearSSL/inc -DLWS_BEARSSL_LIBRARIES=/opt/BearSSL/build/libbearssl.so",
+			"cmake":	"-DLWS_WITH_BEARSSL=1 -DLWS_BEARSSL_INCLUDE_DIRS=/opt/BearSSL/inc -DLWS_BEARSSL_LIBRARIES=/opt/BearSSL/build/libbearssl.so -DLWS_WITH_MINIMAL_EXAMPLES=1",
 			"platforms":	"none, rocky9/aarch64-a72a55-rk3588/gcc"
 		},
 		"default-examples-awslc": {
-			"cmake":	"-DLWS_WITH_AWSLC=1 -DLWS_OPENSSL_INCLUDE_DIRS=\"/usr/aws-lc/include\" -DLWS_OPENSSL_LIBRARIES=\"/usr/aws-lc/lib64/libssl.so;/usr/aws-lc/lib64/libcrypto.so\" -DLWS_WITH_MINIMAL_EXAMPLES=1",
+			"cmake":	"-DLWS_WITH_AWSLC=1 -DLWS_ROLE_QUIC=1 -DLWS_OPENSSL_INCLUDE_DIRS=\"/usr/aws-lc/include\" -DLWS_OPENSSL_LIBRARIES=\"/usr/aws-lc/lib64/libssl.so;/usr/aws-lc/lib64/libcrypto.so\" -DLWS_WITH_MINIMAL_EXAMPLES=1",
 			"platforms":	"none, rocky9/aarch64-a72a55-rk3588/gcc"
 		},
 		"default-examples-boringssl": {
-			"cmake":	"-DLWS_WITH_BORINGSSL=1 -DLWS_OPENSSL_INCLUDE_DIRS=\"/usr/boringssl/include\" -DLWS_OPENSSL_LIBRARIES=\"/usr/boringssl/lib64/libssl.so;/usr/boringssl/lib64/libcrypto.so\" -DLWS_WITH_MINIMAL_EXAMPLES=1",
+			"cmake":	"-DLWS_WITH_BORINGSSL=1 -DLWS_ROLE_QUIC=1 -DLWS_OPENSSL_INCLUDE_DIRS=\"/usr/boringssl/include\" -DLWS_OPENSSL_LIBRARIES=\"/usr/boringssl/lib64/libssl.so;/usr/boringssl/lib64/libcrypto.so\" -DLWS_WITH_MINIMAL_EXAMPLES=1",
 			"platforms":	"none, rocky9/aarch64-a72a55-rk3588/gcc"
 		},
 		"default-examples-libressl": {
-			"cmake":	"-DLWS_OPENSSL_LIBRARIES='/usr/libressl/lib64/libtls.so;/usr/libressl/lib64/libssl.so;/usr/libressl/lib64/libcrypto.so' -DLWS_OPENSSL_INCLUDE_DIRS=/usr/libressl/include -DLWS_WITH_MINIMAL_EXAMPLES=1",
+			"cmake":	"-DLWS_ROLE_QUIC=1 -DLWS_OPENSSL_LIBRARIES='/usr/libressl/lib64/libtls.so;/usr/libressl/lib64/libssl.so;/usr/libressl/lib64/libcrypto.so' -DLWS_OPENSSL_INCLUDE_DIRS=/usr/libressl/include -DLWS_WITH_MINIMAL_EXAMPLES=1",
 			"platforms":	"none, rocky9/aarch64-a72a55-rk3588/gcc"
 		},
 		"default-wolfssl": {
-			"cmake":	"-DLWS_WITH_WOLFSSL=1 -DLWS_WOLFSSL_INCLUDE_DIRS=/usr/local/include -DLWS_WOLFSSL_LIBRARIES=/usr/local/lib/libwolfssl.so -DLWS_WITH_MINIMAL_EXAMPLES=0",
+			"cmake":	"-DLWS_ROLE_QUIC=1 -DLWS_WITH_WOLFSSL=1 -DLWS_WOLFSSL_INCLUDE_DIRS=/usr/local/include -DLWS_WOLFSSL_LIBRARIES=/usr/local/lib/libwolfssl.so -DLWS_WITH_MINIMAL_EXAMPLES=0",
 			"platforms":	"none, rocky9/aarch64-a72a55-rk3588/gcc"
 		},
-		"default-examples": {
-			"cmake":	"-DLWS_WITH_MINIMAL_EXAMPLES=0",
-			"platforms":	"netbsd/aarch64BE-bcm2837-a53/gcc,freebsd/aarch64/llvm"
+                "openhitls": {
+                        "cmake":        "-DLWS_WITH_OPENHITLS=1 -DOPENHITLS_INCLUDE_DIRS=/opt/openhitls/include -DOPENHITLS_LIBRARIES='/opt/openhitls/build/libhitls_tls.so;/opt/openhitls/build/libhitls_pki.so;/opt/openhitls/build/libhitls_crypto.so;/opt/openhitls/build/libhitls_bsl.so;/opt/openhitls/build/libhitls_auth.so'",
+			"platforms":	"none, rocky9/aarch64-a72a55-rk3588/gcc"
 		},
-		"default-examples-tls-sess": {
-			"cmake":	"-DLWS_WITH_MINIMAL_EXAMPLES=1 -DLWS_WITH_TLS_SESSIONS=1"
+		"default-noexamples": {
+			"cmake":	"-DLWS_WITH_MINIMAL_EXAMPLES=0",
+			"platforms":	"freebsd/aarch64/llvm"
+		},
+		"tls-sess-off": {
+			"cmake":	"-DLWS_WITH_MINIMAL_EXAMPLES=1 -DLWS_WITH_TLS_SESSIONS=0"
 		},
 		"h1only-examples": {
-			"cmake":	"-DLWS_WITH_HTTP2=0 -DLWS_WITH_MINIMAL_EXAMPLES=1"
+			"cmake":	"-DLWS_WITH_HTTP3=0 -DLWS_WITH_HTTP2=0 -DLWS_WITH_MINIMAL_EXAMPLES=1"
 		},
 		"h1only-notls": {
-			"cmake":	"-DLWS_WITH_HTTP2=0 -DLWS_WITH_SSL=OFF"
+			"cmake":	"-DLWS_WITH_HTTP3=0 -DLWS_WITH_HTTP2=0 -DLWS_WITH_SSL=OFF"
 		},
-		"unix-domain": {
-			"cmake":	"-DUNIX_SOCK=1"
+		"unix-domain-off": {
+			"cmake":	"-DLWS_UNIX_SOCK=0"
 		},
 		"plugins": {
 			"cmake":	"-DLWS_WITH_PLUGINS=1"
 		},
+
+		#
+		# The oauth / login stack end-to-end: a real lwsws with the
+		# auth-server, oauth2-client and login plugins dlopened out of
+		# the build tree, driven over h1, h2 and h3.  Everything here is
+		# needed for api-test-lwsws-oauth to be built at all -- without
+		# it the whole delegated login flow, which is what every other
+		# service authenticates through, has no coverage on any
+		# transport.
+		#
+		"oauth": {
+			"cmake":	"-DLWS_WITH_LWSWS=1 -DLWS_WITH_LIBUV=1 -DLWS_WITH_PLUGINS=1 -DLWS_WITH_AUTH_SERVER=1 -DLWS_WITH_JOSE=1 -DLWS_WITH_GENCRYPTO=1 -DLWS_WITH_STRUCT_SQLITE3=1 -DLWS_WITH_STRUCT_JSON=1 -DLWS_WITH_HTTP2=1 -DLWS_WITH_HTTP3=1 -DLWS_WITH_MINIMAL_EXAMPLES=1 -DCMAKE_BUILD_TYPE=DEBUG"
+		},
 		# WARN_DEPRECATED disabled for openssl v3 case on windows
 		"lws_system": {
-			"cmake":	"-DLWS_SUPPRESS_DEPRECATED_API_WARNINGS=1 -DLWS_WITH_ACME=1 -DLWS_WITH_MINIMAL_EXAMPLES=1 -DCMAKE_BUILD_TYPE=RELEASE -DLWS_WITH_GENCRYPTO=1 -DLWS_WITH_JOSE=1 -DLWS_WITH_SYS_ASYNC_DNS=1 -DLWS_WITH_SYS_NTPCLIENT=1"
+			"cmake":	"-DLWS_SUPPRESS_DEPRECATED_API_WARNINGS=1 -DLWS_WITH_ACME=1 -DLWS_WITH_MINIMAL_EXAMPLES=1 -DCMAKE_BUILD_TYPE=RELEASE -DLWS_WITH_GENCRYPTO=1 -DLWS_WITH_JOSE=1 -DLWS_WITH_SYS_ASYNC_DNS=1 -DLWS_WITH_AUTHORITATIVE_DNS=1 -DLWS_WITH_SYS_NTPCLIENT=1"
 		},
 		"async_dnssec": {
 			"cmake":	"-DLWS_SUPPRESS_DEPRECATED_API_WARNINGS=1 -DCMAKE_BUILD_TYPE=DEBUG -DLWS_WITH_GENCRYPTO=1 -DLWS_WITH_JOSE=1 -DLWS_WITH_SYS_ASYNC_DNS=1 -DLWS_WITH_SYS_ASYNC_DNS_DNSSEC=1 -DLWS_WITH_AUTHORITATIVE_DNS=1"
 		},
 
-		"secure-streams": {
-			"cmake":	"-DLWS_WITH_SECURE_STREAMS=1 -DLWS_WITH_MINIMAL_EXAMPLES=1",
-			"platforms":	"w11/x86_64-amd/msvc,netbsd/aarch64BE-bcm2837-a53/gcc"
+		"secure-streams-off": {
+			"cmake":	"-DLWS_WITH_SECURE_STREAMS=0 -DLWS_WITH_MINIMAL_EXAMPLES=1",
+			"platforms":	"w11/x86_64-amd/msvc"
 		},
 		"secure-streams-proxy": {
 			"cmake":	"-DLWS_WITH_SECURE_STREAMS=1 -DLWS_WITH_SECURE_STREAMS_PROXY_API=1 -DLWS_WITH_MINIMAL_EXAMPLES=1 "
@@ -175,26 +258,43 @@
 		},
 		"distro_recommended": { # minimal examples also needed for ctest
 			"cmake":	"-DLWS_WITH_DISTRO_RECOMMENDED=1 -DLWS_WITH_MINIMAL_EXAMPLES=1",
-			"cpack":	"&& cpack $SAI_CPACK",
+			"platforms":	"rocky9-ca/aarch64-a72a55-rk3588/clang",
+			"cpack":	"cpack $SAI_CPACK",
 			"artifacts":	"build/*.rpm, build/*.deb, build/*.zip"
 		},
+		# distro_recommended built with gcov instrumentation, run through
+		# ctest, then scripts/coverage-report.py prints the line / function
+		# coverage of lib/ and the worst-covered functions into the log.  The
+		# clang platform's own steps stop at scan-build, so the build, install
+		# and ctest ride along in the cmake string like quic-interop does;
+		# ctest's result still decides the step, the report never does.
+		# Fault injection is on for its extra tests; the http stream
+		# compression (deflate + brotli) and ws permessage-deflate that
+		# distro_recommended already implies are spelled out so they cannot
+		# quietly drop out of the coverage run.  Needs brotli-devel and
+		# llvm-cov on the builder.
+		"coverage": {
+			"cmake":	"-DLWS_WITH_DISTRO_RECOMMENDED=1 -DLWS_WITH_MINIMAL_EXAMPLES=1 -DLWS_WITH_GCOV=1 -DLWS_WITH_SYS_FAULT_INJECTION=1 -DLWS_WITH_HTTP_STREAM_COMPRESSION=1 -DLWS_WITH_HTTP_BROTLI=1 -DLWS_WITHOUT_EXTENSIONS=0 && make -j$SAI_PARALLEL && rm -rf ../destdir && make -j$SAI_PARALLEL DESTDIR=../destdir install && ( LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib ctest -j$SAI_PARALLEL --output-on-failure --repeat until-pass:3 ; R=$? ; python3 ../scripts/coverage-report.py --json ; exit $R )",
+			"platforms":	"none, rocky9-ca/aarch64-a72a55-rk3588/clang",
+			"artifacts":	"build/coverage-summary.json"
+		},
 		"lwsws": {
-			"cmake":	"-DLWS_WITH_LWSWS=ON -DLWS_WITHOUT_EXTENSIONS=0 -DLWS_WITH_HTTP2=1 -DLWS_WITH_ACME=1 -DLWS_WITH_MINIMAL_EXAMPLES=1 -DCMAKE_BUILD_TYPE=DEBUG -DLWS_WITH_GENCRYPTO=1 -DLWS_WITH_JOSE=1 -DLWS_WITH_SYS_ASYNC_DNS=1 -DLWS_WITH_SYS_NTPCLIENT=1"
+			"cmake":	"-DLWS_WITH_LWSWS=ON -DLWS_WITHOUT_EXTENSIONS=0 -DLWS_WITH_HTTP2=1 -DLWS_WITH_ACME=1 -DLWS_WITH_MINIMAL_EXAMPLES=1 -DCMAKE_BUILD_TYPE=DEBUG -DLWS_WITH_GENCRYPTO=1 -DLWS_WITH_JOSE=1 -DLWS_WITH_SYS_ASYNC_DNS=1 -DLWS_WITH_AUTHORITATIVE_DNS=1 -DLWS_WITH_SYS_NTPCLIENT=1"
 		},
 		"lwsws-nometrics": {
-			"cmake":	"-DLWS_WITH_LWSWS=ON -DLWS_WITHOUT_EXTENSIONS=0 -DLWS_WITH_HTTP2=1 -DLWS_WITH_ACME=1 -DLWS_WITH_MINIMAL_EXAMPLES=1 -DCMAKE_BUILD_TYPE=DEBUG -DLWS_WITH_GENCRYPTO=1 -DLWS_WITH_JOSE=1 -DLWS_WITH_SYS_ASYNC_DNS=1 -DLWS_WITH_SYS_NTPCLIENT=1 -DLWS_WITH_SYS_METRICS=0"
+			"cmake":	"-DLWS_WITH_LWSWS=ON -DLWS_WITHOUT_EXTENSIONS=0 -DLWS_WITH_HTTP2=1 -DLWS_WITH_ACME=1 -DLWS_WITH_MINIMAL_EXAMPLES=1 -DCMAKE_BUILD_TYPE=DEBUG -DLWS_WITH_GENCRYPTO=1 -DLWS_WITH_JOSE=1 -DLWS_WITH_SYS_ASYNC_DNS=1 -DLWS_WITH_AUTHORITATIVE_DNS=1 -DLWS_WITH_SYS_NTPCLIENT=1 -DLWS_WITH_SYS_METRICS=0"
 		},
 		"lwsws2": {
 			"cmake":	"-DLWS_WITH_LWSWS=ON -DLWS_WITHOUT_EXTENSIONS=0 -DLWS_WITH_HTTP2=1 -DLWS_WITH_ACME=1 -DLWS_WITH_MINIMAL_EXAMPLES=1 -DCMAKE_BUILD_TYPE=DEBUG -DLWS_WITH_LWS_DSH=1 -DLWS_WITH_CACHE_NSCOOKIEJAR=0"
 		},
 		"justmbedtls": {
-			"cmake": "-DLWS_WITH_MBEDTLS=1 -DLWS_WITHOUT_TESTAPPS=1"
+			"cmake": "-DLWS_WITH_HTTP3=0 -DLWS_WITH_MBEDTLS=1 -DLWS_WITHOUT_TESTAPPS=1"
 		},
 		"mbedtls": {
-			"cmake":	"-DLWS_WITH_MBEDTLS=1 -DLWS_WITH_HTTP2=1 -DLWS_WITH_LWSWS=1 -DLWS_WITH_MINIMAL_EXAMPLES=1 -DLWS_WITH_JOSE=1 -DCMAKE_BUILD_TYPE=DEBUG"
+			"cmake":	"-DLWS_WITH_MBEDTLS=1 -DLWS_WITH_HTTP3=0 -DLWS_WITH_HTTP2=1 -DLWS_WITH_LWSWS=1 -DLWS_WITH_MINIMAL_EXAMPLES=1 -DLWS_WITH_JOSE=1 -DCMAKE_BUILD_TYPE=DEBUG"
 		},
 		"mbedtls-metrics": {
-			"cmake":	"-DLWS_WITH_MBEDTLS=1 -DLWS_WITH_HTTP2=1 -DLWS_WITH_LWSWS=1 -DLWS_WITH_MINIMAL_EXAMPLES=1 -DLWS_WITH_JOSE=1 -DCMAKE_BUILD_TYPE=DEBUG -DLWS_WITH_SYS_METRICS=1"
+			"cmake":	"-DLWS_WITH_HTTP3=0 -DLWS_WITH_MBEDTLS=1 -DLWS_WITH_HTTP2=1 -DLWS_WITH_LWSWS=1 -DLWS_WITH_MINIMAL_EXAMPLES=1 -DLWS_WITH_JOSE=1 -DCMAKE_BUILD_TYPE=DEBUG -DLWS_WITH_SYS_METRICS=1"
 		},
 		"noserver": {
 			"cmake":	"-DLWS_WITHOUT_SERVER=ON -DLWS_WITH_MINIMAL_EXAMPLES=1 -DLWS_WITH_SECURE_STREAMS=1"
@@ -227,6 +327,9 @@
 		"ipv6-off":	{
 			"cmake":	"-DLWS_IPV6=OFF"
 		},
+		"ipv4-off":	{
+			"cmake":	"-DLWS_IPV4=OFF"
+		},
 		"nonetlink":	{
 			"cmake":	"-DLWS_WITH_NETLINK=0"
 		},
@@ -243,8 +346,8 @@
 			"cmake":	"-DLWS_WITH_NO_LOGS=ON",
 			"platforms":	"w11/x86_64-amd/msvc"
 		},
-		"cookiejar": {
-			"cmake":	"-DLWS_WITH_CACHE_NSCOOKIEJAR=ON"
+		"cookiejar-off": {
+			"cmake":	"-DLWS_WITH_CACHE_NSCOOKIEJAR=0"
 		},
 		"jittrust": {
 			"cmake":	"-DLWS_WITH_TLS_JIT_TRUST=1"
@@ -259,20 +362,112 @@
 			"cmake":	"-DLWS_WITH_THREADPOOL=1 -DLWS_WITH_MINIMAL_EXAMPLES=1"
 		},
 
+		# default-on features turned off together, so their #if guards
+		# and the implied-options chain get built without them
+
+		"slim": {
+			"cmake":	"-DLWS_WITH_HL=0 -DLWS_WITH_MD=0 -DLWS_WITH_SVG=0 -DLWS_WITH_GIF=0 -DLWS_WITH_JSONRPC=0 -DLWS_WITH_SYS_ASYNC_DNS=0 -DLWS_WITH_CUSTOM_HEADERS=0 -DLWS_WITH_CONMON=0 -DLWS_WITH_WOL=0 -DLWS_WITH_LIBCAP=0 -DLWS_WITH_BINDTODEVICE=0 -DLWS_WITH_HTTP_DIGEST_AUTH=0 -DLWS_WITH_CBOR_FLOAT=0 -DLWS_WITH_SHARED=0 -DLWS_WITH_CACHE_BLOB=0 -DLWS_WITH_SSL=OFF"
+		},
+
+		# default-off system pieces that no other dimension enables:
+		# brings api-test-gendtls / -mnemonic / -backtrace into ctest.
+		# Not the dhcp client: it holds the system state below
+		# OPERATIONAL until an interface gets a lease, so every client
+		# test would wait forever on a builder
+
+		"sys-extras": {
+			"cmake":	"-DLWS_WITH_DTLS=1 -DLWS_WITH_MNEMONIC=1 -DLWS_WITH_ASYNC_QUEUE=1 -DLWS_WITH_COMPRESSED_BACKTRACES=1 -DLWS_WITH_EXTERNAL_POLL=1 -DLWS_WITH_GENCRYPTO=1 -DLWS_HTTP_HEADERS_ALL=1 -DLWS_WITH_MINIMAL_EXAMPLES=1"
+		},
+
+		# secure streams build variants never otherwise built; with the
+		# static-policy-only flag most SS examples are excluded, so this
+		# is mainly a compile dimension
+
+		"ss-variants": {
+			"cmake":	"-DLWS_WITH_SECURE_STREAMS_STATIC_POLICY_ONLY=1 -DLWS_WITH_SECURE_STREAMS_AUTH_SIGV4=1 -DLWS_WITH_SS_DIRECT_PROTOCOL_STR=1 -DLWS_WITH_SECURE_STREAMS_CPP=1 -DLWS_WITH_SECURE_STREAMS_BUFFER_DUMP=1 -DLWS_WITH_MINIMAL_EXAMPLES=1"
+		},
+
+		# the default build under ASan + LSan + UBSan, examples and
+		# their ctest suite included, on one Linux gcc builder (needs
+		# libasan / libubsan there)
+
+		"asan": {
+			"cmake":	"-DLWS_WITH_ASAN=1 -DCMAKE_BUILD_TYPE=DEBUG -DLWS_WITH_MINIMAL_EXAMPLES=1",
+			"platforms":	"none, linux-fedora44/x86_64-amd/gcc"
+		},
+
+		# the sans-IO split's guards (READMEs/README.sans-io-split.md):
+		# every build compiles the sansIO sources blind to IO, so a call
+		# into IO past the interface fails it; here the sansIO half is
+		# also linked alone with every unresolved symbol an error (the
+		# links-alone test, run by ctest as api-test-sansio-link), and
+		# the link check fails on a private IO symbol the sansIO objects
+		# need.  The optional features that reach across the split (cgi,
+		# access log, proxy, socks, jit trust, mqtt, raw proxy) are on
+		# so the checks see them.  Fault injection is on so lws' random
+		# can be seeded, which the ws-client transcript in
+		# api-test-sansio/transcripts/ needs to be checked rather than
+		# skipped.
+
+		"sansio": {
+			"cmake":	"-DLWS_WITH_SANSIO_LINK_TEST=1 -DLWS_WITH_MINIMAL_EXAMPLES=1 -DLWS_WITH_EMAIL=1 -DLWS_WITH_CGI=1 -DLWS_WITH_ACCESS_LOG=1 -DLWS_WITH_HTTP_PROXY=1 -DLWS_WITH_SOCKS5=1 -DLWS_WITH_TLS_JIT_TRUST=1 -DLWS_ROLE_MQTT=1 -DLWS_ROLE_RAW_PROXY=1 -DLWS_WITH_SYS_ASYNC_DNS=1 -DLWS_WITH_SYS_FAULT_INJECTION=1 -DCMAKE_BUILD_TYPE=DEBUG && make -j$SAI_PARALLEL && ../scripts/sans-io-link-check.sh $PWD",
+			"platforms":	"none, linux-fedora44/x86_64-amd/gcc"
+		}
+		,
+
 		# only applies to the coverity builder, and on pushes to "coverity" branch
 
 		"coverity": {
-			"cmake":	"-DLWS_WITHOUT_EXTENSIONS=0 -DLWS_WITH_CGI=1 -DLWS_IPV6=1 -DLWS_WITH_HTTP_PROXY=1 -DLWS_WITH_RANGES=1 -DLWS_WITH_THREADPOOL=1 -DLWS_WITH_CBOR=1 -DLWS_WITH_JOSE=1 -DLWS_WITH_COSE=1 -DLWS_WITH_SYS_DHCP_CLIENT=1 -DLWS_WITH_FTS=1 -DLWS_WITH_STRUCT_SQLITE3=1 -DLWS_ROLE_DBUS=1 -DLWS_WITH_SYS_ASYNC_DNS=1 -DLWS_WITH_SYS_ASYNC_DNS_DNSSEC=1 -DLWS_WITH_WEBRTC=1 -DLWS_WITH_DHT=1 -DLWS_WITH_ASYNC_QUEUE=1  -DLWS_WITH_SYS_FAULT_INJECTION=1 -DLWS_WITH_TLS_JIT_TRUST=1 -DLWS_ROLE_MQTT=1 -DLWS_ROLE_RAW_PROXY=1 -DLWS_WITH_EVENT_LIBS=1 -DLWS_WITH_LIBUV=1 -DLWS_WITH_STRUCT_JSON=1 -DLWS_WITH_LWS_DSH=1 -DLWS_WITH_SECURE_STREAMS_PROXY_API=1 -DLWS_WITH_AUTHORITATIVE_DNS=1 -DLWS_WITH_DHT=1 -DLWS_WITH_DHT_BACKEND=1 -DLWS_WITH_PLUGINS=1",
+			"cmake":	"-DLWS_WITHOUT_EXTENSIONS=0 -DLWS_WITH_CGI=1 -DLWS_IPV6=1 -DLWS_WITH_HTTP_PROXY=1 -DLWS_WITH_RANGES=1 -DLWS_WITH_THREADPOOL=1 -DLWS_WITH_CBOR=1 -DLWS_WITH_JOSE=1 -DLWS_WITH_COSE=1 -DLWS_WITH_SYS_DHCP_CLIENT=1 -DLWS_WITH_FTS=1 -DLWS_WITH_STRUCT_SQLITE3=1 -DLWS_ROLE_DBUS=1 -DLWS_WITH_SYS_ASYNC_DNS=1 -DLWS_WITH_SYS_ASYNC_DNS_DNSSEC=1 -DLWS_WITH_WEBRTC=1 -DLWS_WITH_DHT=1 -DLWS_WITH_ASYNC_QUEUE=1  -DLWS_WITH_SYS_FAULT_INJECTION=1 -DLWS_WITH_TLS_JIT_TRUST=1 -DLWS_ROLE_MQTT=1 -DLWS_ROLE_RAW_PROXY=1 -DLWS_WITH_EVENT_LIBS=1 -DLWS_WITH_LIBUV=1 -DLWS_WITH_STRUCT_JSON=1 -DLWS_WITH_LWS_DSH=1 -DLWS_WITH_SECURE_STREAMS_PROXY_API=1 -DLWS_WITH_AUTHORITATIVE_DNS=1 -DLWS_WITH_DHT=1 -DLWS_WITH_DHT_BACKEND=1 -DLWS_WITH_PLUGINS=1 -DLWS_WITH_QUIC=1 -DLWS_WITH_HTTP3=1",
 			"platforms":	"none, coverity/x86_64/gcc",
-			"cpack":	"export STAMP=`git log -1 --pretty=format:%h` && rm -f libwebsockets.tgz && tar czvf libwebsockets.tgz cov-int && script -e -q -c \"cat /etc/coverity/secrets.sh | lws-minimal-http-client-post-form --h1 https://scan.coverity.com:443/builds?project=warmcat%2Flibwebsockets --form file=@libwebsockets.tgz --form version=${STAMP} --form 'description=lws qa'\" /dev/null",
+			"cpack":	"export STAMP=`git log -1 --pretty=format:%h` && rm -f libwebsockets.tar.xz && tar cJvf libwebsockets.tar.xz cov-int && script -e -q -c \"cat /etc/coverity/secrets.sh | lws-minimal-http-client-post-form --h1 https://scan.coverity.com:443/builds?project=warmcat%2Flibwebsockets --form file=@libwebsockets.tar.xz --form version=${STAMP} --form 'description=lws qa'\" /dev/null",
 			"branches":	"coverity"
+		},
+
+		"qir": {
+			"cmake":    "cd /opt/quic-interop-runner ; source venv/bin/activate ; rm -rf logs_* ; cd /opt/quic-interop-runner/lws ; if [ \"`docker ps -q`\" ] ; then docker kill $(docker ps -q) ; fi ;  docker system prune -f && docker build -f Dockerfile -t lws-quic-interop --no-cache $HOME/jobs/$SAI_VN/src && cd .. && python3 run.py -c lws -s lws --delete-successful-logs ; python3 run.py -p webtransport -c lws -s lws --delete-successful-logs -t handshake,transfer-unidirectional-receive,transfer-unidirectional-send,transfer-bidirectional-receive,transfer-bidirectional-send,transfer-datagram-receive,transfer-datagram-send",
+			"platforms":	"none, linux-debian13/x86_64-amd/gcc"
+		},
+
+		"mbedtls4-windows": {
+			"cmake":	"-DLWS_WITH_MINIMAL_EXAMPLES=1",
+			"platforms":	"none, w11/x86_64-amd/msvc-mbedtls"
+		},
+
+
+		# libFuzzer + ASan campaign over the untrusted-input parsers in
+		# ./fuzz, 60s per target (~15 min + build).  Corpora persist in
+		# $HOME across jobs so coverage keeps advancing; run.sh exits
+		# nonzero and lists the names of any findings.  Findings are
+		# not artifacts: they can be unfixed security bugs, so under
+		# sai they go to sai-server through the pool, which only shows
+		# them to admins.  Needs clang + libclang-rt-*-dev
+		# on the builder, plus gnutls + zlib dev packages: run.sh would
+		# normally autodetect those via pkg-config and silently drop the
+		# qpack / jose / cose / ws-pmd targets if it can't see them, so
+		# the CI job forces the full build dimension explicitly instead.
+		#
+		# It also has two idle tasks per platform, which carry on fuzzing
+		# the latest completed push in builders' idle time, when their
+		# conf allows it.  There run.sh takes its time from the slice
+		# length sai gives it in SAI_IDLE_SECS instead.
+		#
+		# All of them keep the corpora in the "fuzz" pool, which sai keeps
+		# synced between every builder doing it; run.sh uses the pool
+		# instead of CORPUS when sai gives it one.
+
+		"fuzz": {
+			"cmake":	"CORPUS=$HOME/lws-fuzz-corpus FUZZ_OPTS=-verbosity=0 FUZZ_CMAKE_OPTS=\"-DLWS_WITH_SSL=ON -DLWS_WITH_GNUTLS=ON -DLWS_WITH_GENCRYPTO=ON -DLWS_WITH_JOSE=ON -DLWS_WITH_COSE=ON -DLWS_WITH_SYS_ASYNC_DNS_DNSSEC=ON -DLWS_WITHOUT_EXTENSIONS=OFF -DLWS_WITH_ZLIB=ON\" ./fuzz/run.sh 60",
+			"platforms":	"none, fuzz-linux-debian13/x86_64-amd/gcc",
+			"idle":		2,
+			"pool":		"fuzz"
 		}
-#		,
+		#,
 		# awkward, we also want to test mbedtls, but coverity blocks on SSL build needing manual intervention
 #		"coverity-mbedtls": {
-#			"cmake":	"-DLWS_WITH_MBEDTLS=1 -DLWS_WITHOUT_EXTENSIONS=0 -DLWS_WITH_CGI=1 -DLWS_IPV6=1 -DLWS_WITH_HTTP_PROXY=1 -DLWS_WITH_RANGES=1 -DLWS_WITH_THREADPOOL=1 -DLWS_WITH_CBOR=1 -DLWS_WITH_JOSE=1 -DLWS_WITH_COSE=1 -DLWS_WITH_SYS_DHCP_CLIENT=1 -DLWS_WITH_FTS=1 -DLWS_WITH_STRUCT_SQLITE3=1 -DLWS_ROLE_DBUS=1 -DLWS_WITH_SYS_ASYNC_DNS=1 -DLWS_WITH_SYS_ASYNC_DNS_DNSSEC=1 -DLWS_WITH_WEBRTC=1 -DLWS_WITH_DHT=1  -DLWS_WITH_ASYNC_QUEUE=1 -DLWS_WITH_SYS_FAULT_INJECTION=1 -DLWS_WITH_TLS_JIT_TRUST=1 -DLWS_ROLE_MQTT=1 -DLWS_ROLE_RAW_PROXY=1 -DLWS_WITH_EVENT_LIBS=1 -DLWS_WITH_LIBUV=1 -DLWS_WITH_STRUCT_JSON=1 -DLWS_WITH_LWS_DSH=1 -DLWS_WITH_SECURE_STREAMS_PROXY_API=1",
+#			"cmake":	"-DLWS_WITH_MBEDTLS=1 -DLWS_WITHOUT_EXTENSIONS=0 -DLWS_WITH_CGI=1 -DLWS_IPV6=1 -DLWS_WITH_HTTP_PROXY=1 -DLWS_WITH_RANGES=1 -DLWS_WITH_THREADPOOL=1 -DLWS_WITH_CBOR=1 -DLWS_WITH_JOSE=1 -DLWS_WITH_COSE=1 -DLWS_WITH_SYS_DHCP_CLIENT=1 -DLWS_WITH_FTS=1 -DLWS_WITH_STRUCT_SQLITE3=1 -DLWS_ROLE_DBUS=1 -DLWS_WITH_SYS_ASYNC_DNS=1 -DLWS_WITH_SYS_ASYNC_DNS_DNSSEC=1 -DLWS_WITH_WEBRTC=1 -DLWS_WITH_DHT=1  -DLWS_WITH_ASYNC_QUEUE=1 -DLWS_WITH_SYS_FAULT_INJECTION=1 -DLWS_WITH_TLS_JIT_TRUST=1 -DLWS_ROLE_MQTT=1 -DLWS_ROLE_RAW_PROXY=1 -DLWS_WITH_EVENT_LIBS=1 -DLWS_WITH_LIBUV=1 -DLWS_WITH_STRUCT_JSON=1 -DLWS_WITH_LWS_DSH=1 -DLWS_WITH_SECURE_STREAMS_PROXY_API=1 -DLWS_WITH_QUIC=1 -DLWS_WITH_HTTP3=1",
 #			"platforms":	"none, coverity/x86_64/gcc",
-#			"cpack":	"export STAMP=`git log -1 --pretty=format:%h` && rm -f libwebsockets.tgz && tar czvf libwebsockets.tgz cov-int && script -e -q -c \"cat /etc/coverity/secrets.sh | lws-minimal-http-client-post-form --h1 https://scan.coverity.com:443/builds?project=warmcat%2Flibwebsockets --form file=@libwebsockets.tgz --form version=${STAMP} --form 'description=lws qa'\" /dev/null",
+#			"cpack":	"export STAMP=`git log -1 --pretty=format:%h` && rm -f libwebsockets.tar.xz && tar cJvf libwebsockets.tar.xz cov-int && script -e -q -c \"cat /etc/coverity/secrets.sh | lws-minimal-http-client-post-form --h1 https://scan.coverity.com:443/builds?project=warmcat%2Flibwebsockets --form file=@libwebsockets.tar.xz --form version=${STAMP} --form 'description=lws qa'\" /dev/null",
 #			"branches":	"coverity"
 #		}
 

@@ -44,7 +44,8 @@ static const struct lws_switches switches[] = {
 #include <string.h>
 #include <signal.h>
 
-static int bad = 1, interrupted;
+static int bad = 1;
+static struct lws_context *context;
 
 /* number of forks */
 #define FORKS 4
@@ -206,7 +207,7 @@ multi_myss_state(void *userobj, void *h_src, lws_ss_constate_t state,
 	switch (state) {
 	case LWSSSCS_DESTROYING:
 		lws_sul_cancel(&m->sul);
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		return 0;
 
 	case LWSSSCS_CONNECTED:
@@ -281,7 +282,7 @@ multi_myss_rx_monitor(void *userobj, const uint8_t *buf, size_t len, int flags)
 	/* the test has succeeded */
 
 	bad = 0;
-	interrupted = 1;
+	lws_default_loop_exit(context);
 
 	return LWSSSSRET_OK;
 }
@@ -339,7 +340,7 @@ direct_smd_cb(void *opaque, lws_smd_class_t _class, lws_usec_t timestamp,
 static void
 sul_timeout_cb(lws_sorted_usec_list_t *sul)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int
@@ -347,7 +348,6 @@ smd_ss_multi_test(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
 	lws_sorted_usec_list_t sul_timeout;
-	struct lws_context *context;
 	pid_t pid;
 	int n;
 
@@ -365,8 +365,7 @@ smd_ss_multi_test(int argc, const char **argv)
 		/* the original process */
 		n = -1; /* so original ends up with context.user as 0 below */
 
-	memset(&info, 0, sizeof info);
-	memset(&sul_timeout, 0, sizeof sul_timeout);
+	lws_context_info_defaults(&info, NULL);memset(&sul_timeout, 0, sizeof sul_timeout);
 
 	lws_cmdline_option_handle_builtin(argc, argv, &info);
 
@@ -376,7 +375,14 @@ smd_ss_multi_test(int argc, const char **argv)
 		/* connect to ssproxy via UDS by default, else via
 		 * tcp connection to this port */
 		if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_P].sw)))
-			info.ss_proxy_port = (uint16_t)atoi(p);
+			{
+				int __pt = atoi(p);
+				if (__pt < 0 || __pt > 65535) {
+					lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+					return 1;
+				}
+				info.ss_proxy_port = (uint16_t)__pt;
+			}
 
 		/* UDS "proxy.ss.lws" in abstract namespace, else this socket
 		 * path; when -p given this can specify the network interface
@@ -389,7 +395,6 @@ smd_ss_multi_test(int argc, const char **argv)
 			info.ss_proxy_address = p;
 	}
 
-	info.fd_limit_per_thread	= 1 + 6 + 1;
 	info.port			= CONTEXT_PORT_NO_LISTEN;
 	info.protocols			= lws_sspc_protocols;
 	info.options			= LWS_SERVER_OPTION_EXPLICIT_VHOSTS |
@@ -421,7 +426,7 @@ smd_ss_multi_test(int argc, const char **argv)
 
 	/* the event loop */
 
-	while (lws_service(context, 0) >= 0 && !interrupted)
+	while (lws_service(context, 0) >= 0)
 		;
 
 bail:

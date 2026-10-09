@@ -286,3 +286,137 @@ file handle open.
 For this reason the log contexts have a refcount, and an opaque `void *stg`
 availble for the emit and refounct_cb to use how they see fit, eg, for storing
 the output log file descriptor.
+
+## Rate-limiting logs
+
+If you have a log that may be generated at a high rate under some conditions, you can use the rate-limiting log macros. These allow you to specify a minimum interval between emissions in microseconds, and they will automatically append ` (dropped %u logs)` with the count of suppressed logs if any were dropped.
+
+You need to provide a `lws_log_ratelimit_t` object to hold the state.
+
+If the log context is local to a specific object (e.g., a `wsi` or `vhost`), you can compose the `lws_log_ratelimit_t` type into your object. It only needs to be zero-initialized:
+
+```c
+struct my_object {
+	...
+	lws_log_ratelimit_t rl;
+	...
+};
+
+/* ... inside some object-bound function ... */
+/* ratelimit to 1 emission per second */
+lwsl_ratelimit_wsi_notice(&wsi->rl, 1000000, wsi, "Oops: %s\n", err);
+```
+
+If the log context is global or applies to a specific code block rather than a specific object, you can use the helper macro `LWS_RATELIMIT_DEFINE_STATIC()` to define a static state variable:
+
+```c
+LWS_RATELIMIT_DEFINE_STATIC(rl);
+
+/* ratelimit to 1 emission per second */
+lwsl_ratelimit_notice(&rl, 1000000, "QUIC TX: Congestion window full, blocking POLLOUT\n");
+```
+
+There are rate-limited counterparts for every log level and scoping context. For example:
+
+| Scope | Api example |
+|---|---|
+| Processwide | `lwsl_ratelimit_err(&rl, 1000000, ...)` |
+| lws_context | `lwsl_ratelimit_cx_err(&rl, 1000000, context, ...)` |
+| lws_vhost | `lwsl_ratelimit_vhost_err(&rl, 1000000, vh, ...)` |
+| lws_wsi | `lwsl_ratelimit_wsi_err(&rl, 1000000, wsi, ...)` |
+| lws_ss | `lwsl_ratelimit_ss_err(&rl, 1000000, handle, ...)` |
+
+## Duplicate and spew suppression
+
+Two things happen to every log line that passes the level filter, before it
+reaches the emit function.
+
+### Back-to-back duplicates
+
+A line identical to the previous one is not emitted again.  The count of
+identical lines is accumulated, and at most once a second the line is emitted
+with ` (swallowed %u dupes)` appended.
+
+### Spew mode
+
+A "spew" is a sustained rate of logging that nothing downstream can absorb: a
+tight loop logging every service call, a POLLOUT storm, a state machine
+ping-ponging.  Left alone it fills the disk in seconds, and the lines are not
+even duplicates, so the check above does not help.
+
+lws keeps a small ring of the timestamps of the last 64 lines it emitted.  If
+those 64 lines span less than 20ms, ie, the sustained rate has exceeded about
+3200 lines per second, lws enters spew mode:
+
+ - one line is emitted saying so,
+
+ - subsequent lines are formatted as usual but diverted into a small heap
+   ringbuffer allocated for the purpose, instead of being emitted; the ring
+   retains only the last 10 lines of the spew, fewer if they are long, which
+   is enough to see how it ended: the spew itself is the problem, and this
+   also runs on devices with little heap,
+
+ - once a second, one line is emitted saying the spew is still going and how
+   many lines have been swallowed so far.
+
+Leaving spew mode is decided over a much shorter window than entering it,
+since a real spew never pauses: once the last 8 lines span more than the exit
+quiet, initially 5ms, lws emits a summary line saying how long the quiet was,
+then replays the retained tail of the spew in order, then frees the
+ringbuffer, and goes back to emitting directly.  The timestamp ring is
+restarted at that point, so another full 64 lines at spew rate are needed to
+re-enter, which stops a bursty spew flapping in and out of the mode.
+
+At the moment the next line arrives, a spew that has stopped and a process
+that was starved of cpu for a while, eg, on an overloaded CI builder, look the
+same.  The difference shows afterwards: the spew comes back.  If lws enters
+spew mode again within a second of calling it over, it says it resumed, and
+the exit quiet grows to twice the quiet that fooled it, up to a second, so the
+same size of stall does not end the spew again.  Since the load on the box
+changes, each time a spew starts afresh rather than resuming, the exit quiet
+halves back towards 5ms.  The lines saying spew mode was entered or resumed
+state the exit quiet in force.
+
+The exit check can only run when a log arrives.  If a spew stops dead and
+nothing logs afterwards, the retained tail is replayed by the next log
+whenever that comes, or by `lws_context_destroy()`.  If the process dies during
+a spew, the retained tail dies with it.
+
+A legitimate surge of logs, eg, context creation at debug level, may be fast
+enough to trip entry.  Its first 63 lines were emitted before lws entered spew
+mode, and if it ends within the tail that is retained, that is replayed intact,
+so a surge of up to about 73 lines is waved through losslessly.  A longer one
+loses its middle, as a spew does.
+
+Logging is threadsafe wherever there are pthreads, except on the small
+embedded platforms, where lws runs no threads of its own unless it is built
+with SMP, the threadpool or the async queue.
+
+The tunables are compile-time, and can be overridden on the compiler command
+line, eg, `-DLWS_LOG_SPEW_TAIL_LINES=20`:
+
+|Define|Default|Meaning|
+|---|---|---|
+|`LWS_LOG_SPEW_TS_RING`|64|lines whose timestamps are tracked|
+|`LWS_LOG_SPEW_ENTER_US`|20000|enter spew mode if they all fit in this|
+|`LWS_LOG_SPEW_EXIT_SAMPLES`|8|lines considered for leaving spew mode|
+|`LWS_LOG_SPEW_EXIT_US`|5000|leave spew mode if they span more than this|
+|`LWS_LOG_SPEW_EXIT_MAX_US`|1000000|limit of how far that grows after resuming|
+|`LWS_LOG_SPEW_RESUME_US`|1000000|re-entering this soon after leaving is a resume|
+|`LWS_LOG_SPEW_TAIL_LINES`|10|lines of spew retained|
+|`LWS_LOG_SPEW_RING_SIZE`|2048 (1024 on FreeRTOS)|bytes of spew retained|
+|`LWS_LOG_SPEW_HEARTBEAT_US`|1000000|interval of the still-going line|
+
+How much of the tail is retained can also be set at runtime, for when the part
+of interest is further back than how the spew ended, eg, when debugging at a
+verbose log level where ordinary traffic is enough to trip spew mode.
+`lws_log_spew_tail_lines(lines)` sets it processwide, and any app that calls
+`lws_cmdline_option_handle_builtin()`, which includes lwsws and the examples,
+takes it on the commandline as `--log-spew-tail <lines>`.  The ring is then
+sized for that many lines of typical length (256 bytes each), so long lines
+may mean somewhat fewer are kept; the count is capped at 65536.  0 restores the
+compile-time default.  A spew already in progress keeps the tail it started
+with.
+
+A log context with `LLLF_LOG_SPEW_OFF` in its `lll_flags` is exempt from spew
+handling; its lines are emitted directly regardless of rate.

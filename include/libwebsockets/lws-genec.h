@@ -22,6 +22,10 @@
  * IN THE SOFTWARE.
  */
 
+#if defined(LWS_WITH_OPENHITLS)
+#include <crypt_eal_pkey.h>
+#endif
+
 enum enum_genec_alg {
 	LEGENEC_UNKNOWN,
 
@@ -30,12 +34,29 @@ enum enum_genec_alg {
 	LEGENEC_EDDSA
 };
 
+/*
+ * The ctx is user-allocated storage, and may be uninitialized when first
+ * passed to a create() api.  create() marks the ctx once it has brought it
+ * to a known state, so it can distinguish a ctx that may hold live backend
+ * key handles (and must release them before re-initializing) from
+ * uninitialized storage; lws_genec_destroy() clears the mark.
+ */
+
+#define LWS_GENEC_CTX_CREATED_MARK 0x4c574745u /* "LWGE" */
+
 struct lws_genec_ctx {
 #if defined(LWS_WITH_MBEDTLS)
+#if !defined(LWS_HAVE_MBEDTLS_V4)
 	union {
 		mbedtls_ecdh_context *ctx_ecdh;
 		mbedtls_ecdsa_context *ctx_ecdsa;
 	} u;
+#else
+	psa_key_id_t key_id;
+	psa_algorithm_t alg;
+	uint8_t *peer_key;
+	size_t peer_key_len;
+#endif
 #elif defined(LWS_WITH_SCHANNEL)
 	struct {
 		void *hAlg;
@@ -50,6 +71,8 @@ struct lws_genec_ctx {
 	br_ec_private_key priv;
 	void *kbuf_priv;
 	void *kbuf_pub;
+#elif defined(LWS_WITH_OPENHITLS)
+	CRYPT_EAL_PkeyCtx *ctx[2];
 #else
 	EVP_PKEY_CTX *ctx[2];
 #endif
@@ -57,10 +80,11 @@ struct lws_genec_ctx {
 	const struct lws_ec_curves *curve_table;
 	enum enum_genec_alg genec_alg;
 
+	uint32_t created_mark;
 	char has_private;
 };
 
-#if defined(LWS_WITH_MBEDTLS)
+#if defined(LWS_WITH_MBEDTLS) && !defined(LWS_HAVE_MBEDTLS_V4)
 enum enum_lws_dh_side {
 	LDHS_OURS = MBEDTLS_ECDH_OURS,
 	LDHS_THEIRS = MBEDTLS_ECDH_THEIRS
@@ -90,8 +114,13 @@ struct lws_ec_curves {
  *		       .name = NULL, of curves you want to allow
  *
  * Initializes a genecdh
+ *
+ * \p ctx must be zeroed (eg, using memset) before it is passed to create
+ * apis the first time; if the ctx is still live from an earlier create, the
+ * call fails and returns nonzero.  After lws_genec_destroy() the same ctx
+ * can be passed to the create apis again.
  */
-LWS_VISIBLE int
+LWS_VISIBLE LWS_EXTERN int
 lws_genecdh_create(struct lws_genec_ctx *ctx, struct lws_context *context,
 		   const struct lws_ec_curves *curve_table);
 
@@ -135,9 +164,11 @@ lws_genecdh_compute_shared_secret(struct lws_genec_ctx *ctx, uint8_t *ss,
  *		       struct lws_ec_curves array, terminated by an entry with
  *		       .name = NULL, of curves you want to allow
  *
- * Initializes a genecdh
+ * Initializes a genecdsa.  \p ctx follows the same lifetime rules as for
+ * lws_genecdh_create(): zeroed before first use, and create over a ctx that
+ * is still live fails until lws_genec_destroy() is called on it.
  */
-LWS_VISIBLE int
+LWS_VISIBLE LWS_EXTERN int
 lws_genecdsa_create(struct lws_genec_ctx *ctx, struct lws_context *context,
 		    const struct lws_ec_curves *curve_table);
 
@@ -224,9 +255,11 @@ lws_genecdsa_hash_sign_jws(struct lws_genec_ctx *ctx, const uint8_t *in,
  *		       struct lws_ec_curves array, terminated by an entry with
  *		       .name = NULL, of curves you want to allow
  *
- * Initializes a geneddsa
+ * Initializes a geneddsa.  \p ctx follows the same lifetime rules as for
+ * lws_genecdh_create(): zeroed before first use, and create over a ctx that
+ * is still live fails until lws_genec_destroy() is called on it.
  */
-LWS_VISIBLE int
+LWS_VISIBLE LWS_EXTERN int
 lws_geneddsa_create(struct lws_genec_ctx *ctx, struct lws_context *context,
 		    const struct lws_ec_curves *curve_table);
 

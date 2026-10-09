@@ -7,7 +7,13 @@
 
 function san(s)
 {
-	return document.createTextNode(s);
+	if (typeof s !== 'string')
+		s = s.toString();
+	return s.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;")
+		.replace(/'/g, "&#039;");
 }
 
 function check_file()
@@ -58,7 +64,7 @@ var BrowserDetect = {
 	searchVersion: function (dataString) {
 		var index = dataString.indexOf(this.versionSearchString);
 		if (index === -1) return 0;
-		return parseFloat(dataString.substring(index +
+		return Number.parseFloat(dataString.substring(index +
 										this.versionSearchString.length + 1));
 	},
 	dataBrowser: [
@@ -262,7 +268,7 @@ function ws_open_status()
 			s="<table>";
 			var n;
 			for (n = 0; n < jso.conns.length; n++) {
-				var d = new Date(parseInt(jso.conns[n].time, 10) * 1000);
+				var d = new Date(Number.parseInt(jso.conns[n].time, 10) * 1000);
 				
 				s = s + "<tr><td class=l>client " + (n + 1) +
 				"</td><td><b>" + san(jso.conns[n].peer) +
@@ -292,7 +298,7 @@ function reset() {
 
 
 function junk() {
-	for(var word = ""; word.length < 9000; word += "a"){}
+	var word = "a".repeat(9000);
 	socket_di.send(word);
 }
 

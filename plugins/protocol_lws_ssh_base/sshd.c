@@ -1,7 +1,7 @@
 /*
  * libwebsockets - small server side websockets and web server implementation
  *
- * Copyright (C) 2010 - 2019 Andy Green <andy@warmcat.com>
+ * Copyright (C) 2010 - 2026 Andy Green <andy@warmcat.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
@@ -27,6 +27,8 @@
 
 #include <string.h>
 #include <stdlib.h>
+
+#define LWS_SSH_MAX_PACKET_SIZE  (256 * 1024)
 
 void *sshd_zalloc(size_t s)
 {
@@ -89,10 +91,32 @@ lws_buf(uint8_t **p, void *s, uint32_t len)
 	return 0;
 }
 
+/*
+ * head == tail means "the ring is empty", so the 8-entry ring can only hold 7
+ * tasks.  The peer can queue more than that from a single rx buffer, and
+ * wrapping silently used to overwrite unserviced entries and make the ring
+ * look empty again.  Refuse instead, and remember that we had to, so the
+ * connection is closed rather than left with responses silently dropped.
+ */
+static int
+write_task_full(struct per_session_data__sshd *pss)
+{
+	if (((pss->wt_head + 1) & 7) != pss->wt_tail)
+		return 0;
+
+	lwsl_notice("%s: write task ring full\n", __func__);
+	pss->wt_overflow = 1;
+
+	return 1;
+}
+
 void
 write_task(struct per_session_data__sshd *pss, struct lws_ssh_channel *ch,
 	   int task)
 {
+	if (write_task_full(pss))
+		return;
+
 	pss->write_task[pss->wt_head] = (uint8_t)task;
 	pss->write_channel[pss->wt_head] = ch;
 	pss->wt_head = (pss->wt_head + 1) & 7;
@@ -103,6 +127,9 @@ void
 write_task_insert(struct per_session_data__sshd *pss, struct lws_ssh_channel *ch,
 	   int task)
 {
+	if (write_task_full(pss))
+		return;
+
 	pss->wt_tail = (pss->wt_tail - 1) & 7;
 	pss->write_task[pss->wt_tail] = (uint8_t)task;
 	pss->write_channel[pss->wt_tail] = ch;
@@ -301,7 +328,7 @@ handle_name(struct per_session_data__sshd *pss)
 	struct lws_kex *kex = pss->kex;
 	char keyt[32];
 	uint8_t keybuf[256];
-	int n = 0, len;
+	int len;
 
 	switch (pss->parser_state) {
 	case SSH_KEX_NL_KEX_ALGS:
@@ -309,19 +336,30 @@ handle_name(struct per_session_data__sshd *pss)
 			kex->match_bitfield |= 1;
 		break;
 	case SSH_KEX_NL_SHK_ALGS:
-		len = (int)get_gen_server_key_25519(pss, keybuf, (int)sizeof(keybuf));
-		if (!len)
-			break;
-		if (ed25519_key_parse(keybuf, (unsigned int)len,
-				      keyt, sizeof(keyt),
-				      NULL, NULL)) {
-			lwsl_err("Unable to parse host key %d\n", n);
-		} else {
-			if (!strcmp(pss->name, keyt)) {
-				kex->match_bitfield |= 2;
-				break;
-			}
+		/*
+		 * We are called once per comma-separated name in the peer's
+		 * name-list, and he chooses how many names that is (up to the
+		 * 256KB packet limit).  Reading and parsing the host key file
+		 * for each of them is a huge IO / CPU amplification, so do it
+		 * once per KEX and compare against the cached type after that.
+		 */
+		if (!kex->hostkey_checked) {
+			kex->hostkey_checked = 1;
+			len = (int)get_gen_server_key_25519(pss, keybuf,
+							(int)sizeof(keybuf));
+			if (!len || ed25519_key_parse(keybuf, (unsigned int)len,
+						      keyt, sizeof(keyt),
+						      NULL, NULL))
+				lwsl_err("%s: unable to parse host key\n",
+					 __func__);
+			else
+				lws_strncpy(kex->hostkey_type, keyt,
+					    sizeof(kex->hostkey_type));
 		}
+
+		if (kex->hostkey_type[0] &&
+		    !strcmp(pss->name, kex->hostkey_type))
+			kex->match_bitfield |= 2;
 		break;
 	case SSH_KEX_NL_EACTS_ALGS:
 		if (!strcmp(pss->name, "chacha20-poly1305@openssh.com"))
@@ -386,6 +424,14 @@ lws_kex_destroy(struct per_session_data__sshd *pss)
 	lws_explicit_bzero(pss->kex, sizeof(*pss->kex));
 	free(pss->kex);
 	pss->kex = NULL;
+
+	/*
+	 * copy_to_I_C is only meaningful while there is a kex to copy into,
+	 * and the parser leaves it set if the peer's KEXINIT declared zero
+	 * padding; clear it here or parse() dereferences the NULL kex on the
+	 * next byte that arrives
+	 */
+	pss->copy_to_I_C = 0;
 }
 
 static void
@@ -441,6 +487,122 @@ rsa_hash_alg_from_ident(const char *ident)
         return -1;
 }
 
+/*
+ * Walk a single RFC4251 length-prefixed item out of a peer-supplied blob:
+ * if a whole u32 length fits before end, fetch it into *elen and advance *pp
+ * past the length field.  The item body must also fit inside what remains of
+ * the blob, or the caller would go on to use data from beyond the allocation.
+ */
+static int
+ssh_blob_item_get(uint8_t **pp, const uint8_t *end, uint32_t *elen)
+{
+	if (end - *pp < 4)
+		return 1;
+
+	*elen = lws_g32(pp);
+
+	if (*elen > (uint32_t)(end - *pp))
+		return 1;
+
+	return 0;
+}
+
+/*
+ * Parse the peer's public key blob into RSA key elements
+ *
+ *   string    "ssh-rsa"
+ *   mpint     e
+ *   mpint     n
+ *
+ * The blob is untrusted, so every inner length is bounded against the outer
+ * blob length and the items must exactly consume it.  The elements' bufs
+ * point into the blob, which must outlive the RSA ctx they are imported to.
+ */
+static int
+ssh_parse_pubkey_blob(struct lws_gencrypto_keyelem *e,
+		      uint8_t *blob, uint32_t blob_len)
+{
+	uint8_t *pp = blob, *pe = blob + blob_len;
+	uint32_t m;
+
+	/* string  algo name */
+
+	if (ssh_blob_item_get(&pp, pe, &m))
+		return 1;
+	pp += m;
+
+	/* mpint  e */
+
+	if (ssh_blob_item_get(&pp, pe, &m))
+		return 1;
+	e[LWS_GENCRYPTO_RSA_KEYEL_E].buf = pp;
+	e[LWS_GENCRYPTO_RSA_KEYEL_E].len = m;
+	pp += m;
+
+	/* mpint  n: the last item must exactly consume the blob */
+
+	if (ssh_blob_item_get(&pp, pe, &m) || pp + m != pe)
+		return 1;
+	e[LWS_GENCRYPTO_RSA_KEYEL_N].buf = pp;
+	e[LWS_GENCRYPTO_RSA_KEYEL_N].len = m;
+
+	return 0;
+}
+
+/*
+ * Locate the signature MPI inside the peer's signature blob
+ *
+ *   string    algo name the signature was made with
+ *   string    signature
+ *
+ * As with the pubkey blob, inner lengths are bounded against the blob length
+ * and the signature must exactly consume the rest of the blob.
+ */
+static int
+ssh_parse_sig_blob(uint8_t *blob, uint32_t blob_len,
+		   const uint8_t **sig, uint32_t *sig_len)
+{
+	uint8_t *pp = blob, *pe = blob + blob_len;
+	uint32_t m;
+
+	/* string  algo name */
+
+	if (ssh_blob_item_get(&pp, pe, &m))
+		return 1;
+	pp += m;
+
+	/* string  signature: must exactly consume the blob */
+
+	if (ssh_blob_item_get(&pp, pe, &m) || pp + m != pe)
+		return 1;
+
+	*sig = pp;
+	*sig_len = m;
+
+	return 0;
+}
+
+/*
+ * We have just consumed the last byte of a u32 length prefix, and pss->len is
+ * the length it announced.  Confirm the string body actually fits in what is
+ * left of the packet we are parsing.
+ *
+ * pss->pos includes the 4-byte packet length field while pss->msg_len excludes
+ * it, and pos is already past the byte in hand, so the bytes remaining after
+ * it are msg_len + 4 - pos.  The old test computed msg_len - pos, an unsigned
+ * subtraction that wrapped to ~0 for the last four positions of any packet and
+ * then admitted any length, letting a string escape its own framing and
+ * allocate up to the 16MB cap out of a minimal packet.
+ */
+static int
+ssh_string_overruns_packet(struct per_session_data__sshd *pss)
+{
+	if (pss->pos > pss->msg_len + 4)
+		return 1;
+
+	return (pss->msg_len + 4) - pss->pos < pss->len;
+}
+
 static void
 state_get_string_alloc(struct per_session_data__sshd *pss, int next)
 {
@@ -465,13 +627,14 @@ state_get_u32(struct per_session_data__sshd *pss, int next)
 static struct lws_ssh_channel *
 ssh_get_server_ch(struct per_session_data__sshd *pss, uint32_t chi)
 {
-	struct lws_ssh_channel *ch = pss->ch_list;
+	lws_start_foreach_dll(struct lws_dll2 *, d,
+			      lws_dll2_get_head(&pss->ch_list)) {
+		struct lws_ssh_channel *ch = lws_container_of(d,
+						struct lws_ssh_channel, list);
 
-	while (ch) {
 		if (ch->server_ch == chi)
 			return ch;
-		ch = ch->next;
-	}
+	} lws_end_foreach_dll(d);
 
 	return NULL;
 }
@@ -480,13 +643,14 @@ ssh_get_server_ch(struct per_session_data__sshd *pss, uint32_t chi)
 static struct lws_ssh_channel *
 ssh_get_peer_ch(struct per_session_data__sshd *pss, uint32_t chi)
 {
-	struct lws_ssh_channel *ch = pss->ch_list;
+	lws_start_foreach_dll(struct lws_dll2 *, d,
+			      lws_dll2_get_head(&pss->ch_list)) {
+		struct lws_ssh_channel *ch = lws_container_of(d,
+						struct lws_ssh_channel, list);
 
-	while (ch) {
 		if (ch->sender_ch == chi)
 			return ch;
-		ch = ch->next;
-	}
+	} lws_end_foreach_dll(d);
 
 	return NULL;
 }
@@ -496,22 +660,35 @@ static void
 ssh_destroy_channel(struct per_session_data__sshd *pss,
 		    struct lws_ssh_channel *ch)
 {
-	lws_start_foreach_llp(struct lws_ssh_channel **, ppch, pss->ch_list) {
-		if (*ppch == ch) {
-			lwsl_info("Deleting ch %p\n", ch);
-			if (pss->vhd && pss->vhd->ops &&
-			    pss->vhd->ops->channel_destroy)
-				pss->vhd->ops->channel_destroy(ch->priv);
-			*ppch = ch->next;
-			if (ch->sub)
-				free(ch->sub);
-			free(ch);
+	int n;
 
-			return;
-		}
-	} lws_end_foreach_llp(ppch, next);
+	if (lws_dll2_is_detached(&ch->list)) {
+		lwsl_notice("Failed to delete ch\n");
 
-	lwsl_notice("Failed to delete ch\n");
+		return;
+	}
+
+	lwsl_info("Deleting ch %p\n", ch);
+	if (pss->vhd && pss->vhd->ops &&
+	    pss->vhd->ops->channel_destroy)
+		pss->vhd->ops->channel_destroy(ch->priv);
+	lws_dll2_remove(&ch->list);
+
+	/*
+	 * Queued write tasks and ch_temp hold the channel by bare pointer and
+	 * are rendered later, from the writeable callback; scrub the ones that
+	 * refer to this channel or they read it after this free
+	 */
+
+	for (n = 0; n < (int)LWS_ARRAY_SIZE(pss->write_channel); n++)
+		if (pss->write_channel[n] == ch)
+			pss->write_channel[n] = NULL;
+
+	if (pss->ch_temp == ch)
+		pss->ch_temp = NULL;
+
+	free(ch->sub);
+	free(ch);
 }
 
 static void
@@ -533,11 +710,10 @@ lws_ssh_parse_plaintext(struct per_session_data__sshd *pss, uint8_t *p, size_t l
 	struct lws_genrsa_ctx ctx;
 	struct lws_ssh_channel *ch;
 	struct lws_subprotocol_scp *scp;
-	uint8_t *pp, *ps, hash[64];
-#if !defined(MBEDTLS_VERSION_NUMBER) || MBEDTLS_VERSION_NUMBER < 0x03000000
-	uint8_t *otmp = NULL;
-#endif
-	uint32_t m;
+	uint8_t *pp, *ps;
+	const uint8_t *sigp;
+	uint32_t siglen;
+	uint8_t hash[32];
 	int n;
 
 	while (len --) {
@@ -592,6 +768,11 @@ again:
 			pss->parser_state = SSHS_MSG_PADDING;
 			pss->ctr = 0;
 			pss->pos = 4;
+
+			if (pss->msg_len > LWS_SSH_MAX_PACKET_SIZE) {
+				lwsl_notice("msg size %u exceeds maximum\n", pss->msg_len);
+				goto bail;
+			}
 			if (pss->msg_len < 2 + 4) {
 				lwsl_notice("illegal msg size\n");
 				goto bail;
@@ -659,6 +840,17 @@ again:
 				pss->copy_to_I_C = 1;
 				break;
 			case SSH_MSG_KEX_ECDH_INIT:
+				/*
+				 * The kex is destroyed as soon as both sides
+				 * have applied NEWKEYS; a peer sending this
+				 * afterwards must not reach the states that
+				 * write through pss->kex
+				 */
+				if (!pss->kex) {
+					lwsl_notice("%s: ECDH_INIT: no kex\n",
+						    __func__);
+					goto bail;
+				}
 				pss->parser_state = SSH_KEX_STATE_ECDH_KEYLEN;
 				break;
 
@@ -668,6 +860,20 @@ again:
 				    pss->kex_state !=
 						KEX_STATE_CRYPTO_INITIALIZED) {
 					lwsl_notice("unexpected newkeys\n");
+
+					goto bail;
+				}
+				/*
+				 * kex_state stays CRYPTO_INITIALIZED for the
+				 * rest of the connection, so the check above
+				 * does not stop a second NEWKEYS; that one
+				 * would use a kex we already destroyed, or
+				 * re-activate the cts keys.  It is a protocol
+				 * error either way.
+				 */
+				if (!pss->kex || (pss->kex->newkeys & 2)) {
+					lwsl_notice("%s: repeated newkeys\n",
+						    __func__);
 
 					goto bail;
 				}
@@ -733,6 +939,7 @@ again:
 				goto bail;
 
 			case SSH_MSG_CHANNEL_OPEN:
+				if (pss->ssh_auth_state != SSH_AUTH_STATE_GAVE_AUTH_IGNORE_REQS) goto bail;
 				state_get_string(pss, SSHS_NVC_CHOPEN_TYPE);
 				break;
 
@@ -752,6 +959,7 @@ again:
 				 *  uint32    terminal height, px (e.g., 480)
 				 *  string    encoded terminal modes
 				 */
+				if (pss->ssh_auth_state != SSH_AUTH_STATE_GAVE_AUTH_IGNORE_REQS) goto bail;
 				state_get_u32(pss, SSHS_NVC_CHRQ_RECIP);
 				break;
 
@@ -764,6 +972,7 @@ again:
 				 *  byte      SSH_MSG_CHANNEL_EOF
 				 *  uint32    recipient channel
 				 */
+				if (pss->ssh_auth_state != SSH_AUTH_STATE_GAVE_AUTH_IGNORE_REQS) goto bail;
 				state_get_u32(pss, SSHS_NVC_CH_EOF);
 				break;
 
@@ -781,6 +990,7 @@ again:
 				 * this message be delivered to the actual
 				 * destination, if possible.
 				 */
+				if (pss->ssh_auth_state != SSH_AUTH_STATE_GAVE_AUTH_IGNORE_REQS) goto bail;
 				state_get_u32(pss, SSHS_NVC_CH_CLOSE);
 				break;
 
@@ -791,6 +1001,7 @@ again:
 				 *      uint32    recipient channel
 				 *      string    data
 				 */
+				if (pss->ssh_auth_state != SSH_AUTH_STATE_GAVE_AUTH_IGNORE_REQS) goto bail;
 				state_get_u32(pss, SSHS_NVC_CD_RECIP);
 				break;
 
@@ -801,9 +1012,10 @@ again:
 				 * uint32    recipient channel
 				 * uint32    bytes to add
 				 */
-				if (!pss->ch_list)
+				if (!lws_dll2_count(&pss->ch_list))
 					goto bail;
 
+				if (pss->ssh_auth_state != SSH_AUTH_STATE_GAVE_AUTH_IGNORE_REQS) goto bail;
 				state_get_u32(pss, SSHS_NVC_WA_RECIP);
 				break;
 			default:
@@ -852,7 +1064,7 @@ again:
 			}
 			pss->ctr = 0;
 			pss->npos = 0;
-			if (pss->msg_len - pss->pos < pss->len) {
+			if (ssh_string_overruns_packet(pss)) {
 				lwsl_notice("sanity: length  %d - %d < %d\n",
 					    pss->msg_len, pss->pos, pss->len);
 				goto bail;
@@ -985,6 +1197,10 @@ again:
                         if (++pss->ctr != 4)
                                 break;
                         pss->ctr = 0;
+			if (pss->len == 0xffffffff ||
+			    pss->len > 16 * 1024 * 1024 ||
+			    ssh_string_overruns_packet(pss))
+				goto bail;
 			pss->last_alloc = sshd_zalloc(pss->len + 1);
 			lwsl_debug("SSHS_GET_STRING_LEN_ALLOC: %p, state %d\n",
 				   pss->last_alloc, pss->state_after_string);
@@ -1010,6 +1226,15 @@ again:
 		 */
 
 		case SSHS_DO_SERVICE_REQUEST:
+			/*
+			 * Snapshot the requested service name: the ACCEPT is
+			 * only rendered later, from the writeable callback, by
+			 * which time the parser scratch it used to be taken
+			 * from has been rewritten by any further packets in
+			 * the same rx buffer
+			 */
+			lws_strncpy(pss->service, pss->name,
+				    sizeof(pss->service));
 			pss->okayed_userauth = 1;
 			pss->parser_state = SSHS_MSG_EAT_PADDING;
 			/*
@@ -1231,81 +1456,47 @@ again:
 
 			/*
 			 * Prepare the RSA decryption context: load in
-			 * the E and N factors
+			 * the E and N factors.  Both the pubkey blob and
+			 * the sig blob are attacker-controlled, they're
+			 * walked bounded and have to exactly consume
+			 * their allocations or we're reading from wild
+			 * pointers.
 			 */
-
 			memset(e, 0, sizeof(e));
-			pp = pss->ua->pubkey;
-			m = lws_g32(&pp);
-			pp += m;
-			m = lws_g32(&pp);
-			e[LWS_GENCRYPTO_RSA_KEYEL_E].buf = pp;
-			e[LWS_GENCRYPTO_RSA_KEYEL_E].len = m;
-			pp += m;
-			m = lws_g32(&pp);
-			e[LWS_GENCRYPTO_RSA_KEYEL_N].buf = pp;
-			e[LWS_GENCRYPTO_RSA_KEYEL_N].len = m;
+			memset(&ctx, 0, sizeof(ctx));
+
+			if (ssh_parse_pubkey_blob(e, pss->ua->pubkey,
+						  pss->ua->pubkey_len)) {
+				lwsl_notice("malformed pubkey blob\n");
+				goto ua_fail;
+			}
+
+			/*
+			 * point to the encrypted signature payload we
+			 * were sent
+			 */
+			if (ssh_parse_sig_blob(pss->ua->sig, pss->ua->sig_len,
+					       &sigp, &siglen)) {
+				lwsl_notice("malformed sig blob\n");
+				goto ua_fail;
+			}
 
 			if (lws_genrsa_create(&ctx, e, pss->vhd->context,
 					      LGRSAM_PKCS1_1_5,
 					      LWS_GENHASH_TYPE_UNKNOWN))
 				goto ua_fail;
-			/*
-			 * point to the encrypted signature payload we
-			 * were sent
-			 */
-			pp = pss->ua->sig;
-			m = lws_g32(&pp);
-			pp += m;
-			m = lws_g32(&pp);
-#if !defined(MBEDTLS_VERSION_NUMBER) || MBEDTLS_VERSION_NUMBER < 0x03000000
 
-			/*
-			 * decrypt it, resulting in an error, or some ASN1
-			 * including the decrypted signature
-			 */
-			otmp = sshd_zalloc(m);
-			if (!otmp)
-				/* ua_fail1 frees bn_e, bn_n and rsa */
-				goto ua_fail1;
-
-			n = lws_genrsa_public_decrypt(&ctx, pp, m, otmp, m);
-			if (n > 0) {
-				/* the decrypted sig is in ASN1 format */
-				m = 0;
-				while ((int)m < n) {
-					/* sig payload */
-					if (otmp[m] == 0x04 &&
-					    otmp[m + 1] == lws_genhash_size(
-						  pss->ua->hash_ctx.type)) {
-						m = (uint32_t)memcmp(&otmp[m + 2], hash,
-							(unsigned int)lws_genhash_size(pss->ua->hash_ctx.type));
-						break;
-					}
-					/* go into these */
-					if (otmp[m] == 0x30) {
-						m += 2;
-						continue;
-					}
-					/* otherwise skip payloads */
-					m += (uint32_t)(otmp[m + 1] + 2);
-				}
-			}
-
-			free(otmp);
-		#else
-			ctx.ctx->MBEDTLS_PRIVATE(len) = m;
 			n = lws_genrsa_hash_sig_verify(&ctx, hash,
 				(enum lws_genhash_types)rsa_hash_alg_from_ident(pss->ua->alg),
-				pp, m) == 0 ? 1 : 0;
-		#endif
+				sigp, siglen) == 0 ? 1 : 0;
+
 			lws_genrsa_destroy(&ctx);
 
 			/*
-			 * if no good, m is nonzero and inform peer
+			 * if no good, inform peer
 			 */
 			if (n <= 0) {
-				lwsl_notice("hash sig verify fail: %d\n", m);
+				lwsl_notice("hash sig verify fail\n");
 				goto ua_fail;
 			}
 
@@ -1372,6 +1563,13 @@ again:
 				pss->reason = 3;
 				goto ch_fail;
 			}
+		{
+			if (lws_dll2_count(&pss->ch_list) >= 8) {
+				lwsl_notice("Too many channels\n");
+				pss->reason = 4;
+				goto ch_fail;
+			}
+		}
 			lwsl_info("SSHS_NVC_CHOPEN_TYPE: creating session\n");
 			pss->ch_temp = sshd_zalloc(sizeof(*pss->ch_temp));
 			if (!pss->ch_temp)
@@ -1388,10 +1586,14 @@ again:
 			break;
 		case SSHS_NVC_CHOPEN_WINSIZE:
 			lwsl_info("Initial window set to %d\n", pss->len);
+			if (pss->len > 64 * 1024 * 1024)
+				pss->len = 64 * 1024 * 1024;
 			pss->ch_temp->window = (int32_t)pss->len;
 			state_get_u32(pss, SSHS_NVC_CHOPEN_PKTSIZE);
 			break;
 		case SSHS_NVC_CHOPEN_PKTSIZE:
+			if (pss->len > 16 * 1024 * 1024)
+				pss->len = 16 * 1024 * 1024;
 			pss->ch_temp->max_pkt = pss->len;
 			pss->ch_temp->peer_window_est = LWS_SSH_INITIAL_WINDOW;
 			pss->ch_temp->server_ch = (uint32_t)pss->next_ch_num++;
@@ -1400,8 +1602,7 @@ again:
 			 * as write task needs it and will NULL down
 			 */
 			lwsl_info("creating new session ch\n");
-			pss->ch_temp->next = pss->ch_list;
-			pss->ch_list = pss->ch_temp;
+			lws_dll2_add_head(&pss->ch_temp->list, &pss->ch_list);
 			if (pss->vhd->ops && pss->vhd->ops->channel_create)
 				pss->vhd->ops->channel_create(pss->wsi,
 						&pss->ch_temp->priv);
@@ -1428,6 +1629,8 @@ again:
 					pss->name, pss->rq_want_reply);
 
 			pss->ch_temp = ssh_get_server_ch(pss, pss->ch_recip);
+			if (!pss->ch_temp)
+				goto bail;
 
 			/* after this they differ by the request */
 
@@ -1589,14 +1792,12 @@ again:
 			 * fake scp
 			 */
 
-			/* we only alloc "exec" of scp for scp destination */
-			n = 1;
-			if (pss->last_alloc[0] != 's' ||
-			    pss->last_alloc[1] != 'c' ||
-			    pss->last_alloc[2] != 'p' ||
-			    pss->last_alloc[3] != ' ')
-				/* disallow it */
-				n = 0;
+			/* we only alloc "exec" of scp for scp destination...
+			 * npos is the length of the exec command string,
+			 * don't look for the prefix past the end of it
+			 */
+			n = pss->npos >= 4 &&
+			    !memcmp(pss->last_alloc, "scp ", 4);
 
 			ssh_free_set_NULL(pss->last_alloc);
 			if (!n)
@@ -1633,8 +1834,15 @@ again:
 			}
 #endif
 			ssh_free_set_NULL(pss->last_alloc);
+			/*
+			 * This is a failed CHANNEL_REQUEST on a channel that
+			 * is open and on ch_list, so the answer is
+			 * CHANNEL_FAILURE; ch_fail is for CHANNEL_OPEN and
+			 * used to free the live channel out from under
+			 * ch_list and the queued write tasks.
+			 */
 //			if (!n)
-				goto ch_fail;
+				goto chrq_fail;
 #if 0
 			if (pss->rq_want_reply)
 				write_task(pss, ssh_get_server_ch(pss,
@@ -1677,7 +1885,18 @@ again:
 			pss->ch_recip = pss->len;
 
 			ch = ssh_get_server_ch(pss, pss->ch_recip);
-			ch->peer_window_est -= (int32_t)pss->msg_len;
+			if (!ch)
+				goto bail;
+			/*
+			 * msg_len is peer-controlled up to 256KB and is only
+			 * credited back 32768 at a time, so the estimate
+			 * decreases without bound; saturate at 0 rather than
+			 * overflow the int32_t (UB)
+			 */
+			if (ch->peer_window_est > (int32_t)pss->msg_len)
+				ch->peer_window_est -= (int32_t)pss->msg_len;
+			else
+				ch->peer_window_est = 0;
 
 			if (pss->msg_len < sizeof(pss->name))
 				state_get_string(pss, SSHS_NVC_CD_DATA);
@@ -1698,6 +1917,8 @@ again:
 			lwsl_info("SSHS_NVC_CD_DATA\n");
 
 			ch = ssh_get_server_ch(pss, pss->ch_recip);
+			if (!ch)
+				goto bail;
 			switch (ch->type) {
 			case SSH_CH_TYPE_SCP:
 				scp = &ch->sub->scp;
@@ -1710,6 +1931,9 @@ again:
 
 					/* Header triggers the transfer? */
 					if (pp[0] == 'C' && pp[pss->npos - 1] == '\x0a') {
+						char *fname;
+						uint64_t max_body;
+						
 						while (*pp != ' ' && *pp != '\x0a')
 							pp++;
 						if (*pp++ != ' ') {
@@ -1718,13 +1942,62 @@ again:
 							pss->parser_state = SSHS_MSG_EAT_PADDING;
 							break;
 						}
-						scp->len = (uint64_t)atoll((const char *)pp);
+						/*
+						 * Q-25: parse client-supplied SCP
+						 * length with strtoull (atoll silently
+						 * returns 0 on non-numeric / neg, and
+						 * has no overflow signal).  Require the
+						 * next field separator to follow.
+						 */
+						{
+							char *endp = NULL;
+							unsigned long long L =
+								strtoull((const char *)pp,
+									 &endp, 10);
+							if (endp == (char *)pp ||
+							    *endp != ' ') {
+								write_task(pss, ch,
+								   SSH_WT_SCP_ACK_ERROR);
+								pss->parser_state =
+									SSHS_MSG_EAT_PADDING;
+								break;
+							}
+							scp->len = (uint64_t)L;
+						}
+						max_body = 100 * 1024 * 1024; /* hard limit for SCP in plugin */
+						
+						if (scp->len > max_body) {
+							lwsl_notice("scp payload %llu exceeds max %llu\n",
+								    (unsigned long long)scp->len, (unsigned long long)max_body);
+							write_task(pss, ch, SSH_WT_SCP_ACK_ERROR);
+							pss->parser_state = SSHS_MSG_EAT_PADDING;
+							break;
+						}
+						
+						/* find filename and purify it */
+						fname = (char *)pp;
+						while (*fname != ' ' && *fname != '\x0a')
+							fname++;
+						if (*fname == ' ') {
+							char *end;
+							fname++;
+							end = fname;
+							while (*end != '\x0a' && *end != '\0')
+								end++;
+							*end = '\0';
+							lws_filename_purify_inplace(fname);
+							*end = '\x0a';
+						}
+
 						lwsl_notice("scp payload %llu expected\n",
 							    (unsigned long long)scp->len);
 						scp->ips = SSHS_SCP_PAYLOADIN;
 					}
-					/* ack it */
-					write_task(pss, pss->ch_temp,
+					/* ack it on the channel the data came
+					 * in on; ch_temp is the last channel
+					 * *request* scratch and is usually
+					 * NULL or a different channel here */
+					write_task(pss, ch,
 						   SSH_WT_SCP_ACK_OKAY);
 					break;
 				case SSHS_SCP_PAYLOADIN:
@@ -1771,6 +2044,10 @@ again:
 		case SSHS_NVC_WA_ADD:
 			ch = ssh_get_server_ch(pss, pss->ch_recip);
 			if (ch) {
+				if ((uint64_t)ch->window + pss->len > 64 * 1024 * 1024) {
+					lwsl_notice("window too large\n");
+					goto bail;
+				}
 				ch->window += (int32_t)pss->len;
 				lwsl_notice("got additional window %d (now %d)\n",
 						pss->len, ch->window);
@@ -1856,18 +2133,31 @@ chrq_fail:
 			break;
 
 ch_fail:
-			if (pss->ch_temp) {
+			/*
+			 * CHANNEL_OPEN failed.  ch_temp may be a channel that
+			 * is already linked on ch_list and referenced by
+			 * queued write tasks (it is only cleared when
+			 * CH_OPEN_CONF is rendered), and freeing that with a
+			 * bare free() left the list and the tasks pointing
+			 * into freed memory, and double-freed it at close.
+			 * Only a channel that was never linked may be freed
+			 * here.
+			 */
+			if (pss->ch_temp &&
+			    lws_dll2_is_detached(&pss->ch_temp->list)) {
 				free(pss->ch_temp);
 				pss->ch_temp = NULL;
 			}
-			write_task(pss, pss->ch_temp, SSH_WT_CH_FAILURE);
+			/*
+			 * We fail before the peer's channel id has been
+			 * parsed, so we cannot form a valid
+			 * CHANNEL_OPEN_FAILURE; the write task disconnects on
+			 * the NULL channel.
+			 */
+			write_task(pss, NULL, SSH_WT_CH_FAILURE);
 			pss->parser_state = SSH_KEX_STATE_SKIP;
 			break;
 
-#if !defined(MBEDTLS_VERSION_NUMBER) || MBEDTLS_VERSION_NUMBER < 0x03000000
-ua_fail1:
-#endif
-			lws_genrsa_destroy(&ctx);
 ua_fail:
 			write_task(pss, NULL, SSH_WT_UA_FAILURE);
 ua_fail_silently:
@@ -1880,7 +2170,7 @@ ua_fail_silently:
 			 * limit is 20 attempts).  If the threshold is
 			 * exceeded, the server SHOULD disconnect.
 			 */
-			if (pss->count_auth_attempts++ > 20)
+			if (++pss->count_auth_attempts > 20)
 				goto bail;
 
 			pss->parser_state = SSH_KEX_STATE_SKIP;
@@ -2007,7 +2297,7 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 		      void *user, void *in, size_t len)
 {
 	struct per_session_data__sshd *pss =
-			(struct per_session_data__sshd *)user, **p;
+			(struct per_session_data__sshd *)user;
 	struct per_vhost_data__sshd *vhd = NULL;
 	uint8_t buf[LWS_PRE + 1024], *pp, *ps = &buf[LWS_PRE + 512], *ps1 = NULL;
 	const struct lws_protocol_vhost_options *pvo;
@@ -2095,8 +2385,7 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 		lwsl_info("LWS_CALLBACK_RAW_ADOPT\n");
 		if (!vhd || !pss)
 			return -1;
-		pss->next = vhd->live_pss_list;
-		vhd->live_pss_list = pss;
+		lws_dll2_add_head(&pss->list, &vhd->live_pss_list);
 		pss->parser_state = SSH_INITIALIZE_TRANSIENT;
 		pss->wsi = wsi;
 		pss->vhd = vhd;
@@ -2128,21 +2417,15 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 
 		ssh_free_set_NULL(pss->last_alloc);
 
-		while (pss->ch_list)
-			ssh_destroy_channel(pss, pss->ch_list);
+		while(!lws_dll2_is_empty(&pss->ch_list))
+			ssh_destroy_channel(pss, lws_container_of(
+					lws_dll2_get_head(&pss->ch_list),
+					struct lws_ssh_channel, list));
 
 		lws_chacha_destroy(&pss->active_keys_cts);
 		lws_chacha_destroy(&pss->active_keys_stc);
 
-		p = &vhd->live_pss_list;
-
-		while (*p) {
-			if ((*p) == pss) {
-				*p = pss->next;
-				continue;
-			}
-			p = &((*p)->next);
-		}
+		lws_dll2_remove(&pss->list);
 		break;
 
 	case LWS_CALLBACK_RAW_RX:
@@ -2150,6 +2433,14 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 			return -1;
 		if (parse(pss, in, len))
 			return -1;
+		if (pss->wt_overflow) {
+			/* we could not queue a response the peer is owed;
+			 * close rather than continue with protocol state the
+			 * two ends no longer agree on */
+			lwsl_notice("%s: write task overflow, closing\n",
+				    __func__);
+			return -1;
+		}
 		break;
 
 	case LWS_CALLBACK_RAW_WRITEABLE:
@@ -2191,20 +2482,25 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 			}
 
 			/* we need a copy of it to generate the hash later */
-			if (pss->kex->I_S)
-				free(pss->kex->I_S);
-			pss->kex->I_S = sshd_zalloc((unsigned int)m);
-			if (!pss->kex->I_S) {
-				lwsl_notice("OOM 5: %d\n", m);
+			{
+				uint8_t *is = sshd_zalloc((unsigned int)m);
 
-				return -1;
+				if (!is) {
+					lwsl_notice("OOM 5: %d\n", m);
+
+					return -1;
+				}
+				/* without length + padcount part */
+				memcpy(is, buf + LWS_PRE + 5, (unsigned int)m);
+				free(pss->kex->I_S);
+				pss->kex->I_S = is;
+				pss->kex->I_S_payload_len = (uint32_t)m; /* without padding */
 			}
-			/* without length + padcount part */
-			memcpy(pss->kex->I_S, buf + LWS_PRE + 5, (unsigned int)m);
-			pss->kex->I_S_payload_len = (uint32_t)m; /* without padding */
 			break;
 
 		case SSH_WT_OFFER_REPLY:
+			if (!pss->kex)
+				goto bail;
 			memcpy(ps, pss->kex->kex_r, pss->kex->kex_r_len);
 			n = (int)pad_and_encrypt(&buf[LWS_PRE], ps,
 					    ps + pss->kex->kex_r_len, pss, 1);
@@ -2226,13 +2522,19 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 			 *
 			 *      byte      SSH_MSG_SERVICE_ACCEPT
 			 *      string    service name
+			 *
+			 * This used to render pss->name with pss->npos as its
+			 * length; both are the rx parser's scratch and have
+			 * been overwritten by anything parsed since the task
+			 * was queued (npos ends up as, eg, the length of a
+			 * userauth pubkey blob, which walked pp far past the
+			 * end of buf).  Use the snapshot made at queue time.
 			 */
 			pp = ps + 5;
 			*pp++ = SSH_MSG_SERVICE_ACCEPT;
-			lws_p32(pp, pss->npos);
-			pp += 4;
-			strcpy((char *)pp, pss->name);
-			pp += pss->npos;
+			if (lws_cstr(&pp, pss->service,
+				     sizeof(pss->service) - 1))
+				goto bail;
 			goto pac;
 
 		case SSH_WT_UA_FAILURE:
@@ -2303,6 +2605,11 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 			goto pac;
 
 		case SSH_WT_CH_OPEN_CONF:
+			/* ch_temp is cleared by ch_fail and by
+			 * ssh_destroy_channel(), either of which can happen
+			 * between this task being queued and rendered */
+			if (!pss->ch_temp)
+				goto drop_task;
 			pp = ps + 5;
 			*pp++ = SSH_MSG_CHANNEL_OPEN_CONFIRMATION;
 			lws_p32(pp, pss->ch_temp->sender_ch);
@@ -2321,6 +2628,11 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 			goto pac;
 
 		case SSH_WT_CH_FAILURE:
+			/* every other channel task guards this; without the
+			 * peer's channel id there is nothing valid we can
+			 * send, so fail closed */
+			if (!ch)
+				goto bail;
 			pp = ps + 5;
 			*pp++ = SSH_MSG_CHANNEL_OPEN_FAILURE;
 			lws_p32(pp, ch->sender_ch);
@@ -2333,6 +2645,7 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 			goto pac;
 
 		case SSH_WT_CHRQ_SUCC:
+			if (!ch) goto drop_task;
 			pp = ps + 5;
 			*pp++ = SSH_MSG_CHANNEL_SUCCESS;
 			lws_p32(pp, ch->sender_ch);
@@ -2341,6 +2654,7 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 			goto pac;
 
 		case SSH_WT_CHRQ_FAILURE:
+			if (!ch) goto drop_task;
 			pp = ps + 5;
 			*pp++ = SSH_MSG_CHANNEL_FAILURE;
 			lws_p32(pp, ch->sender_ch);
@@ -2349,6 +2663,7 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 			goto pac;
 
 		case SSH_WT_CH_CLOSE:
+			if (!ch) goto drop_task;
 			pp = ps + 5;
 			*pp++ = SSH_MSG_CHANNEL_CLOSE;
 			lws_p32(pp, ch->sender_ch);
@@ -2357,6 +2672,7 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 			goto pac;
 
 		case SSH_WT_CH_EOF:
+			if (!ch) goto drop_task;
 			pp = ps + 5;
 			*pp++ = SSH_MSG_CHANNEL_EOF;
 			lws_p32(pp, ch->sender_ch);
@@ -2366,6 +2682,7 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 
 		case SSH_WT_SCP_ACK_ERROR:
 		case SSH_WT_SCP_ACK_OKAY:
+			if (!ch) goto drop_task;
 			pp = ps + 5;
 			*pp++ = SSH_MSG_CHANNEL_DATA;
 			/* ps + 6 */
@@ -2381,6 +2698,7 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 			goto pac;
 
 		case SSH_WT_WINDOW_ADJUST:
+			if (!ch) goto drop_task;
 			pp = ps + 5;
 			*pp++ = SSH_MSG_CHANNEL_WINDOW_ADJUST;
 			/* ps + 6 */
@@ -2392,6 +2710,7 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 			goto pac;
 
 		case SSH_WT_EXIT_STATUS:
+			if (!ch) goto drop_task;
 			pp = ps + 5;
 			*pp++ = SSH_MSG_CHANNEL_REQUEST;
 			lws_p32(pp, ch->sender_ch);
@@ -2441,7 +2760,7 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 			else
 				*pp++ = SSH_MSG_CHANNEL_EXTENDED_DATA;
 			/* ps + 6 */
-			lws_p32(pp, pss->ch_list->sender_ch);
+			lws_p32(pp, ch->sender_ch);
 			m = 14;
 			if (n == LWS_STDERR) {
 				pp += 4;
@@ -2453,16 +2772,42 @@ lws_callback_raw_sshd(struct lws *wsi, enum lws_callback_reasons reason,
 			pp += 8;
 			/* ps + 14 / + 18 */
 
-			pp += pss->vhd->ops->tx(ch->priv, n, pp,
-						lws_ptr_diff_size_t(
-							&buf[sizeof(buf) - 1], pp));
+			/*
+			 * ps is the staging half of buf, and
+			 * lws_pad_set_length() appends up to
+			 * 4 + (padding_alignment - 1) bytes of padding after
+			 * whatever ops->tx() writes.  Letting tx() fill buf to
+			 * its last byte put that padding past the end of the
+			 * stack array, so reserve the padding here.
+			 */
+			{
+				size_t avail = lws_ptr_diff_size_t(
+						&buf[sizeof(buf)], pp),
+				       resv = 4u + (size_t)pss->active_keys_stc.
+							     padding_alignment;
+
+				if (avail <= resv) {
+					n = 0;
+					break;
+				}
+
+				pp += pss->vhd->ops->tx(ch->priv, n, pp,
+							avail - resv);
+			}
 
 			lws_p32(ps + m - 4, (uint32_t)lws_ptr_diff(pp, (ps + m)));
 
 			if (pss->vhd->ops->tx_waiting(ch->priv) > 0)
 				lws_callback_on_writable(wsi);
 
-			ch->window -= lws_ptr_diff(pp, ps) - m;
+			/*
+			 * keep the send window from going negative: it is
+			 * sign-extended into a uint64_t by the WINDOW_ADJUST
+			 * sanity check, where a negative value becomes huge
+			 * and rejects every subsequent adjust
+			 */
+			m = lws_ptr_diff(pp, ps) - m;
+			ch->window = ch->window > m ? ch->window - m : 0;
 			//lwsl_debug("our send window: %d\n", ch->window);
 
 			/* fallthru */
@@ -2470,6 +2815,19 @@ pac:
 			if (!pss->vhd)
 				break;
 			n = (int)pad_and_encrypt(&buf[LWS_PRE], ps, pp, pss, 0);
+			break;
+
+drop_task:
+			/*
+			 * The channel this task was queued against has been
+			 * destroyed since; ssh_destroy_channel() scrubbed the
+			 * pointer out of the ring, so consume the task without
+			 * rendering it instead of following a dangling one.
+			 */
+			lwsl_info("%s: dropping task %d for dead channel\n",
+				  __func__, o);
+			pss->wt_tail = (uint8_t)((pss->wt_tail + 1) & 7);
+			n = 0;
 			break;
 
 bail:
@@ -2552,9 +2910,18 @@ bail:
 	case LWS_CALLBACK_CGI:
 		if (!pss)
 			break;
+		/*
+		 * ch_temp is the channel-request parser scratch: it is NULL
+		 * for most of the connection and dangles after the channel it
+		 * last named went away.  The channel we spawned for is the
+		 * one to use.
+		 */
+		ch = ssh_get_server_ch(pss, pss->channel_doing_spawn);
+		if (!ch)
+			break;
 		if (pss->vhd && pss->vhd->ops &&
 		    pss->vhd->ops->child_process_io &&
-		    pss->vhd->ops->child_process_io(pss->ch_temp->priv,
+		    pss->vhd->ops->child_process_io(ch->priv,
 					pss->wsi, (struct lws_cgi_args *)in))
 			return -1;
 		break;
@@ -2573,26 +2940,29 @@ bail:
 	case LWS_CALLBACK_CGI_TERMINATED:
 		if (!pss)
 			break;
-		if (pss->vhd && pss->vhd->ops &&
+		ch = ssh_get_server_ch(pss, pss->channel_doing_spawn);
+		if (ch && pss->vhd && pss->vhd->ops &&
 		    pss->vhd->ops->child_process_terminated)
-		    pss->vhd->ops->child_process_terminated(pss->ch_temp->priv,
-							    pss->wsi);
+			pss->vhd->ops->child_process_terminated(ch->priv,
+								pss->wsi);
 		/*
 		 * we have the child PID in len... we need to match it to a
 		 * channel that is on the wsi
 		 */
-		ch = pss->ch_list;
 
-		while (ch) {
-			if (ch->spawn_pid == len) {
+		lws_start_foreach_dll(struct lws_dll2 *, d,
+				      lws_dll2_get_head(&pss->ch_list)) {
+			struct lws_ssh_channel *chan = lws_container_of(d,
+						struct lws_ssh_channel, list);
+
+			if (chan->spawn_pid == len) {
 				lwsl_notice("starting close of ch with PID %d\n",
 					    (int)len);
-				ch->scheduled_close = 1;
-				write_task(pss, ch, SSH_WT_CH_CLOSE);
+				chan->scheduled_close = 1;
+				write_task(pss, chan, SSH_WT_CH_CLOSE);
 				break;
 			}
-			ch = ch->next;
-		}
+		} lws_end_foreach_dll(d);
 		break;
 
 	default:

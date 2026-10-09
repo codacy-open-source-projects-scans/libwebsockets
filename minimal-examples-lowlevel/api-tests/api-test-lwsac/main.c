@@ -32,23 +32,19 @@ struct mytest {
 
 int main(int argc, const char **argv)
 {
-	int n, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE, acc;
+	int n, acc;
 	lws_list_ptr list_head = NULL, iter;
 	struct lwsac *lwsac = NULL;
 	struct mytest *m;
-	const char *p;
 	(void)switches;
 
-	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
+	if (lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
 		lws_switches_print_help(argv[0], switches, LWS_ARRAY_SIZE(switches));
 		return 0;
 	}
 
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS API selftest: lwsac\n");
 
 	/*

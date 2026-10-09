@@ -251,9 +251,11 @@ lws_netdev_wifi_event_plat(struct lws_netdev_instance *nd, lws_usec_t timestamp,
 			 */
 
 		case WIFI_EVENT_STA_DISCONNECTED:
+#if defined(LWS_WITH_SYS_SMD)
 			lws_smd_msg_printf(ctx, LWSSMDCL_NETWORK,
 					   "{\"type\":\"linkdown\","
 					   "\"if\":\"%s\"}", wnd->inst.name);
+#endif
 			wnd->state = LWSNDVWIFI_STATE_SCAN;
 			/*
 			 * We do it via the sul so we don't get timed scans
@@ -264,9 +266,11 @@ lws_netdev_wifi_event_plat(struct lws_netdev_instance *nd, lws_usec_t timestamp,
 			break;
 
 		case WIFI_EVENT_STA_CONNECTED:
+#if defined(LWS_WITH_SYS_SMD)
 			lws_smd_msg_printf(ctx, LWSSMDCL_NETWORK,
 					   "{\"type\":\"linkup\","
 					   "\"if\":\"%s\"}", wnd->inst.name);
+#endif
 			break;
 
 		case WIFI_EVENT_SCAN_DONE:
@@ -315,9 +319,11 @@ _event_handler_wifi(void *arg, esp_event_base_t event_base, int32_t event_id,
 		 * for other things to consume.
 		 */
 
+#if defined(LWS_WITH_SYS_SMD)
 		lws_smd_msg_printf(ctx, LWSSMDCL_NETWORK,
 				   "{\"type\":\"priv\",\"if\":\"%s\",\"ev\":%d}",
 				   wnd->inst.name, (int)event_id);
+#endif
 		break;
 	default:
 		return;
@@ -355,31 +361,41 @@ _event_handler_ip(void *arg, esp_event_base_t event_base, int32_t event_id,
 	if (event_id == IP_EVENT_STA_GOT_IP) {
 		ip_event_got_ip_t *e = (ip_event_got_ip_t *)event_data;
 		char ip[16];
-#if 0
-		tcpip_adapter_dns_info_t e32ip;
+#if defined(LWS_WITH_ROUTING)
+		struct lws_context_per_thread *pt = &ctx->pt[0];
+		lws_route_t *rou;
 
-		/*
-		 * Since atm we get this via DHCP, presumably we can get ahold
-		 * of related info set by the router
-		 */
+		lws_pt_lock(pt, __func__);
+		_lws_route_table_ifdown(pt, 0);
 
-		if (tcpip_adapter_get_dns_info(TCPIP_ADAPTER_IF_STA,
-					   TCPIP_ADAPTER_DNS_MAIN,
-					   /* also _BACKUP, _FALLBACK */
-					   &e32ip)) {
-			lwsl_err("%s: there's no dns server set\n", __func__);
-			e32ip.ip.u_addr.ipv4 = 0x08080808;
-			e32ip.ip.type = ESP_IPADDR_TYPE_V4;
+		rou = lws_zalloc(sizeof(*rou), __func__);
+		if (rou) {
+			rou->if_idx = 0;
+			rou->priority = 0;
+			rou->dest_len = 0;
+			rou->dest.sa4.sin_family = AF_INET;
+			
+			rou->src_len = 32;
+			rou->src.sa4.sin_family = AF_INET;
+			memcpy(&rou->src.sa4.sin_addr, &e->ip_info.ip, 4);
+			
+			rou->gateway.sa4.sin_family = AF_INET;
+			memcpy(&rou->gateway.sa4.sin_addr, &e->ip_info.gw, 4);
+
+			rou->uidx = _lws_route_get_uidx(ctx);
+
+			lws_dll2_add_tail(&rou->list, &ctx->routing_table);
 		}
-
-		netdevs->sa46_dns_resolver.
+		lws_pt_unlock(pt);
 #endif
 
 		lws_write_numeric_address((void *)&e->ip_info.ip, 4, ip,
 				sizeof(ip));
+#if defined(LWS_WITH_SYS_SMD)
 		lws_smd_msg_printf(ctx, LWSSMDCL_NETWORK,
 				   "{\"type\":\"ipacq\",\"if\":\"%s\","
 				   "\"ipv4\":\"%s\"}", wnd->inst.name, ip);
+#endif
 	}
 }
 
@@ -467,9 +483,11 @@ lws_netdev_wifi_up_plat(struct lws_netdev_instance *nd)
 	esp_wifi_set_ps(WIFI_PS_NONE);
 	wnde32->wnd.flags |= LNDIW_UP;
 
+#if defined(LWS_WITH_SYS_SMD)
 	lws_smd_msg_printf(ctx, LWSSMDCL_NETWORK,
 			   "{\"type\":\"up\",\"if\":\"%s\"}",
 			   wnde32->wnd.inst.name);
+#endif
 
 	return 0;
 }
@@ -484,9 +502,11 @@ lws_netdev_wifi_down_plat(struct lws_netdev_instance *nd)
 	if (!(wnde32->wnd.flags & LNDIW_UP))
 		return 0;
 
+#if defined(LWS_WITH_SYS_SMD)
 	lws_smd_msg_printf(ctx, LWSSMDCL_NETWORK,
 			   "{\"type\":\"down\",\"if\":\"%s\"}",
 			   wnde32->wnd.inst.name);
+#endif
 
 	esp_wifi_stop();
 

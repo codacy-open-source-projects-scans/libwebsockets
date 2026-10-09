@@ -96,48 +96,49 @@ int
 lws_genaes_destroy(struct lws_genaes_ctx *ctx, unsigned char *tag, size_t tlen)
 {
 	if (ctx->mode == LWS_GAESM_GCM && ctx->underway && ctx->u.pbMacContext) {
-		/* Finalize GCM to get/verify tag using persisted authInfo */
-
 		BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO *authInfo =
 			(BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO *)ctx->u.pbMacContext;
 
-		/* Clear the chaining flag for the final call */
-		authInfo->dwFlags &= ~BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG;
+		if (ctx->underway == 1) {
+			/* Finalize GCM if there was no payload call */
+			authInfo->dwFlags &= ~BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG;
 
-		/* We must pass a valid output buffer (even if dummy) to force BCryptEncrypt to execute
-		   and produce the tag, otherwise it acts as "Get Size" */
-		uint8_t dummy[128];
-		ULONG result_len = 0;
+			uint8_t dummy[128];
+			ULONG result_len = 0;
 
-		/* Ensure tag buffer pointers are correct for the final call */
-		if (ctx->op == LWS_GAESO_ENC && tag && tlen) {
-			/* Final call to generate tag in internal buffer */
-			if (BCRYPT_SUCCESS(BCryptEncrypt(ctx->u.hKey, NULL, 0, authInfo, ctx->u.iv, 16, dummy, sizeof(dummy), &result_len, 0))) {
-				/* Copy internal tag to user buffer */
-				if (tlen <= ctx->u.cbTag)
-					memcpy(tag, ctx->u.pbTag, tlen);
+			if (ctx->op == LWS_GAESO_ENC) {
+				BCryptEncrypt(ctx->u.hKey, NULL, 0, authInfo, authInfo->pbMacContext, authInfo->cbMacContext, dummy, sizeof(dummy), &result_len, 0);
+			} else {
+				if (tag && tlen && tlen <= ctx->u.cbTag)
+					memcpy(ctx->u.pbTag, tag, tlen);
+				BCryptDecrypt(ctx->u.hKey, NULL, 0, authInfo, authInfo->pbMacContext, authInfo->cbMacContext, dummy, sizeof(dummy), &result_len, 0);
 			}
 		}
 
-		if (ctx->op == LWS_GAESO_DEC && tag && tlen) {
-			/* For decryption, we must populate the internal tag buffer with the expected tag
-			   BEFORE the final verification call.
-			*/
-			if (tlen <= ctx->u.cbTag)
-				memcpy(ctx->u.pbTag, tag, tlen);
-
-			if (!BCRYPT_SUCCESS(BCryptDecrypt(ctx->u.hKey, NULL, 0, authInfo, ctx->u.iv, 16, dummy, sizeof(dummy), &result_len, 0))) {
-				/* Verification failed */
-				/* We cannot easily return failure here as destroy returns 0 typically,
-				   but the tag check failure is implied. */
-			}
+		/* For encryption, copy the generated tag to the user buffer */
+		if (ctx->op == LWS_GAESO_ENC && tag && tlen && tlen <= ctx->u.cbTag) {
+			memcpy(tag, ctx->u.pbTag, tlen);
 		}
 	}
 
-	if (ctx->u.pbMacContext) lws_free(ctx->u.pbMacContext);
-	if (ctx->u.pbNonce) lws_free(ctx->u.pbNonce);
-	if (ctx->u.pbAuthData) lws_free(ctx->u.pbAuthData);
-	if (ctx->u.pbTag) lws_free(ctx->u.pbTag);
+	/* none of this should be readable in the freed heap afterwards */
+
+	if (ctx->u.pbMacContext) {
+		lws_explicit_bzero(ctx->u.pbMacContext, ctx->u.cbMacContext);
+		lws_free(ctx->u.pbMacContext);
+	}
+	if (ctx->u.pbNonce) {
+		lws_explicit_bzero(ctx->u.pbNonce, ctx->u.cbNonce);
+		lws_free(ctx->u.pbNonce);
+	}
+	if (ctx->u.pbAuthData) {
+		lws_explicit_bzero(ctx->u.pbAuthData, ctx->u.cbAuthData);
+		lws_free(ctx->u.pbAuthData);
+	}
+	if (ctx->u.pbTag) {
+		lws_explicit_bzero(ctx->u.pbTag, ctx->u.cbTag);
+		lws_free(ctx->u.pbTag);
+	}
 
 	if (ctx->u.hKey)
 		BCryptDestroyKey(ctx->u.hKey);
@@ -216,8 +217,22 @@ lws_genaes_crypt(struct lws_genaes_ctx *ctx, const uint8_t *in, size_t len,
 			else
 				memset(ctx->u.pbNonce, 0, ctx->u.cbNonce);
 
-			/* Setup Internal Tag Buffer */
+			/*
+			 * Setup Internal Tag Buffer.  A GCM tag is at most 16
+			 * bytes and lws will not accept a truncation below 4;
+			 * bound the caller's per-call length the same way the
+			 * other backends do (C-362) rather than sizing an
+			 * allocation from it unchecked.
+			 */
 			int tlen = (taglen > 0) ? taglen : 16; /* Default to 16 if unknown */
+
+			if (tlen < 4 || tlen > 16) {
+				lwsl_err("%s: bad taglen %d\n", __func__,
+					 taglen);
+
+				return -1;
+			}
+
 			ctx->u.cbTag = tlen;
 			ctx->u.pbTag = lws_malloc(ctx->u.cbTag, "genaes tag");
 			if (!ctx->u.pbTag) {
@@ -241,26 +256,25 @@ lws_genaes_crypt(struct lws_genaes_ctx *ctx, const uint8_t *in, size_t len,
 
 			/* Process AAD if present */
 			if (in && len) {
-				uint8_t *authData = NULL;
-
-				/* Allocate and copy auth data for alignment */
-				authData = lws_malloc(len, "genaes aad");
-				if (!authData) {
+                               /* Allocate and copy auth data for alignment and persist it across chained calls */
+                               if (ctx->u.pbAuthData) {
+                                       lws_free(ctx->u.pbAuthData);
+                               }
+                               ctx->u.pbAuthData = lws_malloc(len, "genaes aad");
+                               if (!ctx->u.pbAuthData) {
 					return -1;
 				}
-				memcpy(authData, in, len);
+                               memcpy(ctx->u.pbAuthData, in, len);
 
-				authInfo->pbAuthData = (PUCHAR)authData;
+                               authInfo->pbAuthData = (PUCHAR)ctx->u.pbAuthData;
 				authInfo->cbAuthData = (ULONG)len;
 
 				if (ctx->op == LWS_GAESO_ENC)
 					status = BCryptEncrypt(ctx->u.hKey, NULL, 0, authInfo,
-							       ctx->u.iv, 16, NULL, 0, &result_len, 0);
+							       authInfo->pbMacContext, authInfo->cbMacContext, NULL, 0, &result_len, 0);
 				else
 					status = BCryptDecrypt(ctx->u.hKey, NULL, 0, authInfo,
-							       ctx->u.iv, 16, NULL, 0, &result_len, 0);
-
-				lws_free(authData);
+							       authInfo->pbMacContext, authInfo->cbMacContext, NULL, 0, &result_len, 0);
 
 				if (!BCRYPT_SUCCESS(status)) {
 					lwsl_err("lws_genaes_crypt: GCM AAD failed: 0x%x\n",
@@ -277,8 +291,10 @@ lws_genaes_crypt(struct lws_genaes_ctx *ctx, const uint8_t *in, size_t len,
 		/* Retrieve persisted authInfo */
 		authInfo = (BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO *)ctx->u.pbMacContext;
 
-		/* Ensure flags are still set for chaining (should persist, but safety) */
-		authInfo->dwFlags = BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG;
+		/* The payload cannot be chained in BCrypt. So this MUST be the final data call. */
+		authInfo->dwFlags &= ~BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG;
+
+		ctx->underway = 2; /* Mark as finalized */
 
 		/* Reset AAD pointers for payload call */
 		authInfo->pbAuthData = NULL;
@@ -306,14 +322,17 @@ lws_genaes_crypt(struct lws_genaes_ctx *ctx, const uint8_t *in, size_t len,
 				return -1;
 			}
 
-			if (ctx->op == LWS_GAESO_ENC)
+                       if (ctx->op == LWS_GAESO_ENC) {
 				status = BCryptEncrypt(ctx->u.hKey, (PUCHAR)in_aligned, (ULONG)len,
-						       authInfo, ctx->u.iv, 16, (PUCHAR)out_aligned,
+						       authInfo, authInfo->pbMacContext, authInfo->cbMacContext, (PUCHAR)out_aligned,
 						       (ULONG)len, &result_len, 0);
-			else
+                       } else {
+                               if (stream_block_16 && taglen && taglen <= ctx->u.cbTag)
+                                       memcpy(ctx->u.pbTag, stream_block_16, taglen);
 				status = BCryptDecrypt(ctx->u.hKey, (PUCHAR)in_aligned, (ULONG)len,
-						       authInfo, ctx->u.iv, 16, (PUCHAR)out_aligned,
+						       authInfo, authInfo->pbMacContext, authInfo->cbMacContext, (PUCHAR)out_aligned,
 						       (ULONG)len, &result_len, 0);
+                       }
 
 			if (BCRYPT_SUCCESS(status))
 				memcpy(out, out_aligned, len);

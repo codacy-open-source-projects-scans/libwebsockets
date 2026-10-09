@@ -148,7 +148,7 @@ struct lws_dht_stats {
 /**
  * lws_dht_get_stats() - Retrieve current and historical DHT metrics
  *
- * \param ctx: DHT context
+ * \param vh: the vhost the DHT is running on
  * \param current: Pointer to store current un-rotated metrics, or NULL
  * \param history: Pointer to receive the internal history array pointer
  * \param head: Receives the index of the oldest history frame (next to be overwritten)
@@ -166,10 +166,28 @@ struct lws_dht_verb_dispatch_args {
 	lws_dht_verb_result_t out_precedence;
 };
 
+/**
+ * lws_dht_send_subscribe() - ask a node for a token to subscribe to a hash
+ *
+ * \param ctx: the DHT
+ * \param sa: the node's address
+ * \param salen: length of \p sa
+ * \param infohash: the hash to subscribe to
+ * \param want: 0, or the address families wanted in the reply's nodes
+ * \param confirm: unused
+ *
+ * The node answers like a get_peers, with nodes and a token.  The library
+ * chooses the transaction id itself and remembers it, and \p infohash, with
+ * \p sa, so it can route that reply: the token surfaces as
+ * LWS_DHT_EVENT_TOKEN with \p infohash as its info_hash, to be returned in
+ * lws_dht_send_subscribe_confirm() for that hash.  Only the one reply to this
+ * request, from \p sa and within the ping timeout, produces the event; a
+ * token in any other reply is not reported.  A node can only have a few
+ * subscribes awaiting their reply at once: the oldest one gives way.
+ */
 LWS_VISIBLE LWS_EXTERN int
 lws_dht_send_subscribe(struct lws_dht_ctx *ctx, const struct sockaddr *sa, size_t salen,
-		       uint8_t *tid, size_t tid_len, const lws_dht_hash_t *infohash,
-		       int want, int confirm);
+		       const lws_dht_hash_t *infohash, int want, int confirm);
 
 LWS_VISIBLE LWS_EXTERN int
 lws_dht_send_subscribe_confirm(struct lws_dht_ctx *ctx, const struct sockaddr *sa, size_t salen,
@@ -194,12 +212,30 @@ lws_dht_send_notify(struct lws_dht_ctx *ctx, const struct sockaddr *sa, size_t s
  * \param len: length of raw message
  * \param out: struct to populate with parsed data
  *
- * Safe parsing of DHT command messages.
+ * Safe parsing of DHT command messages.  The hash token must be 2 - 128
+ * lowercase hex chars, otherwise the message is rejected.
  *
  * \return 0 on success, non-zero on error
  */
 LWS_VISIBLE LWS_EXTERN int
 lws_dht_msg_parse(const char *in, size_t len, struct lws_dht_msg *out);
+
+/**
+ * lws_dht_valid_domain_name() - Check a domain string is a safe DNS name
+ *
+ * \param domain: NUL-terminated domain string
+ *
+ * F-052: domain strings arriving on DHT NOTIFY datagrams are later
+ * composed into filesystem paths (zone cache paths, lws_dir walks), so
+ * they must be restricted to presentation-format DNS names: 1 - 253
+ * chars of [A-Za-z0-9._-] split into non-empty labels of at most 63
+ * chars, with an optional single trailing root dot.  Anything else
+ * (path separators, "..", empty labels, junk bytes) is refused.
+ *
+ * \return 1 if the name is safe, 0 otherwise
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_dht_valid_domain_name(const char *domain);
 
 /**
  * lws_dht_msg_gen() - Generate a raw DHT message
@@ -238,7 +274,7 @@ lws_dht_register_verbs(struct lws_dht_ctx *ctx, const char **verbs, int count, c
  * \return number of subscribers notified, or negative on error
  */
 LWS_VISIBLE LWS_EXTERN int
-lws_dht_notify_subscribers(struct lws_dht_ctx *ctx, const lws_dht_hash_t *hash, const uint8_t *sha256);
+lws_dht_notify_subscribers(struct lws_dht_ctx *ctx, const lws_dht_hash_t *hash, const uint8_t *sha256, const uint8_t *payload, size_t payload_len);
 
 /**
  * lws_dht_blacklist_cb_t() - DHT blacklist check callback
@@ -309,7 +345,13 @@ typedef enum {
 	LWS_DHT_EVENT_WRITE_COMPLETED,	/**< Reliable write successful */
 	LWS_DHT_EVENT_WRITE_FAILED,	/**< Reliable write failed */
 	LWS_DHT_EVENT_NOTIFY,		/**< Notification received */
-	LWS_DHT_EVENT_TOKEN,		/**< Security token received from a peer */
+	LWS_DHT_EVENT_TOKEN,		/**< Security token received from a peer,
+					  * in reply to our subscribe or get_peers
+					  * request to it; info_hash is the hash
+					  * that request was for */
+	LWS_DHT_EVENT_ERROR,		/**< A peer answered a query of ours with
+					  * a BEP 5 error reply; `data` is a
+					  * struct lws_dht_error_info */
 } lws_dht_event_t;
 
 /**
@@ -323,6 +365,23 @@ struct lws_dht_consensus_info {
 };
 
 /**
+ * struct lws_dht_error_info - Passed as `data` for LWS_DHT_EVENT_ERROR
+ *
+ * A peer's "y":"e" reply to something we sent it: the BEP 5 code (eg, 203,
+ * protocol error) and the peer's description of what it refused.  The tid
+ * and message point into the datagram being processed, are not
+ * NUL-terminated, and are only valid during the callback.  The sender is the
+ * callback's `from`, which is as unauthenticated as any datagram source.
+ */
+struct lws_dht_error_info {
+	const uint8_t	*tid;		/**< tid of the query being refused */
+	size_t		tid_len;
+	const char	*message;	/**< the peer's description */
+	size_t		message_len;
+	int		code;		/**< BEP 5 error code */
+};
+
+/**
  * struct lws_dht_info - Initialization parameters for DHT
  *
  * \param vhost: vhost to attach UDP wsi to
@@ -333,6 +392,10 @@ struct lws_dht_consensus_info {
  * \param port: UDP port to listen on
  * \param ipv6: enable IPv6
  * \param legacy: if set, on wire: no multihash, 20-byte assumed
+ * \param allow_private_ads: if set, peers at private, loopback or link-local
+ *	addresses are admitted to the routing table and exempt from the BEP42
+ *	id check (for a LAN deployment, or tests on loopback); by default such
+ *	peers are refused, as any node on the public internet should
  * \param aux: 0 (sha1), or MULTIHASH_TYPE_...
  * \param iface: interface to bind to
  * \param blacklist_cb: (optional) user blacklist cb
@@ -349,6 +412,7 @@ typedef struct lws_dht_info {
 	int				port;
 	uint8_t				ipv6:1;
 	uint8_t				legacy:1;
+	uint8_t				allow_private_ads:1;
 	uint8_t				aux;
 	const char			*iface;
 	const char			*fallback_nodes_path;
@@ -492,6 +556,52 @@ lws_dht_nodes(struct lws_dht_ctx *ctx, int af, int *good_return, int *dubious_re
 	      int *cached_return, int *incoming_return);
 
 /**
+ * struct lws_dht_node_info - one routing table entry, for lws_dht_foreach_node()
+ *
+ * \param id: the node id it uses
+ * \param sa: the endpoint we know it at
+ * \param salen: length of \p sa
+ * \param heard: seconds since anything came from it, or -1 if nothing has
+ * \param replied: seconds since it last answered something we sent it, or -1
+ *		  if it never has
+ * \param pinged: how many requests we have sent it since it last answered
+ * \param good: whether it counts as good, eg, for lws_dht_get_nodes()
+ * \param bep42_ok: whether its id is bound to its address as BEP42 says (or
+ *		   its address is private)
+ *
+ * Everything pointed to is only valid during the callback.
+ */
+typedef struct lws_dht_node_info {
+	const lws_dht_hash_t		*id;
+	const struct sockaddr		*sa;
+	size_t				salen;
+	long				heard;
+	long				replied;
+	int				pinged;
+	uint8_t				good:1;
+	uint8_t				bep42_ok:1;
+} lws_dht_node_info_t;
+
+typedef int (*lws_dht_node_cb_t)(void *user, const lws_dht_node_info_t *ni);
+
+/**
+ * lws_dht_foreach_node() - visit each node in a routing table
+ *
+ * \param ctx: DHT context
+ * \param af: which table, AF_INET or AF_INET6
+ * \param cb: called with each node, return nonzero to stop
+ * \param user: passed to \p cb
+ *
+ * Lets the application see, eg, why a node it expects to be good is not.
+ * The table must not be changed from \p cb.
+ *
+ * \return how many nodes \p cb was called with.
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_dht_foreach_node(struct lws_dht_ctx *ctx, int af, lws_dht_node_cb_t cb,
+		     void *user);
+
+/**
  * lws_dht_dump_tables() - Log the state of DHT routing tables
  *
  * \param ctx: DHT context
@@ -525,6 +635,40 @@ lws_dht_get_nodes(struct lws_dht_ctx *ctx, struct sockaddr_in *sin, int *num,
  */
 LWS_VISIBLE LWS_EXTERN int
 lws_dht_get_external_addr(struct lws_dht_ctx *ctx, struct sockaddr_storage *ss, size_t *sslen);
+
+/**
+ * lws_dht_bep42_id() - make a node id bound to an address (BEP42)
+ *
+ * \param cx: the lws context (its randomness is used)
+ * \param sa: the node's public address (AF_INET or AF_INET6)
+ * \param rand: the random byte that ends the id (BEP42's "r")
+ * \param type: LWS_DHT_HASH_TYPE_... of the id to make
+ * \param len: the id length in bytes for that type (20 for sha1)
+ *
+ * BEP42 ties a node id to the node's IP: the first 21 bits are the CRC32C of
+ * the masked address with three bits of \p rand folded in, the last byte is
+ * \p rand, the rest is random.  A peer can then check the id it is told
+ * against the address it hears it from, which is what stops one host
+ * choosing ids to fill a bucket.  lws applies the rule to the first three
+ * and last byte of an id of any length.
+ *
+ * \return a new id to free with lws_dht_hash_destroy(), or NULL
+ */
+LWS_VISIBLE LWS_EXTERN lws_dht_hash_t *
+lws_dht_bep42_id(struct lws_context *cx, const struct sockaddr *sa,
+		 uint8_t rand, int type, int len);
+
+/**
+ * lws_dht_bep42_check() - does a node id conform to BEP42 for its address
+ *
+ * \param id: the node id the peer claims
+ * \param sa: the address the claim came from
+ *
+ * \return 1 if the id's first 21 bits are the BEP42 derivation for \p sa and
+ *	   the id's last byte, 0 if not (or the family is unknown)
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_dht_bep42_check(const lws_dht_hash_t *id, const struct sockaddr *sa);
 
 /**
  * lws_dht_get_fallback_node() - Retrieves a default DHT node from the system installation

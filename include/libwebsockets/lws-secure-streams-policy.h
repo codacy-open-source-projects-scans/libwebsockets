@@ -94,7 +94,9 @@ enum {
 	LWSSSPOLF_AUTH_BEARER					= (1 << 6),
 	/**< for http, use lws_system auth token 0 in authentication: bearer */
 	LWSSSPOLF_HTTP_NO_CONTENT_LENGTH			= (1 << 7),
-	/**< don't add any content length even if we have it */
+	/**< don't add any content length even if we have it: over h1 the
+	 * body then goes with "Transfer-Encoding: chunked" instead, since a
+	 * request body with neither header has no end the server can know */
 	LWSSSPOLF_QUIRK_NGHTTP2_END_STREAM			= (1 << 8),
 	/**< set the client flag LCCSCF_H2_QUIRK_NGHTTP2_END_STREAM */
 	LWSSSPOLF_H2_QUIRK_OVERFLOWS_TXCR			= (1 << 9),
@@ -152,6 +154,7 @@ typedef struct lws_ss_trust_store {
 enum {
 	LWSSSP_H1,
 	LWSSSP_H2,
+	LWSSSP_H3,
 	LWSSSP_WS,
 	LWSSSP_MQTT,
 	LWSSSP_RAW,
@@ -242,7 +245,7 @@ typedef struct lws_ss_policy {
 
 	union {
 
-#if defined(LWS_ROLE_H1) || defined(LWS_ROLE_H2) || defined(LWS_ROLE_WS)
+#if defined(LWS_ROLE_H1) || defined(LWS_ROLE_H2) || defined(LWS_ROLE_WS) || defined(LWS_ROLE_H3)
 
 		/* details for http-related protocols... */
 
@@ -267,6 +270,8 @@ typedef struct lws_ss_policy {
 //				} h1;
 //				struct { /* LWSSSP_H2 */
 //				} h2;
+//				struct { /* LWSSSP_H3 */
+//				} h3;
 				struct { /* LWSSSP_WS */
 					const char	*subprotocol;
 					uint8_t		binary;

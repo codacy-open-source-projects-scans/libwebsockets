@@ -1,7 +1,7 @@
 #
 # libwebsockets - small server side websockets and web server implementation
 #
-# Copyright (C) 2010 - 2022 Andy Green <andy@warmcat.com>
+# Copyright (C) 2010 - 2026 Andy Green <andy@warmcat.com>
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to
@@ -43,10 +43,21 @@ endif()
 set(LWS_ROLE_RAW 1)
 set(LWS_WITH_POLL 1)
 
-if (ESP_PLATFORM)
+if (ESP_PLATFORM AND NOT (DEFINED IDF_TARGET AND IDF_TARGET STREQUAL "linux"))
 	set(LWS_ESP_PLATFORM 1)
 	#set(CMAKE_TOOLCHAIN_FILE contrib/cross-esp32.cmake)
-	set(LWIP_PROVIDE_ERRNO 1)
+	# IDF v6 (picolibc + mbedtls 4) makes errno thread-local and its lwip does
+	# not provide an errno of its own. Forcing LWIP_PROVIDE_ERRNO here bakes a
+	# non-TLS `extern int errno` into lws_config_private.h, which then fails to
+	# link against picolibc's TLS errno ("TLS definition ... mismatches non-TLS
+	# reference"). Only force it on older IDF (newlib).  IDF v6 is
+	# recognised by its esp_libc component (renamed from newlib); the
+	# mbedtls 4 cache result from lib/tls is only available on a
+	# reconfigure, since it is detected long after this point.
+	if (NOT LWS_HAVE_MBEDTLS_V4 AND
+	    NOT EXISTS $ENV{IDF_PATH}/components/esp_libc)
+		set(LWIP_PROVIDE_ERRNO 1)
+	endif()
 endif()
 
 # it's at this point any toolchain file is brought in
@@ -79,7 +90,7 @@ if (PICO_SDK_PATH)
 	pico_sdk_init()
 endif()
 
-if (ESP_PLATFORM)
+if (ESP_PLATFORM AND NOT (DEFINED IDF_TARGET AND IDF_TARGET STREQUAL "linux"))
        include_directories(
 		$ENV{IDF_PATH}/components/esp_hw_support/include/soc/
 		$ENV{IDF_PATH}/components/freertos/include/
@@ -148,12 +159,22 @@ option(LWS_WITH_NETWORK "Compile with network-related code" ON)
 option(LWS_ROLE_H1 "Compile with support for http/1 (needed for ws)" ON)
 option(LWS_ROLE_WS "Compile with support for websockets" ON)
 option(LWS_ROLE_MQTT "Build with support for MQTT client" OFF)
+if (DEFINED LWS_WITH_UDP AND NOT LWS_WITH_UDP)
+	set(LWS_QUIC_DEFAULT OFF)
+else()
+	set(LWS_QUIC_DEFAULT ON)
+endif()
+option(LWS_WITH_HTTP3 "Compile with support for HTTP/3" ${LWS_QUIC_DEFAULT})
+option(LWS_ROLE_QUIC "Build with support for QUIC transport" ${LWS_WITH_HTTP3})
+option(LWS_WITH_QUIC_DEBUG_SET_KEYS "QUIC: log every APP-level traffic-secret install (incoming vs installed bytes, resolved cipher). Diagnostic only, off by default." OFF)
 option(LWS_ROLE_DBUS "Compile with support for DBUS" OFF)
 option(LWS_ROLE_RAW_PROXY "Raw packet proxy" OFF)
 option(LWS_ROLE_RAW_FILE "Compile with support for raw files" ON)
 option(LWS_WITH_HTTP2 "Compile with server support for HTTP/2" ON)
+option(LWS_WITH_LS_QPACK "Compile tests against ls-qpack for correctness testing" OFF)
 option(LWS_WITH_LWSWS "Libwebsockets Webserver" OFF)
 option(LWS_WITH_CGI "Include CGI (spawn process with network-connected stdin/out/err) APIs" OFF)
+option(LWS_IPV4 "Compile with support for ipv4" ON)
 option(LWS_IPV6 "Compile with support for ipv6" ON)
 option(LWS_UNIX_SOCK "Compile with support for UNIX domain socket if OS supports it" ON)
 option(LWS_WITH_PLUGINS "Support plugins for protocols and extensions (implies LWS_WITH_PLUGINS_API)" OFF)
@@ -175,7 +196,7 @@ option(LWS_WITH_OPUS "Enable opus audio codec" OFF)
 option(LWS_WITH_ALEXA "Enable Alexa example" OFF)
 option(LWS_WITH_GTK "Enable gtk example" OFF)
 option(LWS_WITH_FTS "Full Text Search support" OFF)
-option(LWS_WITH_SYS_ASYNC_DNS "Nonblocking internal IPv4 + IPv6 DNS resolver" OFF)
+option(LWS_WITH_SYS_ASYNC_DNS "Nonblocking internal IPv4 + IPv6 DNS resolver" ON)
 option(LWS_WITH_SYS_ASYNC_DNS_DNSSEC "Include DNSSEC parsing/validation in async-dns (requires crypto)" OFF)
 option(LWS_WITH_AUTHORITATIVE_DNS "Authoritative DNS zone signer / server" OFF)
 option(LWS_WITH_SYS_NTPCLIENT "Build in tiny ntpclient good for tls date validation and run via lws_system" OFF)
@@ -186,12 +207,21 @@ option(LWS_WITH_HTTP_DIGEST_AUTH "Support Digest Auth (caution deprecated crypto
 option(LWS_WITH_HTTP_UNCOMMON_HEADERS "Include less common http header support" ON)
 option(LWS_WITH_SYS_STATE "lws_system state support" ON)
 option(LWS_WITH_SYS_SMD "Lws System Message Distribution" ON)
+if (LWS_WITH_SYS_ASYNC_DNS)
+	# The async dns resolver detects platform DNS server config changes by
+	# watching for them and distributing the new server set on SMD... it
+	# depends on SMD being built in
+	set(LWS_WITH_SYS_SMD ON)
+endif()
 option(LWS_WITH_SYS_FAULT_INJECTION "Enable fault injection support" OFF)
 option(LWS_WITH_SYS_METRICS "Lws Metrics API" OFF)
 option(LWS_WITH_LATENCY "Event loop latency tracking and monitoring (see ../READMEs/README.LWS_WITH_LATENCY.md)" OFF)
 option(LWS_WITH_UPNG "Enable stateful PNG stream decoder" ON)
 option(LWS_WITH_GZINFLATE "Enable internal minimal gzip inflator" ON)
+option(LWS_WITH_FUZZERS "Build libFuzzer targets against untrusted-input parsers in ./fuzz (needs clang)" OFF)
 option(LWS_WITH_JPEG "Enable stateful JPEG stream decoder" ON)
+option(LWS_WITH_SVG "Enable stateful SVG linewise renderer" ON)
+option(LWS_WITH_GIF "Enable stateful GIF linewise decoder" ON)
 option(LWS_WITH_DLO "Enable Display List Objects" ON)
 option(LWS_WITH_WEBRTC "Enable WebRTC" OFF)
 option(LWS_WITH_WEBRTC_MIXER "Enable WebRTC mixer (gstreamer)" OFF)
@@ -199,7 +229,7 @@ option(LWS_WITH_TRANSCODE "Enable video transcoding support (requires ffmpeg)" O
 option(LWS_WITH_V4L2 "Enable V4L2 support (Linux only)" OFF)
 option(LWS_WITH_LIBV4L2 "Link against libv4l2 if available" OFF)
 option(LWS_WITH_AUTH_SERVER "Include auth server plugin and its assets" OFF)
-option(LWS_WITH_EMAIL "Include async SMTP client plugin" OFF)
+option(LWS_WITH_EMAIL "Include the async SMTP client, lws_smtpc" OFF)
 option(LWS_WITH_QRCODEGEN "Include qrcodegen library natively" OFF)
 option(LWS_WITH_MEDIA_RK_MPI "Compile with Rockchip MPI hardware pipelines" OFF)
 
@@ -219,32 +249,80 @@ option(LWS_ONLY_SSPC "Remove everything from library except standalone SSPC clie
 #
 # CTest options
 #
-#
 # If you build with LWS_WITH_MINIMAL_EXAMPLES, you can use CTest / make test to run
-# examples that can give a pass/fail response.  By default it runs tests both against
-# a local server peer and warmcat.com, if your CI wants to do the tests but does not
-# have internet routing, then you can still run a subset of tests with CTest / make
-# test that only does local tests by disabling this option.
+# examples that can give a pass/fail response.  All of the ctests run against local
+# server peers only, they do not need any internet routing.
 #
-option(LWS_CTEST_INTERNET_AVAILABLE "CTest will performs tests that need the Internet" ON)
+
+if (NOT LWS_IPV4)
+	set(LWS_CTEST_SERVER_RESOLVE "::1")
+	set(LWS_CTEST_SERVER_URL_RESOLVE "[::1]")
+elseif(NOT LWS_IPV6)
+	set(LWS_CTEST_SERVER_RESOLVE "127.0.0.1")
+	set(LWS_CTEST_SERVER_URL_RESOLVE "127.0.0.1")
+else()
+	set(LWS_CTEST_SERVER_RESOLVE "localhost")
+	set(LWS_CTEST_SERVER_URL_RESOLVE "localhost")
+endif()
+
 
 #
 # TLS library options... all except mbedTLS are basically OpenSSL variants.
 #
 option(LWS_WITH_SSL "Include SSL support (defaults to OpenSSL or similar, mbedTLS if LWS_WITH_MBEDTLS is set)" ON)
-option(LWS_WITH_MBEDTLS "Use mbedTLS (>=2.0) replacement for OpenSSL. When setting this, you also may need to specify LWS_MBEDTLS_LIBRARIES and LWS_MBEDTLS_INCLUDE_DIRS" OFF)
+set(LWS_MBEDTLS_DEFAULT OFF)
+if (ESP_PLATFORM)
+	set(LWS_MBEDTLS_DEFAULT ON)
+endif()
+option(LWS_WITH_MBEDTLS "Use mbedTLS (>=2.0) replacement for OpenSSL. When setting this, you also may need to specify LWS_MBEDTLS_LIBRARIES and LWS_MBEDTLS_INCLUDE_DIRS" ${LWS_MBEDTLS_DEFAULT})
 option(LWS_WITH_BEARSSL "Use BearSSL replacement for OpenSSL. When setting this, you also may need to specify LWS_BEARSSL_LIBRARIES and LWS_BEARSSL_INCLUDE_DIRS" OFF)
 set(LWS_BEARSSL_PROFILE "full" CACHE STRING "BearSSL profile to use (e.g. full, client, minimal)")
-option(LWS_WITH_SCHANNEL "Use Windows SChannel for SSL" OFF)
 option(LWS_WITH_BORINGSSL "Use BoringSSL replacement for OpenSSL" OFF)
-option(LWS_WITH_GNUTLS "Use GnuTLS for SSL" OFF)
+option(LWS_WITH_AWSLC "Use AWSLC replacement for OpenSSL" OFF)
+option(LWS_WITH_OPENHITLS "Use openHITLS replacement for OpenSSL. When setting this, you also may need to specify OPENHITLS_LIBRARIES and OPENHITLS_INCLUDE_DIRS" OFF)
 option(LWS_WITH_CYASSL "Use CyaSSL replacement for OpenSSL. When setting this, you also need to specify LWS_CYASSL_LIBRARIES and LWS_CYASSL_INCLUDE_DIRS" OFF)
 option(LWS_WITH_WOLFSSL "Use wolfSSL replacement for OpenSSL. When setting this, you also may need to specify LWS_WOLFSSL_LIBRARIES and LWS_WOLFSSL_INCLUDE_DIRS" OFF)
+
+option(LWS_WITH_GNUTLS "Use GnuTLS for SSL" OFF)
+if (LWS_WITH_HTTP3 AND LWS_WITH_SSL AND NOT (LWS_WITH_BORINGSSL OR LWS_WITH_AWSLC OR LWS_WITH_MBEDTLS OR LWS_WITH_WOLFSSL OR LWS_WITH_CYASSL OR LWS_WITH_BEARSSL OR LWS_WITH_SCHANNEL OR ESP_PLATFORM OR LWS_WITH_ESP32 OR LWS_WITH_OPENHITLS))
+       set(LWS_WITH_GNUTLS ON CACHE BOOL "Use GnuTLS for SSL" FORCE)
+endif()
+
+if (LWS_WITH_BEARSSL)
+	set(LWS_ROLE_QUIC 0)
+	set(LWS_WITH_HTTP3 0)
+endif()
+
+if (NOT (LWS_WITH_BORINGSSL OR LWS_WITH_AWSLC OR LWS_WITH_MBEDTLS OR LWS_WITH_WOLFSSL OR LWS_WITH_CYASSL OR LWS_WITH_GNUTLS OR LWS_WITH_BEARSSL OR LWS_WITH_SCHANNEL))
+    set(LWS_ROLE_QUIC 0)
+    set(LWS_WITH_HTTP3 0)
+endif()
+
+if (WIN32 AND NOT (LWS_WITH_BORINGSSL OR LWS_WITH_AWSLC OR LWS_WITH_MBEDTLS OR LWS_WITH_WOLFSSL OR LWS_WITH_CYASSL OR LWS_WITH_BEARSSL OR LWS_WITH_GNUTLS OR LWS_WITH_OPENHITLS))
+	set(LWS_SCHANNEL_DEFAULT ON)
+else()
+	set(LWS_SCHANNEL_DEFAULT OFF)
+endif()
+if (WIN32)
+	option(LWS_WITH_SCHANNEL "Use Windows SChannel for SSL" ${LWS_SCHANNEL_DEFAULT})
+endif()
 option(LWS_SSL_CLIENT_USE_OS_CA_CERTS "SSL support should make use of the OS-installed CA root certs" ON)
 option(LWS_TLS_LOG_PLAINTEXT_RX "For debugging log the received plaintext as soon as decrypted" OFF)
 option(LWS_TLS_LOG_PLAINTEXT_TX "For debugging log the transmitted plaintext just before encryption" OFF)
 option(LWS_WITH_TLS_SESSIONS "Enable persistent, resumable TLS sessions" ON)
 option(LWS_WITH_TLS_JIT_TRUST "Enable dynamically computing which trusted TLS CA is needed to be instantiated" OFF)
+if (LWS_WITH_SSL AND (LWS_ROLE_H1 OR LWS_WITH_HTTP2 OR LWS_ROLE_WS OR LWS_ROLE_MQTT))
+	set(DEFAULT_TCP_TLS ON)
+else()
+	set(DEFAULT_TCP_TLS OFF)
+endif()
+option(LWS_WITH_TCP_TLS "Compile TCP TLS specific files" ${DEFAULT_TCP_TLS})
+
+if (LWS_WITH_OPENHITLS)
+	set(LWS_WITH_SSL ON)
+endif()
+
+
 
 #
 # Event library options (may select multiple, or none for default poll()
@@ -315,11 +393,15 @@ option(LWS_WITH_CBOR "With the Lightweight LECP CBOR Parser" OFF)
 option(LWS_WITH_CBOR_FLOAT "Build floating point types if building CBOR LECP" ON)
 option(LWS_WITH_SQLITE3 "Require SQLITE3 support" OFF)
 option(LWS_WITH_LHP "With the Lightweight HTML5 parser" ON)
+option(LWS_WITH_LHP_UA_FLASH "Carry lhp's default (user-agent) stylesheet as const tables instead of parsing it into the cascade arenas on every page: ~19KB less heap per parse for ~17KB of const data" ON)
+option(LWS_WITH_HL "With the streaming syntax highlighting tokenizer" ON)
+option(LWS_WITH_HL_LANG_C "With the C language driver for the syntax highlighting tokenizer" ON)
+option(LWS_WITH_HL_LANG_DIFF "With the diff language driver for the syntax highlighting tokenizer" ON)
+option(LWS_WITH_MD "With the streaming markdown to events renderer" ON)
 option(LWS_WITH_STRUCT_JSON "Generic struct serialization to and from JSON" OFF)
 option(LWS_WITH_STRUCT_SQLITE3 "Generic struct serialization to and from SQLITE3" OFF)
 option(LWS_WITH_JSONRPC "JSON RPC support" ON)
-# broken atm
-#option(LWS_WITH_SMTP "Provide SMTP support" OFF)
+option(LWS_WITH_STUB "Formalized stub API for IPC" ON)
 if (LWS_WITH_ESP32)
 option(LWS_WITH_DIR "Directory scanning api support" OFF)
 option(LWS_WITH_LEJP_CONF "With LEJP configuration parser as used by lwsws" OFF)
@@ -335,9 +417,14 @@ option(LWS_LOG_TAG_LIFECYCLE "Log tagged object lifecycle as NOTICE" ON)
 option(LWS_AVOID_SIGPIPE_IGN "Android 7+ reportedly needs this" OFF)
 option(LWS_WITH_JOSE "JOSE JSON Web Signature / Encryption / Keys (RFC7515/6/) API" OFF)
 option(LWS_WITH_COSE "COSE CBOR Signature / Encryption / Keys (RFC8152) API" OFF)
+if (LWS_WITH_COSE)
+	# COSE key and signature parsing is built on LECP; there is no COSE
+	# without it
+	set(LWS_WITH_CBOR ON)
+endif()
 option(LWS_WITH_GENCRYPTO "Enable support for Generic Crypto apis independent of TLS backend" OFF)
 option(LWS_WITH_SELFTESTS "Selftests run at context creation" OFF)
-option(LWS_WITH_GCOV "Build with gcc gcov coverage instrumentation" OFF)
+option(LWS_WITH_GCOV "Build with gcov-format coverage instrumentation (gcc or clang); see READMEs/README.coverage.md" OFF)
 option(LWS_WITH_EXPORT_LWSTARGETS "Export libwebsockets CMake targets.  Disable if they conflict with an outer cmake project." ON)
 option(LWS_REPRODUCIBLE "Build libwebsockets reproducible. It removes the build user and hostname from the build" ON)
 if (ESP_PLATFORM OR LWS_WITH_ESP32 OR LWS_PLAT_BAREMETAL OR LWS_PLAT_FREERTOS)
@@ -362,12 +449,29 @@ option(LWS_WITH_LWS_DSH "Support lws_dsh_t Disordered Shared Heap" OFF)
 option(LWS_CLIENT_HTTP_PROXYING "Support external http proxies for client connections" ON)
 option(LWS_WITH_FILE_OPS "Support file operations vfs" ON)
 option(LWS_WITH_UDP "Platform supports UDP" ON)
+if (NOT LWS_WITH_UDP AND LWS_WITH_SYS_ASYNC_DNS)
+	# the async dns resolver talks to nameservers over UDP, and its public
+	# header (lws-async-dns.h) is compiled out without LWS_WITH_UDP
+	message(STATUS "LWS_WITH_SYS_ASYNC_DNS requires LWS_WITH_UDP, disabling it")
+	set(LWS_WITH_SYS_ASYNC_DNS OFF)
+	set(LWS_WITH_SYS_ASYNC_DNS_DNSSEC OFF)
+endif()
 option(LWS_WITH_SPAWN "Spawn subprocesses with piped stdin/out/stderr" OFF)
 option(LWS_WITH_FSMOUNT "Overlayfs and fallback mounting apis" OFF)
 option(LWS_WITH_FANALYZER "Enable gcc -fanalyzer if compiler supports" OFF)
 option(LWS_HTTP_HEADERS_ALL "Override header reduction optimization and include all like older lws versions" OFF)
 option(LWS_WITH_SUL_DEBUGGING "Enable zombie lws_sul checking on object deletion" OFF)
+option(LWS_WITH_STATE_TRACE "Diagnostic only: append every distinct wsi role/state transition seen by the process to $LWS_STATE_TRACE_FILE (stderr if unset), to derive the transition tables. Off by default." OFF)
+option(LWS_WITH_STATE_CHECK "Debug only: check every wsi role/state transition against the per-machine transition tables in lib/sansio/wsi-state.c and abort on one that is not listed. Off by default." OFF)
+option(LWS_WITH_SERVBUF_CHECK "Debug only: track which code owns which range of the per-thread pt->serv_buf scratch buffer, abort on an overlapping claim or on a claim held across a service pass. Off by default." OFF)
+option(LWS_WITH_SANSIO_LINK_TEST "Also link the sansIO half alone as a shared library (websockets-sansio), with only the substrate neither half owns and the platform's injected clock, random source and file access, and every unresolved symbol an error: it links only when sansIO needs nothing of IO's but the io_ops (READMEs/README.sans-io-split.md).  Not on MSVC.  Off by default." OFF)
 option(LWS_WITH_PLUGINS_API "Build generic lws_plugins apis (see LWS_WITH_PLUGINS to also build protocol plugins)" OFF)
+
+# both dlopened and builtin protocol plugins need the generic plugin apis at
+# runtime to register and bind their protocols (see lws_plugins_handle_builtin)
+if (LWS_WITH_PLUGINS OR LWS_WITH_PLUGINS_BUILTIN)
+	set(LWS_WITH_PLUGINS_API ON)
+endif()
 option(LWS_WITH_CONMON "Collect introspectable connection latency stats on individual client connections" ON)
 option(LWS_WITH_WOL "Wake On Lan support" ON)
 option(LWS_WITHOUT_EVENTFD "Force using pipe instead of eventfd" OFF)
@@ -377,6 +481,8 @@ else()
 	option(LWS_WITH_CACHE_NSCOOKIEJAR "Build file-backed lws-cache-ttl that uses netscape cookie jar format (linux-only)" OFF)
 endif()
 
+option(LWS_WITH_CACHE_BLOB "Build file-backed lws-cache-ttl blob level over the hashed diskcache layout, for the document asset cache (posix, implied by LWS_WITH_LHP where it can build)" ON)
+
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
 	option(LWS_WITH_NETLINK "Monitor Netlink for Routing Table changes" ON)
 	option(LWS_WITH_BINDTODEVICE "Use bind to interface socket option" ON)
@@ -385,6 +491,12 @@ else()
 	set(LWS_WITH_NETLINK 0)
 	set(LWS_WITH_BINDTODEVICE 0)
 	set(LWS_WITH_LIBCAP OFF)
+endif()
+
+if (LWS_WITH_NETLINK OR LWS_WITH_ESP32 OR ESP_PLATFORM)
+	set(LWS_WITH_ROUTING 1)
+else()
+	set(LWS_WITH_ROUTING 0)
 endif()
 option(LWS_WITH_MCUFONT_ENCODER "Build the ttf to mcufont encoder" OFF)
 option(LWS_WITH_WAKE_LOGGING "Log each wake reason" OFF)
@@ -475,6 +587,9 @@ macro(exports_to_parent_scope)
 	if (LWS_LIB_BUILD_INC_PATHS)
 		set(LWS_LIB_BUILD_INC_PATHS ${LWS_LIB_BUILD_INC_PATHS} PARENT_SCOPE)
 	endif()
+	if (DEFINED LIB_LIST_AT_END)
+		set(LIB_LIST_AT_END ${LIB_LIST_AT_END} PARENT_SCOPE)
+	endif()
 endmacro()
 
 macro(export_to_parent_intermediate)
@@ -485,6 +600,9 @@ macro(export_to_parent_intermediate)
 	set(_CMAKE_INC_LIST ${_CMAKE_INC_LIST} PARENT_SCOPE)
 	if (LWS_LIB_BUILD_INC_PATHS)
 		set(LWS_LIB_BUILD_INC_PATHS ${LWS_LIB_BUILD_INC_PATHS} PARENT_SCOPE)
+	endif()
+	if (DEFINED LIB_LIST_AT_END)
+		set(LIB_LIST_AT_END ${LIB_LIST_AT_END} PARENT_SCOPE)
 	endif()
 endmacro()
 
@@ -530,8 +648,8 @@ endif()
 set(PACKAGE "libwebsockets")
 set(CPACK_RPM_PACKAGE_LICENSE "MIT")
 set(CPACK_PACKAGE_NAME "${PACKAGE}")
-set(CPACK_PACKAGE_VERSION_MAJOR "4")
-set(CPACK_PACKAGE_VERSION_MINOR "5")
+set(CPACK_PACKAGE_VERSION_MAJOR "5")
+set(CPACK_PACKAGE_VERSION_MINOR "0")
 set(CPACK_PACKAGE_VERSION_PATCH_NUMBER "99")
 
 set(CPACK_PACKAGE_VERSION_PATCH "${CPACK_PACKAGE_VERSION_PATCH_NUMBER}-${LWS_BUILD_HASH}")
@@ -541,7 +659,7 @@ set(CPACK_PACKAGE_VERSION "${CPACK_PACKAGE_VERSION_MAJOR}.${CPACK_PACKAGE_VERSIO
 set(CPACK_PACKAGE_VENDOR "andy@warmcat.com")
 set(CPACK_PACKAGE_CONTACT "andy@warmcat.com")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "${PACKAGE} ${CPACK_PACKAGE_VERSION}")
-set(SOVERSION "21")
+set(SOVERSION "22")
 if(NOT CPACK_GENERATOR)
     if(UNIX)
         set(CPACK_GENERATOR "TGZ")
@@ -593,7 +711,8 @@ endif()
 if (WIN32)
 message(STATUS "LWS_BUILTIN_PLUGIN_NAMES: ${LWS_BUILTIN_PLUGIN_NAMES}")
 message(STATUS "CONFIG_SCOPE: ${LWS_BUILTIN_PLUGIN_NAMES}")
-	configure_file(${CMAKE_CURRENT_SOURCE_DIR}/win32port/version.rc.in ${CMAKE_CURRENT_BINARY_DIR}/win32port/version.rc @ONLY)
+	message("LWS_HAVE_SSL_set_tlsext_host_name: ${LWS_HAVE_SSL_set_tlsext_host_name}")
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/win32port/version.rc.in ${CMAKE_CURRENT_BINARY_DIR}/win32port/version.rc @ONLY)
 	set(RESOURCES ${CMAKE_CURRENT_BINARY_DIR}/win32port/version.rc)
        include_directories("${CMAKE_CURRENT_SOURCE_DIR}/win32port/win32helpers")
 endif()
@@ -606,6 +725,31 @@ set(LWS_INSTALL_BIN_DIR       ${CMAKE_INSTALL_BINDIR} CACHE PATH "Installation d
 set(LWS_INSTALL_INCLUDE_DIR   ${CMAKE_INSTALL_INCLUDEDIR} CACHE PATH "Installation directory for header files")
 set(LWS_INSTALL_EXAMPLES_DIR  ${CMAKE_INSTALL_BINDIR} CACHE PATH "Installation directory for example files")
 set(LWS_INSTALL_PLUGIN_DIR    "${CMAKE_INSTALL_PREFIX}/share/libwebsockets-test-server/plugins" CACHE PATH "Installation directory for plugins")
+set(LWS_INSTALL_FONTS_DIR     "share/libwebsockets/fonts" CACHE PATH "Installation directory for the mcufont repository")
+
+# The install destination must stay prefix-relative so cpack can stage it
+# (an absolute one is installed to the live filesystem instead of the
+# package tree); the runtime LWS_FONTS_DIR in lws_config.h wants the
+# absolute path the fonts will be found at
+if(IS_ABSOLUTE "${LWS_INSTALL_FONTS_DIR}")
+	set(LWS_ABSOLUTE_INSTALL_FONTS_DIR "${LWS_INSTALL_FONTS_DIR}")
+else()
+	set(LWS_ABSOLUTE_INSTALL_FONTS_DIR "${CMAKE_INSTALL_PREFIX}/${LWS_INSTALL_FONTS_DIR}")
+endif()
+
+if(IS_ABSOLUTE "${LWS_INSTALL_LIB_DIR}")
+	set(LWS_ABSOLUTE_INSTALL_LIBDIR "${LWS_INSTALL_LIB_DIR}")
+	set(PKG_CONFIG_LIBDIR "${LWS_INSTALL_LIB_DIR}")
+else()
+	set(LWS_ABSOLUTE_INSTALL_LIBDIR "${CMAKE_INSTALL_PREFIX}/${LWS_INSTALL_LIB_DIR}")
+	set(PKG_CONFIG_LIBDIR "\${exec_prefix}/${LWS_INSTALL_LIB_DIR}")
+endif()
+
+if(IS_ABSOLUTE "${LWS_INSTALL_INCLUDE_DIR}")
+	set(PKG_CONFIG_INCLUDEDIR "${LWS_INSTALL_INCLUDE_DIR}")
+else()
+	set(PKG_CONFIG_INCLUDEDIR "\${prefix}/${LWS_INSTALL_INCLUDE_DIR}")
+endif()
 
 # if you gave LWS_WITH_MINIZ, point to MINIZ here if not found
 # automatically
@@ -697,6 +841,8 @@ endif()
 
 CHECK_FUNCTION_EXISTS(fork LWS_HAVE_FORK)
 CHECK_FUNCTION_EXISTS(getenv LWS_HAVE_GETENV)
+CHECK_FUNCTION_EXISTS(getppid LWS_HAVE_GETPPID)
+CHECK_FUNCTION_EXISTS(sigaction LWS_HAVE_SIGACTION)
 CHECK_FUNCTION_EXISTS(malloc LWS_HAVE_MALLOC)
 CHECK_FUNCTION_EXISTS(memset LWS_HAVE_MEMSET)
 CHECK_FUNCTION_EXISTS(realloc LWS_HAVE_REALLOC)
@@ -800,7 +946,12 @@ if (LWS_WITH_PLUGINS_API AND UNIX AND CMAKE_DL_LIBS AND NOT (${CMAKE_SYSTEM_NAME
 endif()
 
 
+if (LWS_WITHOUT_CLIENT OR LWS_WITHOUT_SERVER)
+	set(LWS_WITH_STUB OFF)
+endif()
+
 if (WIN32 OR MSVC)
+
 	CHECK_C_SOURCE_COMPILES("#include <winsock2.h>
 				 #include <afunix.h>
 				 int main() { return 0; }" LWS_HAVE_WIN32_AFUNIX_H)
@@ -1029,8 +1180,10 @@ if (CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_GNUCXX OR COMPILER_IS_CLANG)
 	# always warn all and generate debug info
 	if (UNIX AND NOT LWS_PLAT_FREERTOS)
 		set(CMAKE_C_FLAGS "-Wall -Wextra -Wno-unused-parameter -Wconversion -Wsign-compare -Wstrict-aliasing ${VISIBILITY_FLAG} -Wundef ${GCOV_FLAGS} ${CMAKE_C_FLAGS} ${ASAN_FLAGS}" )
+		set(CMAKE_CXX_FLAGS "-Wall -Wextra -Wno-unused-parameter -Wconversion -Wsign-compare -Wstrict-aliasing ${VISIBILITY_FLAG} -Wundef ${GCOV_FLAGS} ${CMAKE_CXX_FLAGS} ${ASAN_FLAGS}" )
 	else()
 		set(CMAKE_C_FLAGS "-Wall -Wsign-compare ${VISIBILITY_FLAG} ${GCOV_FLAGS} ${CMAKE_C_FLAGS}" )
+		set(CMAKE_CXX_FLAGS "-Wall -Wsign-compare ${VISIBILITY_FLAG} ${GCOV_FLAGS} ${CMAKE_CXX_FLAGS} ${ASAN_FLAGS}" )
 	endif()
 
 	if (PICO_SDK_PATH)
@@ -1047,8 +1200,10 @@ if (CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_GNUCXX OR COMPILER_IS_CLANG)
 
 	if (LWS_SUPPRESS_DEPRECATED_API_WARNINGS)
 		set(CMAKE_C_FLAGS "-Wno-deprecated ${CMAKE_C_FLAGS}")
+		set(CMAKE_CXX_FLAGS "-Wno-deprecated ${CMAKE_CXX_FLAGS}")
 		if (LWS_GCC_HAS_NO_DEPRECATED_DECLARATIONS)
 			set(CMAKE_C_FLAGS "-Wno-deprecated-declarations ${CMAKE_C_FLAGS}")
+			set(CMAKE_CXX_FLAGS "-Wno-deprecated-declarations ${CMAKE_CXX_FLAGS}")
 		endif()
 	endif()
 endif ()
@@ -1068,7 +1223,13 @@ if (COMPILER_IS_CLANG)
 	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-deprecated-declarations" )
 	if (UNIX AND LWS_HAVE_PTHREAD_H)
 		set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -pthread -Wno-error=unused-command-line-argument" )
+		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -Wno-error=unused-command-line-argument" )
 	endif()
+endif()
+
+if (LWS_WITH_ASAN)
+	set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${ASAN_FLAGS}")
+	set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${ASAN_FLAGS}")
 endif()
 
 if (${CMAKE_SYSTEM_NAME} MATCHES "SunOS")
@@ -1087,8 +1248,13 @@ endif()
 if (MSVC)
 	# Turn off pointless microsoft security warnings.
 	add_definitions(-D_CRT_SECURE_NO_DEPRECATE -D_CRT_NONSTDC_NO_DEPRECATE)
-	# Fail the build if any warnings
-	add_compile_options(/W3 /WX)
+	# Fail the build if any warnings, unless DISABLE_WERROR is set (mirrors
+	# the GCC/Clang -Werror gating above).
+	if ("${DISABLE_WERROR}" STREQUAL "OFF")
+		add_compile_options(/W3 /WX)
+	else()
+		add_compile_options(/W3)
+	endif()
 	# Unbreak MSVC broken preprocessor __VA_ARGS__ behaviour
 	if (MSVC_VERSION GREATER 1925)
 		add_compile_options(/Zc:preprocessor /wd5105)
@@ -1222,6 +1388,11 @@ ${PLUGIN_PTRS}
 ")
 	file(WRITE "${PROJECT_BINARY_DIR}/lws_builtin_plugin_pcols.c" "${PLUGIN_BUILTIN_C_CONTENT}")
 	list(APPEND SOURCES "${PROJECT_BINARY_DIR}/lws_builtin_plugin_pcols.c")
+
+	# plugins built into the lib may need extra libs (eg, hls -> ffmpeg)
+	if (LWS_PLUGIN_BUILTIN_LIBS)
+		list(APPEND LIB_LIST ${LWS_PLUGIN_BUILTIN_LIBS})
+	endif()
 endif()
 
 
@@ -1234,9 +1405,21 @@ list(APPEND LIB_LIST ${LIB_LIST_AT_END})
 # Second-level CMakeLists
 #
 
+if (LWS_WITH_FUZZERS)
+	#
+	# Instrument the whole lib for libFuzzer coverage + ASan, for the
+	# targets in ./fuzz.  The fuzz targets themselves add the libFuzzer
+	# runtime when they link.  Requires clang and libclang-rt-*-dev.
+	#
+	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=fuzzer-no-link,address -fno-omit-frame-pointer -g")
+endif()
+
 include_directories("${PROJECT_SOURCE_DIR}/lib")
 add_subdirectory(lib)
 
+if (LWS_DEP_LIB_PATHS)
+	link_directories(${LWS_DEP_LIB_PATHS})
+endif()
 
 if(WIN32 AND NOT CYGWIN)
   set(DEF_INSTALL_CMAKE_DIR cmake)
@@ -1246,12 +1429,14 @@ endif()
                 
 message(STATUS "LWS_BUILTIN_PLUGIN_NAMES: ${LWS_BUILTIN_PLUGIN_NAMES}")
 message(STATUS "CONFIG_SCOPE: ${LWS_BUILTIN_PLUGIN_NAMES}")
+message("LWS_HAVE_SSL_set_tlsext_host_name: ${LWS_HAVE_SSL_set_tlsext_host_name}")
 configure_file(${PROJECT_SOURCE_DIR}/cmake/LwsCheckRequirements.cmake
 		${PROJECT_BINARY_DIR}${CMAKE_FILES_DIRECTORY}/LwsCheckRequirements.cmake
 		@ONLY)
 		
 message(STATUS "LWS_BUILTIN_PLUGIN_NAMES: ${LWS_BUILTIN_PLUGIN_NAMES}")
 message(STATUS "CONFIG_SCOPE: ${LWS_BUILTIN_PLUGIN_NAMES}")
+message("LWS_HAVE_SSL_set_tlsext_host_name: ${LWS_HAVE_SSL_set_tlsext_host_name}")
 configure_file(${PROJECT_SOURCE_DIR}/cmake/LwsCheckRequirements.cmake
 		${PROJECT_BINARY_DIR}/LwsCheckRequirements.cmake
 		@ONLY)  
@@ -1259,17 +1444,34 @@ configure_file(${PROJECT_SOURCE_DIR}/cmake/LwsCheckRequirements.cmake
 # Generate version info for both build-tree and install-tree.
 message(STATUS "LWS_BUILTIN_PLUGIN_NAMES: ${LWS_BUILTIN_PLUGIN_NAMES}")
 message(STATUS "CONFIG_SCOPE: ${LWS_BUILTIN_PLUGIN_NAMES}")
+message("LWS_HAVE_SSL_set_tlsext_host_name: ${LWS_HAVE_SSL_set_tlsext_host_name}")
 configure_file(${PROJECT_SOURCE_DIR}/cmake/libwebsockets-config-version.cmake.in
                 ${PROJECT_BINARY_DIR}/libwebsockets-config-version.cmake 
                 @ONLY)
 
+#
+# The public headers include those of the TLS provider and, for a builtin
+# libuv build, libuv's: consumers (and their require_lws_config() probes)
+# need those directories on their include path too, not only lws's own,
+# since eg homebrew keeps them outside the compiler's default search.
+# The lib subdir collected them into LWS_PUBLIC_INCLUDES.
+#
+set(LWS_DEP_INCLUDE_DIRS ${LWS_PUBLIC_INCLUDES})
+if (LWS_DEP_INCLUDE_DIRS)
+	list(REMOVE_DUPLICATES LWS_DEP_INCLUDE_DIRS)
+endif()
+
 # Generate the config file for the build-tree.
 set(LWS__INCLUDE_DIRS 
+    "${PROJECT_SOURCE_DIR}/include"
+    "${PROJECT_BINARY_DIR}/include"
     "${PROJECT_SOURCE_DIR}/lib"
-    "${PROJECT_BINARY_DIR}")
+    "${PROJECT_BINARY_DIR}"
+    ${LWS_DEP_INCLUDE_DIRS})
 set(LIBWEBSOCKETS_INCLUDE_DIRS ${LWS__INCLUDE_DIRS} CACHE PATH "Libwebsockets include directories")
 message(STATUS "LWS_BUILTIN_PLUGIN_NAMES: ${LWS_BUILTIN_PLUGIN_NAMES}")
 message(STATUS "CONFIG_SCOPE: ${LWS_BUILTIN_PLUGIN_NAMES}")
+message("LWS_HAVE_SSL_set_tlsext_host_name: ${LWS_HAVE_SSL_set_tlsext_host_name}")
 configure_file(${PROJECT_SOURCE_DIR}/cmake/libwebsockets-config.cmake.in
                 ${PROJECT_BINARY_DIR}/libwebsockets-config.cmake 
                 @ONLY)
@@ -1298,6 +1500,10 @@ if (NOT LWS_WITHOUT_TESTAPPS)
 	add_subdirectory(test-apps)
 endif()
 
+if (LWS_WITH_FUZZERS)
+	add_subdirectory(fuzz)
+endif()
+
 if (NOT LWS_WITH_PLUGINS_BUILTIN)
 add_subdirectory(plugins)
 endif()
@@ -1313,6 +1519,7 @@ endif()
 # Generate the lws_config.h that includes all the public compilation settings.
 message(STATUS "LWS_BUILTIN_PLUGIN_NAMES: ${LWS_BUILTIN_PLUGIN_NAMES}")
 message(STATUS "CONFIG_SCOPE: ${LWS_BUILTIN_PLUGIN_NAMES}")
+message("LWS_HAVE_SSL_set_tlsext_host_name: ${LWS_HAVE_SSL_set_tlsext_host_name}")
 configure_file(
        "${PROJECT_SOURCE_DIR}/cmake/lws_config.h.in"
        "${PROJECT_BINARY_DIR}/lws_config.h")
@@ -1366,6 +1573,14 @@ export(PACKAGE libwebsockets)
 
 install(DIRECTORY include/libwebsockets
 	DESTINATION "${LWS_INSTALL_INCLUDE_DIR}" COMPONENT dev)
+
+# the mcufont repository: faces an app can register from storage at runtime
+# with lws_fonts_register_dir(cx, LWS_FONTS_DIR)
+if (LWS_WITH_DLO)
+	install(DIRECTORY contrib/mcufont/fonts/
+		DESTINATION "${LWS_INSTALL_FONTS_DIR}" COMPONENT examples
+		FILES_MATCHING PATTERN "*.mcufont")
+endif()
 install(FILES ${PROJECT_BINARY_DIR}/include/libwebsockets.h ${PROJECT_BINARY_DIR}/include/lws_config.h
 	DESTINATION "${LWS_INSTALL_INCLUDE_DIR}" COMPONENT dev)
 install(CODE "
@@ -1382,12 +1597,17 @@ file(RELATIVE_PATH
     "${LWS_ABSOLUTE_INSTALL_INCLUDE_DIR}") # Calculate the relative directory from the cmake dir.
 
 if (DEFINED REL_INCLUDE_DIR)
-    set(LWS__INCLUDE_DIRS "${LWS_CMAKE_DIR}/${REL_INCLUDE_DIR}")
+    set(LWS__INCLUDE_DIRS "\${LWS_CMAKE_DIR}/${REL_INCLUDE_DIR}" ${LWS_DEP_INCLUDE_DIRS})
 endif()
 
 set(STRIPPED_LIB_LIST_AT_END "")
 foreach(lib_path IN LISTS LIB_LIST_AT_END)
-    if(IS_ABSOLUTE "${lib_path}" AND NOT "${lib_path}" MATCHES "^-")
+    if(IS_ABSOLUTE "${lib_path}" AND "${lib_path}" MATCHES "\\.framework$")
+        # a mac framework found by find_library: it is linked by name
+        # with -framework, not as a library
+        get_filename_component(lib_name "${lib_path}" NAME_WE)
+        list(APPEND STRIPPED_LIB_LIST_AT_END "-framework ${lib_name}")
+    elseif(IS_ABSOLUTE "${lib_path}" AND NOT "${lib_path}" MATCHES "^-")
         get_filename_component(lib_name "${lib_path}" NAME_WE)
         string(REGEX REPLACE "^lib" "" lib_name "${lib_name}")
         list(APPEND STRIPPED_LIB_LIST_AT_END "-l${lib_name}")
@@ -1399,6 +1619,7 @@ set(LIB_LIST_AT_END ${STRIPPED_LIB_LIST_AT_END})
 
 message(STATUS "LWS_BUILTIN_PLUGIN_NAMES: ${LWS_BUILTIN_PLUGIN_NAMES}")
 message(STATUS "CONFIG_SCOPE: ${LWS_BUILTIN_PLUGIN_NAMES}")
+message("LWS_HAVE_SSL_set_tlsext_host_name: ${LWS_HAVE_SSL_set_tlsext_host_name}")
 configure_file(${PROJECT_SOURCE_DIR}/cmake/libwebsockets-config.cmake.in
                 ${PROJECT_BINARY_DIR}${CMAKE_FILES_DIRECTORY}/libwebsockets-config.cmake
                 @ONLY)
@@ -1445,6 +1666,19 @@ set(CPACK_SOURCE_IGNORE_FILES $(CPACK_SOURCE_IGNORE_FILES) "/.git/" "/build/" "\
 
 # Most people are more used to "make dist" compared to "make package_source"
 add_custom_target(dist COMMAND "${CMAKE_MAKE_PROGRAM}" package_source)
+
+# "make coverage": summarize the gcov counters left by the last ctest run in
+# this tree, see READMEs/README.coverage.md
+if (LWS_WITH_GCOV)
+	find_program(LWS_PYTHON3 NAMES python3 python)
+	if (LWS_PYTHON3)
+		add_custom_target(coverage
+			COMMAND ${LWS_PYTHON3} ${PROJECT_SOURCE_DIR}/scripts/coverage-report.py
+			WORKING_DIRECTORY ${PROJECT_BINARY_DIR}
+			COMMENT "Summarizing coverage from the last ctest run"
+			VERBATIM)
+	endif()
+endif()
 
 
 

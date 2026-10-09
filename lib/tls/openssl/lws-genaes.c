@@ -52,12 +52,14 @@ lws_genaes_create(struct lws_genaes_ctx *ctx, enum enum_aes_operation op,
 	ctx->init = 0;
 	ctx->op = op;
 	ctx->padding = padding;
+	/* the ctx is caller storage that may be uninitialized */
+	ctx->cipher = NULL;
 
 	switch (ctx->k->len) {
 	case 128 / 8:
 		switch (mode) {
 		case LWS_GAESM_KW:
-#if defined(LWS_HAVE_EVP_aes_128_wrap)
+#if defined(LWS_HAVE_EVP_aes_128_wrap) && !defined(LWS_WITH_BORINGSSL)
 			EVP_CIPHER_CTX_set_flags(ctx->ctx,
 						EVP_CIPHER_CTX_FLAG_WRAP_ALLOW);
 			ctx->cipher = EVP_aes_128_wrap();
@@ -65,17 +67,17 @@ lws_genaes_create(struct lws_genaes_ctx *ctx, enum enum_aes_operation op,
 #else
 			lwsl_err("%s: your OpenSSL lacks AES wrap apis, update it\n",
 				 __func__);
-			return -1;
+			goto bail;
 #endif
 		case LWS_GAESM_CBC:
 			ctx->cipher = EVP_aes_128_cbc();
 			break;
-#if defined(LWS_HAVE_EVP_aes_128_cfb128)
+#if defined(LWS_HAVE_EVP_aes_128_cfb128) && !defined(LWS_WITH_BORINGSSL)
 		case LWS_GAESM_CFB128:
 			ctx->cipher = EVP_aes_128_cfb128();
 			break;
 #endif
-#if defined(LWS_HAVE_EVP_aes_128_cfb8)
+#if defined(LWS_HAVE_EVP_aes_128_cfb8) && !defined(LWS_WITH_BORINGSSL)
 		case LWS_GAESM_CFB8:
 			ctx->cipher = EVP_aes_128_cfb8();
 			break;
@@ -85,7 +87,7 @@ lws_genaes_create(struct lws_genaes_ctx *ctx, enum enum_aes_operation op,
 			ctx->cipher = EVP_aes_128_ctr();
 			break;
 #endif
-#if defined(LWS_HAVE_EVP_aes_128_ecb)
+#if defined(LWS_HAVE_EVP_aes_128_ecb) || defined(OPENSSL_IS_AWSLC)
 		case LWS_GAESM_ECB:
 			ctx->cipher = EVP_aes_128_ecb();
 			break;
@@ -95,11 +97,12 @@ lws_genaes_create(struct lws_genaes_ctx *ctx, enum enum_aes_operation op,
 			ctx->cipher = EVP_aes_128_ofb();
 			break;
 #endif
-#if defined(LWS_HAVE_EVP_aes_128_xts)
+#if defined(LWS_HAVE_EVP_aes_128_xts) && !defined(LWS_WITH_BORINGSSL) && !defined(LWS_WITH_BORINGSSL)
 		case LWS_GAESM_XTS:
+			/* no cipher was selected, we must not continue */
 			lwsl_err("%s: AES XTS requires double-length key\n",
 				 __func__);
-			break;
+			goto bail;
 #endif
 		case LWS_GAESM_GCM:
 			ctx->cipher = EVP_aes_128_gcm();
@@ -112,25 +115,25 @@ lws_genaes_create(struct lws_genaes_ctx *ctx, enum enum_aes_operation op,
 	case 192 / 8:
 		switch (mode) {
 		case LWS_GAESM_KW:
-#if defined(LWS_HAVE_EVP_aes_128_wrap)
+#if defined(LWS_HAVE_EVP_aes_128_wrap) && !defined(LWS_WITH_BORINGSSL)
 			EVP_CIPHER_CTX_set_flags(ctx->ctx,
 						EVP_CIPHER_CTX_FLAG_WRAP_ALLOW);
 			ctx->cipher = EVP_aes_192_wrap();
 			break;
 #else
-                        lwsl_err("%s: your OpenSSL lacks AES wrap apis, update it\n",
-                                 __func__);
-                        return -1;
+			lwsl_err("%s: your OpenSSL lacks AES wrap apis, update it\n",
+				 __func__);
+			goto bail;
 #endif
 		case LWS_GAESM_CBC:
 			ctx->cipher = EVP_aes_192_cbc();
 			break;
-#if defined(LWS_HAVE_EVP_aes_192_cfb128)
+#if defined(LWS_HAVE_EVP_aes_192_cfb128) && !defined(LWS_WITH_BORINGSSL)
 		case LWS_GAESM_CFB128:
 			ctx->cipher = EVP_aes_192_cfb128();
 			break;
 #endif
-#if defined(LWS_HAVE_EVP_aes_192_cfb8)
+#if defined(LWS_HAVE_EVP_aes_192_cfb8) && !defined(LWS_WITH_BORINGSSL)
 		case LWS_GAESM_CFB8:
 			ctx->cipher = EVP_aes_192_cfb8();
 			break;
@@ -140,7 +143,7 @@ lws_genaes_create(struct lws_genaes_ctx *ctx, enum enum_aes_operation op,
 			ctx->cipher = EVP_aes_192_ctr();
 			break;
 #endif
-#if defined(LWS_HAVE_EVP_aes_128_ecb)
+#if defined(LWS_HAVE_EVP_aes_128_ecb) || defined(OPENSSL_IS_AWSLC)
 		case LWS_GAESM_ECB:
 			ctx->cipher = EVP_aes_192_ecb();
 			break;
@@ -150,7 +153,7 @@ lws_genaes_create(struct lws_genaes_ctx *ctx, enum enum_aes_operation op,
 			ctx->cipher = EVP_aes_192_ofb();
 			break;
 #endif
-#if defined(LWS_HAVE_EVP_aes_128_xts)
+#if defined(LWS_HAVE_EVP_aes_128_xts) && !defined(LWS_WITH_BORINGSSL) && !defined(LWS_WITH_BORINGSSL)
 		case LWS_GAESM_XTS:
 			lwsl_err("%s: AES XTS 192 invalid\n", __func__);
 			goto bail;
@@ -166,25 +169,25 @@ lws_genaes_create(struct lws_genaes_ctx *ctx, enum enum_aes_operation op,
 	case 256 / 8:
 		switch (mode) {
 		case LWS_GAESM_KW:
-#if defined(LWS_HAVE_EVP_aes_128_wrap)
+#if defined(LWS_HAVE_EVP_aes_128_wrap) && !defined(LWS_WITH_BORINGSSL)
 			EVP_CIPHER_CTX_set_flags(ctx->ctx,
 						EVP_CIPHER_CTX_FLAG_WRAP_ALLOW);
 			ctx->cipher = EVP_aes_256_wrap();
 			break;
 #else
-                        lwsl_err("%s: your OpenSSL lacks AES wrap apis, update it\n",
-                                 __func__);
-                        return -1;
+			lwsl_err("%s: your OpenSSL lacks AES wrap apis, update it\n",
+				 __func__);
+			goto bail;
 #endif
 		case LWS_GAESM_CBC:
 			ctx->cipher = EVP_aes_256_cbc();
 			break;
-#if defined(LWS_HAVE_EVP_aes_256_cfb128)
+#if defined(LWS_HAVE_EVP_aes_256_cfb128) && !defined(LWS_WITH_BORINGSSL)
 		case LWS_GAESM_CFB128:
 			ctx->cipher = EVP_aes_256_cfb128();
 			break;
 #endif
-#if defined(LWS_HAVE_EVP_aes_256_cfb8)
+#if defined(LWS_HAVE_EVP_aes_256_cfb8) && !defined(LWS_WITH_BORINGSSL)
 		case LWS_GAESM_CFB8:
 			ctx->cipher = EVP_aes_256_cfb8();
 			break;
@@ -194,7 +197,7 @@ lws_genaes_create(struct lws_genaes_ctx *ctx, enum enum_aes_operation op,
 			ctx->cipher = EVP_aes_256_ctr();
 			break;
 #endif
-#if defined(LWS_HAVE_EVP_aes_128_ecb)
+#if defined(LWS_HAVE_EVP_aes_128_ecb) || defined(OPENSSL_IS_AWSLC)
 		case LWS_GAESM_ECB:
 			ctx->cipher = EVP_aes_256_ecb();
 			break;
@@ -204,7 +207,7 @@ lws_genaes_create(struct lws_genaes_ctx *ctx, enum enum_aes_operation op,
 			ctx->cipher = EVP_aes_256_ofb();
 			break;
 #endif
-#if defined(LWS_HAVE_EVP_aes_128_xts)
+#if defined(LWS_HAVE_EVP_aes_128_xts) && !defined(LWS_WITH_BORINGSSL) && !defined(LWS_WITH_BORINGSSL)
 		case LWS_GAESM_XTS:
 			ctx->cipher = EVP_aes_128_xts();
 			break;
@@ -219,7 +222,7 @@ lws_genaes_create(struct lws_genaes_ctx *ctx, enum enum_aes_operation op,
 
 	case 512 / 8:
 		switch (mode) {
-#if defined(LWS_HAVE_EVP_aes_128_xts)
+#if defined(LWS_HAVE_EVP_aes_128_xts) && !defined(LWS_WITH_BORINGSSL) && !defined(LWS_WITH_BORINGSSL)
 		case LWS_GAESM_XTS:
 			ctx->cipher = EVP_aes_256_xts();
 #endif
@@ -279,17 +282,30 @@ lws_genaes_destroy(struct lws_genaes_ctx *ctx, unsigned char *tag, size_t tlen)
 				n = -1;
 			}
 
-			if (ctx->mode == LWS_GAESM_GCM) {
+			/*
+			 * `tag` is optional (cleanup on an error path passes
+			 * NULL) and `tlen` is how much of it we may write...
+			 * OpenSSL copies into `tag` unconditionally, so both
+			 * have to be honoured here rather than assumed
+			 */
+
+			if (ctx->mode == LWS_GAESM_GCM && tag && tlen) {
+				int tl = ctx->taglen;
+
+				if (tl > 0 && tlen < (size_t)tl)
+					tl = (int)tlen;
+
 				if (EVP_CIPHER_CTX_ctrl(ctx->ctx,
 						EVP_CTRL_GCM_GET_TAG,
-						    ctx->taglen, tag) != 1) {
+						    tl, tag) != 1) {
 					lwsl_err("get tag ctrl failed\n");
 					//lws_tls_err_describe_clear();
 					n = 1;
 				}
 			}
-			if (ctx->mode == LWS_GAESM_CBC)
-				memcpy(tag, buf, (unsigned int)outl);
+			if (ctx->mode == LWS_GAESM_CBC && tag && tlen && outl > 0)
+				memcpy(tag, buf, (size_t)outl > tlen ?
+							tlen : (size_t)outl);
 
 			break;
 
@@ -332,6 +348,28 @@ lws_genaes_crypt(struct lws_genaes_ctx *ctx,
 				lwsl_err("%s: SET_IVLEN failed\n", __func__);
 				return -1;
 			}
+			/*
+			 * ctx->tag is a fixed 16 bytes... the tag length is a
+			 * per-call argument, so it has to be bounded against
+			 * that here, otherwise a caller asking for a longer
+			 * (or negative, ie ~4GB unsigned) tag overflows it.
+			 * Same bound as the mbedtls backend (C-362).
+			 */
+
+			if (taglen < 4 || (size_t)taglen > sizeof(ctx->tag)) {
+				lwsl_err("%s: bad taglen %d\n", __func__,
+					 taglen);
+
+				return -1;
+			}
+
+			if (!stream_block_16) {
+				lwsl_err("%s: GCM needs the tag buffer\n",
+					 __func__);
+
+				return -1;
+			}
+
 			memcpy(ctx->tag, stream_block_16, (unsigned int)taglen);
 			ctx->taglen = taglen;
 		}

@@ -56,7 +56,7 @@ struct client {
 
 static struct lws_context *context;
 static struct client clients[200];
-static int interrupted, port = 443, ssl_connection = LCCSCF_USE_SSL;
+static int port = 443, ssl_connection = LCCSCF_USE_SSL;
 static const char *server_address = "libwebsockets.org",
 		  *pro = "lws-mirror-protocol";
 static int concurrent = 3, conn, tries, est, errors, closed, sent, limit = 15;
@@ -125,7 +125,7 @@ callback_minimal_spam(struct lws *wsi, enum lws_callback_reasons reason,
 			}
 		}
 		if (tries == closed + errors) {
-			interrupted = 1;
+			lws_default_loop_exit(context);
 			lws_cancel_service(lws_get_context(wsi));
 		}
 		break;
@@ -143,7 +143,7 @@ callback_minimal_spam(struct lws *wsi, enum lws_callback_reasons reason,
 	case LWS_CALLBACK_CLIENT_CLOSED:
 		closed++;
 		if (tries == closed + errors) {
-			interrupted = 1;
+			lws_default_loop_exit(context);
 			lws_cancel_service(lws_get_context(wsi));
 		}
 		if (tries == limit) {
@@ -204,20 +204,14 @@ static struct lws_protocol_vhost_options pvo = {
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
 	const char *p;
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE
-			/* for LLL_ verbosity above NOTICE to be built into lws,
-			 * lws must have been configured and built with
-			 * -DCMAKE_BUILD_TYPE=DEBUG instead of =RELEASE */
-			/* | LLL_INFO */ /* | LLL_PARSER */ /* | LLL_HEADER */
-			/* | LLL_EXT */ /* | LLL_CLIENT */ /* | LLL_LATENCY */
-			/* | LLL_DEBUG */;
+	int n = 0;
 	(void)switches;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
@@ -228,18 +222,16 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal ws client SPAM\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 	info.port = CONTEXT_PORT_NO_LISTEN; /* we do not run any server */
 	info.protocols = protocols;
 	info.pvo = &pvo;
-#if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL)
+#if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL) || defined(LWS_WITH_OPENHITLS)
 	/*
 	 * OpenSSL uses the system trust store.  mbedTLS has to be told which
 	 * CA to trust explicitly.
@@ -253,7 +245,14 @@ int main(int argc, const char **argv)
 	}
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_PORT].sw)))
-		port = atoi(p);
+		{
+			int __pt = atoi(p);
+			if (__pt < 0 || __pt > 65535) {
+				lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+				return 1;
+			}
+			port = __pt;
+		}
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_L].sw)))
 		limit = atoi(p);
@@ -278,10 +277,10 @@ int main(int argc, const char **argv)
 	 * since we know this lws context is only ever going to be used with
 	 * one client wsis / fds / sockets at a time, let lws know it doesn't
 	 * have to use the default allocations for fd tables up to ulimit -n.
-	 * It will just allocate for 1 internal and n (+ 1 http2 nwsi) that we
-	 * will use.
+	 * It will just allocate for its own fds and overhead
+	 * (LWS_FD_LIMIT_PER_THREAD_MIN) plus the n connections we will use.
 	 */
-	info.fd_limit_per_thread = (unsigned int)(1 + concurrent + 1);
+	info.fd_limit_per_thread = (unsigned int)(LWS_FD_LIMIT_PER_THREAD_MIN + concurrent);
 
 	context = lws_create_context(&info);
 	if (!context) {
@@ -294,7 +293,7 @@ int main(int argc, const char **argv)
 		connect_client(n);
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lwsl_notice("%s: exiting service loop\n", __func__);

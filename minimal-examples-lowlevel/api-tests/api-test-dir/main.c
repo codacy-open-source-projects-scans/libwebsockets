@@ -10,11 +10,14 @@
 #include <libwebsockets.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <errno.h>
 
 #if defined(WIN32)
 #include <direct.h>
 #define mkdir(x,y) _mkdir(x)
 #define rmdir _rmdir
+#else
+#include <unistd.h>
 #endif
 
 static int
@@ -45,14 +48,111 @@ create_file(const char *path, size_t size)
 	return 0;
 }
 
+#if !defined(WIN32)
+static int
+link_is(const char *link, const char *expect)
+{
+	char buf[128];
+	ssize_t n = readlink(link, buf, sizeof(buf) - 1);
+
+	if (n < 0)
+		return !expect; /* no link at all */
+	buf[n] = '\0';
+
+	return expect && !strcmp(buf, expect);
+}
+
+/*
+ * lws_dir_symlink_rotate() as a cert store uses it: each newly written
+ * timestamped file becomes -latest, and what -latest pointed at before
+ * becomes -previous
+ */
+
+static int
+test_symlink_rotate(void)
+{
+	static const char *cur = "./test-rot/example.com-latest-fullchain.crt",
+			  *prev = "./test-rot/example.com-previous-fullchain.crt";
+	int r = 1;
+
+	if (mkdir("./test-rot", 0700) < 0) {
+		lwsl_err("%s: failed mkdir test-rot\n", __func__);
+		return 1;
+	}
+
+	/* first cert: nothing is outgoing yet */
+	if (lws_dir_symlink_rotate(cur, "example.com-1-fullchain.crt",
+				   "-latest", "-previous") ||
+	    !link_is(cur, "example.com-1-fullchain.crt") ||
+	    !link_is(prev, NULL)) {
+		lwsl_err("%s: first rotation wrong\n", __func__);
+		goto bail;
+	}
+
+	/* renewal: the first cert becomes previous */
+	if (lws_dir_symlink_rotate(cur, "example.com-2-fullchain.crt",
+				   "-latest", "-previous") ||
+	    !link_is(cur, "example.com-2-fullchain.crt") ||
+	    !link_is(prev, "example.com-1-fullchain.crt")) {
+		lwsl_err("%s: second rotation wrong\n", __func__);
+		goto bail;
+	}
+
+	/* saving the same cert again must not lose the real previous one */
+	if (lws_dir_symlink_rotate(cur, "example.com-2-fullchain.crt",
+				   "-latest", "-previous") ||
+	    !link_is(prev, "example.com-1-fullchain.crt")) {
+		lwsl_err("%s: repeated rotation lost previous\n", __func__);
+		goto bail;
+	}
+
+	/* the next renewal moves previous on */
+	if (lws_dir_symlink_rotate(cur, "example.com-3-fullchain.crt",
+				   "-latest", "-previous") ||
+	    !link_is(cur, "example.com-3-fullchain.crt") ||
+	    !link_is(prev, "example.com-2-fullchain.crt")) {
+		lwsl_err("%s: third rotation wrong\n", __func__);
+		goto bail;
+	}
+
+	/* a path without the tag is refused, and nothing is created */
+	errno = 0;
+	if (!lws_dir_symlink_rotate("./test-rot/untagged.crt", "x",
+				    "-latest", "-previous") || errno != EINVAL ||
+	    !link_is("./test-rot/untagged.crt", NULL)) {
+		lwsl_err("%s: untagged path not refused with EINVAL\n",
+			 __func__);
+		goto bail;
+	}
+
+	/* a failed link reports the filesystem's reason */
+	errno = 0;
+	if (!lws_dir_symlink_rotate("./test-rot/missing/example.com-latest.crt",
+				    "x", "-latest", "-previous") ||
+	    errno != ENOENT) {
+		lwsl_err("%s: link in a missing dir not refused with ENOENT\n",
+			 __func__);
+		goto bail;
+	}
+
+	lwsl_user("%s: ok\n", __func__);
+	r = 0;
+
+bail:
+	lws_dir("./test-rot", NULL, lws_dir_rm_rf_cb);
+	rmdir("./test-rot");
+
+	return r;
+}
+#endif
+
 int main(int argc, const char **argv)
 {
-	int logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	
 	lws_dir_du_t du;
 	int result = 0;
 
 	lwsl_user("lws-api-test-dir\n");
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS API selftest: lws_dir du\n");
 
 	/* Create test directory structure */
@@ -103,6 +203,11 @@ int main(int argc, const char **argv)
 		lwsl_err("count_files is %u, expected 3\n", du.count_files);
 		result = 1;
 	}
+
+#if !defined(WIN32)
+	if (test_symlink_rotate())
+		result = 1;
+#endif
 
 cleanup:
 	/* Clean up test directory structure */

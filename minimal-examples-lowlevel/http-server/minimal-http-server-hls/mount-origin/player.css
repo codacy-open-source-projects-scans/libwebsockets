@@ -1,0 +1,234 @@
+body {
+    font-family: Arial, sans-serif;
+    background-color: #1a1a1a;
+    color: #ffffff;
+    margin: 0;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+.player-container {
+    position: relative;
+    width: 100%;
+    max-width: 800px;
+    margin-top: 20px;
+    background-color: #000;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+}
+video {
+    width: 100%;
+    height: auto;
+    display: block;
+}
+
+/* shown over the video while the server builds the file's keyframe index */
+.index-overlay {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    text-align: center;
+    padding: 12px 20px;
+    background: rgba(0, 0, 0, 0.7);
+    color: #ddd;
+    font-size: 1.1em;
+    pointer-events: none;
+}
+
+/* Subtitle cue overlay. hls.js parses the WebVTT segments into native
+ * TextTracks which are held at mode "hidden" (hls.subtitleDisplay = false);
+ * player.js renders the active cues here. The browser's own cue rendering
+ * is not used because Chromium and Firefox resolve ::cue styling once, at
+ * the first displayed cue over MSE video, and never re-resolve it, so a
+ * ::cue font can't track the video geometry (small window vs fullscreen).
+ * --cue-fs is set by player.js from the video's rendered height. */
+.cue-display {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 7%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.25em;
+    pointer-events: none;
+    font-size: var(--cue-fs, 18px);
+    line-height: 1.25;
+    color: #ffffff;
+}
+/* one box per cue: the dark background is only as wide as the cue text,
+ * not the frame */
+.cue-box {
+    max-width: 80%;
+    background: rgba(0, 0, 0, 0.72);
+    border-radius: 0.2em;
+    padding: 0.1em 0.35em;
+    white-space: pre-wrap;
+    text-align: center;
+}
+
+/* Fullscreen is taken on the stage (video + cue overlay together) so the
+ * rendered cues ride along at frame-relative size. */
+.player-container:fullscreen {
+    max-width: none;
+    width: 100%;
+    height: 100%;
+    margin-top: 0;
+    border-radius: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.player-container:-webkit-full-screen {
+    max-width: none;
+    width: 100%;
+    height: 100%;
+    margin-top: 0;
+    border-radius: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.player-container:fullscreen video,
+.player-container:-webkit-full-screen video {
+    width: auto;
+    height: 100%;
+    max-width: 100%;
+}
+
+/* The native controls' fullscreen button fullscreens the bare <video> and
+ * would leave the cue overlay behind the fullscreen top layer; hide it
+ * where the pseudo-element exists (Chromium, Safari). Firefox exposes no
+ * such pseudo, so there player.js retargets fullscreen at the stage when
+ * the video alone went fullscreen. */
+video::-webkit-media-controls-fullscreen-button {
+    display: none !important;
+}
+
+.danger-btn {
+    background: #cc0000;
+}
+.header {
+    width: 100%;
+    max-width: 800px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 20px;
+}
+.back-link {
+    color: #4CAF50;
+    text-decoration: none;
+    font-weight: bold;
+}
+.back-link:hover {
+    text-decoration: underline;
+}
+#auth-status {
+    float: right;
+    margin-top: 10px;
+    margin-right: 20px;
+}
+
+.debug-panel {
+    width: 100%;
+    max-width: 800px;
+    margin-top: 20px;
+    background-color: #2b2b2b;
+    border-radius: 8px;
+    padding: 15px;
+    box-sizing: border-box;
+}
+
+/* the controls start out with class "hidden" and player.js removes it once
+ * it knows the corresponding tracks / permission exist */
+.toggle-btn.hidden,
+.debug-panel.hidden {
+    display: none;
+}
+
+.button-container {
+    width: 100%;
+    max-width: 800px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 10px;
+    gap: 12px;
+}
+
+.button-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* put a little air between adjacent controls inside a group */
+.button-group .toggle-btn,
+.button-group select.toggle-btn {
+    margin-right: 0;
+}
+
+.toggle-btn {
+    background-color: #2b2b2b;
+    color: #aaaaaa;
+    border: 1px solid #444444;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-family: monospace, Arial, sans-serif;
+    font-weight: bold;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background-color 0.2s, color 0.2s;
+}
+
+.toggle-btn:hover {
+    background-color: #3b3b3b;
+    color: #ffffff;
+}
+
+/* "on" state, used for the CC toggle */
+.toggle-btn.active {
+    background-color: #2a7a2a;
+    color: #ffffff;
+    border-color: #3a9a3a;
+}
+
+#sub-lang,
+#aud-lang {
+    padding: 5px 8px;
+    cursor: pointer;
+}
+
+.video-title {
+    color: #888888;
+    font-size: 14px;
+    font-family: monospace, Arial, sans-serif;
+    margin-top: 10px;
+    margin-bottom: 5px;
+    width: 100%;
+    max-width: 800px;
+    text-align: left;
+}
+
+.debug-panel h3 {
+    margin-top: 0;
+    color: #4CAF50;
+    font-size: 16px;
+    border-bottom: 1px solid #444;
+    padding-bottom: 8px;
+}
+
+.debug-logs {
+    max-height: 200px;
+    overflow-y: auto;
+    font-family: monospace;
+    font-size: 12px;
+    color: #00FF00;
+    line-height: 1.5;
+}
+

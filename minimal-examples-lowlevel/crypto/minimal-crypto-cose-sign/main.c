@@ -127,8 +127,7 @@ pay_cb(struct lws_cose_validate_context *cps, void *opaque,
 int main(int argc, const char **argv)
 {
 	uint8_t *ks, temp[256], *kid = NULL, ktmp[4096], sbuf[512];
-	int n, m, sign = 0, result = 1,
-	    logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	int n, m, sign = 0, result = 1;
 	enum lws_cose_sig_types sigtype = SIGTYPE_UNKNOWN;
 	struct lws_cose_validate_context *cps = NULL;
 	struct lws_cose_sign_context *csc = NULL;
@@ -152,14 +151,12 @@ int main(int argc, const char **argv)
 	}
 
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 
 	lwsl_user("LWS cose-sign example tool -k keyset [-s alg-name kid ]\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 #if defined(LWS_WITH_NETWORK)
 	info.port = CONTEXT_PORT_NO_LISTEN;
 #endif
@@ -215,7 +212,14 @@ int main(int argc, const char **argv)
 	}
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_KID_HEX].sw))) {
-		kid_len = (size_t)lws_hex_to_byte_array(p, ktmp, sizeof(ktmp));
+		int n = lws_hex_to_byte_array(p, ktmp, sizeof(ktmp));
+
+		if (n < 0) {
+			lwsl_err("%s: bad or over-long kid hex\n", __func__);
+
+			return 1;
+		}
+		kid_len = (size_t)n;
 		kid = (uint8_t *)ktmp;
 	}
 
@@ -392,10 +396,10 @@ bail3:
 			result = 1;
 		else {
 			os = lws_snprintf(buf, sizeof(buf),
-					  "\nresults count %d\n", o->count);
+					  "\nresults count %d\n", lws_dll2_count(o));
 			write(fdout, buf, (size_t)os);
 
-			if (!o->count)
+			if (!lws_dll2_count(o))
 				result = 1;
 		}
 

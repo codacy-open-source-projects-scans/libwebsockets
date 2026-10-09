@@ -29,8 +29,92 @@
 #include <malloc.h>
 
 /* the heap is processwide */
-static size_t allocated;
+static size_t allocated, heap_limit;
 #endif
+
+/*
+ * Reclaimable heap occupants, processwide like the heap.  LRU order: the
+ * head is the least recently used.
+ */
+
+static lws_dll2_owner_t reclaimables;
+static char in_reclaim;
+
+void
+lws_reclaimable_add(lws_reclaimable_t *r)
+{
+	lws_dll2_add_tail(&r->list, &reclaimables);
+}
+
+void
+lws_reclaimable_remove(lws_reclaimable_t *r)
+{
+	lws_dll2_remove(&r->list);
+}
+
+void
+lws_reclaimable_touch(lws_reclaimable_t *r)
+{
+	if (!lws_dll2_is_detached(&r->list)) {
+		lws_dll2_remove(&r->list);
+		lws_dll2_add_tail(&r->list, &reclaimables);
+	}
+}
+
+void
+lws_reclaimable_pin(lws_reclaimable_t *r)
+{
+	r->pins++;
+}
+
+void
+lws_reclaimable_unpin(lws_reclaimable_t *r)
+{
+	if (r->pins)
+		r->pins--;
+}
+
+size_t
+lws_reclaim(size_t want)
+{
+	size_t freed = 0;
+
+	/*
+	 * A tenant's evict() must not allocate; if one does and that fails,
+	 * it gets a plain NULL rather than a nested reclaim
+	 */
+	if (in_reclaim)
+		return 0;
+	in_reclaim = 1;
+
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+				   lws_dll2_get_head(&reclaimables)) {
+		lws_reclaimable_t *r = lws_container_of(d, lws_reclaimable_t,
+							list);
+
+		if (freed >= want)
+			break;
+
+		if (r->pins || !r->resident || !r->evict)
+			continue;
+
+		freed += r->evict(r);
+	} lws_end_foreach_dll_safe(d, d1);
+
+	in_reclaim = 0;
+
+	return freed;
+}
+
+void
+lws_heap_limit_set(size_t bytes)
+{
+#if defined(LWS_HAVE_MALLOC_USABLE_SIZE)
+	heap_limit = bytes;
+#else
+	(void)bytes;
+#endif
+}
 
 #if defined(LWS_WITH_ALLOC_METADATA_LWS)
 static lws_dll2_owner_t active;
@@ -113,15 +197,47 @@ _realloc(void *ptr, size_t size, const char *reason)
 {
 #if defined(LWS_WITH_ALLOC_METADATA_LWS)
 	uint8_t comp[16 * LWS_ARRAY_SIZE(((lws_backtrace_info_t *)NULL)->st)];
-	size_t complen;
-	size_t adj = 0;
+	size_t complen, user_size = size;
+	size_t adj = 0, old_adj = 0;
 #endif
 	void *v;
 
 	if (size) {
 #if defined(LWS_WITH_ALLOC_METADATA_LWS)
+		/*
+		 * Any metadata, old or new, is at most a dll2 and a comp
+		 * buffer's worth: a size so close to the top of size_t that
+		 * adding that wraps must fail like the plain allocation would,
+		 * not wrap into a tiny block the caller then overruns
+		 */
+		if (size > (size_t)-1 - sizeof(lws_dll2_t) - sizeof(comp))
+			return NULL;
+
 		lws_alloc_metadata_gen(size, comp, sizeof(comp), &adj, &complen);
-		size += adj;
+
+		/*
+		 * The pointer we handed the caller last time points into the
+		 * middle of the real allocation, behind our metadata... we
+		 * have to recover the true base (which also unlinks the old
+		 * metadata node from "active") before realloc() may see it
+		 */
+
+		if (ptr) {
+			uint8_t *u = (uint8_t *)ptr;
+
+			_lws_alloc_metadata_trim(&ptr, NULL, NULL);
+			old_adj = lws_ptr_diff_size_t(u, ptr);
+		}
+
+		/*
+		 * The metadata size depends on this call's backtrace and size,
+		 * so it generally differs from the old one: realloc() keeps the
+		 * caller's data at old_adj, but it must end up at adj.  Get
+		 * room for it at whichever offset is further in, and move it
+		 * across once we have the new block.
+		 */
+
+		size += adj > old_adj ? adj : old_adj;
 #endif
 
 #if defined(LWS_PLAT_FREERTOS)
@@ -141,24 +257,59 @@ _realloc(void *ptr, size_t size, const char *reason)
 			allocated -= malloc_usable_size(ptr);
 #endif
 
-#if defined(LWS_WITH_ALLOC_METADATA_LWS)
-		size += adj;
-#endif
+		/*
+		 * If the platform can't give us the memory, ask the
+		 * reclaimable heap occupants to give some back and try
+		 * again, until it works or nothing more can be reclaimed.
+		 * The caller then sees only a successful allocation.
+		 */
 
+		for (;;) {
+#if defined(LWS_HAVE_MALLOC_USABLE_SIZE)
+			if (heap_limit && allocated + size > heap_limit)
+				v = NULL;
+			else
+#endif
 #if defined(LWS_PLAT_OPTEE)
-		v = (void *)TEE_Realloc(ptr, size);
+				v = (void *)TEE_Realloc(ptr, size);
 #else
-		v = (void *)realloc(ptr, size);
+				v = (void *)realloc(ptr, size);
 #endif
+			if (v)
+				break;
 
-		if (!v)
-			return v;
+			if (!lws_reclaim(size)) {
+#if defined(LWS_HAVE_MALLOC_USABLE_SIZE)
+				/* the old block is still ours */
+				if (ptr)
+					allocated += malloc_usable_size(ptr);
+#endif
+#if defined(LWS_WITH_ALLOC_METADATA_LWS)
+				/* ... and still live: list it again */
+				if (ptr)
+					lws_dll2_add_tail((lws_dll2_t *)
+						((uint8_t *)ptr + old_adj -
+						 sizeof(lws_dll2_t)), &active);
+#endif
+				return NULL;
+			}
+		}
 
 #if defined(LWS_HAVE_MALLOC_USABLE_SIZE)
 		allocated += malloc_usable_size(v);
 #endif
 
 #if defined(LWS_WITH_ALLOC_METADATA_LWS)
+		/*
+		 * Before the new metadata goes in, since with adj > old_adj it
+		 * overlaps where the data was.  user_size is in bounds at both
+		 * offsets; on a grow the part past the old data is garbage
+		 * either way.
+		 */
+		if (old_adj && old_adj != adj)
+			memmove((uint8_t *)v + adj, (uint8_t *)v + old_adj,
+				user_size);
+
 		_lws_alloc_metadata_adjust(&active, &v, adj, comp, (unsigned int)complen);
 #endif
 

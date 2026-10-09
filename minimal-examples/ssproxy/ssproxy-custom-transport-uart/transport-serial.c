@@ -34,7 +34,6 @@
 
 #include "private.h"
 
-extern int interrupted;
 
 static const char *filepath = "/dev/ttyUSB0";
 
@@ -84,7 +83,6 @@ open_serial_port(const char *filepath)
 	memset(&tio, 0, sizeof tio);
 	if (tcgetattr(fd, &tio)) {
 		close(fd);
-		fd = -1;
 		return -1;
 	}
 
@@ -155,7 +153,7 @@ cb_proxy_serial_transport(struct lws *wsi, enum lws_callback_reasons reason,
 		n = (int)read(pss->filefd, buf, sizeof(buf));
 		if (n <= 0) {
 			lwsl_err("Reading from %s failed\n", filepath);
-			interrupted = 1;
+			lws_default_loop_exit(lws_get_context(wsi));
 			return 1;
 		}
 		lwsl_hexdump_notice(buf, (size_t)n);
@@ -220,6 +218,7 @@ struct lws_protocols protocol_sspc_serial_transport =
 static void
 txp_serial_onward_bind(lws_transport_priv_t priv, struct lws_ss_handle *h)
 {
+	/* the serial transport needs no onward bind step */
 }
 
 static void

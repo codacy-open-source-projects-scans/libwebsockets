@@ -136,16 +136,18 @@ t2_config_dump(struct lws_dll2 *d, void *user)
 #if !defined(LWS_WITH_NO_LOGS)
 	t2_config_t *c = lws_container_of(d, t2_config_t, list);
 
-	lwsl_notice("%s:   id1 '%s'\n", __func__, c->id1);
-	lwsl_notice("%s:   arg1 '%s'\n", __func__, c->arg1);
-	lwsl_notice("%s:   ssid '%s'\n", __func__, c->ssid);
+	/* members absent from the JSON are left NULL */
+	lwsl_notice("%s:   id1 '%s'\n", __func__, c->id1 ? c->id1 : "(null)");
+	lwsl_notice("%s:   arg1 '%s'\n", __func__, c->arg1 ? c->arg1 : "(null)");
+	lwsl_notice("%s:   ssid '%s'\n", __func__, c->ssid ? c->ssid : "(null)");
 
 	lwsl_notice("%s:   freq %d\n", __func__, c->frequency);
 	lwsl_notice("%s:   arg2 %llu\n", __func__, c->arg2);
 	lwsl_notice("%s:   priority %d\n", __func__, c->priority);
 
 	lwsl_notice("%s:      key1: %s, key2: %s\n", __func__,
-			     c->creds->key1, c->creds->key2);
+		    c->creds->key1 ? c->creds->key1 : "(null)",
+		    c->creds->key2 ? c->creds->key2 : "(null)");
 #endif
 
 	return 0;
@@ -155,7 +157,7 @@ static int
 t2_configs_dump(t2_configs_t *t2cs)
 {
 	lwsl_notice("%s: number of configs: %d\n", __func__,
-		    t2cs->configs.count);
+		    lws_dll2_count(&t2cs->configs));
 
 	lws_dll2_foreach_safe(&t2cs->configs, NULL, t2_config_dump);
 

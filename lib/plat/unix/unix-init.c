@@ -62,28 +62,27 @@ lws_sul_plat_unix(lws_sorted_usec_list_t *sul)
 
 #if defined(LWS_WITH_SERVER)
 	lws_context_lock(context, "periodic checks");
-	lws_start_foreach_llp(struct lws_vhost **, pv,
-			      context->no_listener_vhost_list) {
-		struct lws_vhost *v = *pv;
-		lwsl_debug("deferred iface: checking if on vh %s\n", (*pv)->name);
-		if (_lws_vhost_init_server(NULL, *pv) == 0) {
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+				   lws_dll2_get_head(&context->no_listener_vhost_owner)) {
+		struct lws_vhost *v = lws_container_of(d, struct lws_vhost,
+						       no_listener_vlist);
+		lwsl_debug("deferred iface: checking if on vh %s\n", v->name);
+		if (_lws_vhost_init_server(NULL, v) == 0) {
 			/* became happy */
 			lwsl_notice("vh %s: became connected\n", v->name);
-			*pv = v->no_listener_vhost_list;
-			v->no_listener_vhost_list = NULL;
+			lws_dll2_remove(&v->no_listener_vlist);
 			break;
 		}
-	} lws_end_foreach_llp(pv, no_listener_vhost_list);
+	} lws_end_foreach_dll_safe(d, d1);
 	lws_context_unlock(context);
 #endif
 
-	__lws_sul_insert_us(&pt->pt_sul_owner[LWSSULLI_MISS_IF_SUSPENDED],
+	__lws_sul_insert_us(pt, LWSSULLI_MISS_IF_SUSPENDED,
 			    &pt->sul_plat, 30 * LWS_US_PER_SEC);
 }
 #endif
 
-#if (defined(LWS_WITH_PLUGINS) && !defined(LWS_WITH_PLUGINS_BUILTIN)) || \
-    (defined(LWS_BUILTIN_PLUGIN_NAMES) && defined(LWS_WITH_PLUGINS))
+#if defined(LWS_WITH_PROTOCOL_PLUGINS)
 static int
 protocol_plugin_cb(struct lws_plugin *pin, void *each_user)
 {
@@ -141,6 +140,7 @@ lws_plat_init(struct lws_context *context,
 	{
 		int n;
 
+#if !defined(LWS_MBEDTLS_PSA_RNG)
 		/* initialize platform random through mbedtls */
 		mbedtls_entropy_init(&context->mec);
 		mbedtls_ctr_drbg_init(&context->mcdc);
@@ -150,6 +150,12 @@ lws_plat_init(struct lws_context *context,
 		if (n)
 			lwsl_err("%s: mbedtls_ctr_drbg_seed() returned 0x%x\n",
 				 __func__, n);
+#else
+		n = psa_crypto_init();
+		if (n != 0)
+			lwsl_err("%s: psa_crypto_init() returned 0x%x\n",
+				 __func__, n);
+#endif
 #if 0
 		else {
 			uint8_t rtest[16];
@@ -179,7 +185,7 @@ lws_plat_init(struct lws_context *context,
 		return 1;
 	}
 
-#if defined(LWS_HAVE_SSL_CTX_set_keylog_callback) && !defined(__COVERITY__) && \
+#if defined(LWS_WITH_TLS_KEYLOG) && !defined(__COVERITY__) && \
 		defined(LWS_WITH_TLS) && defined(LWS_WITH_CLIENT)
 	{
 		char *klf_env = getenv("SSLKEYLOGFILE");
@@ -221,7 +227,7 @@ lws_plat_init(struct lws_context *context,
 	}
 
 #endif
-#if defined(LWS_BUILTIN_PLUGIN_NAMES) && defined(LWS_WITH_PLUGINS)
+#if defined(LWS_BUILTIN_PLUGIN_NAMES)
 	lws_plugins_handle_builtin(&context->plugin_list,
 				   protocol_plugin_cb, context);
 #endif
@@ -231,7 +237,7 @@ lws_plat_init(struct lws_context *context,
 	/* we only need to do this on pt[0] */
 
 	context->pt[0].sul_plat.cb = lws_sul_plat_unix;
-	__lws_sul_insert_us(&context->pt[0].pt_sul_owner[LWSSULLI_MISS_IF_SUSPENDED],
+	__lws_sul_insert_us(&context->pt[0], LWSSULLI_MISS_IF_SUSPENDED,
 			    &context->pt[0].sul_plat, 30 * LWS_US_PER_SEC);
 #endif
 
@@ -251,12 +257,13 @@ lws_plat_context_early_init(void)
 void
 lws_plat_context_early_destroy(struct lws_context *context)
 {
+	/* unix fds and pipes are closed in late_destroy */
 }
 
 void
 lws_plat_context_late_destroy(struct lws_context *context)
 {
-#if defined(LWS_WITH_PLUGINS)
+#if defined(LWS_WITH_PROTOCOL_PLUGINS)
 	if (context->plugin_list)
 		lws_plugins_destroy(&context->plugin_list, NULL, NULL);
 #endif
@@ -269,8 +276,32 @@ lws_plat_context_late_destroy(struct lws_context *context)
 	if (context->fd_random != LWS_INVALID_FILE)
 		close(context->fd_random);
 
-#if defined(LWS_WITH_MBEDTLS)
+#if defined(LWS_WITH_MBEDTLS) && !defined(LWS_MBEDTLS_PSA_RNG)
 	mbedtls_entropy_free(&context->mec);
 	mbedtls_ctr_drbg_free(&context->mcdc);
 #endif
+}
+
+/*
+ * Platform-specific ntpclient server configuration
+ */
+
+int
+lws_plat_ntpclient_config(struct lws_context *context)
+{
+#if defined(LWS_HAVE_GETENV)
+	char *ntpsrv = getenv("LWS_NTP_SERVER");
+
+	if (ntpsrv && strlen(ntpsrv) < 64) {
+		lws_system_blob_t *blob = lws_system_get_blob(context,
+                                            LWS_SYSBLOB_TYPE_NTP_SERVER, 0);
+		if (!blob)
+			return 0;
+
+		lws_system_blob_direct_set(blob, (const uint8_t *)ntpsrv,
+					    strlen(ntpsrv));
+		return 1;
+	}
+#endif
+	return 0;
 }

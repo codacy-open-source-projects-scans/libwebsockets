@@ -22,6 +22,15 @@
  * IN THE SOFTWARE.
  */
 
+/*
+ * mbedtls 3.x only exposes the negotiated DTLS-SRTP profile inside
+ * mbedtls_dtls_srtp_info, whose members are MBEDTLS_PRIVATE(), and there is no
+ * getter for it; this is the same approach lib/plat/windows/windows-sockets.c
+ * takes.  It changes nothing but how the member names expand, and on 2.x the
+ * members are public anyway.
+ */
+#define MBEDTLS_ALLOW_PRIVATE_ACCESS
+
 #include "private-lib-core.h"
 #include "private-lib-tls-mbedtls.h"
 
@@ -131,17 +140,26 @@ lws_gendtls_create(struct lws_gendtls_ctx *ctx,
 
 	mbedtls_ssl_init(&ctx->ssl);
 	mbedtls_ssl_config_init(&ctx->conf);
+#if !defined(LWS_MBEDTLS_PSA_RNG)
 	mbedtls_ctr_drbg_init(&ctx->ctr_drbg);
 	mbedtls_entropy_init(&ctx->entropy);
+#endif
 	mbedtls_x509_crt_init(&ctx->cacert);
 	mbedtls_pk_init(&ctx->pkey);
 	mbedtls_ssl_cookie_init(&ctx->cookie_ctx);
 
+#if !defined(LWS_MBEDTLS_PSA_RNG)
 	if (mbedtls_ctr_drbg_seed(&ctx->ctr_drbg, mbedtls_entropy_func,
 				  &ctx->entropy, (const unsigned char *)"lws_gendtls", 11) != 0) {
 		lwsl_err("mbedtls_ctr_drbg_seed failed\n");
 		goto bail;
 	}
+#else
+	if (psa_crypto_init() != PSA_SUCCESS) {
+		lwsl_err("psa_crypto_init failed\n");
+		goto bail;
+	}
+#endif
 
 	if ((ret = mbedtls_ssl_config_defaults(&ctx->conf,
 					(mode == LWS_GENDTLS_MODE_SERVER) ?
@@ -153,10 +171,19 @@ lws_gendtls_create(struct lws_gendtls_ctx *ctx,
 		goto bail;
 	}
 
+	/*
+	 * RFC 8827 6: DTLS 1.2 or later only, and RFC 8827 6.5 forbids
+	 * renegotiation for WebRTC (the caller's fingerprint check is a
+	 * one-shot latch).  Parity with the openssl gendtls ctx, C-298.
+	 * There is no info struct on this api, so no override: a DTLS ctx is
+	 * only ever used for WebRTC, where the RFC is not negotiable.
+	 */
+	lws_mbedtls_conf_floor(&ctx->conf, 0);
+
 	if (mode == LWS_GENDTLS_MODE_SERVER) {
 		if ((ret = mbedtls_ssl_cookie_setup(&ctx->cookie_ctx,
-						    mbedtls_ctr_drbg_random,
-						    &ctx->ctr_drbg)) != 0) {
+						    LWS_MBEDTLS_F_RNG,
+						    LWS_MBEDTLS_P_RNG(&ctx->ctr_drbg))) != 0) {
 			lwsl_err("mbedtls_ssl_cookie_setup failed: -0x%x\n", -ret);
 			goto bail;
 		}
@@ -167,9 +194,18 @@ lws_gendtls_create(struct lws_gendtls_ctx *ctx,
 					      &ctx->cookie_ctx);
 	}
 
-	mbedtls_ssl_conf_authmode(&ctx->conf, MBEDTLS_SSL_VERIFY_NONE);
+	/*
+	 * OPTIONAL, not NONE: as the DTLS server we must send a
+	 * CertificateRequest, else the peer sends no certificate and there is
+	 * nothing for the caller's a=fingerprint check to bind the media to
+	 * (RFC 5763 5).  We must not *require* the chain to verify, since
+	 * DTLS-SRTP peer certificates are self-signed by design and the trust
+	 * anchor is the signalled fingerprint, which the caller compares.
+	 */
+	mbedtls_ssl_conf_authmode(&ctx->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
 
-	mbedtls_ssl_conf_rng(&ctx->conf, mbedtls_ctr_drbg_random, &ctx->ctr_drbg);
+	mbedtls_ssl_conf_rng(&ctx->conf, LWS_MBEDTLS_F_RNG,
+			     LWS_MBEDTLS_P_RNG(&ctx->ctr_drbg));
 
 	if ((ret = mbedtls_ssl_setup(&ctx->ssl, &ctx->conf)) != 0) {
 		lwsl_err("mbedtls_ssl_setup failed: -0x%x\n", -ret);
@@ -186,13 +222,13 @@ lws_gendtls_create(struct lws_gendtls_ctx *ctx,
 #if defined(MBEDTLS_SSL_DTLS_SRTP)
 	if (info->use_srtp) {
 		int n = 0;
-		if (strstr(info->use_srtp, "SRTP_AES128_CM_SHA1_80"))
+		if ((char *)strstr(info->use_srtp, "SRTP_AES128_CM_SHA1_80"))
 			ctx->srtp_profiles[n++] = MBEDTLS_TLS_SRTP_AES128_CM_HMAC_SHA1_80;
-		if (strstr(info->use_srtp, "SRTP_AES128_CM_SHA1_32"))
+		if ((char *)strstr(info->use_srtp, "SRTP_AES128_CM_SHA1_32"))
 			ctx->srtp_profiles[n++] = MBEDTLS_TLS_SRTP_AES128_CM_HMAC_SHA1_32;
-		if (strstr(info->use_srtp, "SRTP_NULL_HMAC_SHA1_80"))
+		if ((char *)strstr(info->use_srtp, "SRTP_NULL_HMAC_SHA1_80"))
 			ctx->srtp_profiles[n++] = MBEDTLS_TLS_SRTP_NULL_HMAC_SHA1_80;
-		if (strstr(info->use_srtp, "SRTP_NULL_HMAC_SHA1_32"))
+		if ((char *)strstr(info->use_srtp, "SRTP_NULL_HMAC_SHA1_32"))
 			ctx->srtp_profiles[n++] = MBEDTLS_TLS_SRTP_NULL_HMAC_SHA1_32;
 
 		ctx->srtp_profiles[n] = MBEDTLS_TLS_SRTP_UNSET;
@@ -238,8 +274,10 @@ lws_gendtls_destroy(struct lws_gendtls_ctx *ctx)
 {
 	mbedtls_ssl_free(&ctx->ssl);
 	mbedtls_ssl_config_free(&ctx->conf);
+#if !defined(LWS_MBEDTLS_PSA_RNG)
 	mbedtls_ctr_drbg_free(&ctx->ctr_drbg);
 	mbedtls_entropy_free(&ctx->entropy);
+#endif
 	mbedtls_x509_crt_free(&ctx->cacert);
 	mbedtls_pk_free(&ctx->pkey);
 	mbedtls_ssl_cookie_free(&ctx->cookie_ctx);
@@ -269,7 +307,7 @@ lws_gendtls_set_key_mem(struct lws_gendtls_ctx *ctx, const uint8_t *key, size_t 
 	if ((ret = mbedtls_pk_parse_key(&ctx->pkey, (const unsigned char *)key, len,
 				 NULL, 0
 #if defined(MBEDTLS_VERSION_NUMBER) && MBEDTLS_VERSION_NUMBER >= 0x03000000
-				 , mbedtls_ctr_drbg_random, &ctx->ctr_drbg
+				 , LWS_MBEDTLS_F_RNG, LWS_MBEDTLS_P_RNG(&ctx->ctr_drbg)
 #endif
 	)) != 0) {
 		printf("mbedtls_pk_parse_key failed: -0x%x\n", -ret);
@@ -295,7 +333,16 @@ lws_gendtls_put_rx(struct lws_gendtls_ctx *ctx, const uint8_t *in, size_t len)
 int
 lws_gendtls_get_rx(struct lws_gendtls_ctx *ctx, uint8_t *out, size_t max_len)
 {
-	int ret = mbedtls_ssl_read(&ctx->ssl, out, max_len);
+	int ret;
+	do {
+		ret = mbedtls_ssl_read(&ctx->ssl, out, max_len);
+	} while (
+#if defined(MBEDTLS_VERSION_NUMBER) && MBEDTLS_VERSION_NUMBER >= 0x03000000
+		ret == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET
+#else
+		0
+#endif
+	);
 
 	if (ret > 0)
 		return ret;
@@ -310,9 +357,6 @@ lws_gendtls_get_rx(struct lws_gendtls_ctx *ctx, uint8_t *out, size_t max_len)
 		return -1;
 	}
 
-	if (ret == 0) /* EOF */
-		return -1;
-
 	return -1;
 }
 
@@ -322,7 +366,15 @@ lws_gendtls_put_tx(struct lws_gendtls_ctx *ctx, const uint8_t *in, size_t len)
 	int ret;
 
 	while (len) {
-		ret = mbedtls_ssl_write(&ctx->ssl, in, len);
+		do {
+			ret = mbedtls_ssl_write(&ctx->ssl, in, len);
+		} while (
+#if defined(MBEDTLS_VERSION_NUMBER) && MBEDTLS_VERSION_NUMBER >= 0x03000000
+			ret == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET
+#else
+			0
+#endif
+		);
 		if (ret > 0) {
 			in += ret;
 			len -= (size_t)ret;
@@ -411,9 +463,12 @@ const char *
 lws_gendtls_get_srtp_profile(struct lws_gendtls_ctx *ctx)
 {
 #if defined(MBEDTLS_SSL_DTLS_SRTP)
-	mbedtls_ssl_srtp_profile profile = mbedtls_ssl_get_dtls_srtp_protection_profile(&ctx->ssl);
+	mbedtls_dtls_srtp_info info;
 
-	switch (profile) {
+	memset(&info, 0, sizeof(info));
+	mbedtls_ssl_get_dtls_srtp_negotiation_result(&ctx->ssl, &info);
+
+	switch (info.MBEDTLS_PRIVATE(chosen_dtls_srtp_profile)) {
 	case MBEDTLS_TLS_SRTP_AES128_CM_HMAC_SHA1_80:
 		return "SRTP_AES128_CM_SHA1_80";
 	case MBEDTLS_TLS_SRTP_AES128_CM_HMAC_SHA1_32:

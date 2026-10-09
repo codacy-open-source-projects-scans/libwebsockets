@@ -31,7 +31,8 @@ static const struct lws_switches switches[] = {
 #include <string.h>
 #include <signal.h>
 
-static int interrupted, bad = 1, status;
+static int bad = 1, status;
+static struct lws_context *context;
 static struct lws *client_wsi;
 
 static int
@@ -151,24 +152,14 @@ static const struct lws_protocols protocols[] = {
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
 	struct lws_client_connect_info i;
-	struct lws_context *context;
-	const char *p;
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE
-		   /*
-		    * For LLL_ verbosity above NOTICE to be built into lws,
-		    * lws must have been configured and built with
-		    * -DCMAKE_BUILD_TYPE=DEBUG instead of =RELEASE
-		    *
-		    * | LLL_INFO   | LLL_PARSER  | LLL_HEADER | LLL_EXT |
-		    *   LLL_CLIENT | LLL_LATENCY | LLL_DEBUG
-		    */ ;
+	int n = 0;
 	(void)switches;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
@@ -179,13 +170,11 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal http client Custom Headers [-d<verbosity>] [-l] [--h1]\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 	info.port = CONTEXT_PORT_NO_LISTEN; /* we do not run any server */
 	info.protocols = protocols;
@@ -193,10 +182,10 @@ int main(int argc, const char **argv)
 	 * since we know this lws context is only ever going to be used with
 	 * one client wsis / fds / sockets at a time, let lws know it doesn't
 	 * have to use the default allocations for fd tables up to ulimit -n.
-	 * It will just allocate for 1 internal and 1 (+ 1 http2 nwsi) that we
-	 * will use.
+	 * It will just allocate for its own fds and overhead
+	 * (LWS_FD_LIMIT_PER_THREAD_MIN) plus the one connection we will use.
 	 */
-	info.fd_limit_per_thread = 1 + 1 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 1;
 
 #if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL)
 	/*
@@ -239,7 +228,7 @@ int main(int argc, const char **argv)
 	i.pwsi = &client_wsi;
 	lws_client_connect_via_info(&i);
 
-	while (n >= 0 && client_wsi && !interrupted)
+	while (n >= 0 && client_wsi)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

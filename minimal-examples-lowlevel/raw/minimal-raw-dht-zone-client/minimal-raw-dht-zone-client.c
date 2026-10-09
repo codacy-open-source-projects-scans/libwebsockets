@@ -24,7 +24,6 @@
 
 static lws_state_notify_link_t nl;
 int retcode = 1;
-int interrupted;
 int use_stdin;
 char port_buf[16];
 const char *storage_path = "./dht-store";
@@ -57,9 +56,7 @@ static const struct lws_switches switches[] = {
 static void
 dht_completion_cb(void *closure, int result)
 {
-	int *p_interrupted = (int *)closure;
-
-	*p_interrupted = 1;
+	lws_default_loop_exit(*(struct lws_context **)closure);
 
 	// lwsl_user("dht_completion_cb called! result: %d\n", result);
 
@@ -98,7 +95,7 @@ struct lws_protocol_vhost_options pvos[] = {
 		.options	= NULL,
 		.next		= &pvos[5],
 		.name		= "completion-cb-arg",
-		.value		= (const char *)&interrupted
+		.value		= (const char *)&cx
 	},
 	{
 		.options	= NULL,
@@ -145,10 +142,16 @@ app_system_state_nf(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
                 if (current == LWS_SYSTATE_OPERATIONAL)
                         break;
 
-		memset(&info, 0, sizeof(info));
-                info.vhost_name		= "dht-client";
+		lws_context_info_defaults(&info, NULL);info.vhost_name		= "dht-client";
                 info.pvo		= pvos;
-		info.port		= atoi(port_buf);
+		{
+			int __pt = atoi(port_buf);
+			if (__pt < 0 || __pt > 65535) {
+				lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+				return 1;
+			}
+			info.port = __pt;
+		}
 		info.protocols		= app_protocols;
                 info.options		= LWS_SERVER_OPTION_EXPLICIT_VHOSTS | LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 
@@ -171,7 +174,7 @@ app_system_state_nf(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(cx);
 }
 
 int main(int argc, const char **argv)
@@ -201,7 +204,14 @@ int main(int argc, const char **argv)
 	pvos[1].value = storage_path;
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_P].sw)))
-		dht_port = atoi(p);
+		{
+			int __pt = atoi(p);
+			if (__pt < 0 || __pt > 65535) {
+				lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+				return 1;
+			}
+			dht_port = __pt;
+		}
 
 	lws_snprintf(port_buf, sizeof(port_buf), "%d", dht_port);
 
@@ -229,7 +239,7 @@ int main(int argc, const char **argv)
 				}
 				lws_snprintf(auto_put_buf, sizeof(auto_put_buf), "%s.zone.signed.jws", domain_arg);
 				pvos[7].value = auto_put_buf;
-			} else if (strstr(put_arg, ".jws")) {
+			} else if ((char *)strstr(put_arg, ".jws")) {
 				pvos[7].value = put_arg;
 			} else {
 				lws_snprintf(auto_put_buf, sizeof(auto_put_buf), "%s.zone.signed.jws", put_arg);
@@ -248,6 +258,7 @@ int main(int argc, const char **argv)
 	app_protocols[1].name			= NULL;
 	app_protocols[1].callback		= NULL;
 
+#if defined(LWS_WITH_PLUGINS)
 	static const char * const pdirs[] = {
 		"./lib",
 		"../lib",
@@ -256,13 +267,16 @@ int main(int argc, const char **argv)
 		"../../lib",
 		NULL
 	};
+#endif
 
 	info.port				= CONTEXT_PORT_NO_LISTEN;
 	info.options				= LWS_SERVER_OPTION_EXPLICIT_VHOSTS | LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 	info.protocols				= app_protocols;
 	info.fd_limit_per_thread		= 100;
 	info.pvo 				= NULL;
+#if defined(LWS_WITH_PLUGINS)
 	info.plugin_dirs			= pdirs;
+#endif
 
         nl.name					= "app";
         nl.notify_cb				= app_system_state_nf;
@@ -274,7 +288,7 @@ int main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(cx, 0);
 
 	lws_context_destroy(cx);

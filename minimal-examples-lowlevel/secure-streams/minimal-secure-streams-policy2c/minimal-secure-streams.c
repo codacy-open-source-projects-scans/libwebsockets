@@ -23,13 +23,13 @@
 #include <stdio.h>
 #include <assert.h>
 
-static int interrupted, bad = 1;
+static int bad = 1;
 
 
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	(void)sig;
 }
 
 struct aggstr {
@@ -83,12 +83,11 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	memset(&info, 0, sizeof info);
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	lws_context_info_defaults(&info, NULL);lws_cmdline_option_handle_builtin(argc, argv, &info);
 
 	lwsl_user("LWS secure streams policy2c [-d<verb>]\n");
 
-	info.fd_limit_per_thread = 1 + 6 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 6;
 	info.port = CONTEXT_PORT_NO_LISTEN;
 
 	info.options = LWS_SERVER_OPTION_EXPLICIT_VHOSTS |
@@ -380,6 +379,7 @@ int main(int argc, const char **argv)
 		switch (pol->protocol) {
 		case LWSSSP_H1:
 		case LWSSSP_H2:
+		case LWSSSP_H3:
 		case LWSSSP_WS:
 
 			if (!pol->u.http.count_respmap)
@@ -500,6 +500,7 @@ int main(int argc, const char **argv)
 		switch (pol->protocol) {
 		case LWSSSP_H1:
 		case LWSSSP_H2:
+		case LWSSSP_H3:
 		case LWSSSP_WS:
 
 			printf("\t.u = {\n\t\t.http = {\n");

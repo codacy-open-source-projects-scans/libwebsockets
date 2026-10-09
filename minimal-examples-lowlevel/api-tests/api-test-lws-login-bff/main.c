@@ -1,0 +1,1470 @@
+/*
+ * lws-api-test-lws-login-bff
+ *
+ * Written in 2010-2026 by Andy Green <andy@warmcat.com>
+ *
+ * This file is made available under the Creative Commons CC0 1.0
+ * Universal Public Domain Dedication.
+ *
+ * PURPOSE
+ *
+ * End-to-end test of lws-login's background BFF renewal endpoint
+ * (.lws-login-refresh), focussing on how it treats the auth_csrf sidecar
+ * cookie that pairs with auth_refresh_session.
+ *
+ * The side-channel exchange POSTs csrf_token=<csrf> alongside the browser's
+ * forwarded cookie jar to the auth server /api/sso_exchange, which
+ * double-submits the form field against the auth_csrf cookie in that jar.
+ * The incident class this guards against: the jar's auth_csrf expires or is
+ * lost while auth_refresh_session lives on (they are minted by different
+ * flows -- a native login on the auth server's own host plants an unpaired
+ * Domain-scoped refresh cookie), and the renewal used to be denied with 401.
+ * The login widget maps any 401 to "session dead" and answers by navigating
+ * the whole page to the auth form, trashing whatever the user was doing.
+ *
+ * Scenarios:
+ *
+ *  - "paired-jar": both cookies present -> renewal runs, 200 + rotated
+ *    auth_session / auth_csrf cookies;  the mock answers with the real
+ *    minted multi-KB JWT, and the rotation fence asserts the planted
+ *    auth_session carries the COMPLETE token: the side-channel extraction
+ *    once truncated >255-byte tokens to their tail and planted the
+ *    truncation as the session cookie, an infinite-bounce loop;
+ *
+ *  - "self-heal": only auth_refresh_session present -> the BFF mints the
+ *    double-submit pair for the side channel itself, the exchange succeeds
+ *    and the response rotates fresh cookies.  The mock auth server asserts
+ *    the minted pair really did arrive matching, so the self-heal cannot
+ *    regress into submitting an inconsistent pair;
+ *
+ *  - "writeable-in-flight": paired jar, but while the mock auth server holds
+ *    its answer back the parked browser leg is sent an unsolicited
+ *    WRITEABLE (over h3 the quic stream gets one) -> it must stay parked
+ *    and still complete 200 + rotated cookies.  Taking that WRITEABLE as the
+ *    exchange's end killed every silent renewal on the sai deployment with
+ *    an instant 401 "no auth server response (connection failed)";
+ *
+ *  - "anonymous": no auth cookies at all -> still denied with 401 (an
+ *    anonymous visitor's renewal probe must never start an exchange);
+ *
+ *  - "relative-authapi": a second app vhost whose lws-login has only a
+ *    relative auth-server-url ("/oauth/login", the BFF-delegate shape with
+ *    no auth-api-url PVO) and a paired jar -> the side channel must be
+ *    refused up-front: an immediate 401 with no exchange attempt.  A
+ *    relative URL parses into an empty host / port 0, and kicking the
+ *    exchange against that died asynchronously as an anonymous "no auth
+ *    server response (connection failed)" while nothing ever reached the
+ *    auth server -- exactly the shape that kept silent renewal silently
+ *    broken on the sai deployment.
+ *
+ * plus /.lws-login-sso scenarios exercising the origin/referer CSRF gate
+ * around the cross-domain SSO form POST (F-020):
+ *
+ *  - "sso-nohdrs": validly-signed token POSTed with neither Origin nor
+ *    Referer (sandboxed iframe + no-referrer suppresses both) -> must be
+ *    rejected 403 with nothing planted, not accepted as the browser's
+ *    session;
+ *
+ *  - "sso-origin-null": same but with the literal "Origin: null" a
+ *    sandboxed iframe sends;
+ *
+ *  - "sso-origin-good": Origin matching auth-server-url scheme+host+port,
+ *    exactly like the auth server's auto-submitting form -> 302 and the
+ *    submitted token planted as auth_session (positive control);
+ *
+ *  - "sso-origin-evil": Origin naming anything else -> 403, nothing
+ *    planted;
+ *
+ *  - "sso-referer-good": no Origin, Referer on the auth server origin ->
+ *    302 and planted (the fallback legitimate UAs without Origin use).
+ *
+ * plus a widget-JS render-boundary fence scenario (F-021):
+ *
+ *  - "widget-js-fence": GET /lws-login.js and check the served bytes carry
+ *    the escaping fence -- every dynamic string the widget composes into
+ *    innerHTML must go through window.lwsLoginEsc() (the device-provided
+ *    preauth strings reaching the admin's page over WS are
+ *    unauthenticated-attacker-controlled), and the device_code query value
+ *    must be encodeURIComponent'd.  Asserting against the served bytes (not
+ *    the C source) keeps the fence honest about what deployments get.
+ *
+ * plus a widget-CSS self-contained colour-scheme fence:
+ *
+ *  - "widget-css-fence": GET /lws-login.css and check the served bytes
+ *    assert the widget's own complete colour scheme.  The status div and the
+ *    preauth dropdown render inside arbitrary host pages, so any property
+ *    they leave to inherit comes from the page -- pre-fix the status box
+ *    left its background translucent, unreadable whenever the host page's
+ *    colours disagreed with the widget's asserted text colour.  The scheme
+ *    must also be one static choice: adapting to the browser's
+ *    prefers-color-scheme showed a dark widget on light-styled pages viewed
+ *    with a dark-mode preference.  So .lws-login-box and the dropdown (which
+ *    floats directly over the host page) must each paint a fully-opaque
+ *    background behind an asserted text colour, with no
+ *    prefers-color-scheme media queries anywhere in the stylesheet.
+ *
+ * plus an F-022 Set-Cookie attribute-tail fence, applied to every scenario
+ * that mints cookies: the SSO token is deliberately minted near the
+ * LWS_SSO_MAX_COOKIE cap, so composing its auth_session cookie runs the
+ * plugin's buffer math at the limit -- any Set-Cookie frag carrying one of
+ * the session cookies must keep its complete HttpOnly / SameSite / Secure
+ * tail, never a silently truncated remainder.
+ *
+ * plus the C-774 unauth-protocols fence, ws upgrades against a mount the
+ * app vhost gates through lws-login (interceptor_path), with no cookie:
+ *
+ *  - the bypass must judge the subprotocol the upgrade will BIND, which is
+ *    the first offered name the vhost has a protocol for, in the client's
+ *    order (RFC 6455 4.2.2), not merely find an exempt name somewhere in the
+ *    offer.  "<privileged>, <exempt>" used to pass the bouncer on the
+ *    strength of its second name and then bind the privileged first one
+ *    with no JWT at all; it must be refused, while "<exempt>" alone and
+ *    "<exempt>, <privileged>" still reach the waiting room, and an offer
+ *    led by a name the vhost does not know binds the next one it does.
+ *
+ * The app vhost runs the real lws-login plugin (builtin plugins build) with
+ * lws_login_client enabled on the same vhost as the side channel requires,
+ * against an in-process mock auth server.  Ports come from the CI port
+ * allocator; the plugin's sqlite db-path points into the build dir.
+ */
+
+#include <libwebsockets.h>
+
+#include <signal.h>
+#include <string.h>
+#include <unistd.h>
+#include <limits.h>
+#include <stdlib.h>
+
+/* -------------------------------------------------------------- scenarios */
+
+struct scenario {
+	const char	*name;
+	const char	*path;		/* request path */
+	const char	*body;		/* urlencoded body, NULL for bodyless */
+	const char	*origin;	/* Origin: value, NULL = header absent */
+	const char	*referer;	/* Referer: value, NULL = header absent */
+	const char	*cookie;	/* Cookie: header to send, NULL for none */
+	unsigned	expect_status;
+	int		expect_pair;	/* mock must see a matching csrf pair */
+	int		expect_rotate;	/* response must rotate the auth cookies */
+	int		expect_sso;	/* /.lws-login-sso outcome: 1 = must plant
+					 * the submitted token as auth_session,
+					 * -1 = must plant nothing, 0 = n/a */
+	const char	*method;	/* "POST" (as before) or "GET" */
+	int		expect_js;	/* 1 = response body is lws-login.js and
+					 * must carry the F-021 render-boundary
+					 * escaping fence */
+	int		expect_css;	/* 1 = response body is lws-login.css and
+						 * must carry the static self-contained
+						 * colour scheme (opaque backgrounds
+						 * behind asserted text colours, no
+						 * prefers-color-scheme adaptation) */
+	int		app2;		/* 1 = target the second app vhost, whose
+					 * lws-login is configured with only a
+					 * relative auth-server-url (no
+					 * auth-api-url PVO) */
+	int		poke;		/* 1 = while the mock holds the exchange
+					 * open, send the parked browser leg
+					 * an unsolicited WRITEABLE */
+	const char	*ws_offer;	/* non-NULL = a ws upgrade offering this
+					 * Sec-WebSocket-Protocol list instead
+					 * of an http request */
+	const char	*ws_bind;	/* ws_offer: the server protocol that
+					 * must end up bound, NULL = the upgrade
+					 * must be refused and nothing bound */
+};
+
+/* the two ws protocols on the gated mount: only the second is exempt */
+#define BFF_WS_PRIV	"lws-api-test-lws-login-bff-priv"
+#define BFF_WS_WAITING	"lws-api-test-lws-login-bff-waiting"
+
+/* minted in main() once the context and allocated ports exist */
+static char	minted_jwt[LWS_SSO_MAX_COOKIE];
+static char	sso_body[LWS_SSO_MAX_COOKIE * 3 + 64];
+static char	o_origin_good[64], o_origin_evil[64], o_referer_good[64];
+
+/*
+ * Throwaway P-256 keypair: parsed by the plugin at init to validate tokens,
+ * and by the test to MINT them (it carries the private member), so the SSO
+ * scenarios' tokens are genuinely validly-signed and exercise only the
+ * origin/referer gate.
+ */
+static const char jwk_json[] =
+	"{\"crv\":\"P-256\",\"d\":\"D4EjZm33VsKBwIO2_BXL-GRKuQpn65wDo0a9Tc7TdMI\",\"kty\":\"EC\",\"x\":\"M_5UuNbZp2RGuV_6_us0qstvioPr4nd6d_FU0dTfsBc\",\"y\":\"2hmXygj6XfChnLtCtLeLO1y8OOWWLRYzabvjBUVVbJk\"}";
+
+static const struct scenario scenarios[] = {
+	{ "paired-jar", "/.lws-login-refresh", NULL, NULL, NULL,
+	  "auth_refresh_session=0123456789abcdef0123456789abcdef; "
+	  "auth_csrf=fedcba9876543210fedcba9876543210", 200u, 1, 1, 0,
+	  "POST", 0, 0, 0, 0, NULL, NULL },
+	{ "self-heal", "/.lws-login-refresh", NULL, NULL, NULL,
+	  "auth_refresh_session=0123456789abcdef0123456789abcdef", 200u, 1, 1, 0,
+	  "POST", 0, 0, 0, 0, NULL, NULL },
+	/* a WRITEABLE the parked browser leg gets while the exchange is
+	 * still in flight (over h3 the quic stream gets one) must not be
+	 * taken as the exchange's end: that killed every silent renewal
+	 * with an instant 401 "no auth server response" on the sai
+	 * deployment */
+	{ "writeable-in-flight", "/.lws-login-refresh", NULL, NULL, NULL,
+	  "auth_refresh_session=0123456789abcdef0123456789abcdef; "
+	  "auth_csrf=fedcba9876543210fedcba9876543210", 200u, 1, 1, 0,
+	  "POST", 0, 0, 0, 1, NULL, NULL },
+	{ "anonymous", "/.lws-login-refresh", NULL, NULL, NULL, NULL, 401u, 0, 0, 0,
+	  "POST", 0, 0, 0, 0, NULL, NULL },
+
+	/* F-027: an auth_session cookie holding a compact JWT whose JOSE
+	 * header has no "alg" member must be cleanly rejected by the
+	 * per-request session gate, not kill the server process */
+	{ "alg-less-session-jwt", "/", NULL, NULL, NULL,
+	  "auth_session=eyJ0eXAiOiJKV1QifQ.e30.AQ", 303u, 0, 0, 0,
+	  "GET", 0, 0, 0, 0, NULL, NULL },
+
+	/* F-020: the token below is genuinely signed by the plugin's own JWK
+	 * (the throwaway key carries its private member), so these scenarios
+	 * exercise the origin/referer gate and nothing else */
+	{ "sso-nohdrs", "/.lws-login-sso", sso_body, NULL, NULL, NULL,
+	  403u, 0, 0, -1, "POST", 0, 0, 0, 0, NULL, NULL },
+	{ "sso-origin-null", "/.lws-login-sso", sso_body, "null", NULL, NULL,
+	  403u, 0, 0, -1, "POST", 0, 0, 0, 0, NULL, NULL },
+	{ "sso-origin-good", "/.lws-login-sso", sso_body, o_origin_good, NULL,
+	  NULL, 302u, 0, 0, 1, "POST", 0, 0, 0, 0, NULL, NULL },
+	{ "sso-origin-evil", "/.lws-login-sso", sso_body, o_origin_evil, NULL,
+	  NULL, 403u, 0, 0, -1, "POST", 0, 0, 0, 0, NULL, NULL },
+	{ "sso-referer-good", "/.lws-login-sso", sso_body, NULL, o_referer_good,
+	  NULL, 302u, 0, 0, 1, "POST", 0, 0, 0, 0, NULL, NULL },
+
+	/* F-021: the widget JS served to (admin) pages must HTML-escape every
+	 * dynamic string at its innerHTML render boundary */
+	{ "widget-js-fence", "/lws-login.js", NULL, NULL, NULL, NULL, 200u, 0, 0,
+	  0, "GET", 1, 0, 0, 0, NULL, NULL },
+
+	/* the widget CSS served to pages must assert a complete, self-contained
+	 * colour scheme (see the css fence in step_advance) */
+	{ "widget-css-fence", "/lws-login.css", NULL, NULL, NULL, NULL, 200u, 0,
+	  0, 0, "GET", 0, 1, 0, 0, NULL, NULL },
+
+	/* refusal must be immediate and legible: no exchange started against
+	 * the empty host the relative URL parses to (second app vhost) */
+	{ "relative-authapi", "/.lws-login-refresh", NULL, NULL, NULL,
+	  "auth_refresh_session=0123456789abcdef0123456789abcdef; "
+	  "auth_csrf=fedcba9876543210fedcba9876543210", 401u, 0, 0, 0,
+	  "POST", 0, 0, 1, 0, NULL, NULL },
+
+	/* C-774: cookieless ws upgrades against the gated mount, where the
+	 * vhost's unauth-protocols names only the waiting-room protocol.
+	 * The server binds the first offered name it has a protocol for, so
+	 * that is the name the bypass has to be judged on */
+
+	/* the bouncer itself: a privileged offer alone is refused */
+	{ "ws-priv-only", "/gated", NULL, NULL, NULL, NULL, 401u, 0, 0, 0,
+	  NULL, 0, 0, 0, 0, BFF_WS_PRIV, NULL },
+	/* the bypass: the exempt offer alone reaches the waiting room */
+	{ "ws-waiting-only", "/gated", NULL, NULL, NULL, NULL, 101u, 0, 0, 0,
+	  NULL, 0, 0, 0, 0, BFF_WS_WAITING, BFF_WS_WAITING },
+	/* exempt name first: it is what gets bound, so it is let through */
+	{ "ws-waiting-then-priv", "/gated", NULL, NULL, NULL, NULL, 101u, 0, 0,
+	  0, NULL, 0, 0, 0, 0, BFF_WS_WAITING ", " BFF_WS_PRIV, BFF_WS_WAITING },
+	/* the finding: privileged name first rides along with the exempt one;
+	 * the bind would be the privileged protocol, so it must be refused */
+	{ "ws-priv-then-waiting", "/gated", NULL, NULL, NULL, NULL, 401u, 0, 0,
+	  0, NULL, 0, 0, 0, 0, BFF_WS_PRIV ", " BFF_WS_WAITING, NULL },
+	/* a name the vhost does not know is skipped by the selection, so the
+	 * judgement falls on the next one, exactly as the bind does */
+	{ "ws-unknown-then-waiting", "/gated", NULL, NULL, NULL, NULL, 101u, 0,
+	  0, 0, NULL, 0, 0, 0, 0, "nonesuch, " BFF_WS_WAITING, BFF_WS_WAITING },
+	{ "ws-unknown-then-priv", "/gated", NULL, NULL, NULL, NULL, 401u, 0, 0,
+	  0, NULL, 0, 0, 0, 0, "nonesuch, " BFF_WS_PRIV ", " BFF_WS_WAITING,
+	  NULL },
+};
+
+#define N_SCENARIOS  (int)LWS_ARRAY_SIZE(scenarios)
+
+/* -------------------------------------------------------------- globals */
+
+static struct lws_context *context;
+
+static int	g_port_app, g_port_auth, g_port_app2;
+static struct lws_vhost *g_vh_cli, *g_vh_app;
+
+static int	step;
+static int	step_done;		/* 1 = completed, -1 = failed */
+
+/* Captured from the response headers of the step in flight. */
+static unsigned	got_status;
+/* joined (frag-chain) copy must hold the planted long-token session cookie */
+static char	got_sc[LWS_SSO_MAX_COOKIE + 512];
+
+/*
+ * F-022 probe state: every Set-Cookie header frag the client parsed, so the
+ * attribute-tail fence can look at each cookie the plugin minted on its own
+ * (a truncated first cookie must not hide behind an intact second one in the
+ * joined copy).
+ */
+#define MAX_SC_FRAGS	8
+#define SC_FRAG_SZ	(LWS_SSO_MAX_COOKIE + 64)
+static char	got_sc_frags[MAX_SC_FRAGS][SC_FRAG_SZ];
+static int	got_sc_nfrags;
+
+/* Captured from the response body of the step in flight (widget-js fence). */
+static char	got_body[32768];
+static size_t	got_body_len;
+static int	got_body_trunc;
+
+/* Captured by the mock auth server from the side-channel exchange. */
+static int	mock_hits, mock_got_refresh, mock_pair_ok;
+
+static int	tests, fail;
+static volatile sig_atomic_t sequence_done;
+static struct lws	*current_wsi;
+static int	result = 1;		/* 0 = PASS (api-test idiom) */
+
+/*
+ * C-774 ws scenarios: what the client saw, and which protocol the server
+ * actually bound (recorded by the gated protocols' own ESTABLISHED), since
+ * that, not the client's view, is the security property under test.
+ */
+static int	got_ws_established, got_ws_refused;
+static char	g_ws_bound[64];
+
+/* ------------------------------------------------------- mock auth server */
+
+struct pss_auth {
+	lws_sorted_usec_list_t sul_resp;
+	struct lws	*wsi;
+	char		body[256];
+	size_t		body_len;
+};
+
+/*
+ * Built in main() from the genuinely-minted SSO JWT (~4KB): the mock must
+ * answer the side-channel exchange with a REAL, >255-byte token, since the
+ * tokenizer-based extraction in the plugin used to silently keep only the
+ * token's tail for anything over its internal 255-byte limit... the rotated
+ * auth_session cookie assertions below catch any such truncation.
+ */
+static char MOCK_TOKEN_JSON[LWS_SSO_MAX_COOKIE];
+
+/*
+ * The response is written from its own sul callback a few ms after the POST
+ * body completed: answering inline from BODY_COMPLETION can leave the
+ * client-side response bytes buffered but never surfaced in some
+ * interleavings.
+ */
+static void
+sul_respond_cb(lws_sorted_usec_list_t *sul)
+{
+	struct pss_auth *pss = lws_container_of(sul, struct pss_auth, sul_resp);
+	struct lws *wsi = pss->wsi;
+	uint8_t buf[LWS_PRE + sizeof(MOCK_TOKEN_JSON) + 64],
+		*start = &buf[LWS_PRE], *p = start,
+		*end = &buf[sizeof(buf) - 1];
+	size_t blen = strlen(MOCK_TOKEN_JSON);
+
+	if (!wsi)
+		return;
+
+	if (lws_add_http_common_headers(wsi, HTTP_STATUS_OK,
+					"application/json", (lws_filepos_t)blen,
+					&p, end) ||
+	    lws_finalize_http_header(wsi, &p, end))
+		return;
+
+	memcpy(p, MOCK_TOKEN_JSON, blen);
+	p += blen;
+
+	if (lws_write(wsi, start, lws_ptr_diff_size_t(p, start),
+		      LWS_WRITE_HTTP_HEADERS) < 0)
+		return;
+
+	if (lws_http_transaction_completed(wsi))
+		lws_close_free_wsi(wsi, LWS_CLOSE_STATUS_NOSTATUS,
+				   "mock tx done");
+}
+
+static int
+callback_authmock(struct lws *wsi, enum lws_callback_reasons reason,
+		  void *user, void *in, size_t len)
+{
+	struct pss_auth *pss = (struct pss_auth *)user;
+	const char *uri;
+
+	switch (reason) {
+
+	case LWS_CALLBACK_HTTP:
+		pss->wsi = wsi;
+		/* Normalize the URI to begin with '/' (lws strips it, since
+		 * the mount is at "/") */
+		uri = (const char *)in;
+		if (uri && uri[0] != '/') {
+			static char normalized[128];
+
+			lws_snprintf(normalized, sizeof(normalized), "/%s", uri);
+			uri = normalized;
+		}
+
+		if (!uri || strcmp(uri, "/api/sso_exchange")) {
+			lwsl_err("%s: mock auth: unexpected uri '%s'\n",
+				 __func__, uri ? uri : "(null)");
+			return 1;
+		}
+		/* wait for the POST body, then answer from a later pass */
+		lws_set_timeout(wsi, PENDING_TIMEOUT_HTTP_CONTENT, 10);
+		return 0;
+
+	case LWS_CALLBACK_HTTP_BODY:
+		if (pss->body_len + len < sizeof(pss->body)) {
+			memcpy(pss->body + pss->body_len, in, len);
+			pss->body_len += len;
+		} else {
+			lwsl_err("%s: mock auth: body too large\n", __func__);
+			return 1;
+		}
+		return 0;
+
+	case LWS_CALLBACK_HTTP_BODY_COMPLETION: {
+		/*
+		 * This is the auth server's csrf double-submit check: the
+		 * csrf_token= form field must match the auth_csrf cookie in
+		 * the (forwarded) jar.  The side channel always posts exactly
+		 * "csrf_token=<csrf>" as the whole body.
+		 */
+		char csrf_ck[64] = {0};
+		size_t csrf_ck_len = sizeof(csrf_ck);
+		char refresh[128] = {0};
+		size_t refresh_len = sizeof(refresh);
+		int got_cookie_csrf;
+
+		mock_hits++;
+		mock_got_refresh =
+			lws_http_cookie_get(wsi, "auth_refresh_session",
+					    refresh, &refresh_len) == 0 &&
+			refresh[0];
+		got_cookie_csrf =
+			lws_http_cookie_get(wsi, "auth_csrf",
+					    csrf_ck, &csrf_ck_len) == 0 &&
+			csrf_ck[0];
+
+		mock_pair_ok = 0;
+		if (got_cookie_csrf && mock_got_refresh) {
+			/*
+			 * The side channel posts exactly
+			 * "csrf_token=<cookie value>" as the whole body; a
+			 * strict full-body comparison catches any drift from
+			 * that contract.
+			 */
+			size_t expect_len = sizeof("csrf_token=") - 1 +
+							strlen(csrf_ck);
+
+			mock_pair_ok = pss->body_len == expect_len &&
+				!memcmp(pss->body, "csrf_token=",
+					sizeof("csrf_token=") - 1) &&
+				!lws_timingsafe_bcmp(csrf_ck,
+					pss->body + sizeof("csrf_token=") - 1,
+					(uint32_t)strlen(csrf_ck));
+		}
+
+		lwsl_notice("%s: mock exchange validated: refresh=%d "
+			    "pair=%d\n", __func__, mock_got_refresh,
+			    mock_pair_ok);
+
+		if (scenarios[step].poke) {
+			/*
+			 * Hold the answer back and meanwhile wake every
+			 * lws-login wsi on the app vhost, ie, the browser leg
+			 * parked on this exchange: it must stay parked until
+			 * the exchange really ends.
+			 */
+			lws_callback_on_writable_all_protocol_vhost(g_vh_app,
+				lws_vhost_name_to_protocol(g_vh_app,
+							   "lws-login"));
+			lws_sul_schedule(lws_get_context(wsi), 0,
+					 &pss->sul_resp, sul_respond_cb,
+					 250 * LWS_US_PER_MS);
+			return 0;
+		}
+
+		lws_sul_schedule(lws_get_context(wsi), 0, &pss->sul_resp,
+				 sul_respond_cb, 10 * LWS_US_PER_MS);
+		return 0;
+	}
+
+	default:
+		break;
+	}
+
+	return lws_callback_http_dummy(wsi, reason, user, in, len);
+}
+
+/* ---------------------------------------------------------------- client */
+
+static void
+step_advance(void);
+
+static int
+callback_cli(struct lws *wsi, enum lws_callback_reasons reason,
+	     void *user, void *in, size_t len)
+{
+	/*
+	 * Ignore callbacks from any wsi that isn't the in-flight step's wsi:
+	 * the plugin's own outgoing /api/sso_exchange client connection runs
+	 * concurrently under its own protocol on the app vhost.  A genuine
+	 * step failure always arrives on the step's own wsi, which i.pwsi
+	 * parked in current_wsi.
+	 */
+	if (wsi != current_wsi)
+		return lws_callback_http_dummy(wsi, reason, user, in, len);
+
+	switch (reason) {
+
+	case LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER: {
+		unsigned char **p = (unsigned char **)in;
+		unsigned char *end = (*p) + len;
+
+		if (scenarios[step].ws_offer) {
+			/* a ws upgrade carries no body-shape headers */
+		} else if (scenarios[step].body) {
+			/*
+			 * The auth server's auto-submitting SSO form: a real
+			 * urlencoded body carrying the token, sized honestly.
+			 */
+			char cl[16];
+
+			lws_snprintf(cl, sizeof(cl), "%d",
+				     (int)strlen(scenarios[step].body));
+			if (lws_add_http_header_by_token(wsi,
+					WSI_TOKEN_HTTP_CONTENT_TYPE,
+					(const unsigned char *)"application/x-www-form-urlencoded",
+					33, p, end) ||
+			    lws_add_http_header_by_token(wsi,
+					WSI_TOKEN_HTTP_CONTENT_LENGTH,
+					(const unsigned char *)cl,
+					(int)strlen(cl), p, end))
+				return -1;
+
+			lws_client_http_body_pending(wsi, 1);
+			lws_callback_on_writable(wsi);
+		} else if (!scenarios[step].method ||
+			   strcmp(scenarios[step].method, "GET")) {
+			/*
+			 * A bodyless POST, exactly like the widget's fetch():
+			 * the plugin answers from the request headers alone
+			 * (it suspends the wsi against the side channel), and
+			 * a request body would interact with that suspension.
+			 */
+			if (lws_add_http_header_by_token(wsi,
+					WSI_TOKEN_HTTP_CONTENT_TYPE,
+					(const unsigned char *)"application/x-www-form-urlencoded",
+					33, p, end) ||
+			    lws_add_http_header_by_token(wsi,
+					WSI_TOKEN_HTTP_CONTENT_LENGTH,
+					(const unsigned char *)"0", 1, p, end))
+				return -1;
+		}
+		/* GET: no body-shape headers at all */
+
+		/*
+		 * On SSO scenarios the Origin/Referer pair must be exactly
+		 * what the scenario says, including both-absent (the filed
+		 * F-020 vector); lws synthesizes "Origin: http://<origin>"
+		 * from connect-info .origin on POSTs, so the driver leaves
+		 * that NULL on SSO paths and the headers are added here
+		 * instead, under the test's sole control.
+		 */
+		if (scenarios[step].origin &&
+		    lws_add_http_header_by_token(wsi, WSI_TOKEN_ORIGIN,
+				(const unsigned char *)scenarios[step].origin,
+				(int)strlen(scenarios[step].origin), p, end))
+			return -1;
+
+		if (scenarios[step].referer &&
+		    lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_REFERER,
+				(const unsigned char *)scenarios[step].referer,
+				(int)strlen(scenarios[step].referer), p, end))
+			return -1;
+
+		if (scenarios[step].cookie &&
+		    lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_COOKIE,
+				(const unsigned char *)scenarios[step].cookie,
+				(int)strlen(scenarios[step].cookie), p, end))
+			return -1;
+		break;
+	}
+
+	case LWS_CALLBACK_CLIENT_HTTP_WRITEABLE: {
+		const char *body = scenarios[step].body;
+		uint8_t buf[LWS_PRE + sizeof(sso_body)], *start = &buf[LWS_PRE];
+		size_t blen;
+
+		if (!body)
+			return 0;
+
+		blen = strlen(body);
+		memcpy(start, body, blen);
+		lws_client_http_body_pending(wsi, 0);
+
+		/* single-part body: this write is also the stream end */
+		if (lws_write(wsi, start, blen, LWS_WRITE_HTTP_FINAL) < 0)
+			return -1;
+		break;
+	}
+
+	case LWS_CALLBACK_ESTABLISHED_CLIENT_HTTP:
+		lwsl_notice("%s: scenario '%s': response %d\n", __func__,
+			    scenarios[step].name,
+			    (int)lws_http_client_http_response(wsi));
+
+	got_status = lws_http_client_http_response(wsi);
+	if (scenarios[step].ws_offer) {
+		/* a ws upgrade: 101 means the handshake goes on to
+		 * CLIENT_ESTABLISHED, any other status is the refusal */
+		if (got_status == 101)
+			break;
+		got_ws_refused = 1;
+	}
+	got_sc[0] = '\0';
+	if (lws_hdr_copy(wsi, got_sc, sizeof(got_sc),
+			 WSI_TOKEN_HTTP_SET_COOKIE) < 0)
+		got_sc[0] = '\0';
+
+	/* ... and every Set-Cookie frag, for the F-022 attribute-tail fence */
+	got_sc_nfrags = 0;
+	while (got_sc_nfrags < MAX_SC_FRAGS &&
+	       lws_hdr_copy_fragment(wsi, got_sc_frags[got_sc_nfrags],
+				      SC_FRAG_SZ, WSI_TOKEN_HTTP_SET_COOKIE,
+				      got_sc_nfrags) >= 0) {
+		got_sc_nfrags++;
+	}
+
+		if (scenarios[step].expect_js || scenarios[step].expect_css) {
+			/*
+			 * The body (the served lws-login.js / lws-login.css)
+			 * is what the fence scenarios assert on: keep the
+			 * connection and drain it via RECEIVE_CLIENT_HTTP(_READ).
+			 */
+			got_body_len = 0;
+			got_body_trunc = 0;
+			break;
+		}
+
+		/* headers are all we came for */
+		if (!step_done)
+			step_done = 1;
+		step_advance();
+
+		return -1;
+
+	case LWS_CALLBACK_RECEIVE_CLIENT_HTTP: {
+		char abuf[LWS_PRE + 2048], *px = abuf + LWS_PRE;
+		int alen = (int)sizeof(abuf) - LWS_PRE;
+
+		/* h1 requires the callback to pull the body itself (h2 mux
+		 * delivers RECEIVE_CLIENT_HTTP_READ directly) */
+		if (lws_http_client_read(wsi, &px, &alen) < 0)
+			return -1;
+		return 0; /* don't passthru */
+	}
+
+	case LWS_CALLBACK_RECEIVE_CLIENT_HTTP_READ:
+		if (got_body_len + len < sizeof(got_body)) {
+			memcpy(got_body + got_body_len, in, len);
+			got_body_len += len;
+		} else
+			got_body_trunc = 1;
+		return 0; /* don't passthru */
+
+	/* the step's body is fully drained either way, or its ws closed */
+	case LWS_CALLBACK_COMPLETED_CLIENT_HTTP:
+	case LWS_CALLBACK_CLOSED_CLIENT_HTTP:
+	case LWS_CALLBACK_CLIENT_CLOSED:
+		if (!step_done)
+			step_done = 1;
+		step_advance();
+		break;
+
+	/* C-774 ws scenarios: the upgrade was accepted... */
+	case LWS_CALLBACK_CLIENT_ESTABLISHED:
+		lwsl_notice("%s: scenario '%s': ws established\n", __func__,
+			    scenarios[step].name);
+		got_ws_established = 1;
+		if (!step_done)
+			step_done = 1;
+		step_advance();
+
+		return -1; /* the handshake was all we came for */
+
+	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+		if (scenarios[step].ws_offer) {
+			/* ... or refused: a legitimate outcome, judged against
+			 * ws_bind in step_advance */
+			lwsl_notice("%s: scenario '%s': ws refused: %s\n",
+				    __func__, scenarios[step].name,
+				    in ? (const char *)in : "(null)");
+			got_ws_refused = 1;
+			step_done = 1;
+			step_advance();
+			break;
+		}
+		lwsl_err("%s: scenario '%s' connect error: %s\n", __func__,
+			 scenarios[step].name,
+			 in ? (const char *)in : "(null)");
+		step_done = -1;
+		step_advance();
+		break;
+
+	default:
+		break;
+	}
+
+	return lws_callback_http_dummy(wsi, reason, user, in, len);
+}
+
+/*
+ * The two ws protocols living on the app vhost behind the gated mount: a
+ * stand-in for a privileged application protocol, and the exempt waiting
+ * room.  Neither does any auth of its own, exactly the deployment the
+ * bouncer's contract is for; they only record which one the server bound.
+ */
+static int
+callback_gated_ws(struct lws *wsi, enum lws_callback_reasons reason,
+		  void *user, void *in, size_t len)
+{
+	if (reason == LWS_CALLBACK_ESTABLISHED) {
+		lws_strncpy(g_ws_bound, lws_get_protocol(wsi)->name,
+			    sizeof(g_ws_bound));
+		lwsl_notice("%s: server bound '%s'\n", __func__, g_ws_bound);
+	}
+
+	return lws_callback_http_dummy(wsi, reason, user, in, len);
+}
+
+/* ------------------------------------------------------------- protocols */
+
+static const struct lws_protocols
+	defprot = { "defprot", lws_callback_http_dummy, 0, 0, 0, NULL, 0 },
+	prot_auth = { "lws-api-test-lws-login-bff-authmock", callback_authmock,
+		      sizeof(struct pss_auth), 0, 0, NULL, 0 },
+	prot_cli = { "lws-api-test-lws-login-bff-cli", callback_cli,
+		     0, 0, 0, NULL, 0 },
+	prot_priv = { BFF_WS_PRIV, callback_gated_ws, 0, 0, 0, NULL, 0 },
+	prot_waiting = { BFF_WS_WAITING, callback_gated_ws, 0, 0, 0, NULL, 0 };
+
+static const struct lws_protocols
+	*pprotocols_auth[] = { &defprot, &prot_auth, NULL },
+	*pprotocols_cli[]  = { &defprot, &prot_cli, NULL },
+	*pprotocols_app[]  = { &defprot, &prot_priv, &prot_waiting, NULL };
+
+static const struct lws_http_mount
+	mount_auth = {
+		.mountpoint		= "/",
+		.protocol		= "lws-api-test-lws-login-bff-authmock",
+		.origin_protocol	= LWSMPRO_CALLBACK,
+		.mountpoint_len		= 1,
+	},
+	/*
+	 * A mount on the app vhost that lws-login gates (its interceptor_path
+	 * is the lws-login mount below): the C-774 ws upgrades target it
+	 */
+	mount_gated = {
+		.mountpoint		= "/gated",
+		.protocol		= "defprot",
+		.origin_protocol	= LWSMPRO_CALLBACK,
+		.mountpoint_len		= 6,
+		.interceptor_path	= "/",
+	},
+	/*
+	 * Route http on the app vhost to the real lws-login plugin protocol
+	 * (present in the vhost protocol table because the build has builtin
+	 * plugins)
+	 */
+	mount_app = {
+		.mount_next		= &mount_gated,
+		.mountpoint		= "/",
+		.protocol		= "lws-login",
+		.origin_protocol	= LWSMPRO_CALLBACK,
+		.mountpoint_len		= 1,
+	};
+
+/*
+ * pvo chain handing the plugin its vhd config.  The lws-login entry both
+ * enables the protocol on the vhost and carries its options; a second,
+ * optionless entry enables lws_login_client, which the side channel
+ * resolves on its own vhost before it will start an exchange.  The
+ * auth-server-url value is computed in main() once the listen port is
+ * known.
+ */
+static struct lws_protocol_vhost_options
+	pvo_dbpath	= { NULL, NULL, "db-path", NULL },
+	/*
+	 * cookie-domain set so the Domain= variants of the rotated
+	 * auth_session / auth_csrf cookies (the longest csrf cookie string
+	 * this plugin can emit) are the ones under test
+	 */
+	pvo_cdom	= { NULL, NULL, "cookie-domain", "127.0.0.1" },
+	/* C-774: only the waiting room is exempt from the JWT on upgrades */
+	pvo_uap		= { NULL, NULL, "unauth-protocols", BFF_WS_WAITING },
+	pvo_asu		= { NULL, NULL, "auth-server-url", NULL },
+	pvo_jwk	= {
+		NULL, NULL, "jwt-jwk", jwk_json
+	},
+	pvo_login	= { NULL, NULL, "lws-login", NULL },
+	pvo_lc		= { NULL, NULL, "lws_login_client", NULL };
+
+/*
+ * Second app vhost's lws-login options, mirroring the sai deployment shape
+ * the relative-authapi scenario exists to fence: auth-server-url is a local
+ * BFF delegate entry (relative) and no auth-api-url PVO is set, so the
+ * plugin's effective auth-api-url is relative and silent renewal must be
+ * refused rather than kicked against the empty host it parses to.
+ */
+static struct lws_protocol_vhost_options
+	pvo_dbpath2	= { NULL, NULL, "db-path", NULL },
+	pvo_cdom2	= { NULL, NULL, "cookie-domain", "127.0.0.1" },
+	pvo_asu2	= { NULL, NULL, "auth-server-url", "/oauth/login" },
+	pvo_jwk2	= { NULL, NULL, "jwt-jwk", jwk_json },
+	pvo_login2	= { NULL, NULL, "lws-login", NULL },
+	pvo_lc2		= { NULL, NULL, "lws_login_client", NULL };
+
+/* -------------------------------------------------------------- driver */
+
+static lws_sorted_usec_list_t sul_next;
+static lws_sorted_usec_list_t sul_timeout;
+
+static void
+sul_timeout_cb(lws_sorted_usec_list_t *sul)
+{
+	(void)sul;
+	lwsl_err("%s: scenario '%s' timed out\n", __func__,
+		 scenarios[step].name);
+	step_done = -1;
+	step_advance();
+}
+
+/*
+ * F-022 class fence: truncation always removes a suffix, so a Set-Cookie
+ * frag carrying one of the plugin's session cookies must contain all three
+ * security attributes or its tail was chopped.  The SSO token is
+ * deliberately minted near the LWS_SSO_MAX_COOKIE cap: pre-fix, composing
+ * its auth_session cookie truncated the trailing "; HttpOnly; SameSite=Lax;
+ * Secure" into the fixed 4096-byte buffer.
+ */
+static int
+sc_frag_tail_check(void)
+{
+	int i;
+
+	for (i = 0; i < got_sc_nfrags; i++) {
+		if (!(strstr(got_sc_frags[i], "auth_session=") ||
+		      strstr(got_sc_frags[i], "auth_csrf=") ||
+		      strstr(got_sc_frags[i], "auth_refresh_session=")))
+			continue;
+		if (!strstr(got_sc_frags[i], "HttpOnly") ||
+		    !strstr(got_sc_frags[i], "SameSite=Lax") ||
+		    !strstr(got_sc_frags[i], "Secure")) {
+			lwsl_err("%s: set-cookie frag %d lost its attribute "
+				 "tail: '%s'\n", __func__, i,
+				 got_sc_frags[i]);
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * Extract the declaration list of the first css rule beginning with prefix
+ * (eg ".lws-login-box{") into decls, nul-terminated.  Returns 1 if the rule
+ * was found, 0 otherwise.
+ */
+static int
+css_rule_decls(const char *css, const char *prefix, char *decls, size_t len)
+{
+	const char *start = strstr(css, prefix), *end;
+	size_t pl = strlen(prefix), n;
+
+	if (!start)
+		return 0;
+
+	end = strchr(start + pl, '}');
+	if (!end)
+		return 0;
+
+	n = (size_t)(end - (start + pl));
+	if (n >= len)
+		n = len - 1;
+	memcpy(decls, start + pl, n);
+	decls[n] = '\0';
+
+	return 1;
+}
+
+/*
+ * widget-css fence: every widget surface that floats on the host page must
+ * assert its own complete colour scheme.  The prefix names the rule (see
+ * css_rule_decls); its background declaration must be a fully-opaque colour
+ * (background:#hex -- background:rgba(... blends the host page's colour
+ * back in through the widget) and it must explicitly assert a text colour.
+ * Decorative rgba (borders, shadows) is fine: it cannot affect readability.
+ */
+static int
+css_rule_solid_bg_check(const char *css, const char *prefix, const char *what)
+{
+	char decls[512];
+
+	if (!css_rule_decls(css, prefix, decls, sizeof(decls))) {
+		lwsl_err("%s: served lws-login.css lacks rule '%s'\n",
+			 __func__, what);
+		return 1;
+	}
+
+	if (!strstr(decls, "background:#") ||
+	    strstr(decls, "background:rgba(") ||
+	    !strstr(decls, "color:#")) {
+		lwsl_err("%s: rule '%s' does not assert its own colour "
+			 "scheme: '%s'\n", __func__, what, decls);
+		return 1;
+	}
+
+	return 0;
+}
+
+static void
+start_step(lws_sorted_usec_list_t *sul)
+{
+	struct lws_client_connect_info i;
+	static char host_hdr[32];
+
+	(void)sul;
+
+	step_done = 0;
+	got_status = 0;
+	got_sc[0] = '\0';
+	got_sc_nfrags = 0;
+	got_body_len = 0;
+	got_body_trunc = 0;
+	mock_hits = 0;
+	mock_got_refresh = 0;
+	mock_pair_ok = 0;
+	got_ws_established = 0;
+	got_ws_refused = 0;
+	g_ws_bound[0] = '\0';
+
+	/* Host: header must name the app vhost this scenario targets */
+	lws_snprintf(host_hdr, sizeof(host_hdr), "127.0.0.1:%d",
+		     scenarios[step].app2 ? g_port_app2 : g_port_app);
+
+	memset(&i, 0, sizeof(i));
+	i.context		= context;
+	i.vhost		= g_vh_cli;
+	i.address		= "127.0.0.1";
+	i.port			= scenarios[step].app2 ? g_port_app2
+							 : g_port_app;
+	i.path			= scenarios[step].path;
+	i.host			= host_hdr;
+	/* see APPEND_HANDSHAKE_HEADER: SSO scenarios own their Origin header,
+	 * including its absence */
+	i.origin		= strcmp(scenarios[step].path, "/.lws-login-sso")
+					? host_hdr : NULL;
+	i.method		= scenarios[step].method ? scenarios[step].method
+							: "POST";
+	/* we assert the response ourselves rather than following it */
+	i.ssl_connection	= LCCSCF_HTTP_NO_FOLLOW_REDIRECT;
+	i.protocol		= "defprot";
+	if (scenarios[step].ws_offer) {
+		/* a ws upgrade: the offer list goes out verbatim as
+		 * Sec-WebSocket-Protocol */
+		i.method	= NULL;
+		i.protocol	= scenarios[step].ws_offer;
+	}
+	i.local_protocol_name	= "lws-api-test-lws-login-bff-cli";
+	i.pwsi			= &current_wsi;
+
+	current_wsi = NULL;
+	if (!lws_client_connect_via_info(&i)) {
+		lwsl_err("%s: connect failed (scenario '%s')\n", __func__,
+			 scenarios[step].name);
+		step_done = -1;
+		lws_cancel_service(context);
+		return;
+	}
+
+	lws_sul_schedule(context, 0, &sul_timeout, sul_timeout_cb,
+			 20 * LWS_US_PER_SEC);
+}
+
+static void
+step_advance(void)
+{
+	if (sequence_done || step >= N_SCENARIOS)
+		return;
+
+	if (step_done <= 0) {
+		if (step_done < 0) {
+			lwsl_err("%s: scenario '%s' failed\n", __func__,
+				 scenarios[step].name);
+			fail++;
+			result = 1;
+			sequence_done = 1;
+			lws_cancel_service(context);
+			return;
+		}
+		return; /* still in flight */
+	}
+
+	lws_sul_cancel(&sul_timeout);
+	tests++;
+
+	if (got_status != scenarios[step].expect_status) {
+		fail++;
+		lwsl_err("%s: FAIL scenario '%s': status %d, "
+			 "expect %d (set-cookie '%s')\n", __func__,
+			 scenarios[step].name, got_status,
+			 scenarios[step].expect_status, got_sc);
+		result = 1;
+		sequence_done = 1;
+		lws_cancel_service(context);
+		return;
+	}
+
+	if (scenarios[step].ws_offer) {
+		const char *want = scenarios[step].ws_bind;
+
+		/*
+		 * C-774: what matters is what the SERVER bound.  An upgrade
+		 * that must be refused must leave nothing bound at all, and
+		 * one that is let through must have bound the exempt
+		 * protocol, never the privileged one.
+		 */
+		if (want ? (!got_ws_established || strcmp(g_ws_bound, want))
+			 : (!got_ws_refused || g_ws_bound[0])) {
+			fail++;
+			lwsl_err("%s: FAIL scenario '%s': offer '%s' "
+				 "established=%d refused=%d bound '%s', "
+				 "expected %s\n", __func__,
+				 scenarios[step].name,
+				 scenarios[step].ws_offer, got_ws_established,
+				 got_ws_refused, g_ws_bound,
+				 want ? want : "refusal");
+			result = 1;
+			sequence_done = 1;
+			lws_cancel_service(context);
+			return;
+		}
+	}
+
+	if (scenarios[step].expect_pair &&
+	    (!mock_hits || !mock_got_refresh || !mock_pair_ok)) {
+		fail++;
+		lwsl_err("%s: FAIL scenario '%s': exchange not "
+			 "validated (hits=%d refresh=%d pair=%d)\n",
+			 __func__, scenarios[step].name, mock_hits,
+			 mock_got_refresh, mock_pair_ok);
+		result = 1;
+		sequence_done = 1;
+		lws_cancel_service(context);
+		return;
+	}
+
+	if (!scenarios[step].expect_pair && mock_hits) {
+		fail++;
+		lwsl_err("%s: FAIL scenario '%s': exchange started "
+			 "but must not\n", __func__,
+			 scenarios[step].name);
+		result = 1;
+		sequence_done = 1;
+		lws_cancel_service(context);
+		return;
+	}
+
+	if (scenarios[step].expect_rotate &&
+	    (!strstr(got_sc, "auth_session=") ||
+	     !strstr(got_sc, minted_jwt) ||
+	     !strstr(got_sc, "auth_csrf=") ||
+	     !strstr(got_sc, "Domain=127.0.0.1"))) {
+		fail++;
+		lwsl_err("%s: FAIL scenario '%s': rotated cookies "
+			 "missing (set-cookie '%s')\n", __func__,
+			 scenarios[step].name, got_sc);
+		result = 1;
+		sequence_done = 1;
+		lws_cancel_service(context);
+		return;
+	}
+
+	if (scenarios[step].expect_sso > 0 &&
+	    (!strstr(got_sc, "auth_session=") ||
+	     !strstr(got_sc, minted_jwt))) {
+		fail++;
+		lwsl_err("%s: FAIL scenario '%s': SSO cookie not "
+			 "planted with the submitted token "
+			 "(set-cookie '%s')\n", __func__,
+			 scenarios[step].name, got_sc);
+		result = 1;
+		sequence_done = 1;
+		lws_cancel_service(context);
+		return;
+	}
+
+	if (scenarios[step].expect_sso < 0 &&
+	    strstr(got_sc, "auth_session=")) {
+		fail++;
+		lwsl_err("%s: FAIL scenario '%s': token planted "
+			 "despite failed origin check (set-cookie "
+			 "'%s')\n", __func__, scenarios[step].name,
+			 got_sc);
+		result = 1;
+		sequence_done = 1;
+		lws_cancel_service(context);
+		return;
+	}
+
+	/*
+	 * F-022 class fence: every cookie the plugin minted must
+	 * keep its complete HttpOnly / SameSite / Secure tail.
+	 */
+	if ((scenarios[step].expect_rotate ||
+	     scenarios[step].expect_sso > 0) &&
+	    sc_frag_tail_check()) {
+		fail++;
+		result = 1;
+		sequence_done = 1;
+		lws_cancel_service(context);
+		return;
+	}
+
+	if (scenarios[step].expect_js) {
+		/*
+		 * F-021 render-boundary fence, asserted against the
+		 * actually-served lws-login.js: the escaper must exist
+		 * and every dynamic innerHTML interpolation must go
+		 * through it (or encodeURIComponent for the query
+		 * value).  The banned patterns are the raw
+		 * interpolations as they existed pre-fix.
+		 */
+		static const char * const fence_need[] = {
+			"window.lwsLoginEsc=function",
+			"window.lwsLoginEsc(d.name)",
+			"window.lwsLoginEsc(st.identity)",
+			"encodeURIComponent(d.user_code)",
+		};
+		static const char * const fence_banned[] = {
+			"+d.name+'",
+			"+st.identity+'",
+			"+d.user_code+'",
+		};
+		size_t fi;
+		int bad = got_body_trunc;
+
+		got_body[got_body_len] = '\0';
+
+		for (fi = 0; fi < LWS_ARRAY_SIZE(fence_need); fi++)
+			if (!strstr(got_body, fence_need[fi])) {
+				lwsl_err("%s: FAIL scenario '%s': "
+					 "served lws-login.js lacks "
+					 "'%s'\n", __func__,
+					 scenarios[step].name,
+					 fence_need[fi]);
+				bad = 1;
+			}
+
+		for (fi = 0; fi < LWS_ARRAY_SIZE(fence_banned); fi++)
+			if (strstr(got_body, fence_banned[fi])) {
+				lwsl_err("%s: FAIL scenario '%s': "
+					 "served lws-login.js still "
+					 "composes '%s' raw into "
+					 "innerHTML\n", __func__,
+					 scenarios[step].name,
+					 fence_banned[fi]);
+				bad = 1;
+			}
+
+		if (bad) {
+			fail++;
+			result = 1;
+			sequence_done = 1;
+			lws_cancel_service(context);
+			return;
+		}
+	}
+
+	if (scenarios[step].expect_css) {
+		/*
+		 * Asserted against the actually-served lws-login.css: the
+		 * status box's colour scheme must be one static choice -- a
+		 * fully-opaque background behind an asserted text colour, with
+		 * no prefers-color-scheme adaptation (a widget following the
+		 * browser preference showed up dark on light-styled pages
+		 * that ignore it) and no translucent background handing the
+		 * colour back to the host page (the pre-fix rgba(0,0,0,0.02)
+		 * was unreadable on dark pages).  The preauth dropdown floats
+		 * directly over the host page, so the same applies to it.
+		 */
+		int bad = got_body_trunc;
+
+		got_body[got_body_len] = '\0';
+
+		bad |= css_rule_solid_bg_check(got_body,
+				".lws-login-box{", ".lws-login-box");
+		bad |= css_rule_solid_bg_check(got_body,
+				".lws-preauth-widget{", ".lws-preauth-widget");
+
+		if (strstr(got_body, "prefers-color-scheme")) {
+			lwsl_err("%s: served lws-login.css adapts to "
+				 "prefers-color-scheme\n", __func__);
+			bad = 1;
+		}
+
+		if (bad) {
+			fail++;
+			result = 1;
+			sequence_done = 1;
+			lws_cancel_service(context);
+			return;
+		}
+	}
+
+	lwsl_user("  scenario[%d] '%s': PASS\n", step,
+		  scenarios[step].name);
+
+	step_done = 0;
+	current_wsi = NULL;
+
+	step++;
+	if (step < N_SCENARIOS) {
+		lws_sul_schedule(context, 0, &sul_next, start_step, 1);
+		return;
+	}
+
+	if (!fail)
+		result = 0;
+	sequence_done = 1;
+	lws_cancel_service(context);
+}
+
+static void
+sigint_handler(int sig)
+{
+	(void)sig;
+	result = 1;
+	lws_default_loop_exit(context);
+}
+
+int main(int argc, const char **argv)
+{
+	struct lws_context_creation_info info;
+	struct lws_vhost *vh;
+	const char *p;
+	int n = 0;
+
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
+
+	/* see api-test-oauth2-client: two listening vhosts + a client + the
+	 * plugin's side-channel connection need the real fd limit */
+	info.fd_limit_per_thread	= 0;
+
+	/*
+	 * F-022: the planted auth_session Set-Cookie for the near-cap SSO
+	 * token is ~4.1KB; the default client ah data area (4096) cannot
+	 * parse a response carrying it (browsers allow much larger header
+	 * sets, this only sizes the test client's receive buffer)
+	 */
+	info.max_http_header_data	= LWS_SSO_MAX_COOKIE + 1024;
+
+	if ((p = lws_cmdline_option(argc, argv, "-p")))
+		g_port_app = atoi(p);
+	g_port_auth = g_port_app + 1;
+	g_port_app2 = g_port_app + 2;
+
+	pvo_dbpath.value = lws_cmdline_option(argc, argv, "--db-path");
+	if (!pvo_dbpath.value)
+		pvo_dbpath.value = "lws-api-test-lws-login-bff.sqlite3";
+
+	signal(SIGINT, sigint_handler);
+
+	lwsl_user("LWS API selftest: lws-login BFF refresh / csrf self-heal"
+		  " + SSO origin gate + widget JS/CSS fence"
+		  " + unauth-protocols bind fence\n");
+
+	{
+		static char auth_url[128];
+
+		lws_snprintf(auth_url, sizeof(auth_url), "http://127.0.0.1:%d",
+			     g_port_auth);
+		pvo_asu.value = auth_url;
+	}
+
+	/* options chain for lws-login:
+	 * jwk -> auth-server-url -> cookie-domain -> db-path ->
+	 * unauth-protocols */
+	pvo_jwk.next	= &pvo_asu;
+	pvo_asu.next	= &pvo_cdom;
+	pvo_cdom.next	= &pvo_dbpath;
+	pvo_dbpath.next	= &pvo_uap;
+	pvo_login.options = &pvo_jwk;
+
+	/* protocol-enabling chain: lws-login (with options) then the
+	 * optionless side-channel client protocol */
+	pvo_login.next	= &pvo_lc;
+
+	/* second app vhost's chain: same shape but the relative BFF-delegate
+	 * auth-server-url and no auth-api-url, exactly the misconfiguration
+	 * the relative-authapi scenario fences (db-path shared with app) */
+	pvo_dbpath2.value = pvo_dbpath.value;
+	pvo_jwk2.next	= &pvo_asu2;
+	pvo_asu2.next	= &pvo_cdom2;
+	pvo_cdom2.next	= &pvo_dbpath2;
+	pvo_login2.options = &pvo_jwk2;
+	pvo_login2.next	= &pvo_lc2;
+
+	/* --------------------------------------------------- context/vhosts */
+
+	info.options		= LWS_SERVER_OPTION_EXPLICIT_VHOSTS;
+
+	context = lws_create_context(&info);
+	if (!context) {
+		lwsl_err("lws init failed\n");
+		return 1;
+	}
+
+	/*
+	 * Mint the SSO token and the port-dependent header values once the
+	 * context exists (signing needs it), so every sso-* scenario submits
+	 * exactly the same genuinely-signed token and differs only in the
+	 * Origin/Referer pair it carries.
+	 *
+	 * F-022: the token is deliberately minted near the LWS_SSO_MAX_COOKIE
+	 * cap (~4040 bytes): planting it must compose an auth_session
+	 * Set-Cookie larger than the plugin's old fixed 4096-byte buffer, so
+	 * any truncation would cost the cookie its HttpOnly / SameSite /
+	 * Secure tail (the fence assertion in step_advance).
+	 */
+	{
+		struct lws_jwk jwk;
+		static char pad[LWS_SSO_MAX_COOKIE];
+		/* must hold the b64 jose + payload + sig segments at once */
+		char temp[LWS_SSO_MAX_COOKIE * 2];
+		size_t padlen = 2900;
+		int tries = 0;
+
+		memset(&jwk, 0, sizeof(jwk));
+		if (lws_jwk_import(&jwk, NULL, NULL, jwk_json,
+				   strlen(jwk_json))) {
+			lwsl_err("%s: SSO token mint failed\n", __func__);
+			goto bail;
+		}
+
+		memset(pad, 'a', sizeof(pad) - 1);
+
+		for (;;) {
+			size_t out_len = sizeof(minted_jwt);
+
+			if (lws_jwt_sign_compact(context, &jwk, "ES256",
+						 minted_jwt, &out_len, temp,
+						 sizeof(temp),
+						 "{\"iss\":\"apitest\",\"sub\":"
+						 "\"sso\",\"pad\":\"%.*s\"}",
+						 (int)padlen, pad)) {
+				lws_jwk_destroy(&jwk);
+				lwsl_err("%s: SSO token mint failed\n",
+					 __func__);
+				goto bail;
+			}
+
+			/* converges in one step: b64 grows 4/3 as fast */
+			if (out_len >= 4030 && out_len <= 4090) {
+				lwsl_notice("%s: minted %llu-byte SSO "
+					    "token\n", __func__,
+					    (unsigned long long)out_len);
+				break;
+			}
+			if (++tries > 4 || out_len > LWS_SSO_MAX_COOKIE - 8) {
+				lws_jwk_destroy(&jwk);
+				lwsl_err("%s: cannot size the long SSO token "
+					 "(last %llu)\n", __func__,
+					 (unsigned long long)out_len);
+				goto bail;
+			}
+			padlen += (4060 - out_len) * 3 / 4;
+		}
+		lws_jwk_destroy(&jwk);
+
+		lws_snprintf(MOCK_TOKEN_JSON, sizeof(MOCK_TOKEN_JSON),
+			     "{\"token\":\"%s\"}", minted_jwt);
+
+		lws_snprintf(sso_body, sizeof(sso_body), "token=%s&target=/",
+			     minted_jwt);
+		lws_snprintf(o_origin_good, sizeof(o_origin_good),
+			     "http://127.0.0.1:%d", g_port_auth);
+		lws_snprintf(o_origin_evil, sizeof(o_origin_evil),
+			     "http://127.0.0.1:%d", g_port_app);
+		lws_snprintf(o_referer_good, sizeof(o_referer_good),
+			     "http://127.0.0.1:%d/login", g_port_auth);
+	}
+
+	/* mock auth server vhost */
+	info.port		= g_port_auth;
+	info.vhost_name		= "auth";
+	info.protocols		= NULL;
+	info.pprotocols		= pprotocols_auth;
+	info.mounts		= &mount_auth;
+	info.pvo		= NULL;
+
+	vh = lws_create_vhost(context, &info);
+	if (!vh) {
+		lwsl_err("Failed to create mock auth vhost\n");
+		goto bail;
+	}
+
+	/* app vhost: real lws-login plugin via a pvo chain */
+	info.port		= g_port_app;
+	info.vhost_name		= "app";
+	info.pprotocols		= pprotocols_app;
+	info.mounts		= &mount_app;
+	info.pvo		= &pvo_login;
+
+	g_vh_app = lws_create_vhost(context, &info);
+	if (!g_vh_app) {
+		lwsl_err("Failed to create app vhost\n");
+		goto bail;
+	}
+
+	/* second app vhost: lws-login with a relative auth-server-url and no
+	 * auth-api-url, for the relative-authapi refusal scenario */
+	info.port		= g_port_app2;
+	info.vhost_name		= "app2";
+	info.pvo		= &pvo_login2;
+
+	if (!lws_create_vhost(context, &info)) {
+		lwsl_err("Failed to create second app vhost\n");
+		goto bail;
+	}
+
+	/* client vhost: no listener */
+	info.port		= CONTEXT_PORT_NO_LISTEN;
+	info.vhost_name		= "cli";
+	info.pprotocols		= pprotocols_cli;
+	info.mounts		= NULL;
+	info.pvo		= NULL;
+
+	g_vh_cli = lws_create_vhost(context, &info);
+	if (!g_vh_cli) {
+		lwsl_err("Failed to create client vhost\n");
+		goto bail;
+	}
+
+	/* kick off the scenario sequence */
+	step = 0;
+	lws_sul_schedule(context, 0, &sul_next, start_step, 1);
+
+	while (n >= 0 && !sequence_done)
+		n = lws_service(context, 0);
+
+bail:
+	lws_context_destroy(context);
+
+	lwsl_user("Completed: %s (tests=%d fail=%d)\n",
+		  result ? "FAIL" : "PASS", tests, fail);
+
+	return result;
+}

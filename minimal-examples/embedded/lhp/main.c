@@ -24,7 +24,8 @@ struct lws_context *cx;
 static lws_dlo_filesystem_t *fs_splash_html, *fs_update_html;
 static char did_splash, seen_operational, subsequent;
 static int carousel, boot_step = -1, lbs, update_pc, lupc = -1;
-static lws_sorted_usec_list_t sul_display_update;
+static lws_sorted_usec_list_t sul_display_update, sul_scan_redraw;
+static uint32_t scan_sig_rendered;
 static struct lws_plat_file_ops dlo_fops;
 static lws_display_render_state_t rs;
 static uint8_t flip;
@@ -81,17 +82,19 @@ jit_trust_query(struct lws_context *cx, const uint8_t *skid,
 	 * For this example, we look up SKIDs using a trust table that's
 	 * compiled in, synchronously.  Lws provides the necessary helper.
 	 *
-	 * DER will remain NULL if no match.
+	 * Only a return of 0 means it found a trusted CA and set der and
+	 * der_len, otherwise we tell the completion helper there is none.
 	 */
 
-	lws_tls_jit_trust_blob_queury_skid(jit_trust_blob,
-					   sizeof(jit_trust_blob), skid,
-					   skid_len, &der, &der_len);
+	if (lws_tls_jit_trust_blob_queury_skid(jit_trust_blob,
+					       sizeof(jit_trust_blob), skid,
+					       skid_len, &der, &der_len)) {
+		der = NULL;
+		der_len = 0;
+	}
 
-	if (der)
-		lwsl_info("%s: found len %d\n", __func__, (int)der_len);
-	else
-		lwsl_info("%s: not trusted\n", __func__);
+	lwsl_info("%s: %s (len %d)\n", __func__,
+		  der ? "found" : "not trusted", (int)der_len);
 
 	/* Once we have a result, pass it to the completion helper */
 
@@ -103,6 +106,7 @@ static int
 do_reboot(void)
 {
 	esp_restart();
+	return 0;
 }
 
 static int
@@ -225,6 +229,35 @@ start_frame(lws_sorted_usec_list_t *sul)
 	lws_ss_dump_extant(cx, 0);
 }
 
+/*
+ * Order-independent signature of the set of APs in the scan list, so we can
+ * tell when the splash's AP table is stale without redrawing on every scan
+ * (the averaged rssi jitters, so rssi and ordering are deliberately left out)
+ */
+
+static uint32_t
+scan_sig(void)
+{
+	uint32_t sig = 0;
+
+	if (!wnd)
+		return 0;
+
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&wnd->scan)) {
+		lws_wifi_sta_t *w = lws_container_of(d, lws_wifi_sta_t, list);
+		uint32_t h = 2166136261u;
+		int n;
+
+		for (n = 0; n < 6; n++)
+			h = (h ^ w->bssid[n]) * 16777619u;
+		h = (h ^ (uint8_t)w->ch) * 16777619u;
+
+		sig += h;
+	} lws_end_foreach_dll(d);
+
+	return sig;
+}
+
 static int
 display_splash(lws_display_state_t *lds)
 {
@@ -232,11 +265,16 @@ display_splash(lws_display_state_t *lds)
 #if defined(LWS_WITH_OTA)
 	uint64_t fw = 0;
 #endif
-	lws_dll2_t *d;
 
 	lwsl_err("%s: boot_step %d... fs_splash_html %p, choose splash.html %p\n", __func__, boot_step, fs_splash_html, lws_dlo_file_choose(cx, "splash.html"));
 
-	if (lbs == boot_step || did_splash || fs_splash_html)
+	/*
+	 * Redraw if the boot step moved on, or if the set of APs the splash
+	 * shows has changed since we last drew it
+	 */
+
+	if ((lbs == boot_step && scan_sig() == scan_sig_rendered) ||
+	    did_splash || fs_splash_html)
 		return 0;
 
 	if (boot_step < 0)
@@ -288,7 +326,7 @@ display_splash(lws_display_state_t *lds)
 			"%s<br>%s"
 			"</div>"
 			"<div class=\"c\">"
-			"<table><tr><td>RSSI</td><td>Ch</td><td>BSSID</td></tr>",
+			"<table><tr><td>RSSI</td><td>Ch</td><td>SSID</td></tr>",
 
 		(boot_step * 250) / 13,
 		(boot_step * 100) / 13,
@@ -297,20 +335,21 @@ display_splash(lws_display_state_t *lds)
 //				lds->disp->ic.wh_px[1].whole,
 		);
 
-	d = wnd->scan.tail;
-	while (d) {
+	/* the scan list is kept sorted strongest-first from the head */
+
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&wnd->scan)) {
 		lws_wifi_sta_t *w = lws_container_of(d, lws_wifi_sta_t, list);
 
 		fs_splash_html->len += lws_snprintf(p + fs_splash_html->len,
 						    4096 - fs_splash_html->len,
 				"<tr><td>%d</td><td>%d</td><td>%s</td></tr>",
 				rssi_averaged(w), w->ch, (const char *)&w[1]);
-		d = d->prev;
-	};
+	} lws_end_foreach_dll(d);
 
 	fs_splash_html->len += lws_snprintf(p + fs_splash_html->len, 4096 - fs_splash_html->len, "</table></div></body></html>");
 
 	lbs = boot_step;
+	scan_sig_rendered = scan_sig();
 
 	if (!lws_dlo_file_register(cx, fs_splash_html))
 		lwsl_err("registering splash failed\n");
@@ -375,6 +414,23 @@ display_completion_cb(lws_display_state_t *lds, int a)
 }
 
 
+/*
+ * A wifi scan completed while we are still on the splash: redraw it if the
+ * AP table changed.  Deferred via a sul so we run after the netdev has taken
+ * the results into its scan list, whatever order the smd participants are
+ * called in; while the display is busy with the previous refresh, the
+ * completion callback picks the redraw up instead.
+ */
+
+static void
+scan_redraw(lws_sorted_usec_list_t *sul)
+{
+	if (did_splash || strcmp(lds.current_url, "file://dlofs/splash.html"))
+		return;
+
+	display_splash(&lds);
+}
+
 static int
 smd_cb(void *opaque, lws_smd_class_t _class, lws_usec_t timestamp, void *buf,
        size_t len)
@@ -385,6 +441,14 @@ smd_cb(void *opaque, lws_smd_class_t _class, lws_usec_t timestamp, void *buf,
 				   &lws_pwmseq_linear_wipe);
 		flip++;
 	}
+
+	/* platform-private wifi event 1 is WIFI_EVENT_SCAN_DONE on esp32 */
+
+	if ((_class & LWSSMDCL_NETWORK) &&
+	    !lws_json_simple_strcmp(buf, len, "\"type\":", "priv") &&
+	    !lws_json_simple_strcmp(buf, len, "\"ev\":", "1"))
+		lws_sul_schedule(cx, 0, &sul_scan_redraw, scan_redraw,
+				 100 * LWS_US_PER_MS);
 
 	lwsl_hexdump_notice(buf, len);
 
@@ -524,7 +588,8 @@ app_main(void)
 
 
 spin:
-	vTaskDelay(10);
-	taskYIELD();
-	goto spin;
+	while (1) {
+		vTaskDelay(10);
+		taskYIELD();
+	}
 }

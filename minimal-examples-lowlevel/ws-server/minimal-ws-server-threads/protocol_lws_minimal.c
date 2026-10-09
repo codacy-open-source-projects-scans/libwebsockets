@@ -166,6 +166,14 @@ callback_minimal(struct lws *wsi, enum lws_callback_reasons reason,
 
 		pthread_mutex_init(&vhd->lock_ring, NULL);
 
+		/*
+		 * We are also instantiated on vhosts that have no pvo for
+		 * us (eg, Secure Streams' internal vhosts)... only our own
+		 * vhost passes the pvo chain in
+		 */
+		if (!in)
+			break;
+
 		/* recover the pointer to the globals struct */
 		pvo = lws_pvo_search(
 			(const struct lws_protocol_vhost_options *)in,
@@ -193,13 +201,24 @@ callback_minimal(struct lws *wsi, enum lws_callback_reasons reason,
 			if (pthread_create(&vhd->pthread_spam[n], NULL,
 					   thread_spam, vhd)) {
 				lwsl_err("thread creation failed\n");
-				r = 1;
+				vhd->finished = 1;
 				goto init_fail;
 			}
 		break;
 
-	case LWS_CALLBACK_PROTOCOL_DESTROY:
 init_fail:
+		vhd->finished = 1;
+		for (n = 0; n < (int)LWS_ARRAY_SIZE(vhd->pthread_spam); n++)
+			if (vhd->pthread_spam[n])
+				pthread_join(vhd->pthread_spam[n], &retval);
+
+		if (vhd->ring)
+			lws_ring_destroy(vhd->ring);
+
+		pthread_mutex_destroy(&vhd->lock_ring);
+		return 1;
+
+	case LWS_CALLBACK_PROTOCOL_DESTROY:
 		vhd->finished = 1;
 		for (n = 0; n < (int)LWS_ARRAY_SIZE(vhd->pthread_spam); n++)
 			if (vhd->pthread_spam[n])

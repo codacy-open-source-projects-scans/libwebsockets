@@ -25,7 +25,7 @@ static const struct lws_switches switches[] = {
 	[LWS_SW_HELP]		= { "--help",		"Show this help information" },
 };
 
-static int interrupted, bad = 1;
+static int bad = 1;
 static struct lws_context *context;
 
 /* 
@@ -45,16 +45,16 @@ smd_cb(void *opaque, lws_smd_class_t c, lws_usec_t ts, void *buf, size_t len)
 	if (!buf)
 		return 0;
 
-	if (!strstr((const char *)buf, "\"ext-ips\""))
+	if (!(char *)strstr((const char *)buf, "\"ext-ips\""))
 		return 0;
 
 	lwsl_user("Extip SMD: %s\n", (const char *)buf);
 
 	/* Check if we got at least one valid IP. */
-	if (strstr((const char *)buf, ",")) {
+	if ((char *)strstr((const char *)buf, ",")) {
 		bad = 0;
-		interrupted = 1; /* Got both! Exit immediately. */
-	} else if (strstr((const char *)buf, ".") || strstr((const char *)buf, ":\"")) {
+		lws_default_loop_exit(context); /* Got both! Exit immediately. */
+	} else if ((char *)strstr((const char *)buf, ".") || (char *)strstr((const char *)buf, ":\"")) {
 		bad = 0;
 	}
 
@@ -63,7 +63,7 @@ smd_cb(void *opaque, lws_smd_class_t c, lws_usec_t ts, void *buf, size_t len)
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 static lws_sorted_usec_list_t sul_timeout;
@@ -77,8 +77,7 @@ timeout_cb(lws_sorted_usec_list_t *sul)
 	} else {
 		lwsl_err("Failed to obtain any external IP!\n");
 	}
-	interrupted = 1;
-	lws_cancel_service(context);
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
@@ -90,8 +89,7 @@ int main(int argc, const char **argv)
 	
 	signal(SIGINT, sigint_handler);
 	
-	memset(&info, 0, sizeof info);
-	memset(&ops, 0, sizeof ops);
+	lws_context_info_defaults(&info, NULL);memset(&ops, 0, sizeof ops);
 
 	lws_cmdline_option_handle_builtin(argc, argv, &info);
 
@@ -159,8 +157,8 @@ int main(int argc, const char **argv)
 
 	lws_sul_schedule(context, 0, &sul_timeout, timeout_cb, 5 * LWS_USEC_PER_SEC);
 
-	while (!interrupted)
-		lws_service(context, 0);
+	while (lws_service(context, 0) >= 0)
+		;
 
 	lws_context_destroy(context);
 

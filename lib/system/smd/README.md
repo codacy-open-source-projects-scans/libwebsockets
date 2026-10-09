@@ -145,6 +145,7 @@ Class|Schema
 LWSSMDCL_INTERACTION|lws_button events
 LWSSMDCL_NETWORK|captive portal detection requests and results
 LWSSMDCL_SYSTEM_STATE|lws_system state progression
+LWSSMDCL_CERTS|requests to certificate management, eg, the ACME client
 
 ### User interaction Button events
 
@@ -179,6 +180,25 @@ up|The button has come up, useful for duration-based response
 click|The button activity resulted in a classification as a single-click
 longclick|The button activity resulted in a classification as a long-click
 doubleclick|The button activity resulted in a classification as a double-click
+
+### Force certificate reissue
+
+Class: `LWSSMDCL_CERTS`
+
+Asks the ACME client to reissue one certificate it manages, the one with that
+common name in that domain, on its next evaluation, however much validity is
+left, and to start that evaluation now.  The dnssec monitor issues it from the
+"Force reissue" button on each row of its TLS certificates table.
+
+Schema:
+
+```
+	{
+	  "acme":        "force-reissue",
+	  "domain":      "<domain>",
+	  "common-name": "<certificate common name>"
+	}
+```
 
 ### Routing Table Change
 

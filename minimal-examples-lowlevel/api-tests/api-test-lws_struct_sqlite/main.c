@@ -82,29 +82,26 @@ static const char *test_string =
 
 int main(int argc, const char **argv)
 {
-	int e = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	int e = 0;
 	struct lws_context_creation_info info;
 	struct lws_context *context;
 	struct lwsac *ac = NULL;
 	lws_dll2_owner_t resown;
 	teststruct_t ts, *pts;
-	const char *p;
 	sqlite3 *db;
 	(void)switches;
 
-	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
+	if (lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
 		lws_switches_print_help(argv[0], switches, LWS_ARRAY_SIZE(switches));
 		return 0;
 	}
 
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS API selftest: lws_struct SQLite\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 #if defined(LWS_WITH_NETWORK)
 	info.port = CONTEXT_PORT_NO_LISTEN;
 #endif

@@ -19,11 +19,13 @@
 
 enum {
 	LWS_SW_D,
+	LWS_SW_PORT,
 	LWS_SW_HELP,
 };
 
 static const struct lws_switches switches[] = {
 	[LWS_SW_D]	= { "-d",              "Debug logs (e.g. -d 15)" },
+	[LWS_SW_PORT]	= { "--port",          "Port to listen on (default 7681)" },
 	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
 };
 
@@ -72,7 +74,7 @@ struct vhd {
 	char finished;
 };
 
-static int interrupted;
+static struct lws_context *context;
 
 #if defined(WIN32)
 static void usleep(unsigned long l) { Sleep(l / 1000); }
@@ -180,6 +182,8 @@ callback_sse(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 	case LWS_CALLBACK_PROTOCOL_INIT:
 		vhd = lws_protocol_vh_priv_zalloc(lws_get_vhost(wsi),
 				lws_get_protocol(wsi), sizeof(struct vhd));
+		if (!vhd)
+			return 1;
 		vhd->context = lws_get_context(wsi);
 		vhd->protocol = lws_get_protocol(wsi);
 		vhd->vhost = lws_get_vhost(wsi);
@@ -197,13 +201,24 @@ callback_sse(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 			if (pthread_create(&vhd->pthread_spam[n], NULL,
 					   thread_spam, vhd)) {
 				lwsl_err("thread creation failed\n");
+				vhd->finished = 1;
 				goto init_fail;
 			}
 
 		return 0;
 
+init_fail:
+		vhd->finished = 1;
+		for (n = 0; n < (int)LWS_ARRAY_SIZE(vhd->pthread_spam); n++)
+			pthread_join(vhd->pthread_spam[n], &retval);
+
+		if (vhd->ring)
+			lws_ring_destroy(vhd->ring);
+
+		pthread_mutex_destroy(&vhd->lock_ring);
+		return 1;
+
 	case LWS_CALLBACK_PROTOCOL_DESTROY:
-		init_fail:
 		vhd->finished = 1;
 		for (n = 0; n < (int)LWS_ARRAY_SIZE(vhd->pthread_spam); n++)
 			pthread_join(vhd->pthread_spam[n], &retval);
@@ -344,21 +359,14 @@ static const struct lws_http_mount mount = {
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	struct lws_context *context;
 	const char *p;
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE
-			/* for LLL_ verbosity above NOTICE to be built into lws,
-			 * lws must have been configured and built with
-			 * -DCMAKE_BUILD_TYPE=DEBUG instead of =RELEASE */
-			/* | LLL_INFO */ /* | LLL_PARSER */ /* | LLL_HEADER */
-			/* | LLL_EXT */ /* | LLL_CLIENT */ /* | LLL_LATENCY */
-			/* | LLL_DEBUG */;
+	int n = 0;
 	(void)switches;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
@@ -369,14 +377,23 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal http Server-Side Events + ring | visit http://localhost:7681\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	/* a server: size the fds tables to the process limit */
+	info.fd_limit_per_thread = 0;
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.port = 7681;
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_PORT].sw))) {
+		int pt = atoi(p);
+
+		if (pt <= 0 || pt > 65535) {
+			lwsl_err("Port %d is outside valid 16-bit range\n", pt);
+			return 1;
+		}
+		info.port = pt;
+	}
 	info.protocols = protocols;
 	info.mounts = &mount;
 	info.options =
@@ -388,7 +405,7 @@ int main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

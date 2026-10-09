@@ -25,7 +25,7 @@ static const struct lws_switches switches[] = {
 extern const lws_ss_info_t ssi_client, ssi_server;
 
 static struct lws_context *context;
-int interrupted, tests_bad = 1, multipart;
+int tests_bad = 1, multipart;
 static const char * const default_ss_policy =
 	"{"
 	  "\"release\":"			"\"01234567\","
@@ -56,7 +56,7 @@ static const char * const default_ss_policy =
 		 * deployed in browsers.  We use the ISRG path because that
 		 * way we can skip the extra IdenTrust root cert.
 		 */
-			"{\"isrg_root_x1\": \""
+					"{\"isrg_root_x1\": \""
 	"MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw"
 	"TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh"
 	"cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4"
@@ -84,8 +84,22 @@ static const char * const default_ss_policy =
 	"jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc"
 	"oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq"
 	"4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA"
-	"mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d"
-	"emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc="
+	"mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57de"
+	"myPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc="
+	  "\"},\n"
+		"{\"isrg_root_x2\": \""
+	"MIICGzCCAaGgAwIBAgIQQdKd0XLq7qeAwSxs6S+HUjAKBggqhkjOPQQDAzBPMQsw"
+	"CQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJuZXQgU2VjdXJpdHkgUmVzZWFyY2gg"
+	"R3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBYMjAeFw0yMDA5MDQwMDAwMDBaFw00"
+	"MDA5MTcxNjAwMDBaME8xCzAJBgNVBAYTAlVTMSkwJwYDVQQKEyBJbnRlcm5ldCBT"
+	"ZWN1cml0eSBSZXNlYXJjaCBHcm91cDEVMBMGA1UEAxMMSVNSRyBSb290IFgyMHYw"
+	"EAYHKoZIzj0CAQYFK4EEACIDYgAEzZvVn4CDCuwJSvMWSj5cz3es3mcFDR0HttwW"
+	"+1qLFNvicWDEukWVEYmO6gbf9yoWHKS5xcUy4APgHoIYOIvXRdgKam7mAHf7AlF9"
+	"ItgKbppbd9/w+kHsOdx1ymgHDB/qo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0T"
+	"AQH/BAUwAwEB/zAdBgNVHQ4EFgQUfEKWrt5LSDv6kviejM9ti6lyN5UwCgYIKoZI"
+	"zj0EAwMDaAAwZQIwe3lORlCEwkSHRhtFcP9Ymd70/aTSVaYgLXTWNLxBo1BfASdW"
+	"tL4ndQavEi51mI38AjEAi/V3bNTIZargCyzuFJ0nN6T5U6VR5CmD1/iQMVtCnwr1"
+	"/q4AaOeMSQ+2b1tbFfLn"
 	  "\"},"
 		/*
 		 * a selfsigned cert for localhost for 100 years
@@ -184,7 +198,8 @@ static const char * const default_ss_policy =
 		"{"
 			"\"name\": \"le_via_isrg\","
 			"\"stack\": ["
-				"\"isrg_root_x1\""
+				"\"isrg_root_x1\","
+				"\"isrg_root_x2\""
 			"]"
 		"}"
 	  "],"
@@ -249,7 +264,7 @@ smd_cb(void *opaque, lws_smd_class_t c, lws_usec_t ts, void *buf, size_t len)
 			lwsl_err("%s: failed to create secure stream\n",
 				 __func__);
 			tests_bad = 1;
-			interrupted = 1;
+			lws_default_loop_exit(context);
 			lws_cancel_service(context);
 			return -1;
 		}
@@ -271,7 +286,7 @@ smd_cb(void *opaque, lws_smd_class_t c, lws_usec_t ts, void *buf, size_t len)
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
@@ -288,8 +303,7 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	lws_context_info_defaults(&info, NULL);lws_cmdline_option_handle_builtin(argc, argv, &info);
 
 	if (lws_cmdline_option(argc, argv, switches[LWS_SW_M].sw))
 		multipart = 1;
@@ -298,7 +312,7 @@ int main(int argc, const char **argv)
 
 	info.options			= LWS_SERVER_OPTION_EXPLICIT_VHOSTS |
 					  LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
-	info.fd_limit_per_thread	= 1 + 6 + 1;
+	info.fd_limit_per_thread	= 0; /* server: size to the process fd limit */
 	info.pss_policies_json		= default_ss_policy;
 	info.port			= CONTEXT_PORT_NO_LISTEN;
 	info.early_smd_cb		= smd_cb;
@@ -312,7 +326,7 @@ int main(int argc, const char **argv)
 
 	/* the event loop */
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	tests_bad = 0;

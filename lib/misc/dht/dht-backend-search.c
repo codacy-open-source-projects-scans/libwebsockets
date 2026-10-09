@@ -29,15 +29,52 @@
 struct search *
 find_search(struct lws_dht_ctx *ctx, unsigned short tid, int af)
 {
-	struct search *sr = ctx->searches;
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&ctx->searches)) {
+		struct search *sr = lws_container_of(d, struct search, list);
 
-	while (sr) {
 		if (sr->tid == tid && sr->af == af)
 			return sr;
-		sr = sr->next;
-	}
+	} lws_end_foreach_dll(d);
 
 	return NULL;
+}
+
+/*
+ * Did we actually send a request to this address as part of this search?
+ *
+ * A search tid is only 16 bits and find_search() matches on (tid, af) alone,
+ * so without this an off-path peer that guesses or observes a tid can inject
+ * nodes, a token and search *results* into somebody else's lookup, and end it
+ * early.  The search node list is our pending-request table: it holds the
+ * addresses we sent get_peers / announce_peer to, along with the time, so we
+ * require the reply to come from one of those with a request outstanding.
+ */
+
+int
+search_awaiting_reply_from(struct lws_dht_ctx *ctx, struct search *sr,
+			   const struct sockaddr *sa)
+{
+	int i;
+
+	for (i = 0; i < sr->numnodes; i++) {
+		struct search_node *n = &sr->nodes[i];
+
+		/*
+		 * Accept either a node with a request outstanding, or one that
+		 * already passed this test and replied, so that a late
+		 * duplicate or a second reply datagram from a node we really
+		 * did query still counts.  ->replied is only ever set from
+		 * this path, and the reuse path in lws_dht_search() clears it.
+		 */
+		if (!n->replied && (!n->request_time || n->request_time <
+			    ctx->now - LWS_DHT_PING_TIMEOUT_SECS))
+			continue;
+
+		if (dht_sa_same_peer((const struct sockaddr *)&n->ss, sa))
+			return 1;
+	}
+
+	return 0;
 }
 
 /*
@@ -51,6 +88,7 @@ insert_search_node(struct lws_dht_ctx *ctx, lws_dht_hash_t *id,
 		struct search *sr, int replied,
 		const uint8_t *token, size_t token_len)
 {
+	lws_dht_hash_t *nid;
 	struct search_node *n;
 	int i, j;
 
@@ -68,10 +106,27 @@ insert_search_node(struct lws_dht_ctx *ctx, lws_dht_hash_t *id,
 			break;
 	}
 
-	if (i == SEARCH_NODES)
+	if (i >= SEARCH_NODES)
 		return 0;
 
-	if (sr->numnodes < SEARCH_NODES)
+	/*
+	 * Take the copy of the id before disturbing the list, so a failure here
+	 * cannot leave a counted entry behind with a NULL ->id.
+	 */
+	nid = lws_dht_hash_dup(id);
+	if (!nid)
+		return 0;
+
+	/*
+	 * ->id is a heap object here (it is inline in the original dht.c).  If
+	 * the list is already full, the shift below drops the last entry off
+	 * the end by overwriting it, so destroy its id first or it is leaked
+	 * unrecoverably (nothing walks past ->numnodes).
+	 */
+	if (sr->numnodes >= SEARCH_NODES) {
+		lws_dht_hash_destroy(&sr->nodes[SEARCH_NODES - 1].id);
+		sr->numnodes = SEARCH_NODES;
+	} else
 		sr->numnodes++;
 
 	for (j = sr->numnodes - 1; j > i; j--) {
@@ -81,9 +136,7 @@ insert_search_node(struct lws_dht_ctx *ctx, lws_dht_hash_t *id,
 	n = &sr->nodes[i];
 
 	memset(n, 0, sizeof(struct search_node));
-	n->id = lws_dht_hash_dup(id);
-	if (!n->id)
-		return 0;
+	n->id = nid;
 
 found:
 	memcpy(&n->ss, sa, (size_t)salen);
@@ -91,7 +144,7 @@ found:
 
 	if (replied) {
 		n->replied = 1;
-		n->reply_time = ctx->now.tv_sec;
+		n->reply_time = ctx->now;
 		n->request_time = 0;
 		n->pinged = 0;
 	}
@@ -110,25 +163,18 @@ found:
 void
 expire_searches(struct lws_dht_ctx *ctx)
 {
-	struct search *sr = ctx->searches, *previous = NULL;
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+				   lws_dll2_get_head(&ctx->searches)) {
+		struct search *sr = lws_container_of(d, struct search, list);
 
-	while (sr) {
-		struct search *next = sr->next;
-		if (sr->step_time < ctx->now.tv_sec - DHT_SEARCH_EXPIRE_TIME) {
-			if (previous)
-				previous->next = next;
-			else
-				ctx->searches = next;
+		if (sr->step_time < ctx->now - DHT_SEARCH_EXPIRE_TIME) {
+			lws_dll2_remove(d);
 			lws_dht_hash_destroy(&sr->id);
 			for (int i = 0; i < sr->numnodes; i++)
 				lws_dht_hash_destroy(&sr->nodes[i].id);
 			lws_free(sr);
-			ctx->numsearches--;
-		} else
-			previous = sr;
-
-		sr = next;
-	}
+		}
+	} lws_end_foreach_dll_safe(d, d1);
 }
 
 /* This must always return 0 or 1, never -1, not even on failure (see below). */
@@ -142,21 +188,21 @@ search_send_get_peers(struct lws_dht_ctx *ctx, struct search *sr, struct search_
 		int i;
 		for (i = 0; i < sr->numnodes; i++) {
 			if (sr->nodes[i].pinged < LWS_DHT_MAX_PING_FAILURES && !sr->nodes[i].replied &&
-					sr->nodes[i].request_time < ctx->now.tv_sec - LWS_DHT_PING_TIMEOUT_SECS)
+					sr->nodes[i].request_time < ctx->now - LWS_DHT_PING_TIMEOUT_SECS)
 				n = &sr->nodes[i];
 		}
 	}
 
 	if (!n || n->pinged >= LWS_DHT_MAX_PING_FAILURES || n->replied ||
-			n->request_time >= ctx->now.tv_sec - LWS_DHT_PING_TIMEOUT_SECS)
+			n->request_time >= ctx->now - LWS_DHT_PING_TIMEOUT_SECS)
 		return 0;
 
 	lwsl_dht_info("Sending get_peers.\n");
 	make_tid(tid, "gp", sr->tid);
 	send_get_peers(ctx, (struct sockaddr*)&n->ss, n->sslen, tid, 4, sr->id, -1,
-			n->reply_time >= ctx->now.tv_sec - LWS_DHT_PING_TIMEOUT_SECS);
+			n->reply_time >= ctx->now - LWS_DHT_PING_TIMEOUT_SECS);
 	n->pinged++;
-	n->request_time = ctx->now.tv_sec;
+	n->request_time = ctx->now;
 
 	/* If the node happens to be in our main routing table, mark it
 	   as pinged. */
@@ -221,9 +267,9 @@ search_step(struct lws_dht_ctx *ctx, struct search *sr, lws_dht_callback_t *call
 						sizeof(struct sockaddr_storage),
 						tid, 4, sr->id, sr->port,
 						n->token, n->token_len,
-						n->reply_time >= ctx->now.tv_sec - LWS_DHT_PING_TIMEOUT_SECS);
+						n->reply_time >= ctx->now - LWS_DHT_PING_TIMEOUT_SECS);
 				n->pinged++;
-				n->request_time = ctx->now.tv_sec;
+				n->request_time = ctx->now;
 
 				node = find_node(ctx, n->id, n->ss.ss_family);
 				if (node) mark_as_pinged(ctx, node, NULL);
@@ -233,11 +279,11 @@ search_step(struct lws_dht_ctx *ctx, struct search *sr, lws_dht_callback_t *call
 		if (all_acked)
 			goto done;
 
-		sr->step_time = ctx->now.tv_sec;
+		sr->step_time = ctx->now;
 		return;
 	}
 
-	if (sr->step_time + LWS_DHT_PING_TIMEOUT_SECS >= ctx->now.tv_sec)
+	if (sr->step_time + LWS_DHT_PING_TIMEOUT_SECS >= ctx->now)
 		return;
 
 	j = 0;
@@ -246,61 +292,69 @@ search_step(struct lws_dht_ctx *ctx, struct search *sr, lws_dht_callback_t *call
 		if (j >= LWS_DHT_MAX_PING_FAILURES)
 			break;
 	}
-	sr->step_time = ctx->now.tv_sec;
+	sr->step_time = ctx->now;
 	return;
 
 done:
 	sr->done = 1;
+	/*
+	 * Update ->step_time *before* dispatching: the app may start another
+	 * search from its SEARCH_DONE handler, and new_search() then sees this
+	 * one as the oldest done search and may free or recycle it.  Writing
+	 * ->step_time after the callback returned would be a write into freed
+	 * or reused memory.
+	 */
+	sr->step_time = ctx->now;
+
 	if (callback)
 		(*callback)(closure, sr->af == AF_INET ?
 				LWS_DHT_EVENT_SEARCH_DONE : LWS_DHT_EVENT_SEARCH_DONE6,
 				sr->id, NULL, 0, NULL, 0);
-
-	sr->step_time = ctx->now.tv_sec;
 }
 
 static struct search *
 new_search(struct lws_dht_ctx *ctx)
 {
-	struct search *sr, *oldest = NULL;
+	struct search *oldest = NULL;
 
 	/* Find the oldest done search */
-	sr = ctx->searches;
-	while (sr) {
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&ctx->searches)) {
+		struct search *sr = lws_container_of(d, struct search, list);
+
 		if (sr->done &&
 		    (oldest == NULL || oldest->step_time > sr->step_time))
 			oldest = sr;
-		sr = sr->next;
-	}
+	} lws_end_foreach_dll(d);
 
-	/* The oldest slot is expired. */
-	if (oldest && oldest->step_time < ctx->now.tv_sec - DHT_SEARCH_EXPIRE_TIME) {
+	/* The oldest slot is expired, drop it and allocate a fresh one. */
+	if (oldest && oldest->step_time < ctx->now - DHT_SEARCH_EXPIRE_TIME) {
+		lws_dll2_remove(&oldest->list);
 		lws_dht_hash_destroy(&oldest->id);
 		for (int i = 0; i < oldest->numnodes; i++)
 			lws_dht_hash_destroy(&oldest->nodes[i].id);
 		lws_free(oldest);
-		ctx->numsearches--;
-
-		return NULL; /* Indicate that the slot was freed, caller should allocate new */
+		oldest = NULL;
 	}
 
 	/* Allocate a new slot. */
-	if (ctx->numsearches < DHT_MAX_SEARCHES) {
-		sr = lws_zalloc(sizeof(struct search), __func__);
+	if (lws_dll2_count(&ctx->searches) < DHT_MAX_SEARCHES) {
+		struct search *sr = lws_zalloc(sizeof(struct search), __func__);
+
 		if (sr != NULL) {
-			sr->next = ctx->searches;
-			ctx->searches = sr;
-			ctx->numsearches++;
+			lws_dll2_add_head(&sr->list, &ctx->searches);
 			return sr;
 		}
 	}
 
 	/* Oh, well, never mind.  Re-use the oldest slot. */
 	if (oldest) {
+		lws_dll2_t list = oldest->list;
+
 		lws_dht_hash_destroy(&oldest->id);
 		for (int i = 0; i < oldest->numnodes; i++)
 			lws_dht_hash_destroy(&oldest->nodes[i].id);
-		memset(oldest, 0, sizeof(struct search)); // Clear old data
+		memset(oldest, 0, sizeof(*oldest)); /* Clear old data */
+		oldest->list = list; /* ... but stay on the searches list */
 	}
 	return oldest;
 }
@@ -309,17 +363,15 @@ new_search(struct lws_dht_ctx *ctx)
 static void
 insert_search_bucket(struct lws_dht_ctx *ctx, struct bucket *b, struct search *sr)
 {
-	struct node *n;
-
 	if (!b)
 		return;
 
-	n = b->nodes;
-	while (n) {
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&b->nodes)) {
+		struct node *n = lws_container_of(d, struct node, list);
+
 		insert_search_node(ctx, n->id, (struct sockaddr*)&n->ss, n->sslen,
 				sr, 0, NULL, 0);
-		n = n->next;
-	}
+	} lws_end_foreach_dll(d);
 }
 
 /*
@@ -396,12 +448,15 @@ lws_dht_search(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id, int port, int 
 		}
 	}
 
-	sr = ctx->searches;
-	while (sr) {
-		if (sr->af == af && id_cmp(sr->id, id) == 0)
+	sr = NULL;
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&ctx->searches)) {
+		struct search *sr1 = lws_container_of(d, struct search, list);
+
+		if (sr1->af == af && id_cmp(sr1->id, id) == 0) {
+			sr = sr1;
 			break;
-		sr = sr->next;
-	}
+		}
+	} lws_end_foreach_dll(d);
 
 	if (sr) {
 		/*
@@ -410,20 +465,20 @@ lws_dht_search(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id, int port, int 
 		 */
 		int i;
 		sr->done = 0;
-again:
-		for (i = 0; i < sr->numnodes; i++) {
-			struct search_node *n;
+		i = 0;
+		while (i < sr->numnodes) {
+			struct search_node *n = &sr->nodes[i];
 
-			n = &sr->nodes[i];
 			/* Discard any doubtful nodes. */
-			if (n->pinged >= LWS_DHT_MAX_PING_FAILURES || n->reply_time < ctx->now.tv_sec - LWS_DHT_NODE_EXPIRE_SECS) {
+			if (n->pinged >= LWS_DHT_MAX_PING_FAILURES || n->reply_time < ctx->now - LWS_DHT_NODE_EXPIRE_SECS) {
 				flush_search_node(n, sr);
-				goto again;
+				continue;
 			}
 			n->pinged	= 0;
 			n->token_len	= 0;
 			n->replied	= 0;
 			n->acked	= 0;
+			i++;
 		}
 	} else {
 		sr = new_search(ctx);
@@ -433,27 +488,16 @@ again:
 		}
 		sr->af		= af;
 		sr->tid		= ctx->search_id++;
-		sr->step_time	= 0;
+		sr->step_time	= ctx->now;
 		sr->id		= lws_dht_hash_dup(id);
 
 		if (!sr->id) {
 			/*
-			 * If we fail to dup the ID, we should free the search struct
-			 * and decrement numsearches if it was incremented.
-			 * For now, just return NULL and let the caller handle it.
-			 * This is a memory allocation failure, so returning -1 is appropriate.
+			 * If we fail to dup the ID, free the search struct and
+			 * take it back off the list again.
 			 */
-			if (sr == ctx->searches)
-				ctx->searches = sr->next;
-			else {
-				struct search *temp_sr = ctx->searches;
-				while (temp_sr && temp_sr->next != sr)
-					temp_sr = temp_sr->next;
-				if (temp_sr)
-					temp_sr->next = sr->next;
-			}
+			lws_dll2_remove(&sr->list);
 			lws_free(sr);
-			ctx->numsearches--;
 			errno = ENOMEM;
 			return -1;
 		}
@@ -466,9 +510,11 @@ again:
 	insert_search_bucket(ctx, b, sr);
 
 	if (sr->numnodes < SEARCH_NODES) {
-		struct bucket *p = previous_bucket(ctx, b);
-		if (b->next)
-			insert_search_bucket(ctx, b->next, sr);
+		struct bucket *p = previous_bucket(b);
+		struct bucket *nb = bucket_next(b);
+
+		if (nb)
+			insert_search_bucket(ctx, nb, sr);
 		if (p)
 			insert_search_bucket(ctx, p, sr);
 	}
@@ -476,6 +522,6 @@ again:
 		insert_search_bucket(ctx, find_bucket(ctx, ctx->myid, af), sr);
 
 	search_step(ctx, sr, callback, closure);
-	ctx->search_time = ctx->now.tv_sec;
+	ctx->search_time = ctx->now;
 	return 1;
 }

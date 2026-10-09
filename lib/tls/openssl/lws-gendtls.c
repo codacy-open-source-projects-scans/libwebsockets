@@ -27,18 +27,43 @@
 #include "private-lib-core.h"
 #include "private-lib-tls-openssl.h"
 
+/* most ciphertext we hold in the read memory BIO waiting for SSL_read() */
+#define LWS_OPENSSL_GENDTLS_RX_LIMIT	(64 * 1024)
+
 static void
 ssl_info_cb(const SSL *ssl, int where, int ret)
 {
+	/*
+	 * Everything here is driven by an unauthenticated peer, so it must not
+	 * be able to produce err- or notice-level log traffic on demand.
+	 */
 	if (where & SSL_CB_ALERT)
-		lwsl_notice("SSL_CB_ALERT: %s: %s: %s\n",
-			    where & SSL_CB_READ ? "read" : "write",
-			    SSL_alert_type_string_long(ret),
-			    SSL_alert_desc_string_long(ret));
+		lwsl_info("SSL_CB_ALERT: %s: %s: %s\n",
+			  where & SSL_CB_READ ? "read" : "write",
+			  SSL_alert_type_string_long(ret),
+			  SSL_alert_desc_string_long(ret));
 	else if (where & SSL_CB_LOOP)
 		lwsl_debug("SSL_CB_LOOP: %s\n", SSL_state_string_long(ssl));
 	else if (where & SSL_CB_HANDSHAKE_DONE)
-		lwsl_notice("SSL_CB_HANDSHAKE_DONE: %s\n", SSL_state_string_long(ssl));
+		lwsl_info("SSL_CB_HANDSHAKE_DONE: %s\n",
+			  SSL_state_string_long(ssl));
+}
+
+static int
+lws_gendtls_verify_cb(int preverify_ok, X509_STORE_CTX *x509_ctx)
+{
+	/*
+	 * RFC 5763: a DTLS-SRTP peer certificate is self-signed by design, the
+	 * trust anchor is the a=fingerprint from the signalling channel which
+	 * the caller compares against the peer certificate once the handshake
+	 * completes.  So we deliberately accept any chain here; the point of
+	 * SSL_VERIFY_PEER is only to make the server ask for, and keep, a
+	 * certificate for the caller to fingerprint.
+	 */
+	(void)preverify_ok;
+	(void)x509_ctx;
+
+	return 1;
 }
 
 int
@@ -47,12 +72,14 @@ lws_gendtls_create(struct lws_gendtls_ctx *ctx,
 {
 	enum lws_gendtls_conn_mode mode = info->mode;
 	unsigned int mtu = info->mtu ? info->mtu : 1400;
-	unsigned int timeout_ms = info->timeout_ms ? info->timeout_ms : 1000;
 	SSL_CTX *ssl_ctx;
 	BIO *rbio, *wbio;
 
-	(void)timeout_ms;
+	memset(ctx, 0, sizeof(*ctx));
 
+	ctx->timeout_ms = info->timeout_ms ? info->timeout_ms :
+					     LWS_GENDTLS_TIMEOUT_DEFAULT_MS;
+	ctx->created_us = lws_now_usecs();
 
 	/* Create DTLS context */
 	ssl_ctx = SSL_CTX_new(mode == LWS_GENDTLS_MODE_SERVER ?
@@ -61,6 +88,21 @@ lws_gendtls_create(struct lws_gendtls_ctx *ctx,
 		lwsl_err("%s: SSL_CTX_new failed\n", __func__);
 		return -1;
 	}
+
+	/*
+	 * RFC 8827 6: DTLS 1.2 or later only.  DTLS 1.0 drags in the TLS
+	 * 1.0-era CBC / SHA1 record layer and is a downgrade target.
+	 */
+	SSL_CTX_set_min_proto_version(ssl_ctx, DTLS1_2_VERSION);
+
+	if (mode == LWS_GENDTLS_MODE_SERVER)
+		/*
+		 * As the DTLS server we must send a CertificateRequest, else
+		 * the peer sends no certificate and there is nothing for the
+		 * caller's a=fingerprint check to bind the media to.
+		 */
+		SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER,
+				   lws_gendtls_verify_cb);
 
 	/* We need to set the read ahead for DTLS to work with BIO pairs/mem */
 	SSL_CTX_set_read_ahead(ssl_ctx, 1);
@@ -80,9 +122,20 @@ lws_gendtls_create(struct lws_gendtls_ctx *ctx,
 		return -1;
 	}
 
-	SSL_set_options((SSL *)ctx->ssl, SSL_OP_NO_QUERY_MTU);
+	/*
+	 * RFC 8827 6.5 forbids renegotiation for WebRTC, and the caller's
+	 * fingerprint check is a one-shot latch, so a renegotiation presenting
+	 * a different certificate would never be rechecked.  It is also a cheap
+	 * asymmetric CPU amplifier (one small datagram in, a signature and a
+	 * certificate flight out).
+	 */
+	SSL_set_options((SSL *)ctx->ssl, SSL_OP_NO_QUERY_MTU
+#if defined(SSL_OP_NO_RENEGOTIATION)
+					 | SSL_OP_NO_RENEGOTIATION
+#endif
+			);
 	DTLS_set_link_mtu((SSL *)ctx->ssl, (long)mtu);
-	lwsl_notice("%s: DTLS MTU set to %u (OP_NO_QUERY_MTU set)\n", __func__, mtu);
+	lwsl_info("%s: DTLS MTU set to %u (OP_NO_QUERY_MTU set)\n", __func__, mtu);
 
 	/* Create memory BIOs for input/output */
 	rbio = BIO_new(BIO_s_mem());
@@ -200,10 +253,72 @@ lws_gendtls_put_rx(struct lws_gendtls_ctx *ctx, const uint8_t *in, size_t len)
 {
 	SSL *ssl = (SSL *)ctx->ssl;
 	BIO *rbio = SSL_get_rbio(ssl);
+	size_t pending;
 
-	int n = BIO_write(rbio, in, (int)len);
-	if (n <= 0)
+	/*
+	 * Once the session is over, either because we read the peer's
+	 * close_notify or because it failed, SSL_read() returns at once
+	 * without looking at the rbio.  Anything written there now would stay
+	 * there for as long as the ctx lives, so refuse it.
+	 */
+	if (ctx->failed || (SSL_get_shutdown(ssl) & SSL_RECEIVED_SHUTDOWN))
 		return -1;
+
+	/*
+	 * lws_gendtls_get_rx() drains the rbio as it goes, so normally it
+	 * holds one datagram.  Bound it anyway, so however the caller drives
+	 * us, what the peer sends cannot pile up here: a datagram that does not
+	 * fit is dropped, as the network might have.
+	 */
+	pending = (size_t)BIO_ctrl_pending(rbio);
+	if (pending > LWS_OPENSSL_GENDTLS_RX_LIMIT ||
+	    len > LWS_OPENSSL_GENDTLS_RX_LIMIT - pending)
+		return -1;
+
+	if (BIO_write(rbio, in, (int)len) != (int)len)
+		return -1;
+
+	return 0;
+}
+
+/*
+ * Both directions call this before they touch the SSL object.
+ *
+ * DTLS handshake flights are retransmitted by our own timer, so if nothing
+ * calls DTLSv1_handle_timeout() a lost ServerHello / Certificate flight is
+ * never resent.  OpenSSL keeps the deadline and the exponential backoff
+ * itself and returns 0 if it has not expired, so it is safe to poll here; the
+ * retransmitted flight lands in the wbio the caller is about to drain.
+ *
+ * It also enforces info->timeout_ms as the overall handshake deadline, so an
+ * abandoned handshake becomes visible to the caller as an error rather than
+ * sitting there until the caller's own lifetime ends.
+ *
+ * Returns 0 to continue, or -1 if the handshake must be abandoned, or the
+ * session already ended (ctx->failed).
+ */
+
+static int
+lws_gendtls_check_timeout(struct lws_gendtls_ctx *ctx)
+{
+	SSL *ssl = (SSL *)ctx->ssl;
+
+	if (ctx->failed)
+		return -1;
+
+	if (SSL_is_init_finished(ssl))
+		return 0;
+
+	if ((lws_usec_t)(lws_now_usecs() - ctx->created_us) >
+				(lws_usec_t)ctx->timeout_ms * LWS_US_PER_MS) {
+		lwsl_info("%s: DTLS handshake incomplete after %ums\n",
+			  __func__, ctx->timeout_ms);
+		ctx->failed = 1;
+
+		return -1;
+	}
+
+	(void)DTLSv1_handle_timeout(ssl);
 
 	return 0;
 }
@@ -214,6 +329,9 @@ lws_gendtls_get_rx(struct lws_gendtls_ctx *ctx, uint8_t *out, size_t max_len)
 	SSL *ssl = (SSL *)ctx->ssl;
 	int n;
 
+	if (lws_gendtls_check_timeout(ctx))
+		return -1;
+
 	if (max_len > INT_MAX)
 		max_len = INT_MAX;
 
@@ -222,7 +340,20 @@ lws_gendtls_get_rx(struct lws_gendtls_ctx *ctx, uint8_t *out, size_t max_len)
 		int err = SSL_get_error(ssl, n);
 		if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
 			return 0; /* No data available yet */
-		lwsl_notice("%s: SSL_read error %d (%s)\n", __func__, err, ERR_error_string(LWS_TLS_ERR_CAST(ERR_get_error()), NULL));
+		/*
+		 * Peer-driven: a garbage record or an alert must not be able to
+		 * generate notice-level log traffic on demand.
+		 */
+		lwsl_info("%s: SSL_read error %d (%s)\n", __func__, err,
+			  ERR_error_string(LWS_TLS_ERR_CAST(ERR_get_error()),
+					   NULL));
+		/*
+		 * SSL_ERROR_ZERO_RETURN is the peer's close_notify, the rest
+		 * are fatal: either way the session is over, and stays over
+		 * for every later call in both directions.
+		 */
+		ctx->failed = 1;
+
 		return -1;
 	}
 
@@ -259,6 +390,9 @@ lws_gendtls_get_tx(struct lws_gendtls_ctx *ctx, uint8_t *out, size_t max_len)
 
 	uint8_t *p;
 	long avail;
+
+	if (lws_gendtls_check_timeout(ctx))
+		return -1;
 
 	/* Check if there is enough for a DTLS record header */
 	avail = BIO_get_mem_data(wbio, &p);

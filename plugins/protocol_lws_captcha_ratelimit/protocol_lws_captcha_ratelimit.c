@@ -51,11 +51,11 @@ ratelimit_verify(struct lws *wsi, const void *in, size_t len)
 {
 	const struct lws_protocols *pt = lws_vhost_name_to_protocol(lws_get_vhost(wsi), "lws-login");
 
-	/* If the lws-login plugin confirms upstream auth via API, allow bypass */
-	if (pt && pt->callback(wsi, LWS_CALLBACK_USER + 1, NULL, NULL, 0) == 0) {
-		lwsl_info("%s: ratelimit bypass via lws-login API detected, allowing immediate pass\n", __func__);
+	(void)in;
+	(void)len;
+
+	if (pt && !pt->callback(wsi, LWS_CALLBACK_HTTP_INTERCEPTOR_CHECK, NULL, (void *)pt, 0))
 		return LWS_INTERCEPTOR_RET_PASS;
-	}
 
 	return LWS_INTERCEPTOR_RET_DELAYED;
 }

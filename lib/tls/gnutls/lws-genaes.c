@@ -45,6 +45,7 @@ lws_genaes_create(struct lws_genaes_ctx *ctx, enum enum_aes_operation op,
 
 	switch (mode) {
 	case LWS_GAESM_CBC:
+	case LWS_GAESM_ECB:
 		switch (key.size) {
 		case 16: alg = GNUTLS_CIPHER_AES_128_CBC; break;
 		case 24: alg = GNUTLS_CIPHER_AES_192_CBC; break;
@@ -53,6 +54,13 @@ lws_genaes_create(struct lws_genaes_ctx *ctx, enum enum_aes_operation op,
 		break;
 	case LWS_GAESM_CFB8:
 		if (key.size == 16) alg = GNUTLS_CIPHER_AES_128_CFB8;
+		break;
+	case LWS_GAESM_CTR:
+		switch (key.size) {
+		case 16: alg = GNUTLS_CIPHER_AES_128_CBC; break;
+		case 24: alg = GNUTLS_CIPHER_AES_192_CBC; break;
+		case 32: alg = GNUTLS_CIPHER_AES_256_CBC; break;
+		}
 		break;
 	case LWS_GAESM_GCM:
 		switch (key.size) {
@@ -76,8 +84,17 @@ lws_genaes_create(struct lws_genaes_ctx *ctx, enum enum_aes_operation op,
 	if (alg == GNUTLS_CIPHER_UNKNOWN)
 		return 1;
 
-	if (gnutls_cipher_init(&ctx->ctx, alg, &key, NULL) < 0)
-		return 1;
+	if (mode == LWS_GAESM_ECB || mode == LWS_GAESM_CBC) {
+		uint8_t iv[16] = {0};
+		gnutls_datum_t giv;
+		giv.data = iv;
+		giv.size = 16;
+		if (gnutls_cipher_init(&ctx->ctx, alg, &key, &giv) < 0)
+			return 1;
+	} else {
+		if (gnutls_cipher_init(&ctx->ctx, alg, &key, NULL) < 0)
+			return 1;
+	}
 
 	return 0;
 }
@@ -172,8 +189,69 @@ lws_genaes_crypt(struct lws_genaes_ctx *ctx, const uint8_t *in, size_t len,
 		 uint8_t *stream_block_16, size_t *nc_or_iv_off, int taglen)
 {
 	int n;
+	(void)n;
+
+	if (ctx->mode == LWS_GAESM_CTR) {
+		uint8_t counter[16];
+		uint8_t keystream[16];
+		size_t offset = 0;
+
+		if (!iv_or_nonce_ctr_or_data_unit_16) {
+			lwsl_err("%s: CTR mode requires counter IV\n", __func__);
+			return -1;
+		}
+
+		memcpy(counter, iv_or_nonce_ctr_or_data_unit_16, 16);
+
+		while (offset < len) {
+			size_t block_len = len - offset;
+			if (block_len > 16)
+				block_len = 16;
+
+			/* Reset CBC IV to zero for single block encryption (ECB mode emulation) */
+			uint8_t zero_iv[16] = {0};
+			gnutls_cipher_set_iv(ctx->ctx, zero_iv, 16);
+
+			/* Encrypt the counter block */
+			if (gnutls_cipher_encrypt2(ctx->ctx, counter, 16, keystream, 16) < 0) {
+				lwsl_err("%s: CTR block encryption failed\n", __func__);
+				return -1;
+			}
+
+			/* XOR with input */
+			for (size_t i = 0; i < block_len; i++) {
+				out[offset + i] = in[offset + i] ^ keystream[i];
+			}
+
+			/* Increment counter (128-bit big-endian) */
+			for (int i = 15; i >= 0; i--) {
+				counter[i]++;
+				if (counter[i] != 0)
+					break;
+			}
+
+			offset += block_len;
+		}
+
+		/* Save updated counter back to IV buffer */
+		memcpy(iv_or_nonce_ctr_or_data_unit_16, counter, 16);
+		return 0;
+	}
+
+	if (ctx->mode == LWS_GAESM_CBC || ctx->mode == LWS_GAESM_ECB) {
+		if (!(ctx->op == LWS_GAESO_ENC && ctx->padding == LWS_GAESP_WITH_PADDING)) {
+			if (len % 16) {
+				lwsl_err("%s: input length %zu not a multiple of block size\n", __func__, len);
+				return -1;
+			}
+		}
+	}
 
 	if (ctx->mode == LWS_GAESM_KW) {
+		if (len < 16 || len % 8) {
+			lwsl_err("%s: KW len %zu invalid\n", __func__, len);
+			return -1;
+		}
 		n = lws_genaes_rfc3394_wrap(ctx->op == LWS_GAESO_ENC,
 				(ctx->op == LWS_GAESO_ENC ? (int)len * 8 :
 						((int)len - 8) * 8), ctx->k->buf,
@@ -182,7 +260,31 @@ lws_genaes_crypt(struct lws_genaes_ctx *ctx, const uint8_t *in, size_t len,
 		return n;
 	}
 
-	if (iv_or_nonce_ctr_or_data_unit_16) {
+	if (ctx->mode == LWS_GAESM_GCM && ctx->op == LWS_GAESO_DEC &&
+	    stream_block_16 && taglen > 0) {
+		/*
+		 * On decrypt, stream_block_16 is the *expected* tag from the
+		 * peer... keep it, lws_genaes_destroy()'s own tag argument is
+		 * an out buffer and must not be what we compare against
+		 */
+
+		/* same 4..16 bound as the mbedtls / openssl backends (C-362):
+		 * a 0-3 byte GCM tag is not authentication */
+
+		if (taglen < 4 || (size_t)taglen > sizeof(ctx->tag)) {
+			lwsl_err("%s: bad taglen %d\n", __func__, taglen);
+
+			return -1;
+		}
+
+		memcpy(ctx->tag, stream_block_16, (size_t)taglen);
+		ctx->taglen = taglen;
+	}
+
+	if (ctx->mode == LWS_GAESM_ECB) {
+		uint8_t zero_iv[16] = {0};
+		gnutls_cipher_set_iv(ctx->ctx, zero_iv, 16);
+	} else if (iv_or_nonce_ctr_or_data_unit_16) {
 		if (ctx->mode != LWS_GAESM_GCM || !ctx->gnutls_gcm_initialized) {
 			size_t iv_len = (nc_or_iv_off && *nc_or_iv_off) ? *nc_or_iv_off : 16;
 			gnutls_cipher_set_iv(ctx->ctx, iv_or_nonce_ctr_or_data_unit_16, iv_len);
@@ -213,7 +315,7 @@ lws_genaes_crypt(struct lws_genaes_ctx *ctx, const uint8_t *in, size_t len,
 				if (gnutls_cipher_encrypt2(ctx->ctx, in + in_pos, blocks, out + out_pos, blocks) < 0)
 					return 1;
 				in_pos += blocks;
-				out_pos += blocks;
+				(void)out_pos;
 			}
 
 			left = len - in_pos;
@@ -246,12 +348,33 @@ lws_genaes_crypt(struct lws_genaes_ctx *ctx, const uint8_t *in, size_t len,
 int
 lws_genaes_destroy(struct lws_genaes_ctx *ctx, unsigned char *tag, size_t tlen)
 {
+	int ret = 0;
 	if (ctx->ctx) {
-		if (tag && tlen && ctx->mode == LWS_GAESM_GCM && ctx->op == LWS_GAESO_ENC)
-			gnutls_cipher_tag(ctx->ctx, tag, tlen);
+		if (tag && tlen && ctx->mode == LWS_GAESM_GCM) {
+			/*
+			 * tag is an out buffer in both directions: it receives
+			 * the tag we computed.  On decrypt we then compare it
+			 * with the expected tag lws_genaes_crypt() was handed
+			 */
+
+			if (gnutls_cipher_tag(ctx->ctx, tag, tlen))
+				ret = -1;
+			else if (ctx->op != LWS_GAESO_ENC) {
+				if ((size_t)ctx->taglen != tlen) {
+					lwsl_err("%s: no expected GCM tag\n",
+						 __func__);
+					ret = -1;
+				} else if (lws_timingsafe_bcmp(ctx->tag, tag,
+							(uint32_t)tlen)) {
+					lwsl_err("%s: GCM tag mismatch\n",
+						 __func__);
+					ret = -1;
+				}
+			}
+		}
 
 		if (ctx->op == LWS_GAESO_ENC && ctx->padding == LWS_GAESP_WITH_PADDING &&
-		    ctx->mode == LWS_GAESM_CBC && tag) {
+		    ctx->mode == LWS_GAESM_CBC && tag && tlen >= 16) {
 			uint8_t pad_val = (uint8_t)(16 - ctx->buf_len);
 			memset(ctx->buf + ctx->buf_len, pad_val, (size_t)pad_val);
 			if (gnutls_cipher_encrypt2(ctx->ctx, ctx->buf, 16, tag, 16) < 0)
@@ -262,5 +385,5 @@ lws_genaes_destroy(struct lws_genaes_ctx *ctx, unsigned char *tag, size_t tlen)
 	}
 	ctx->ctx = NULL;
 
-	return 0;
+	return ret;
 }

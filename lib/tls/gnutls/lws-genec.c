@@ -75,17 +75,23 @@ int
 lws_genecdh_create(struct lws_genec_ctx *ctx, struct lws_context *context,
 		   const struct lws_ec_curves *curve_table)
 {
+	/* the caller must hand us a zeroed ctx; a still-live ctx is a misuse */
+	if (ctx->created_mark == LWS_GENEC_CTX_CREATED_MARK)
+		return -1;
+
 	memset(ctx, 0, sizeof(*ctx));
 	ctx->context = context;
 	ctx->curve_table = curve_table;
 	ctx->genec_alg = LEGENEC_ECDH;
+	ctx->created_mark = LWS_GENEC_CTX_CREATED_MARK;
 
 	return 0;
 }
 
-int
-lws_genecdh_set_key(struct lws_genec_ctx *ctx, const struct lws_gencrypto_keyelem *el,
-		    enum enum_lws_dh_side side)
+static int
+lws_genec_keypair_import(struct lws_genec_ctx *ctx,
+			 const struct lws_gencrypto_keyelem *el,
+			 enum enum_lws_dh_side side)
 {
 	gnutls_datum_t x = {0, 0}, y = {0, 0}, d = {0, 0};
 	gnutls_ecc_curve_t curve;
@@ -93,6 +99,23 @@ lws_genecdh_set_key(struct lws_genec_ctx *ctx, const struct lws_gencrypto_keyele
 	int keybytes;
 	uint8_t *x_pad = NULL, *y_pad = NULL, *d_pad = NULL;
 	int ret = 1;
+
+	/*
+	 * crv may simply be missing from an attacker-provided JWK (eg, a JWE
+	 * "epk"), in which case .buf is NULL... the same guard the openssl and
+	 * mbedtls imports have
+	 */
+
+	if (el[LWS_GENCRYPTO_EC_KEYEL_CRV].len < 4 ||
+	    !el[LWS_GENCRYPTO_EC_KEYEL_CRV].buf) {
+		lwsl_notice("%s: crv '%s' (%d)\n", __func__,
+			    el[LWS_GENCRYPTO_EC_KEYEL_CRV].buf ?
+				    (char *)el[LWS_GENCRYPTO_EC_KEYEL_CRV].buf :
+					    "null",
+			    (int)el[LWS_GENCRYPTO_EC_KEYEL_CRV].len);
+
+		return 1;
+	}
 
 	curve = lws_genec_curve_to_gnutls((const char *)el[LWS_GENCRYPTO_EC_KEYEL_CRV].buf);
 	if (curve == GNUTLS_ECC_CURVE_INVALID)
@@ -104,6 +127,18 @@ lws_genecdh_set_key(struct lws_genec_ctx *ctx, const struct lws_gencrypto_keyele
 		return 1;
 
 	keybytes = c->key_bytes;
+
+	/*
+	 * element lengths must match the curve exactly, except d which may
+	 * be absent... the same contract the openssl and mbedtls imports
+	 * already enforce.  Anything else is a malformed key.
+	 */
+
+	if ((el[LWS_GENCRYPTO_EC_KEYEL_D].len &&
+	     el[LWS_GENCRYPTO_EC_KEYEL_D].len != (uint32_t)keybytes) ||
+	    el[LWS_GENCRYPTO_EC_KEYEL_X].len != (uint32_t)keybytes ||
+	    el[LWS_GENCRYPTO_EC_KEYEL_Y].len != (uint32_t)keybytes)
+		return 1;
 
 	if (el[LWS_GENCRYPTO_EC_KEYEL_X].len) {
 		x_pad = lws_zalloc((size_t)keybytes, "x_pad");
@@ -155,19 +190,30 @@ lws_genecdh_set_key(struct lws_genec_ctx *ctx, const struct lws_gencrypto_keyele
 
 	if (side == LDHS_OURS) {
 		if (d.size) {
+			if (ctx->priv) {
+				gnutls_privkey_deinit(ctx->priv);
+				ctx->priv = NULL;
+				ctx->has_private = 0;
+			}
 			if (gnutls_privkey_init(&ctx->priv) < 0)
 				goto bail;
 			if (gnutls_privkey_import_ecc_raw(ctx->priv, curve, &x, &y, &d) < 0) {
 				gnutls_privkey_deinit(ctx->priv);
+				ctx->priv = NULL;
 				goto bail;
 			}
 			ctx->has_private = 1;
 		}
 		if (x.size && y.size) {
+			if (ctx->pub) {
+				gnutls_pubkey_deinit(ctx->pub);
+				ctx->pub = NULL;
+			}
 			if (gnutls_pubkey_init(&ctx->pub) < 0)
 				goto bail;
 			if (gnutls_pubkey_import_ecc_raw(ctx->pub, curve, &x, &y) < 0) {
 				gnutls_pubkey_deinit(ctx->pub);
+				ctx->pub = NULL;
 				goto bail;
 			}
 		}
@@ -178,10 +224,15 @@ lws_genecdh_set_key(struct lws_genec_ctx *ctx, const struct lws_gencrypto_keyele
 			 * but we might need one for ECDH.
 			 * Actually we can just store it in ctx->pub if it's the peer's.
 			 */
+			if (ctx->pub) {
+				gnutls_pubkey_deinit(ctx->pub);
+				ctx->pub = NULL;
+			}
 			if (gnutls_pubkey_init(&ctx->pub) < 0)
 				goto bail;
 			if (gnutls_pubkey_import_ecc_raw(ctx->pub, curve, &x, &y) < 0) {
 				gnutls_pubkey_deinit(ctx->pub);
+				ctx->pub = NULL;
 				goto bail;
 			}
 		}
@@ -194,8 +245,17 @@ bail:
 	lws_free(d_pad);
 
 	return ret;
+}
 
-	return 0;
+int
+lws_genecdh_set_key(struct lws_genec_ctx *ctx,
+		    const struct lws_gencrypto_keyelem *el,
+		    enum enum_lws_dh_side side)
+{
+	if (ctx->genec_alg != LEGENEC_ECDH)
+		return -1;
+
+	return lws_genec_keypair_import(ctx, el, side);
 }
 
 int
@@ -220,6 +280,12 @@ lws_genecdh_new_keypair(struct lws_genec_ctx *ctx, enum enum_lws_dh_side side,
 	if (!c) {
 		lwsl_err("lws_genec_curve failed to find curve %s\n", curve_name);
 		return -1;
+	}
+
+	if (ctx->priv) {
+		gnutls_privkey_deinit(ctx->priv);
+		ctx->priv = NULL;
+		ctx->has_private = 0;
 	}
 
 	if (gnutls_privkey_init(&ctx->priv) < 0) {
@@ -268,8 +334,10 @@ bail_datum:
 	gnutls_free(y.data);
 	gnutls_free(d.data);
 bail:
-	if (ret)
+	if (ret) {
 		gnutls_privkey_deinit(ctx->priv);
+		ctx->priv = NULL;
+	}
 
 	return ret;
 }
@@ -317,10 +385,15 @@ int
 lws_genecdsa_create(struct lws_genec_ctx *ctx, struct lws_context *context,
 		    const struct lws_ec_curves *curve_table)
 {
+	/* the caller must hand us a zeroed ctx; a still-live ctx is a misuse */
+	if (ctx->created_mark == LWS_GENEC_CTX_CREATED_MARK)
+		return -1;
+
 	memset(ctx, 0, sizeof(*ctx));
 	ctx->context = context;
 	ctx->curve_table = curve_table;
 	ctx->genec_alg = LEGENEC_ECDSA;
+	ctx->created_mark = LWS_GENEC_CTX_CREATED_MARK;
 
 	return 0;
 }
@@ -340,7 +413,10 @@ int
 lws_genecdsa_set_key(struct lws_genec_ctx *ctx,
 		     const struct lws_gencrypto_keyelem *el)
 {
-	return lws_genecdh_set_key(ctx, el, LDHS_OURS);
+	if (ctx->genec_alg != LEGENEC_ECDSA)
+		return -1;
+
+	return lws_genec_keypair_import(ctx, el, LDHS_OURS);
 }
 
 int
@@ -467,6 +543,8 @@ lws_genec_destroy(struct lws_genec_ctx *ctx)
 
 	ctx->priv = NULL;
 	ctx->pub = NULL;
+	ctx->has_private = 0;
+	ctx->created_mark = 0;
 }
 
 int

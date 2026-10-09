@@ -11,15 +11,7 @@
 
 #include <libwebsockets.h>
 
-enum {
-	LWS_SW_D,
-	LWS_SW_HELP,
-};
 
-static const struct lws_switches switches[] = {
-	[LWS_SW_D]	= { "-d",              "Debug logs (e.g. -d 15)" },
-	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
-};
 
 #include <string.h>
 #include <signal.h>
@@ -42,7 +34,7 @@ static const struct lws_switches switches[] = {
 
 static struct lws *raw_wsi, *stdin_wsi;
 static uint8_t buf[LWS_PRE + 4096];
-static int waiting, interrupted;
+static int waiting;
 static struct lws_context *context;
 static int us_wait_after_input_close = LWS_USEC_PER_SEC / 10;
 
@@ -69,14 +61,14 @@ callback_raw_test(struct lws *wsi, enum lws_callback_reasons reason,
 		if (raw_wsi)
 			lws_set_timer_usecs(raw_wsi, us_wait_after_input_close);
 		else {
-			interrupted = 1;
+			lws_default_loop_exit(context);
 			lws_cancel_service(context);
 		}
 		break;
 
 	case LWS_CALLBACK_RAW_RX_FILE:
 		lwsl_user("LWS_CALLBACK_RAW_RX_FILE\n");
-		waiting = (int)read(0, buf, sizeof(buf));
+		waiting = (int)read(0, buf + LWS_PRE, sizeof(buf) - LWS_PRE);
 		lwsl_notice("raw file read %d\n", waiting);
 		if (waiting < 0)
 			return -1;
@@ -104,7 +96,7 @@ callback_raw_test(struct lws *wsi, enum lws_callback_reasons reason,
 		 * If the socket to the remote server closed, we must close
 		 * and drop any remaining stdin
 		 */
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		lws_cancel_service(context);
 		/* our pointer to this wsi is invalid now we close */
 		raw_wsi = NULL;
@@ -124,7 +116,7 @@ callback_raw_test(struct lws *wsi, enum lws_callback_reasons reason,
 			break;
 		if (stdin_wsi)
 			lws_rx_flow_control(stdin_wsi, 1);
-		if (lws_write(wsi, buf, (unsigned int)waiting, LWS_WRITE_RAW) != waiting) {
+		if (lws_write(wsi, buf + LWS_PRE, (unsigned int)waiting, LWS_WRITE_RAW) != waiting) {
 			lwsl_notice("%s: raw skt write failed\n", __func__);
 
 			return -1;
@@ -133,7 +125,7 @@ callback_raw_test(struct lws *wsi, enum lws_callback_reasons reason,
 
 	case LWS_CALLBACK_TIMER:
 		lwsl_user("LWS_CALLBACK_TIMER\n");
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		lws_cancel_service(context);
 		return -1;
 
@@ -166,14 +158,21 @@ system_notify_cb(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 	i.alpn			= "http/1.1";
 	i.address		= server;
 	i.host			= server;
-	i.port			= atoi(port);
+	{
+		int __pt = atoi(port);
+		if (__pt < 0 || __pt > 65535) {
+			lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+			return 1;
+		}
+		i.port = (uint16_t)__pt;
+	}
 	i.local_protocol_name	= "raw-test";
 
-	waiting = lws_snprintf((char *)buf, sizeof(buf), "GET / HTTP/1.1\xaHost: libwebsockets.org\xa\xa");
+	waiting = lws_snprintf((char *)buf + LWS_PRE, sizeof(buf) - LWS_PRE, "GET / HTTP/1.1\xaHost: libwebsockets.org\xa\xa");
 
         if (!lws_client_connect_via_info(&i)) {
                 lwsl_err("Client creation failed\n");
-                interrupted = 1;
+                lws_default_loop_exit(context);
         }
 
 	return 0;
@@ -181,28 +180,24 @@ system_notify_cb(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	const char *p;
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	int n = 0;
 	lws_state_notify_link_t notifier = { { NULL, NULL, NULL },
 					     system_notify_cb, "app" };
 	lws_state_notify_link_t *na[] = { &notifier, NULL };
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal raw client\n");
 
-	memset(&info, 0, sizeof info);
-
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 	info.port = CONTEXT_PORT_NO_LISTEN_SERVER;
 	info.protocols = protocols;
@@ -214,7 +209,7 @@ int main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lwsl_user("%s: destroying context\n", __func__);

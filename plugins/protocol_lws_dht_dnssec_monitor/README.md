@@ -7,8 +7,8 @@ The `lws-dht-dnssec-monitor` plugin automates the tracking, signing, and uploadi
 2. Checks for missing ZSK or KSK DNSSEC keys and automatically generates them if they don't exist.
 3. Compares the modification timestamps of unsigned zone files against their signed counterparts to detect upstream zone edits.
 4. Securely merges any active temporary ACME zones (via `dns-01`) into the main zone payload before authoritative signing.
-5. Automatically signs (or re-signs) the zone if the upstream `.zone` file is newer than the `.signed` file.
-6. Automatically publishes the resulting JWS payloads directly into the libwebsockets DHT for propagation.
+5. Automatically signs (or re-signs) the zone if the upstream `.zone` file is newer than the `.signed` file, or if the DHT-detected external addresses its `${EXTIP4}` / `${EXTIP6}` records resolve to have changed (see below).
+6. Automatically publishes the resulting JWS payloads directly into the libwebsockets DHT for propagation: each one when it is (re)signed, and every one it finds at startup, since it can't know they were published before.  The DHT ignores a zone it already has, since it only takes a validly signed one with a later serial.  A publication the DHT peer does not answer is tried again after 30s, doubling up to every 10 minutes, until it gets through or the zone is signed again.
 
 This monitor is designed specifically to work in tandem with the [lws-acme-client](../acme-client/protocol_lws_acme_client.md) using the centralized multi-certificate management flow, allowing your LAN servers to handle thousands of domains securely.
 
@@ -16,6 +16,54 @@ This monitor is designed specifically to work in tandem with the [lws-acme-clien
 The plugin includes a set of HTML/JS/CSS assets for a modern, Web-based management UI that interfaces securely with the backend JSON WS proxy using stateless `lws_jwt_auth` API verification.
 
 These UI assets do not contain any inline scripts or styles, ensuring they are strictly Content-Security-Policy (CSP) compliant. The `assets/` directory must be manually mounted by the administrator in the `lwsws` JSON configuration if Web UI management is desired. To prevent unauthenticated users from even loading the UI files, configure the mount to use the `lws-login` interceptor protocol, requiring the `domain-admin` service grant (which aligns identically with the WebSocket backend verification).
+
+#### Force cert reissue
+
+Each row of the TLS tab's "Cross-Domain TLS Certificates" table ends with a
+"Force reissue" button, which has the ACME client reissue that row's
+certificate now, however much validity it has left, for example to move it
+onto a newly chosen certificate profile at once rather than at the next
+renewal.  The buttons are only enabled while the "ACME Enabled" checkbox of the
+certificate's toplevel domain is set.  The ACME client runs in the lwsws
+process rather than the root process, so the proxy answers this request itself,
+checking the row's FQDN lies inside its domain and sending
+`{"acme":"force-reissue","domain":"...","common-name":"..."}` on SMD class
+`LWSSMDCL_CERTS`.  The usual backoff after failed acquisitions still applies,
+and Let's Encrypt allows only 5 identical certificates per week.
+
+#### Registrar DS record
+
+For the domain's DNSSEC chain to reach the root, the parent zone must publish
+a DS record for the domain's KSK, which you give your registrar.  The domain's
+header's Registrar row shows the DS fields registrars ask for, each with a
+Copy button: the key tag, algorithm, digest type and digest.  The root process
+computes them from the KSK with `lws_auth_dns_key_records()`, the same way the
+signer does when it logs the DS.  They are all public.
+
+#### Registry WHOIS
+
+Each domain's header shows the registry's expiry date, the nameservers the
+registry delegates to, and whether the registry says the delegation is
+DNSSEC-signed, from `<base-dir>/domains/<domain>/whois.json`.  Whois servers
+are untrusted, so the lwsws process does the queries, not the root process:
+about 20s after startup, and then every 10 minutes, it looks for a domain whose
+`whois.json` is missing or more than a day old, and queries the registry
+(found through whois.iana.org), one domain at a time.  A domain is not queried
+again within an hour, whatever the result.  The results go to the root process
+over the UDS IPC as canonical JSON in an authenticated `update_whois` request,
+and the root process validates them again before writing `whois.json`.
+
+#### Server IP Inventory
+
+The Domains tab also carries a Server IP Inventory table below the domain list. It lists unique network interfaces rather than DNS names: a name binding both an A and an AAAA record is evidence that those two addresses live on the same interface of one server, so addresses are grouped into interfaces by the names that bind them together, and every name pointing at any of an interface's addresses is listed once as evidence on that row instead of once per name. Each name links into the zonefile editor for the zonefile(s) it was found in, and carries any LOC record written for it.
+
+Records written against the DHT-detected dynamic addresses (`${EXTIP4}` / `${EXTIP6}`) resolve to the currently detected external addresses, which the UI already learns from the `ext-ips` distribution and passes with the inventory request, with the configured IPv6 suffix applied exactly as the zonefile editor previews `${EXTIP6}`. Until an address is detected, the records still group together on the `${EXTIP4}` / `${EXTIP6}` macro text.
+
+A world map between the domain list and the inventory places one abstract server icon per interface. Interfaces with a LOC record are placed at its exact coordinates; the others are estimated at the centroid of their address's country, resolved through dbip-country CSVs that the monitor's root process downloads monthly from [sapics/ip-location-db](https://github.com/sapics/ip-location-db) into `<base-dir>/geo` (and re-downloads when older than 30 days). Scrolling and dragging pan the map, pinching (or ctrl+scroll, or the corner +/- buttons) zooms it, and clicking a marker opens the zonefile editor of its first name. The map outline is vendored Natural Earth 1:110m land TopoJSON (`assets/land-110m.json`, public domain via the world-atlas packaging); the projection is a few lines of Web Mercator in `monitor.js` with no third-party JavaScript.
+
+Each address tracks what kinds of names point at it. If an address is only referred to by NS records (delegation glue), it is marked "NS only", since it may not be your infrastructure; if the same address is also bound to host names in the same or another zonefile, the more specific records indicate the nameserver is your infrastructure.
+
+The table is served from an ephemeral sqlite3 cache (`<base-dir>/ip-inventory.sqlite3`) holding a row for every record parsed from every zonefile. The cache is regenerated by rescanning only zonefiles whose mtime or size changed since they were last scanned, so the table stays cheap even with a large number of zonefiles. This requires lws to be built with `-DLWS_WITH_SQLITE3=1`; without it, the inventory answers an explicit "built without sqlite3 support" error and the rest of the UI is unaffected.
 
 ## Prerequisite: lws-dht-dnssec
 
@@ -117,9 +165,44 @@ Based on the global `/etc/lwsws/policy` `dns_base_dir` usage (e.g. `/var/lib/lws
     │   └── example.com.json            <-- Your JSON configuration here
     ├── example.com.zone            <-- The raw unsigned DNS zone file
     ├── example.com.signed          <-- (Generated automatically)
+    ├── example.com.zone.signed.extip <-- (Generated for zones using ${EXTIP4} / ${EXTIP6})
+    ├── whois.json                  <-- (Registry whois, refreshed daily)
     ├── example.com.jws             <-- (Generated automatically)
     ├── example.com.zsk.private.jwk <-- (Generated automatically if missing)
     └── example.com.ksk.private.jwk <-- (Generated automatically if missing)
 ```
 
+The root process creates these, but lwsws has to get into each domain's
+directory and `conf.d` too: it publishes the signed zone's `.jws` to the DHT,
+and its ACME client reads `conf.d`.  So directories the monitor creates there
+are mode 0750 with the group lwsws runs as (the gid after the `:` in the root
+process' `--uds-perms=<uid>:<gid>`, which is lwsws' own group, eg, `apache`,
+not necessarily one called `lwsws`), and the `conf.d` JSON is 0640; the
+`.private.jwk` keys stay 0600.  A domain directory lwsws can't get into is
+never published, and lwsws warns about it at startup.  One made by hand, or by
+an older version of the monitor, needs the same group and modes, eg, as root:
+
+```
+chgrp -R <group> domains/example.com
+chmod 0750 domains/example.com domains/example.com/conf.d
+find domains/example.com/conf.d -name '*.json' -exec chmod 0640 {} +
+```
+
+(`find` rather than a `conf.d/*.json` glob: under sudo, the glob is expanded
+by the calling shell, which can't read `conf.d`.)
+
+A domain created from the UI starts with an empty `example.com.zone`.  When
+the zone is empty, the editor fills in a starter zone to edit (an SOA, two
+nameservers, and example `@` records on the documentation addresses), but
+nothing is written, and so signed and published, until you save it.  Creating
+a domain that already exists leaves its zone and configuration alone.
+
 If you edit `example.com.zone`, the monitor will automatically detect the timestamp mismatch during its next periodic scan (every 5 minutes) and re-sign the zone, replacing the `.signed` and `.jws` outputs.
+
+## Dynamic external addresses
+
+Zonefile records can use `${EXTIP4}` / `${EXTIP6}` for the host's external addresses, as detected by the DHT. The DHT runs in the unprivileged lwsws process, while zones are signed by the spawned root monitor process; lwsws forwards every change of the detected addresses to the root process over the root process' stdin pipe, which is otherwise only used to hand it the IPC auth token at spawn.
+
+`${EXTIP6}` has the IPv6 suffix set in the UI applied, as the zonefile editor previews it: the suffix is one hex group that replaces the last 16 bits of the detected address. With no suffix set, the address is used as the DHT detected it.
+
+After signing a zone that uses either macro, the monitor records the values it signed with in `<domain>.zone.signed.extip`. Whenever the detected addresses or the suffix change, including after a restart, only zones whose record differs are re-signed and so republished. The signed zone is authoritative, so only a different detected address replaces the one a zone was signed with: a family that stops being detected (eg, the detector loses sight of it for a while) keeps its last address, and after a restart each family keeps the address in the zone's record until one is detected. A zone using the macros that was never signed with an address is not signed at all until at least one external address is known, since that would publish it without those records; if only one family has been detected, the other waits up to a minute to appear before the zone is signed without it (the `${EXTIP6}` lines are then dropped, as the signer documents).

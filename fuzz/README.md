@@ -1,0 +1,168 @@
+# lws fuzzing
+
+Coverage-guided fuzzing of lws' untrusted-input parsers, using clang's
+libFuzzer + AddressSanitizer.  Everything runs locally with no dependency
+on any external fuzzing infrastructure.
+
+## Quick start
+
+Requirements: `clang` and the libFuzzer runtime (Debian-ish:
+`clang-19 libclang-rt-19-dev`), plus `libgnutls28-dev` if you want the
+`qpack` target (it needs the h3 role, which needs a QUIC-capable TLS
+provider; without gnutls that one target is silently skipped).
+
+```sh
+./fuzz/run.sh              # build + 60s per target against all targets
+./fuzz/run.sh 3600         # an hour per target
+./fuzz/run.sh 600 lejp qpack   # selected targets only
+BUILD=~/fz ./fuzz/run.sh   # non-default build dir
+CORPUS=~/fzc ./fuzz/run.sh # keep the corpora outside the build dir
+```
+
+Corpora accumulate per-target in `<build>/fuzz/corpus-<name>/` across runs
+(so coverage keeps advancing between campaigns), seeded from the committed
+inputs in `fuzz/fuzz-<name>/seeds/`.  Set `CORPUS` to keep them somewhere
+persistent when the build dir is disposable, as in CI.  Anything the fuzzer
+finds is written to `<build>/fuzz/crash-<sha1>` (or `leak-` / `timeout-` /
+`oom-`); `run.sh` lists the absolute paths of everything found by the run at
+the end and exits nonzero.  Re-run the target directly on the artifact file
+to reproduce:
+
+```sh
+./build-fuzz/bin/fuzz-qpack build-fuzz/fuzz/crash-<sha1>   # repro under ASan
+```
+
+`clang` is autodetected if there is no `clang` binary (eg `clang-19`).
+Additional cmake options can be passed via `FUZZ_CMAKE_OPTS`.
+
+## Reading the output
+
+- `Done N runs in Ts` for a target means its time slice completed with no
+  findings.  Corpus (`corp: N/MKb`) and coverage (`cov:`) growing between
+  runs is the normal steady state, not a problem.
+- Parser error logs during fuzzing are the *expected* face of malformed
+  input being rejected, not findings — the harnesses silence them to keep
+  throughput.  Set `LWS_FUZZ_VERBOSE=1` to replay a specific input with
+  logs, e.g. `LWS_FUZZ_VERBOSE=1 ./build-fuzz/bin/fuzz-qpack <artifact>`.
+- An actual finding is an ASan/UBSan report on stderr plus a
+  `crash-<sha1>` artifact in `<build>/fuzz/`, and `run.sh` exits nonzero.
+- `Ctrl-C` mid-campaign is safe; corpora reached so far are kept, and each
+  target also self-terminates at its `-max_total_time`.
+
+## CI / ctest
+
+The same build registers a fast smoke test per target (`-runs=0`, runs
+each committed seed exactly once under ASan):
+
+```sh
+CC=clang-19 cmake .. --fresh -DLWS_WITH_FUZZERS=ON -DLWS_WITH_CBOR=ON
+cmake --build . --parallel
+ctest -R fuzz-       # seconds, deterministic
+```
+
+`LWS_WITH_FUZZERS` implies whole-lib `-fsanitize=fuzzer-no-link,address`
+instrumentation, so it should stay OFF for normal builds and normal CI.
+Longer campaigns belong on a dedicated runner via `./fuzz/run.sh`: the
+`fuzz` configuration in `.sai.json` runs it on one Linux builder with a
+persistent corpus, failing the job and listing the finding paths if
+anything turns up.
+
+`run.sh` turns on everything the targets need that it can find on the
+host (gnutls for h3 / JOSE / COSE / DNSSEC, zlib for permessage-deflate);
+a target whose option is off is skipped, not an error.
+
+The same configuration also asks sai for idle tasks, which keep fuzzing the
+latest completed push in time the builders would otherwise spend idle, if
+their conf gives them a share of it (see sai's `READMEs/README-idle.md`).
+sai tells an idle task how long its slice is in `SAI_IDLE_SECS`, and then
+`run.sh` goes by that instead of the seconds argument: whatever time is left
+after the build goes to as many targets as can each have at least two
+minutes, taking turns in order across slices so every target is covered.
+Whose turn it is is kept in `<corpus>/.idle-next`.  Each target's share is
+worked out from the clock just before it starts, and it's interrupted if it
+runs past it (eg, while it's still replaying a large corpus), so a slow target
+only shortens the ones after it, and the slice isn't overrun.  Targets that
+don't fit any more go first next slice.  The log says how long the build and
+each target took, and how much of the slice was used.  An idle task also lets
+an input run for at most a minute before libFuzzer calls it a hang.
+
+The configuration also names a sai pool, `fuzz`, which sai keeps synced
+between all the builders running it (see sai's `READMEs/README-pool.md`).
+When sai provides it in `SAI_POOL_DIR`, `run.sh` keeps the corpora there
+instead of in `CORPUS`, so every builder fuzzes from, and adds to, the same
+corpora.  The first time, any corpora already in `CORPUS` are copied into
+the pool.
+
+In a CI run under sai (not an idle task), `run.sh` first replays each target's
+known bug reproducers from `SAI_POOL_KNOWN`, which sai-server keeps for every
+bug found so far, and fails if any still crash.  So once something is found,
+CI on that branch keeps failing until it's fixed.  What it finds, and the known
+bugs that still crash, go to sai-server through `SAI_POOL_FINDINGS`, which
+groups them into bugs and shows them to sai admins (see sai's
+`READMEs/README-findings.md`).  Under sai, the sanitizer reports are not put in
+the task log, which is public, since they may be unfixed security bugs; the log
+just says what was found.  An idle task reports what it finds the same way, but
+doesn't fail.
+
+## Targets
+
+| target | parser under test | notes |
+|---|---|---|
+| `fuzz-lejp` | lejp JSON parser (`lib/misc/lejp.c`) | policy, JOSE, RPC JSON; fed in two chunks to cover partial-input states |
+| `fuzz-lecp` | lecp CBOR parser (`lib/misc/lecp.c`) | needs `-DLWS_WITH_CBOR=ON` |
+| `fuzz-qpack` | native QPACK decoders (`lib/sansio/h3/qpack.c`) | first byte selects encoder-stream vs header-block decode; needs h3 (`LWS_WITH_HTTP3` + gnutls) |
+| `fuzz-upng` | stateful PNG decoder (`lib/misc/upng.c`) | seeds from `test-apps/*.png` |
+| `fuzz-lhp` | HTML5 + CSS parser (`lib/misc/lhp.c`) | builds a dlo document per input and destroys it; leaks and heap errors in teardown are caught |
+| `fuzz-h1` | h1 server header/body parser (`lib/sansio/http/`) | evil-peer target, see below |
+| `fuzz-h2` | h2 framing + hpack (`lib/sansio/h2/`) | evil-peer: the fuzz input is h2 frames after a canned h2c upgrade + connection preface |
+| `fuzz-ws` | ws server frame parser (`lib/sansio/ws/`) | evil-peer: the fuzz input is client frames after a canned upgrade handshake |
+| `fuzz-ws-pmd` | ws rx through permessage-deflate (`lib/sansio/ws/ext/`) | evil-peer: as `fuzz-ws` but the canned handshake negotiates the extension, so RSV1 frames reach the inflater; needs zlib (`LWS_WITHOUT_EXTENSIONS=OFF`) |
+| `fuzz-jpeg` | stateful JPEG decoder (`lib/misc/jpeg.c`) | same shape as `fuzz-upng`; needs `LWS_WITH_JPEG` |
+| `fuzz-svg` | svg scene parser + linewise rasterizer (`lib/misc/svg.c`, `svg-raster.c`) | parses into the retained vector scene then renders every line to a sink; first byte selects hold-at-metadata, the chunk stride, antialiasing and the raster size; needs `LWS_WITH_SVG` |
+| `fuzz-gif` | stateful GIF decoder (`lib/misc/gif.c`) | same shape as `fuzz-jpeg`, then a second pass after `lws_gif_restart()` like the dlo interlace flow; needs `LWS_WITH_GIF` |
+| `fuzz-hl` | streaming syntax highlighting tokenizer (`lib/misc/hl*.c`) | each language driver (C, diff) runs a one-fragment reference pass and a fragmented + sink-deferring stress pass over the same input; the token bytes must round-trip the input exactly with identical per-byte classes, and at most one decision byte may be held back; then the html sink and escaper run over it; needs `LWS_WITH_HL` |
+| `fuzz-md` | streaming markdown renderer + html sink (`lib/misc/md*.c`) | reference vs fragmented + deferring passes of both the raw event stream (with BEGIN/END nesting checked) and the stock html sink output (with the lws-hl fence bridge) must be identical; needs `LWS_WITH_MD` |
+| `fuzz-tokenize` | `lws_tokenize` + core string helpers (`lib/core/libwebsockets.c`, `lib/misc/base64-decode.c`) | first byte selects the helper (tokenize / b64 / b32 / hex / urldecode / dumb-json / strexp / wildcard / iso8601 / uri / humanize / purify), next two are the tokenize flags; small output buffers so bounding bugs overflow |
+| `fuzz-jose` | JWK / JWS / JWE layer above lejp (`lib/jose/`) | first byte selects import / compact / flattened / JOSE-header / JWE decrypt, second selects the fixed oct / RSA / EC key; needs `LWS_WITH_JOSE` |
+| `fuzz-cose` | cose_key import + signature validator (`lib/cose/`) | first byte selects import vs validate against a fixed key set, second the sigtype; needs `LWS_WITH_COSE` |
+| `fuzz-adns` | async-dns response parser + dnssec (`lib/system/async-dns/`) | each input is delivered as the response to a real pending query, tid patched in; the only nameserver is a UDP sink the harness binds itself, so nothing leaves the process; first byte selects query type and DNSSEC mode |
+
+The `fuzz-h1`, `fuzz-h2` and `fuzz-ws` targets use the shared evil-peer
+helper in [peer.h](peer.h): one real, adopted server-side connection per
+input over a socketpair, fed the fuzz bytes as if received from the peer,
+serviced deterministically via `lws_service_fd()`, then hung up on so the
+close paths run too.  This exercises the production wsi state machines,
+not just the parsing functions in isolation.  The same pattern will work
+for any other adoptable server-side parser (eg, mqtt).
+
+When a crash is found: reproduce on the artifact, minimize it, fix, then
+commit a minimized seed under the target's `seeds/` and add the same input
+as a case to the corresponding api-test where one exists, so it stays
+covered in normal CI.
+
+## Survey: what to harness next
+
+The wsi-bound h1, h2/hpack and ws parsers are covered via `peer.h`, and
+the standalone decoders (lejp, lecp, qpack, upng, jpeg, lhp, tokenize +
+helpers, JOSE, COSE, async-dns) directly.  The remaining untrusted-input
+surfaces, easiest first:
+
+ - the parsers that take bytes from a malicious *server*: mqtt rx
+   (`lib/sansio/mqtt/mqtt.c`), h1 client response, ws client frames
+   (`client-parser-ws.c`), Set-Cookie (`lib/sansio/http/cookie.c`).  These
+   need a client-mode variant of `peer.h` (lws connects out to the
+   harness's socketpair end instead of adopting it); one helper unlocks
+   all four
+ - Secure Streams serialized proxy / client deserializers
+   (`lib/secure-streams/serialized/`): byte state machines over a local
+   unix socket, evil-peer shape against the proxy's listener
+ - dht bencode / rpc (`lib/misc/dht`): needs a dht ctx with a UDP wsi
+ - auth-dns zone parser (`lib/system/auth-dns/`), jrpc (`lib/misc/jrpc/`),
+   `lws_struct` JSON-to-struct (`lib/misc/lws-struct-lejp.c`), sshd
+   userauth / bipacket
+ - wt (WebTransport) and full h3/QUIC framing: these need the UDP/QUIC
+   stack stood up, a larger project than a socketpair
+
+Fault injection (`lws_fi`) can additionally be used from inside harnesses
+to fail the Nth allocation during parsing, which is where most parser
+lifetime bugs hide.

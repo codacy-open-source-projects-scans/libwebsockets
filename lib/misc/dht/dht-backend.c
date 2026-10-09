@@ -31,26 +31,26 @@ lws_dht_nodes(struct lws_dht_ctx *ctx, int af, int *good_return, int *dubious_re
 		int *incoming_return)
 {
 	int good = 0, dubious = 0, cached = 0, incoming = 0;
-	struct bucket *b = af == AF_INET ? ctx->buckets : ctx->buckets6;
+	lws_dll2_owner_t *bo = af == AF_INET ? &ctx->buckets : &ctx->buckets6;
 
-	while (b) {
-		struct node *n = b->nodes;
+	lws_start_foreach_dll(struct lws_dll2 *, db, lws_dll2_get_head(bo)) {
+		struct bucket *b = lws_container_of(db, struct bucket, list);
 
-		while (n) {
+		lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&b->nodes)) {
+			struct node *n = lws_container_of(d, struct node, list);
+
 			if (node_good(ctx, n)) {
 				good++;
 				if (n->time > n->reply_time)
 					incoming++;
 			} else
 				dubious++;
-
-			n = n->next;
-		}
+		} lws_end_foreach_dll(d);
 
 		if (b->cached.ss_family > 0)
 			cached++;
-		b = b->next;
-	}
+	} lws_end_foreach_dll(db);
+
 	if (good_return)
 		*good_return = good;
 	if (dubious_return)
@@ -63,37 +63,71 @@ lws_dht_nodes(struct lws_dht_ctx *ctx, int af, int *good_return, int *dubious_re
 	return good + dubious;
 }
 
+int
+lws_dht_foreach_node(struct lws_dht_ctx *ctx, int af, lws_dht_node_cb_t cb,
+		     void *user)
+{
+	lws_dll2_owner_t *bo = af == AF_INET ? &ctx->buckets : &ctx->buckets6;
+	lws_dht_node_info_t ni;
+	int count = 0;
+
+	lws_start_foreach_dll(struct lws_dll2 *, db, lws_dll2_get_head(bo)) {
+		struct bucket *b = lws_container_of(db, struct bucket, list);
+
+		lws_start_foreach_dll(struct lws_dll2 *, d,
+				      lws_dll2_get_head(&b->nodes)) {
+			struct node *n = lws_container_of(d, struct node, list);
+
+			memset(&ni, 0, sizeof(ni));
+			ni.id		= n->id;
+			ni.sa		= (const struct sockaddr *)&n->ss;
+			ni.salen	= n->sslen;
+			ni.heard	= n->time ? (long)(ctx->now - n->time) : -1;
+			ni.replied	= n->reply_time ?
+					  (long)(ctx->now - n->reply_time) : -1;
+			ni.pinged	= n->pinged;
+			ni.good		= !!node_good(ctx, n);
+			ni.bep42_ok	= !!n->bep42_ok;
+
+			count++;
+			if (cb(user, &ni))
+				return count;
+		} lws_end_foreach_dll(d);
+	} lws_end_foreach_dll(db);
+
+	return count;
+}
+
 static int
 check_pending_notifications(struct lws_dht_ctx *ctx)
 {
 	int soon = 0;
-	struct storage *st = ctx->storage;
 
-	while (st) {
-		struct subscriber *sub = st->subscribers;
-		struct subscriber **psub = &st->subscribers;
-		while (sub) {
+	lws_start_foreach_dll(struct lws_dll2 *, dst, lws_dll2_get_head(&ctx->storage)) {
+		struct storage *st = lws_container_of(dst, struct storage, list);
+
+		lws_start_foreach_dll_safe(struct lws_dll2 *, dsb, dsb1,
+					   lws_dll2_get_head(&st->subscribers)) {
+			struct subscriber *sub = lws_container_of(dsb, struct subscriber, list);
+
 			if (sub->pending_notify) {
-				if (ctx->now.tv_sec >= sub->last_notify + 3) {
+				if (ctx->now >= sub->last_notify + 3) {
 					if (sub->notify_retries >= 5) {
-						struct subscriber *drop = sub;
-						*psub = sub->next;
-						sub = sub->next;
-						lws_free(drop);
+						/* give up on this subscriber */
+						lws_dll2_remove(dsb);
+						lws_free(sub);
 						continue;
-					} else {
-						lws_dht_send_notify(ctx, (struct sockaddr *)&sub->ss, sub->sslen, sub->tid, sub->tid_len, st->id, sub->pending_sha256, NULL, 0);
-						sub->last_notify = ctx->now.tv_sec;
-						sub->notify_retries++;
 					}
+
+					lws_dht_send_notify(ctx, (struct sockaddr *)&sub->ss, sub->sslen, sub->tid, sub->tid_len, st->id, sub->pending_sha256, NULL, 0);
+					sub->last_notify = ctx->now;
+					sub->notify_retries++;
 				}
 				soon = 1;
 			}
-			psub = &sub->next;
-			sub = sub->next;
-		}
-		st = st->next;
-	}
+		} lws_end_foreach_dll_safe(dsb, dsb1);
+	} lws_end_foreach_dll(dst);
+
 	return soon;
 }
 
@@ -102,73 +136,89 @@ lws_dht_periodic_cb(lws_sorted_usec_list_t *sul)
 {
 	struct lws_dht_ctx *ctx = lws_container_of(sul, struct lws_dht_ctx, sul);
 	time_t tosleep = 10;
+	uint32_t r;
 
-	ctx->now.tv_sec = (time_t)lws_now_secs();
+	ctx->now = (time_t)lws_now_secs();
 
-	if (ctx->now.tv_sec >= ctx->rotate_secrets_time)
+	if (ctx->now >= ctx->rotate_secrets_time)
 		rotate_secrets(ctx);
 
-	if (ctx->now.tv_sec >= ctx->expire_stuff_time) {
+	if (ctx->now >= ctx->expire_stuff_time) {
 		int soon = 0;
 
-		expire_buckets(ctx, ctx->buckets);
-		expire_buckets(ctx, ctx->buckets6);
+		expire_buckets(ctx, &ctx->buckets);
+		expire_buckets(ctx, &ctx->buckets6);
 		expire_storage(ctx);
 		expire_searches(ctx);
 
 		soon |= bucket_maintenance(ctx, AF_INET);
 		soon |= bucket_maintenance(ctx, AF_INET6);
-		ctx->expire_stuff_time = ctx->now.tv_sec + LWS_DHT_IDLE_EXPIRE_SECS;
+		ctx->expire_stuff_time = ctx->now + LWS_DHT_IDLE_EXPIRE_SECS;
 		if (soon) {
 			if (ctx->confirm_nodes_time == 0 ||
-			    ctx->confirm_nodes_time > ctx->now.tv_sec + 2)
-				ctx->confirm_nodes_time = ctx->now.tv_sec + 2;
+			    ctx->confirm_nodes_time > ctx->now + 2)
+				ctx->confirm_nodes_time = ctx->now + 2;
 		}
 	}
 
-	if (ctx->search_time > 0 && ctx->now.tv_sec >= ctx->search_time) {
-		struct search *sr;
+	if (ctx->search_time > 0 && ctx->now >= ctx->search_time) {
+		/*
+		 * search_step() dispatches the app's SEARCH_DONE callback, and
+		 * an app that starts a search from there can retire a done
+		 * search underneath us, so walk with the safe iterator.
+		 */
+		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+					   lws_dll2_get_head(&ctx->searches)) {
+			struct search *sr = lws_container_of(d, struct search, list);
 
-		sr = ctx->searches;
-		while (sr) {
-			if (!sr->done && sr->step_time + 5 <= ctx->now.tv_sec) {
+			if (!sr->done && sr->step_time + 5 <= ctx->now)
 				search_step(ctx, sr, ctx->cb, ctx->closure);
-			}
-			sr = sr->next;
-		}
+		} lws_end_foreach_dll_safe(d, d1);
 
 		ctx->search_time = 0;
 
-		sr = ctx->searches;
-		while (sr) {
+		lws_start_foreach_dll(struct lws_dll2 *, d2, lws_dll2_get_head(&ctx->searches)) {
+			struct search *sr = lws_container_of(d2, struct search, list);
+
 			if (!sr->done) {
-				time_t tm = sr->step_time + LWS_DHT_PING_TIMEOUT_SECS + ((lws_get_random(ctx->vhost->context, &tm, sizeof(tm)), tm) % 10);
+				uint32_t r;
+				time_t tm;
+
+				lws_get_random(ctx->vhost->context, &r, sizeof(r));
+				tm = sr->step_time + LWS_DHT_PING_TIMEOUT_SECS +
+						(time_t)(r % 10);
 				if (ctx->search_time == 0 || ctx->search_time > tm)
 					ctx->search_time = tm;
 			}
-			sr = sr->next;
-		}
+		} lws_end_foreach_dll(d2);
 	}
 
-	if (ctx->confirm_nodes_time > 0 && ctx->now.tv_sec >= ctx->confirm_nodes_time) {
+	if (ctx->confirm_nodes_time > 0 && ctx->now >= ctx->confirm_nodes_time) {
 		int soon = neighbourhood_maintenance(ctx, AF_INET) |
 			   neighbourhood_maintenance(ctx, AF_INET6);
 
 		if (!soon) {
-			if (ctx->mybucket_grow_time >= ctx->now.tv_sec - 150)
+			if (ctx->mybucket_grow_time >= ctx->now - 150)
 				soon |= neighbourhood_maintenance(ctx, AF_INET);
-			if (ctx->mybucket6_grow_time >= ctx->now.tv_sec - 150)
+			if (ctx->mybucket6_grow_time >= ctx->now - 150)
 				soon |= neighbourhood_maintenance(ctx, AF_INET6);
 		}
 
+		/*
+		 * Unsigned draw: % of a negative signed random is negative in
+		 * C99, which would leave confirm_nodes_time in the past, make
+		 * tosleep 0 and burst find_node into the event loop.
+		 */
+		lws_get_random(ctx->vhost->context, &r, sizeof(r));
+
 		if (soon)
-			ctx->confirm_nodes_time = ctx->now.tv_sec + 5 + ((lws_get_random(ctx->vhost->context, &soon, sizeof(soon)), soon) % 20);
+			ctx->confirm_nodes_time = ctx->now + 5 + (time_t)(r % 20);
 		else
-			ctx->confirm_nodes_time = ctx->now.tv_sec + 60 + ((lws_get_random(ctx->vhost->context, &soon, sizeof(soon)), soon) % 120);
+			ctx->confirm_nodes_time = ctx->now + 60 + (time_t)(r % 120);
 	}
 
-	if (ctx->confirm_nodes_time > ctx->now.tv_sec)
-		tosleep = ctx->confirm_nodes_time - ctx->now.tv_sec;
+	if (ctx->confirm_nodes_time > ctx->now)
+		tosleep = ctx->confirm_nodes_time - ctx->now;
 	else
 		tosleep = 0;
 
@@ -178,10 +228,10 @@ lws_dht_periodic_cb(lws_sorted_usec_list_t *sul)
 	}
 
 	if (ctx->search_time > 0) {
-		if (ctx->search_time <= ctx->now.tv_sec)
+		if (ctx->search_time <= ctx->now)
 			tosleep = 0;
-		else if (tosleep > ctx->search_time - ctx->now.tv_sec)
-			tosleep = ctx->search_time - ctx->now.tv_sec;
+		else if (tosleep > ctx->search_time - ctx->now)
+			tosleep = ctx->search_time - ctx->now;
 	}
 
 	lws_sul_schedule(ctx->vhost->context, 0, &ctx->sul,
@@ -194,7 +244,6 @@ lws_dht_get_nodes(struct lws_dht_ctx *ctx, struct sockaddr_in *sin, int *num,
 {
 	int i, j;
 	struct bucket *b;
-	struct node *n;
 
 	i = 0;
 
@@ -206,33 +255,43 @@ lws_dht_get_nodes(struct lws_dht_ctx *ctx, struct sockaddr_in *sin, int *num,
 	if (b == NULL)
 		goto no_ipv4;
 
-	n = b->nodes;
-	while (n && i < *num) {
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&b->nodes)) {
+		struct node *n = lws_container_of(d, struct node, list);
+
+		if (i >= *num)
+			break;
+
 		if (node_good(ctx, n)) {
 			sin[i] = *(struct sockaddr_in*)&n->ss;
 			i++;
 		}
-		n = n->next;
-	}
+	} lws_end_foreach_dll(d);
 
-	b = ctx->buckets;
-	while (b && i < *num) {
-		if (id_cmp(b->first, ctx->myid) <= 0 &&
-				(b->next == NULL || id_cmp(ctx->myid, b->next->first) < 0))
+	lws_start_foreach_dll(struct lws_dll2 *, db, lws_dll2_get_head(&ctx->buckets)) {
+		struct bucket *b1 = lws_container_of(db, struct bucket, list);
+		struct bucket *nb = bucket_next(b1);
+
+		if (i >= *num)
+			break;
+
+		if (id_cmp(b1->first, ctx->myid) <= 0 &&
+		    (nb == NULL || id_cmp(ctx->myid, nb->first) < 0))
 		{
 			/* skip, handled above */
 		} else {
-			n = b->nodes;
-			while (n && i < *num) {
+			lws_start_foreach_dll(struct lws_dll2 *, d1, lws_dll2_get_head(&b1->nodes)) {
+				struct node *n = lws_container_of(d1, struct node, list);
+
+				if (i >= *num)
+					break;
+
 				if (node_good(ctx, n)) {
 					sin[i] = *(struct sockaddr_in*)&n->ss;
 					i++;
 				}
-				n = n->next;
-			}
+			} lws_end_foreach_dll(d1);
 		}
-		b = b->next;
-	}
+	} lws_end_foreach_dll(db);
 
 no_ipv4:
 
@@ -242,33 +301,43 @@ no_ipv4:
 	if (b == NULL)
 		goto no_ipv6;
 
-	n = b->nodes;
-	while (n && j < *num6) {
+	lws_start_foreach_dll(struct lws_dll2 *, d2, lws_dll2_get_head(&b->nodes)) {
+		struct node *n = lws_container_of(d2, struct node, list);
+
+		if (j >= *num6)
+			break;
+
 		if (node_good(ctx, n)) {
 			sin6[j] = *(struct sockaddr_in6*)&n->ss;
 			j++;
 		}
-		n = n->next;
-	}
+	} lws_end_foreach_dll(d2);
 
-	b = ctx->buckets6;
-	while (b && j < *num6) {
-		if (id_cmp(b->first, ctx->myid) <= 0 &&
-		    (b->next == NULL || id_cmp(ctx->myid, b->next->first) < 0))
+	lws_start_foreach_dll(struct lws_dll2 *, db6, lws_dll2_get_head(&ctx->buckets6)) {
+		struct bucket *b1 = lws_container_of(db6, struct bucket, list);
+		struct bucket *nb = bucket_next(b1);
+
+		if (j >= *num6)
+			break;
+
+		if (id_cmp(b1->first, ctx->myid) <= 0 &&
+		    (nb == NULL || id_cmp(ctx->myid, nb->first) < 0))
 		{
 			/* skip */
 		} else {
-			n = b->nodes;
-			while (n && j < *num6) {
+			lws_start_foreach_dll(struct lws_dll2 *, d3, lws_dll2_get_head(&b1->nodes)) {
+				struct node *n = lws_container_of(d3, struct node, list);
+
+				if (j >= *num6)
+					break;
+
 				if (node_good(ctx, n)) {
 					sin6[j] = *(struct sockaddr_in6*)&n->ss;
 					j++;
 				}
-				n = n->next;
-			}
+			} lws_end_foreach_dll(d3);
 		}
-		b = b->next;
-	}
+	} lws_end_foreach_dll(db6);
 
 no_ipv6:
 

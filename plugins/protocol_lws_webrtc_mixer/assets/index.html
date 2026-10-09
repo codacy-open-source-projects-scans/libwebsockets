@@ -55,7 +55,7 @@
 
                 <div id="chatOverlay" class="chat-overlay hidden">
                     <div id="chatHistory" class="chat-history"></div>
-                    <input type="text" id="chatInput" placeholder="Type a message..." maxlength="256">
+                    <input type="text" id="chatInput" placeholder="Type a message..." maxlength="256" aria-label="Chat message">
                 </div>
             </div>
 
@@ -129,6 +129,11 @@
                 </div>
             </div>
         </div>
-    <script src="main.js?v=7"></script>
+    <!--
+        data-ice-servers is a JSON array of RTCIceServer dictionaries, eg
+        '[{"urls":"stun:stun.example.com:19302"}]'.  Empty (the default) means
+        host candidates only and no third party is contacted.
+    -->
+    <script id="mixerScript" src="main.js?v=8" data-ice-servers=""></script>
 </body>
 </html>

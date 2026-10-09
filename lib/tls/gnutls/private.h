@@ -32,11 +32,28 @@
 struct lws_tls_gnutls_ctx {
 	gnutls_certificate_credentials_t creds;
 	gnutls_priority_t priority;
+#if GNUTLS_VERSION_NUMBER >= 0x030603
+	gnutls_datum_t ticket_key;
+	uint8_t ticket_key_valid;
+#endif
+	uint8_t has_client_cert;	/* creds contain a client cert pair */
 };
 
 struct lws_x509_cert {
 	gnutls_x509_crt_t cert;
 };
+
+struct lws;
+
+#if defined(LWS_WITH_CLIENT)
+/*
+ * The name we put in SNI and the name we check the peer certificate against
+ * have to be the same thing, and both are derived from the connection's
+ * Host: / stash hostname... this is the single place that decides it
+ */
+int
+lws_gnutls_client_hostname(struct lws *wsi, char *buf, size_t len);
+#endif
 
 /* Connection is just the session pointer itself to match SSL* return of lws_get_ssl */
 typedef SSL lws_tls_conn;

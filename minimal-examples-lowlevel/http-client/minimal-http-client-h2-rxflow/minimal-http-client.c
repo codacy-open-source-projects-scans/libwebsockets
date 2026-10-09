@@ -16,7 +16,8 @@
 #include <string.h>
 #include <signal.h>
 
-static int interrupted, bad = 1, status, each = 1024;
+static int bad = 1, status, each = 1024;
+static struct lws_context *context;
 static struct lws *client_wsi;
 
 static const lws_retry_bo_t retry = {
@@ -58,7 +59,7 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
 		lwsl_err("CLIENT_CONNECTION_ERROR: %s\n",
 			 in ? (char *)in : "(null)");
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		break;
 
 	case LWS_CALLBACK_ESTABLISHED_CLIENT_HTTP:
@@ -107,13 +108,13 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 
 	case LWS_CALLBACK_COMPLETED_CLIENT_HTTP:
 		lwsl_user("LWS_CALLBACK_COMPLETED_CLIENT_HTTP\n");
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		bad = status != 200;
 		lws_cancel_service(lws_get_context(wsi)); /* abort poll wait */
 		break;
 
 	case LWS_CALLBACK_CLOSED_CLIENT_HTTP:
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		bad = status != 200;
 		lws_sul_cancel(&pss->sul);
 		lws_cancel_service(lws_get_context(wsi)); /* abort poll wait */
@@ -139,7 +140,7 @@ static const struct lws_protocols protocols[] = {
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 struct args {
@@ -151,9 +152,9 @@ static int
 system_notify_cb(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 		   int current, int target)
 {
-	struct lws_context *context = mgr->parent;
+	struct lws_context *cx = mgr->parent;
 	struct lws_client_connect_info i;
-	struct args *a = lws_context_user(context);
+	struct args *a = lws_context_user(cx);
 	const char *p;
 
 	if (current != LWS_SYSTATE_OPERATIONAL || target != LWS_SYSTATE_OPERATIONAL)
@@ -162,7 +163,7 @@ system_notify_cb(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 	lwsl_info("%s: operational\n", __func__);
 
 	memset(&i, 0, sizeof i); /* otherwise uninitialized garbage */
-	i.context = context;
+	i.context = cx;
 	if (!lws_cmdline_option(a->argc, a->argv, "-n"))
 		i.ssl_connection = LCCSCF_USE_SSL;
 
@@ -182,11 +183,16 @@ system_notify_cb(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 			    LCCSCF_H2_QUIRK_NGHTTP2_END_STREAM;
 
 	i.alpn = "h2";
-	if (lws_cmdline_option(a->argc, a->argv, "--h1"))
-		i.alpn = "http/1.1";
 
 	if ((p = lws_cmdline_option(a->argc, a->argv, "-p")))
-		i.port = atoi(p);
+		{
+			int __pt = atoi(p);
+			if (__pt < 0 || __pt > 65535) {
+				lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+				return 1;
+			}
+			i.port = (uint16_t)__pt;
+		}
 
 	if (lws_cmdline_option(a->argc, a->argv, "-j"))
 		i.ssl_connection |= LCCSCF_ALLOW_SELFSIGNED;
@@ -239,7 +245,6 @@ int main(int argc, const char **argv)
 						system_notify_cb, "app" };
 	lws_state_notify_link_t *na[] = { &notifier, NULL };
 	struct lws_context_creation_info info;
-	struct lws_context *context;
 	struct args args;
 	int n = 0;
 	// uint8_t memcert[4096];
@@ -249,10 +254,9 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	lws_context_info_defaults(&info, NULL);lws_cmdline_option_handle_builtin(argc, argv, &info);
 
-	lwsl_user("LWS minimal http client [-d<verbosity>] [-l] [--h1]\n");
+	lwsl_user("LWS minimal http client [-d<verbosity>] [-l]\n");
 
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 	info.port = CONTEXT_PORT_NO_LISTEN; /* we do not run any server */
@@ -266,10 +270,10 @@ int main(int argc, const char **argv)
 	 * since we know this lws context is only ever going to be used with
 	 * one client wsis / fds / sockets at a time, let lws know it doesn't
 	 * have to use the default allocations for fd tables up to ulimit -n.
-	 * It will just allocate for 1 internal and 1 (+ 1 http2 nwsi) that we
-	 * will use.
+	 * It will just allocate for its own fds and overhead
+	 * (LWS_FD_LIMIT_PER_THREAD_MIN) plus the one connection we will use.
 	 */
-	info.fd_limit_per_thread = 1 + 1 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 1;
 
 #if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL)
 	/*
@@ -294,7 +298,7 @@ int main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

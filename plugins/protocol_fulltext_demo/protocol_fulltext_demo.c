@@ -38,6 +38,16 @@
 #endif
 #include <stdio.h>
 
+/*
+ * Free space we insist on having in the output buffer before starting another
+ * JSON record.  It must exceed the longest record any of the loops below can
+ * emit (the largest is the autocomplete one, at most ~330 bytes with a full
+ * 255-char purified string), so that lws_snprintf() can never saturate and
+ * leave p sitting on end.
+ */
+
+#define FTS_RECORD_HEADROOM 384
+
 struct vhd_fts_demo {
 	const char *indexpath;
 };
@@ -75,16 +85,34 @@ callback_fts(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 	switch (reason) {
 
 	case LWS_CALLBACK_PROTOCOL_INIT:
+		if (lws_cmdline_option_cx(lws_get_context(wsi), "--lws-stub"))
+			return 0;
+
+		/*
+		 * We are offered to every vhost.  One that has no pvo for us
+		 * simply doesn't want us: leave silently without a vhd, so
+		 * LWS_CALLBACK_HTTP stays inert on it.
+		 */
 		if (!in)
 			return 0;
+
 		vhd = lws_protocol_vh_priv_zalloc(lws_get_vhost(wsi),
 			     lws_get_protocol(wsi),sizeof(struct vhd_fts_demo));
 		if (!vhd)
-			return 0;
+			return 1;
+
+		/*
+		 * A vhost that does want us must say where the index is; fail
+		 * init rather than leave the protocol bindable with a NULL
+		 * indexpath.
+		 */
+
 		if (lws_pvo_get_str(in, "indexpath",
 				    (const char **)&vhd->indexpath)) {
-			lwsl_vhost_notice(lws_get_vhost(wsi), "%s: indexpath PVO required\n", __func__);
-                       return 0;
+			lwsl_vhost_err(lws_get_vhost(wsi),
+				       "%s: indexpath pvo required", __func__);
+
+			return 1;
 		}
 
 		return 0;
@@ -101,6 +129,10 @@ callback_fts(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 		 * /r/ = results
 		 */
 
+		if (!vhd || !vhd->indexpath)
+			/* the protocol was not usefully configured here */
+			goto reply_404;
+
 		if (strncmp(ccp, "/a/", 3) && strncmp(ccp, "/r/", 3))
 			goto reply_404;
 
@@ -115,6 +147,8 @@ callback_fts(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 				       LWSFTS_F_QUERY_QUOTE_LINE;
 		params.max_autocomplete = 10;
 		params.max_files = 10;
+		/* per-file line hits: the results page shows a handful anyway */
+		params.max_lines = 128;
 
 		jtf = lws_fts_open(vhd->indexpath);
 		if (!jtf) {
@@ -169,11 +203,17 @@ reply_404:
 			p += lws_snprintf((char *)p, lws_ptr_diff_size_t(end, p),
 				"{\"indexed\": %d, \"ac\": [", !!pss->result);
 
-		while (pss->ac && lws_ptr_diff(end, p) > 256) {
+		while (pss->ac && lws_ptr_diff(end, p) > FTS_RECORD_HEADROOM) {
+			char escaped_ac[256];
+			int in_used = 0;
+
+			lws_json_purify(escaped_ac, (const char *)(pss->ac + 1),
+					sizeof(escaped_ac), &in_used);
+
 			p += lws_snprintf((char *)p, lws_ptr_diff_size_t(end, p),
 				"%c{\"ac\": \"%s\",\"matches\": %d,"
 				"\"agg\": %d, \"elided\": %d}",
-				pss->first ? ' ' : ',', (char *)(pss->ac + 1),
+				pss->first ? ' ' : ',', escaped_ac,
 				pss->ac->instances, pss->ac->agg_instances,
 				pss->ac->elided);
 
@@ -188,15 +228,18 @@ reply_404:
 					  "], \"fp\": [");
 		}
 
-		while (pss->fp && lws_ptr_diff_size_t(end, p) > 256) {
+		while (pss->fp && lws_ptr_diff(end, p) > FTS_RECORD_HEADROOM) {
 			if (!pss->fp_init_done) {
+				char escaped_path[256];
+				int in_used = 0;
+				lws_json_purify(escaped_path, ((char *)(pss->fp + 1)) + pss->fp->matches_length, sizeof(escaped_path), &in_used);
+
 				p += lws_snprintf((char *)p,
 						lws_ptr_diff_size_t(end, p),
 					"%c{\"path\": \"%s\",\"matches\": %d,"
 					"\"origlines\": %d,"
 					"\"hits\": [", pss->first ? ' ' : ',',
-					((char *)(pss->fp + 1)) +
-						pss->fp->matches_length,
+					escaped_path,
 					pss->fp->matches,
 					pss->fp->lines_in_file);
 
@@ -206,7 +249,11 @@ reply_404:
 				pss->first = 0;
 			} else {
 				while (pss->done < pss->fp->matches &&
-				       lws_ptr_diff(end, p) > 256) {
+				       lws_ptr_diff(end, p) >
+						       FTS_RECORD_HEADROOM) {
+					char escaped_s[256];
+					int in_used = 0;
+					lws_json_purify(escaped_s, *((const char **)&pss->li[2]), sizeof(escaped_s), &in_used);
 
 					p += lws_snprintf((char *)p,
 							lws_ptr_diff_size_t(end, p),
@@ -214,17 +261,25 @@ reply_404:
 						"\"s\":\"%s\"}",
 						!pss->done ? ' ' : ',',
 						pss->li[0], pss->li[1],
-						*((const char **)&pss->li[2]));
+						escaped_s);
 					pss->li += 2 + (sizeof(const char *) /
 							sizeof(uint32_t));
 					pss->done++;
 				}
 
 				if (pss->done == pss->fp->matches) {
-					*p++ = ']';
+					/*
+					 * p may only ever reach end (the last
+					 * valid byte): if it went past, the
+					 * lws_ptr_diff_size_t() below would
+					 * become a huge unsigned size and the
+					 * next lws_snprintf() unbounded
+					 */
+					if (p < end)
+						*p++ = ']';
 					pss->fp_init_done = 0;
 					pss->fp = pss->fp->next;
-					if (!pss->fp)
+					if (!pss->fp && p < end)
 						*p++ = '}';
 				}
 			}

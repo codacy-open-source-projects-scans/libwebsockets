@@ -4615,20 +4615,700 @@ test_cb(struct lecp_ctx *ctx, char reason)
 	return 0;
 }
 
+/*
+ * Structural conformance
+ *
+ * The vectors above pin exact event sequences.  These instead check, for any
+ * well-formed input, invariants the event stream must keep whatever the
+ * input is:
+ *
+ *  - every ARRAY / OBJECT / TAG / STR / BLOB START has its END, properly
+ *    nested, and string chunks only arrive inside an open string of their
+ *    own kind
+ *  - ARRAY_ITEM_START / ARRAY_ITEM_END only appear directly inside an array,
+ *    and bracket exactly one item each
+ *  - a tag encloses exactly one item
+ *  - inside a map, items alternate key, value, key, value... and
+ *    lecp_parse_map_is_key() says so to the callback for each of them
+ *  - ctx->path is what the enclosing containers and the current keys say it
+ *    should be: "[]" per array, "." per map followed by the name of the key
+ *    the map is on (empty for a key that is not a text string)
+ *  - ctx->path_match is the first of the paths[] given to lecp_construct()
+ *    that the shortest matching prefix of that path matches, ie, a match
+ *    covers everything inside what it matched, and nothing else
+ *
+ * The model of what is open is built from the events alone, so it is
+ * independent of the parser's own stack.
+ */
+
+enum {
+	SC_ROOT,
+	SC_ARRAY,
+	SC_MAP,
+	SC_TAG,
+	SC_STR,
+	SC_BLOB,
+};
+
+enum {
+	SC_KEY_NAMED,		/* map: name[] is the current key, maybe "" */
+	SC_KEY_COLLECTING,	/* map: a tstr key is arriving into name[] */
+	SC_KEY_UNKNOWN,		/* map: a bstr key, can't compare it */
+};
+
+struct sc_frame {
+	char			name[48]; /* map: current text key */
+	uint8_t			kind;
+	uint8_t			item;	/* array: 0 idle, 1 ITEM_START, 2 item */
+	uint8_t			key;	/* this frame is a map key */
+	uint8_t			key_state; /* map: SC_KEY_... */
+	uint8_t			name_len;
+	uint32_t		count;	/* completed child items */
+};
+
+struct sc_priv {
+	struct sc_frame		st[LECP_MAX_DEPTH + 1];
+	const char * const	*paths;
+	int			count_paths;
+	int			sp;
+	int			fail;
+};
+
+static int
+sc_fail(struct sc_priv *pr, const char *why)
+{
+	lwsl_warn("%s: sp %d: %s\n", __func__, pr->sp, why);
+	pr->fail = 1;
+
+	return 1;
+}
+
+/* the first of paths[] that is exactly this, if any */
+
+static int
+sc_match(struct sc_priv *pr, const char *path)
+{
+	int n;
+
+	for (n = 0; n < pr->count_paths; n++)
+		if (!strcmp(pr->paths[n], path))
+			return n + 1;
+
+	return 0;
+}
+
+/*
+ * Compose the path the open frames say we should be at, plus the suffix of an
+ * item that is just opening, and the path_match we should see there: the
+ * match of the shortest prefix, at the points the path grows by, that has
+ * one.  Returns nonzero if we can't know them.
+ */
+
+static int
+sc_path(struct sc_priv *pr, const char *suffix, char *path, size_t len,
+	int *match)
+{
+	char *p = path, *end = path + len;
+	int n;
+
+	*p = '\0';
+	*match = 0;
+
+	for (n = 1; n <= pr->sp; n++) {
+		const struct sc_frame *f = &pr->st[n];
+
+		switch (f->kind) {
+		case SC_ARRAY:
+			p += lws_snprintf(p, lws_ptr_diff_size_t(end, p), "[]");
+			break;
+		case SC_MAP:
+			if (f->key_state != SC_KEY_NAMED)
+				return 1;
+			p += lws_snprintf(p, lws_ptr_diff_size_t(end, p), ".");
+			if (!*match)
+				*match = sc_match(pr, path);
+			p += lws_snprintf(p, lws_ptr_diff_size_t(end, p), "%s",
+					  f->name);
+			break;
+		default:
+			continue;
+		}
+		if (!*match)
+			*match = sc_match(pr, path);
+	}
+
+	lws_snprintf(p, lws_ptr_diff_size_t(end, p), "%s", suffix);
+	if (!*match)
+		*match = sc_match(pr, path);
+
+	return 0;
+}
+
+static int
+sc_check_path(struct lecp_ctx *ctx, struct sc_priv *pr, const char *suffix)
+{
+	char path[LECP_MAX_PATH + 16];
+	int match;
+
+	if (sc_path(pr, suffix, path, sizeof(path), &match))
+		return 0;
+
+	if (strcmp(path, ctx->path)) {
+		lwsl_warn("%s: path '%s', expected '%s'\n", __func__,
+			  ctx->path, path);
+
+		return sc_fail(pr, "wrong path");
+	}
+
+	if (ctx->path_match != match) {
+		lwsl_warn("%s: path '%s': path_match %d, expected %d\n",
+			  __func__, path, ctx->path_match, match);
+
+		return sc_fail(pr, "wrong path_match");
+	}
+
+	return 0;
+}
+
+/* a new item is starting in the innermost open frame */
+
+static int
+sc_item_start(struct lecp_ctx *ctx, struct sc_priv *pr, uint8_t *is_key)
+{
+	struct sc_frame *f = &pr->st[pr->sp];
+
+	*is_key = 0;
+
+	switch (f->kind) {
+	case SC_STR:
+	case SC_BLOB:
+		return sc_fail(pr, "item inside a string");
+	case SC_ARRAY:
+		if (f->item != 1)
+			return sc_fail(pr, "array item without ITEM_START");
+		f->item = 2;
+		break;
+	case SC_MAP:
+		*is_key = !(f->count & 1);
+		if (*is_key) {
+			/* the path loses the previous key's name */
+			f->key_state	= SC_KEY_NAMED;
+			f->name_len	= 0;
+			f->name[0]	= '\0';
+		}
+		break;
+	case SC_TAG:
+		if (f->count)
+			return sc_fail(pr, "second item inside a tag");
+		break;
+	}
+
+	if (lecp_parse_map_is_key(ctx) != *is_key)
+		return sc_fail(pr, *is_key ? "key reported as a value" :
+					     "value reported as a key");
+
+	return 0;
+}
+
+static int
+sc_open(struct lecp_ctx *ctx, struct sc_priv *pr, uint8_t kind)
+{
+	static const char * const sfx[] = { "", "[]", ".", "", "", "" };
+	struct sc_frame *f = &pr->st[pr->sp];
+	uint8_t is_key;
+
+	if (sc_item_start(ctx, pr, &is_key))
+		return 1;
+
+	if (sc_check_path(ctx, pr, sfx[kind]))
+		return 1;
+
+	if (is_key && kind == SC_STR)
+		f->key_state = SC_KEY_COLLECTING;
+	if (is_key && kind == SC_BLOB)
+		f->key_state = SC_KEY_UNKNOWN;
+
+	if (pr->sp + 1 >= (int)LWS_ARRAY_SIZE(pr->st))
+		return sc_fail(pr, "too deep");
+
+	pr->sp++;
+	memset(&pr->st[pr->sp], 0, sizeof(pr->st[pr->sp]));
+	pr->st[pr->sp].kind	= kind;
+	pr->st[pr->sp].key	= is_key;
+
+	return 0;
+}
+
+/* a text key's content arrives in one or more pieces */
+
+static int
+sc_key_text(struct lecp_ctx *ctx, struct sc_priv *pr)
+{
+	struct sc_frame *m;
+
+	if (!pr->st[pr->sp].key || pr->st[pr->sp].kind != SC_STR)
+		return 0;
+
+	m = &pr->st[pr->sp - 1];
+	if ((size_t)m->name_len + ctx->npos >= sizeof(m->name))
+		return sc_fail(pr, "test key too long");
+
+	memcpy(m->name + m->name_len, ctx->buf, ctx->npos);
+	m->name_len = (uint8_t)(m->name_len + ctx->npos);
+	m->name[m->name_len] = '\0';
+
+	return 0;
+}
+
+static int
+sc_close(struct sc_priv *pr, uint8_t kind)
+{
+	struct sc_frame *f = &pr->st[pr->sp];
+
+	if (!pr->sp || f->kind != kind)
+		return sc_fail(pr, "END does not match the open START");
+	if (kind == SC_ARRAY && f->item)
+		return sc_fail(pr, "ARRAY_END inside an unfinished item");
+	if (kind == SC_TAG && f->count != 1)
+		return sc_fail(pr, "tag did not enclose exactly one item");
+
+	pr->sp--;
+	pr->st[pr->sp].count++;
+
+	return 0;
+}
+
+static signed char
+sc_cb(struct lecp_ctx *ctx, char reason)
+{
+	struct sc_priv *pr = (struct sc_priv *)ctx->user;
+	struct sc_frame *f = &pr->st[pr->sp];
+	uint8_t is_key;
+
+	if (pr->fail)
+		return 1;
+
+	switch (reason) {
+	case LECPCB_CONSTRUCTED:
+	case LECPCB_DESTRUCTED:
+	case LECPCB_LITERAL_CBOR:
+		return 0;
+
+	case LECPCB_FAILED:
+		return (signed char)sc_fail(pr, "parse failed");
+
+	case LECPCB_VAL_TRUE:
+	case LECPCB_VAL_FALSE:
+	case LECPCB_VAL_NULL:
+	case LECPCB_VAL_NUM_INT:
+	case LECPCB_VAL_NUM_UINT:
+	case LECPCB_VAL_UNDEFINED:
+	case LECPCB_VAL_FLOAT16:
+	case LECPCB_VAL_FLOAT32:
+	case LECPCB_VAL_FLOAT64:
+	case LECPCB_VAL_SIMPLE:
+		if (sc_item_start(ctx, pr, &is_key) ||
+		    sc_check_path(ctx, pr, ""))
+			return 1;
+		pr->st[pr->sp].count++;
+		return 0;
+
+	case LECPCB_ARRAY_START:
+		return (signed char)sc_open(ctx, pr, SC_ARRAY);
+	case LECPCB_ARRAY_END:
+		return (signed char)sc_close(pr, SC_ARRAY);
+	case LECPCB_OBJECT_START:
+		return (signed char)sc_open(ctx, pr, SC_MAP);
+	case LECPCB_OBJECT_END:
+		if (f->kind == SC_MAP && (f->count & 1))
+			return (signed char)sc_fail(pr, "map ended on a key");
+		return (signed char)sc_close(pr, SC_MAP);
+	case LECPCB_TAG_START:
+		return (signed char)sc_open(ctx, pr, SC_TAG);
+	case LECPCB_TAG_END:
+		return (signed char)sc_close(pr, SC_TAG);
+
+	case LECPCB_VAL_STR_START:
+		return (signed char)sc_open(ctx, pr, SC_STR);
+	case LECPCB_VAL_STR_CHUNK:
+		if (f->kind != SC_STR)
+			return (signed char)sc_fail(pr, "STR_CHUNK outside a string");
+		return (signed char)sc_key_text(ctx, pr);
+	case LECPCB_VAL_STR_END:
+		if (f->kind != SC_STR)
+			return (signed char)sc_fail(pr, "STR_END outside a string");
+		if (sc_key_text(ctx, pr))
+			return 1;
+		if (f->key) {
+			/* the whole key is on the path now */
+			pr->st[pr->sp - 1].key_state = SC_KEY_NAMED;
+			if (sc_check_path(ctx, pr, ""))
+				return 1;
+		}
+		return (signed char)sc_close(pr, SC_STR);
+
+	case LECPCB_VAL_BLOB_START:
+		return (signed char)sc_open(ctx, pr, SC_BLOB);
+	case LECPCB_VAL_BLOB_CHUNK:
+		if (f->kind != SC_BLOB)
+			return (signed char)sc_fail(pr, "BLOB_CHUNK outside a blob");
+		return 0;
+	case LECPCB_VAL_BLOB_END:
+		return (signed char)sc_close(pr, SC_BLOB);
+
+	case LECPCB_ARRAY_ITEM_START:
+		if (f->kind != SC_ARRAY)
+			return (signed char)sc_fail(pr, "ITEM_START outside an array");
+		if (f->item)
+			return (signed char)sc_fail(pr, "ITEM_START inside an item");
+		f->item = 1;
+		return 0;
+	case LECPCB_ARRAY_ITEM_END:
+		if (f->kind != SC_ARRAY)
+			return (signed char)sc_fail(pr, "ITEM_END outside an array");
+		if (f->item != 2)
+			return (signed char)sc_fail(pr, "ITEM_END without an item");
+		f->item = 0;
+		return 0;
+	}
+
+	return (signed char)sc_fail(pr, "unexpected callback reason");
+}
+
+/*
+ * Returns 0 if the whole of cbor parsed and the event stream kept every
+ * invariant
+ */
+
+static int
+sc_run(const char *name, const uint8_t *cbor, size_t len,
+       const char * const *paths, int count_paths)
+{
+	struct lecp_ctx ctx;
+	struct sc_priv pr;
+	int n;
+
+	memset(&pr, 0, sizeof(pr));
+	pr.paths	= paths;
+	pr.count_paths	= count_paths;
+
+	lecp_construct(&ctx, sc_cb, &pr, paths, (unsigned char)count_paths);
+	n = lecp_parse(&ctx, cbor, len);
+	lecp_destruct(&ctx);
+
+	if (n || pr.fail || pr.sp) {
+		lwsl_err("%s: %s: structure check failed (parse %d, fail %d, "
+			 "sp %d)\n", __func__, name, n, pr.fail, pr.sp);
+		lwsl_hexdump_notice(cbor, len);
+
+		return 1;
+	}
+
+	return 0;
+}
+
+/*
+ * Conformance vectors that put two containers of different kinds, or of
+ * different length encodings, side by side at the same level
+ */
+
+static const uint8_t
+	/* [{_ "a": 1}, {"b": 2}]: an indefinite map, then a definite one */
+	sc1[] = { 0x82, 0xbf, 0x61, 0x61, 0x01, 0xff,
+			0xa1, 0x61, 0x62, 0x02 },
+	/* [[1], {"b": 2}]: an odd-length array, then a map */
+	sc2[] = { 0x82, 0x81, 0x01, 0xa1, 0x61, 0x62, 0x02 },
+	/* [[1], {1: 2}]: an array, then a map with int labels */
+	sc3[] = { 0x82, 0x81, 0x01, 0xa1, 0x01, 0x02 },
+	/* [(_ h'01'), [h'02']]: an indefinite bstr, then an array of bstr */
+	sc4[] = { 0x82, 0x5f, 0x41, 0x01, 0xff, 0x81, 0x41, 0x02 },
+	/* [1(0), {"b": 2}]: a tag, then a map */
+	sc5[] = { 0x82, 0xc1, 0x00, 0xa1, 0x61, 0x62, 0x02 },
+	/* [[1], 1(2)]: an array, then a tag */
+	sc6[] = { 0x82, 0x81, 0x01, 0xc1, 0x02 },
+	/* [{"a": 1}, {"b": 2}]: two definite maps */
+	sc7[] = { 0x82, 0xa1, 0x61, 0x61, 0x01, 0xa1, 0x61, 0x62, 0x02 },
+	/* [[_ 1], {1: [h'02']}]: indefinite array, then map holding an array */
+	sc8[] = { 0x82, 0x9f, 0x01, 0xff, 0xa1, 0x01, 0x81, 0x41, 0x02 },
+	/* {1: (_ "A"), 2: [h'aabbcc']}: a keyed indefinite tstr, then array */
+	sc9[] = { 0xa2, 0x01, 0x7f, 0x61, 0x41, 0xff,
+			0x02, 0x81, 0x43, 0xaa, 0xbb, 0xcc },
+	/* [[{1: 2}], 1({3: 4})]: tag body map after a nested map */
+	sc10[] = { 0x82, 0x81, 0xa1, 0x01, 0x02, 0xc1, 0xa1, 0x03, 0x04 },
+	/* {"a": [], "b": 1}: a keyed empty array, then another key */
+	sc11[] = { 0xa2, 0x61, 0x61, 0x80, 0x61, 0x62, 0x01 },
+	/* {"a": {}, "b": 1}: a keyed empty map, then another key */
+	sc12[] = { 0xa2, 0x61, 0x61, 0xa0, 0x61, 0x62, 0x01 },
+	/* {"a": [1], "b": {"c": 2}, "d": 3}: keyed containers in a row */
+	sc13[] = { 0xa3, 0x61, 0x61, 0x81, 0x01, 0x61, 0x62, 0xa1,
+			0x61, 0x63, 0x02, 0x61, 0x64, 0x03 },
+	/* {"a": 1, "": 2}: an empty key replaces a named one */
+	sc14[] = { 0xa2, 0x61, 0x61, 0x01, 0x60, 0x02 },
+	/* {"a": 1, 2: 3}: an int key replaces a named one */
+	sc15[] = { 0xa2, 0x61, 0x61, 0x01, 0x02, 0x03 },
+	/* {(_ "k", "ey"): [], "b": 1}: an indefinite-length key */
+	sc16[] = { 0xa2, 0x7f, 0x61, 0x6b, 0x62, 0x65, 0x79, 0xff,
+			0x80, 0x61, 0x62, 0x01 },
+	/* {"a": (_ "x"), "b": 1}: an indefinite-length value */
+	sc17[] = { 0xa2, 0x61, 0x61, 0x7f, 0x61, 0x78, 0xff,
+			0x61, 0x62, 0x01 },
+	/* [{"a": [1]}, {"b": 2}]: keyed container, then the next map */
+	sc18[] = { 0x82, 0xa1, 0x61, 0x61, 0x81, 0x01,
+			0xa1, 0x61, 0x62, 0x02 },
+	/* {"a": 1, "b": 2} */
+	sc19[] = { 0xa2, 0x61, 0x61, 0x01, 0x61, 0x62, 0x02 },
+	/* {"a": 1, "c": 2} */
+	sc20[] = { 0xa2, 0x61, 0x61, 0x01, 0x61, 0x63, 0x02 },
+	/* {"a": {"x": 1}, "b": [2, 3], "c": 4} */
+	sc21[] = { 0xa3, 0x61, 0x61, 0xa1, 0x61, 0x78, 0x01,
+			0x61, 0x62, 0x82, 0x02, 0x03, 0x61, 0x63, 0x04 },
+	/*
+	 * [(_ h'<24 bytes>', h'01'), 1]: an indefinite bstr whose first
+	 * fragment is long enough to need the long-form length
+	 */
+	sc22[] = { 0x82, 0x5f, 0x58, 0x18,
+			0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+			0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+			0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+			0x41, 0x01, 0xff, 0x01 },
+	/* {"t": (_ "<24 chars>")}: the same for a tstr, as a map value */
+	sc23[] = { 0xa1, 0x61, 0x74, 0x7f, 0x78, 0x18,
+			0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
+			0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70,
+			0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78,
+			0xff },
+	/* [(_ h'01', h'<24 bytes>')]: a long-form fragment after a short one */
+	sc24[] = { 0x81, 0x5f, 0x41, 0x01, 0x58, 0x18,
+			0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+			0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+			0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+			0xff };
+
+static const char * const sc_p_ab[]	= { ".a", ".b" };
+static const char * const sc_p_a[]	= { ".a" };
+static const char * const sc_p_arr_a[]	= { "[].a" };
+static const char * const sc_p_nested[]	= { ".a", ".b[]" };
+
+struct sc_vec {
+	const char		*name;
+	const uint8_t		*b;
+	size_t			blen;
+	const char * const	*paths;
+	int			count_paths;
+};
+
+static const struct sc_vec sc_vecs[] = {
+	{ .name = "indef map then map",
+	  .b = sc1, .blen = sizeof(sc1) },
+	{ .name = "array then map",
+	  .b = sc2, .blen = sizeof(sc2) },
+	{ .name = "array then int map",
+	  .b = sc3, .blen = sizeof(sc3) },
+	{ .name = "indef bstr then array",
+	  .b = sc4, .blen = sizeof(sc4) },
+	{ .name = "tag then map",
+	  .b = sc5, .blen = sizeof(sc5) },
+	{ .name = "array then tag",
+	  .b = sc6, .blen = sizeof(sc6) },
+	{ .name = "map then map",
+	  .b = sc7, .blen = sizeof(sc7) },
+	{ .name = "indef array then map",
+	  .b = sc8, .blen = sizeof(sc8) },
+	{ .name = "indef tstr value then array",
+	  .b = sc9, .blen = sizeof(sc9) },
+	{ .name = "nested map then tagged map",
+	  .b = sc10, .blen = sizeof(sc10) },
+	{ .name = "keyed empty array, next key",
+	  .b = sc11, .blen = sizeof(sc11) },
+	{ .name = "keyed empty map, next key",
+	  .b = sc12, .blen = sizeof(sc12) },
+	{ .name = "keyed containers in a row",
+	  .b = sc13, .blen = sizeof(sc13) },
+	{ .name = "empty key after named key",
+	  .b = sc14, .blen = sizeof(sc14) },
+	{ .name = "int key after named key",
+	  .b = sc15, .blen = sizeof(sc15) },
+	{ .name = "indefinite key",
+	  .b = sc16, .blen = sizeof(sc16) },
+	{ .name = "indefinite value, next key",
+	  .b = sc17, .blen = sizeof(sc17) },
+	{ .name = "keyed container, next map",
+	  .b = sc18, .blen = sizeof(sc18) },
+	{ .name = "path match on 2nd value",
+	  .b = sc19, .blen = sizeof(sc19),
+	  .paths = sc_p_ab, .count_paths = LWS_ARRAY_SIZE(sc_p_ab) },
+	{ .name = "path match only on 1st value",
+	  .b = sc20, .blen = sizeof(sc20),
+	  .paths = sc_p_a, .count_paths = LWS_ARRAY_SIZE(sc_p_a) },
+	{ .name = "path match in 1st map only",
+	  .b = sc7, .blen = sizeof(sc7),
+	  .paths = sc_p_arr_a, .count_paths = LWS_ARRAY_SIZE(sc_p_arr_a) },
+	{ .name = "path match covers its insides",
+	  .b = sc21, .blen = sizeof(sc21),
+	  .paths = sc_p_nested, .count_paths = LWS_ARRAY_SIZE(sc_p_nested) },
+	{ .name = "indef bstr, long-form first fragment",
+	  .b = sc22, .blen = sizeof(sc22) },
+	{ .name = "indef tstr, long-form first fragment",
+	  .b = sc23, .blen = sizeof(sc23) },
+	{ .name = "indef bstr, long-form second fragment",
+	  .b = sc24, .blen = sizeof(sc24) },
+};
+
+/*
+ * A map of 16 ten-character keys, each holding an empty array: the path
+ * never needs more than one key's worth of room, however many keys there are
+ */
+
+static size_t
+sc_many_keyed_arrays(uint8_t *buf, size_t len)
+{
+	uint8_t *p = buf;
+	int n;
+
+	if (len < 1 + 16 * 12)
+		return 0;
+
+	*p++ = 0xb0; /* map of 16 pairs */
+	for (n = 0; n < 16; n++) {
+		*p++ = 0x6a; /* tstr, 10 */
+		memcpy(p, "key-", 4);
+		p += 4;
+		lws_snprintf((char *)p, 7, "%06d", n);
+		p += 6;
+		*p++ = 0x80; /* [] */
+	}
+
+	return lws_ptr_diff_size_t(p, buf);
+}
+
+/*
+ * The writer has to produce the same bytes whatever size of output buffer
+ * it is given, refilling it on LWS_LECPCTX_RET_AGAIN.  Each case is written
+ * once into a buffer big enough for all of it, then again through output
+ * windows of every size from 1 to LEC_WIN_MAX bytes, and each concatenation
+ * has to match the one-shot encoding.  The cases put heads of every width
+ * into the writer's scratch so that windows end inside each of them.
+ */
+
+#define LEC_WIN_MAX 80
+
+static const uint8_t lec_blob[] = {
+	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+	0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
+	0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+};
+
+static const char * const lec_chunk_names[] = {
+	"8-byte integer",
+	"tagged bstr, 2-byte heads",
+	"map of wide literal ints",
+	"long tstr literal and indefinite tstr",
+	"map of %d keys, %.*b and %s values",
+	"array of %u, %lld and a %t tagged %.*s",
+	"lone %s",
+};
+
+static enum lws_lec_pctx_ret
+lec_chunk_emit(lws_lec_pctx_t *ctx, int which)
+{
+	switch (which) {
+	case 0:
+		return lws_lec_printf(ctx, "%lld", 0x123456789abcdef0ll);
+	case 1:
+		return lws_lec_printf(ctx, "1234(%.*b)", (int)sizeof(lec_blob),
+				      lec_blob);
+	case 2:
+		return lws_lec_printf(ctx, "{'ghi':[-129,1024,4294967296],"
+					   "'jkl':-70000,'mno':65536}");
+	case 3:
+		return lws_lec_printf(ctx, "['abcdefghijklmnopqrstuvwxyz',"
+					   "<t'hello'>]");
+	/*
+	 * Resuming a format has to skip the args conversions before the
+	 * current one already consumed, whichever of them the window ended
+	 * after, and pick up the right pointer for a string it is inside
+	 */
+	case 4:
+		return lws_lec_printf(ctx, "{%d:%.*b,%d:%s}", 4,
+				      (int)sizeof(lec_blob), lec_blob, -70000,
+				      "a text string of 32 characters..");
+	case 5:
+		return lws_lec_printf(ctx, "[%u,%lld,%t(%.*s)]", 65536u,
+				      -0x123456789ll, 1234, 26,
+				      "abcdefghijklmnopqrstuvwxyz");
+	case 6:
+		return lws_lec_printf(ctx, "%s",
+				      "a text string of 32 characters..");
+	}
+
+	return LWS_LECPCTX_RET_FAIL;
+}
+
+static int
+lec_chunked(int which)
+{
+	uint8_t one[256], cat[256], win[LEC_WIN_MAX];
+	enum lws_lec_pctx_ret r;
+	lws_lec_pctx_t ctx;
+	size_t ol, cl, w;
+
+	lws_lec_init(&ctx, one, sizeof(one));
+	if (lec_chunk_emit(&ctx, which) != LWS_LECPCTX_RET_FINISHED)
+		return 1;
+	ol = ctx.used;
+
+	for (w = 1; w <= sizeof(win); w++) {
+		lws_lec_init(&ctx, win, w);
+		cl = 0;
+
+		do {
+			r = lec_chunk_emit(&ctx, which);
+			/*
+			 * a window that ended exactly on the end of the output
+			 * still gets AGAIN, then a FINISHED with nothing in it
+			 */
+			if (r == LWS_LECPCTX_RET_FAIL ||
+			    (r == LWS_LECPCTX_RET_AGAIN && !ctx.used) ||
+			    ctx.used > sizeof(cat) - cl) {
+				lwsl_err("%s: %s: window %u: fail at %u\n",
+					 __func__, lec_chunk_names[which],
+					 (unsigned int)w, (unsigned int)cl);
+				return 1;
+			}
+			memcpy(cat + cl, win, ctx.used);
+			cl += ctx.used;
+			lws_lec_setbuf(&ctx, win, w);
+		} while (r == LWS_LECPCTX_RET_AGAIN);
+
+		if (cl != ol || memcmp(cat, one, ol)) {
+			lwsl_err("%s: %s: window %u differs\n", __func__,
+				 lec_chunk_names[which], (unsigned int)w);
+			lwsl_hexdump_notice(one, ol);
+			lwsl_hexdump_notice(cat, cl);
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
 int main(int argc, const char **argv)
 {
 	int n, m, e = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE,
 			expected = (int)LWS_ARRAY_SIZE(cbor_tests) +
-					33 /* <-- how many write tests */;
+				   /* structure check of the same vectors */
+				   (int)LWS_ARRAY_SIZE(cbor_tests) - 1 +
+				   (int)LWS_ARRAY_SIZE(sc_vecs) + 1 +
+					34 /* <-- how many write tests */ +
+				   (int)LWS_ARRAY_SIZE(lec_chunk_names);
 	struct lecp_ctx ctx;
 	const char *p;
 	(void)switches;
 
-	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
+	if (lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
 		lws_switches_print_help(argv[0], switches, LWS_ARRAY_SIZE(switches));
 		return 0;
 	}
-
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
 		logs = atoi(p);
@@ -4675,6 +5355,42 @@ int main(int argc, const char **argv)
 					lecp_error_to_string(n));
 			e++;
 		}
+	}
+
+	/*
+	 * The same vectors again, this time only checking the structure of
+	 * the event stream (46 is the one that is expected to fail)
+	 */
+
+	for (m = 0; m < (int)LWS_ARRAY_SIZE(cbor_tests); m++) {
+		char name[32];
+
+		if (m + 1 == 46)
+			continue;
+
+		lws_snprintf(name, sizeof(name), "test %d", m + 1);
+		if (sc_run(name, cbor_tests[m].b, cbor_tests[m].blen, NULL, 0))
+			e++;
+		else
+			pass++;
+	}
+
+	for (m = 0; m < (int)LWS_ARRAY_SIZE(sc_vecs); m++) {
+		if (sc_run(sc_vecs[m].name, sc_vecs[m].b, sc_vecs[m].blen,
+			   sc_vecs[m].paths, sc_vecs[m].count_paths))
+			e++;
+		else
+			pass++;
+	}
+
+	{
+		uint8_t many[1 + 16 * 12];
+		size_t ml = sc_many_keyed_arrays(many, sizeof(many));
+
+		if (!ml || sc_run("many keyed arrays", many, ml, NULL, 0))
+			e++;
+		else
+			pass++;
 	}
 
 	{
@@ -5065,6 +5781,40 @@ int main(int argc, const char **argv)
 			lwsl_hexdump_notice(ctx.start, ctx.used);
 			e++;
 		} else
+			pass++;
+
+		/*
+		 * A format that fails part-way must not leave the context
+		 * part-way through it: the next format on the same context
+		 * has to start from its own beginning, in the idle state
+		 */
+
+		lwsl_user("%s: test34\n", __func__);
+		lws_lec_setbuf(&ctx, buf, sizeof(buf));
+
+		if (lws_lec_printf(&ctx, "[1,2]]") != LWS_LECPCTX_RET_FAIL ||
+		    lws_lec_printf(&ctx, "<x") != LWS_LECPCTX_RET_FAIL) {
+			e++;
+		} else {
+			lws_lec_setbuf(&ctx, buf, sizeof(buf));
+
+			if (lws_lec_printf(&ctx, "'hello'") !=
+					LWS_LECPCTX_RET_FINISHED ||
+			    ctx.used != sizeof(w1) ||
+			    memcmp(w1, buf, ctx.used)) {
+				lwsl_hexdump_notice(ctx.start, ctx.used);
+				e++;
+			} else
+				pass++;
+		}
+	}
+
+	for (m = 0; m < (int)LWS_ARRAY_SIZE(lec_chunk_names); m++) {
+		lwsl_user("%s: chunked write: %s\n", __func__,
+			  lec_chunk_names[m]);
+		if (lec_chunked(m))
+			e++;
+		else
 			pass++;
 	}
 

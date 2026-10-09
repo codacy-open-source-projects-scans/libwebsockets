@@ -338,6 +338,9 @@ plugins and lwsws.
 
  - If cpu and memory is not super restricted and you care about TLS speed,
    OpenSSL or a directly compatible variant like Boring SSL is a good choice.
+
+ - To build with openHITLS (from https://gitcode.com/openhitls/openhitls.git example shown if built in `/opt/openhitls/build`) , use:
+   `cmake .. -DLWS_WITH_OPENHITLS=1 -DOPENHITLS_INCLUDE_DIRS=/opt/openhitls/include -DOPENHITLS_LIBRARIES=/opt/openhitls/build/libhitls_tls.so;/opt/openhitls/build/libhitls_pki.so;/opt/openhitls/build/libhitls_crypto.so;/opt/openhitls/build/libhitls_bsl.so;/opt/openhitls/build/libhitls_auth.so`
  
 Just building lws against stock Fedora OpenSSL or stock Fedora mbedTLS, for
 SSL handhake mbedTLS takes ~36ms and OpenSSL takes ~1ms on the same x86_64
@@ -546,18 +549,8 @@ Testing with h2spec (https://github.com/summerwind/h2spec)
 
 @section coverage Automated Coverage Testing
 
-./test-apps/attack.sh contains scripted tests that are the basis
-of the automated test coverage assessment available for gcc and clang.
-
-To reproduce
-
- $ cd build
- $ cmake .. -DLWS_WITH_GCOV=1 -DCMAKE_BUILD_TYPE=DEBUG
- $ ../scripts/build-gcov.sh
- $ ../test-apps/attack.sh
- $ ../scripts/gcov.sh
-...
-Lines executed:51.24% of 8279
+Coverage is measured over the ctest selftests, see
+[README.coverage.md](README.coverage.md).
 
 @section windowsprebuilt Using Windows binary builds on Appveyor
 

@@ -23,6 +23,71 @@ key_import_cb(struct lws_cose_key *s, void *user)
 	return 0;
 }
 
+/*
+ * Counts the set members it sees in *user, and refuses the second one, the
+ * way an application's key admission policy would
+ */
+
+static int
+key_import_refuse_second_cb(struct lws_cose_key *s, void *user)
+{
+	int *count = (int *)user;
+
+	return ++(*count) == 2;
+}
+
+/*
+ * Exporting a key through output buffers of every size from 1 to 80 bytes,
+ * refilling on LWS_LECPCTX_RET_AGAIN, has to give the same CBOR as exporting
+ * it in one go.  Small buffers end inside the item heads the writer keeps in
+ * its scratch, and inside the key_ops array export copies there itself.
+ */
+
+static int
+key_export_chunked(struct lws_cose_key *ck, int flags)
+{
+	uint8_t one[512], cat[512], win[80];
+	enum lws_lec_pctx_ret r;
+	lws_lec_pctx_t wc;
+	size_t ol, cl, w;
+
+	lws_lec_init(&wc, one, sizeof(one));
+	if (lws_cose_key_export(ck, &wc, flags) != LWS_LECPCTX_RET_FINISHED)
+		return 1;
+	ol = wc.used;
+
+	for (w = 1; w <= sizeof(win); w++) {
+		lws_lec_init(&wc, win, w);
+		cl = 0;
+
+		do {
+			r = lws_cose_key_export(ck, &wc, flags);
+			/* it may never claim more than the window it was given */
+			if (r == LWS_LECPCTX_RET_FAIL ||
+			    (r == LWS_LECPCTX_RET_AGAIN && !wc.used) ||
+			    wc.used > w || wc.used > sizeof(cat) - cl) {
+				lwsl_err("%s: window %u: fail at %u\n",
+					 __func__, (unsigned int)w,
+					 (unsigned int)cl);
+				return 1;
+			}
+			memcpy(cat + cl, win, wc.used);
+			cl += wc.used;
+			lws_lec_setbuf(&wc, win, w);
+		} while (r == LWS_LECPCTX_RET_AGAIN);
+
+		if (cl != ol || memcmp(cat, one, ol)) {
+			lwsl_err("%s: window %u differs\n", __func__,
+				 (unsigned int)w);
+			lwsl_hexdump_notice(one, ol);
+			lwsl_hexdump_notice(cat, cl);
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
 static const uint8_t
 	cose_key1[] = {
 			0xa6, 0x01, 0x02, 0x02, 0x62,
@@ -251,6 +316,40 @@ static const uint8_t
 			0xc5, 0x69, 0x7b, 0x32, 0x69,
 			0x19, 0x70, 0x3b, 0xac, 0x03,
 			0x1c, 0xae, 0x7f, 0x60
+	},
+
+	/*
+	 * key1's material with the curve and alg given as CBOR text strings
+	 * rather than ints: {1: 2, 3: "ES256", -1: "P-256", -2: x, -3: y,
+	 * -4: d} (F-035)
+	 */
+
+	cose_key1_tstrcrv[] = {
+			0xa6, 0x01, 0x02, 0x03, 0x65,
+			0x45, 0x53, 0x32, 0x35, 0x36,
+			0x20, 0x65, 0x50, 0x2d, 0x32,
+			0x35, 0x36, 0x21, 0x58, 0x20,
+			0xba, 0xc5, 0xb1, 0x1c, 0xad,
+			0x8f, 0x99, 0xf9, 0xc7, 0x2b,
+			0x05, 0xcf, 0x4b, 0x9e, 0x26,
+			0xd2, 0x44, 0xdc, 0x18, 0x9f,
+			0x74, 0x52, 0x28, 0x25, 0x5a,
+			0x21, 0x9a, 0x86, 0xd6, 0xa0,
+			0x9e, 0xff, 0x22, 0x58, 0x20,
+			0x20, 0x13, 0x8b, 0xf8, 0x2d,
+			0xc1, 0xb6, 0xd5, 0x62, 0xbe,
+			0x0f, 0xa5, 0x4a, 0xb7, 0x80,
+			0x4a, 0x3a, 0x64, 0xb6, 0xd7,
+			0x2c, 0xcf, 0xed, 0x6b, 0x6f,
+			0xb6, 0xed, 0x28, 0xbb, 0xfc,
+			0x11, 0x7e, 0x23, 0x58, 0x20,
+			0x57, 0xc9, 0x20, 0x77, 0x66,
+			0x41, 0x46, 0xe8, 0x76, 0x76,
+			0x0c, 0x95, 0x20, 0xd0, 0x54,
+			0xaa, 0x93, 0xc3, 0xaf, 0xb0,
+			0x4e, 0x30, 0x67, 0x05, 0xdb,
+			0x60, 0x90, 0x30, 0x85, 0x07,
+			0xb4, 0xd3,
 	},
 
 	cose_key_set1[] = {
@@ -659,7 +758,7 @@ static const uint8_t
 int
 test_cose_keys(struct lws_context *context)
 {
-	struct lws_cose_key *ck;
+	struct lws_cose_key *ck, *ck2;
 	lws_dll2_owner_t set;
 	lws_lec_pctx_t wc;
 	uint8_t buf[4096];
@@ -746,6 +845,126 @@ test_cose_keys(struct lws_context *context)
 		goto bail;
 
 	// lwsl_hexdump_notice(buf, wc.used);
+
+	/*
+	 * The same key material with the curve and alg as CBOR text strings
+	 * has to import with both stored NUL-terminated, so the strcmp-based
+	 * curve name lookup at export stays inside the allocation and
+	 * resolves the curve to its COSE int form (F-035)
+	 */
+
+	lwsl_user("%s: key 1 text-curve import + export\n", __func__);
+
+	ck = lws_cose_key_import(NULL, NULL, NULL, cose_key1_tstrcrv,
+				 sizeof(cose_key1_tstrcrv));
+	if (!ck) {
+		lwsl_err("%s: text-curve key import fail\n", __func__);
+		goto bail;
+	}
+
+	if (ck->kty != LWSCOSE_WKKTV_EC2 ||
+	    ck->gencrypto_kty != LWS_GENCRYPTO_KTY_EC ||
+	    ck->cose_curve != LWSCOSE_WKEC_P256 ||
+	    ck->cose_alg != LWSCOSE_WKAECDSA_ALG_ES256 ||
+	    ck->e[LWS_GENCRYPTO_EC_KEYEL_CRV].len != 5 ||
+	    memcmp(ck->e[LWS_GENCRYPTO_EC_KEYEL_CRV].buf, "P-256", 5) ||
+	    ck->e[LWS_GENCRYPTO_EC_KEYEL_CRV].buf[5] || /* NUL-terminated */
+	    ck->meta[COSEKEY_META_ALG].len != 5 ||
+	    memcmp(ck->meta[COSEKEY_META_ALG].buf, "ES256", 5) ||
+	    ck->meta[COSEKEY_META_ALG].buf[5] ||
+	    ck->e[LWS_GENCRYPTO_EC_KEYEL_X].len != sizeof(key1_x) ||
+	    memcmp(ck->e[LWS_GENCRYPTO_EC_KEYEL_X].buf, key1_x, sizeof(key1_x)) ||
+	    ck->e[LWS_GENCRYPTO_EC_KEYEL_Y].len != sizeof(key1_y) ||
+	    memcmp(ck->e[LWS_GENCRYPTO_EC_KEYEL_Y].buf, key1_y, sizeof(key1_y)) ||
+	    ck->e[LWS_GENCRYPTO_EC_KEYEL_D].len != sizeof(key1_d) ||
+	    memcmp(ck->e[LWS_GENCRYPTO_EC_KEYEL_D].buf, key1_d, sizeof(key1_d))) {
+		lwsl_err("%s: text-curve key checks fail\n", __func__);
+		lws_cose_key_destroy(&ck);
+		goto bail;
+	}
+
+	/* its text alg goes out as a tstr, check that in small buffers too */
+
+	if (key_export_chunked(ck, LWSJWKF_EXPORT_PRIVATE)) {
+		lwsl_err("%s: text-curve chunked export fail\n", __func__);
+		lws_cose_key_destroy(&ck);
+		goto bail;
+	}
+
+	/*
+	 * A curve name lws has no COSE int for goes out as the same tstr,
+	 * and that also has to survive small output buffers
+	 */
+
+	memcpy(buf, cose_key1_tstrcrv, sizeof(cose_key1_tstrcrv));
+	buf[16] = 'X'; /* "P-256" -> "P-25X" */
+	ck2 = lws_cose_key_import(NULL, NULL, NULL, buf,
+				  sizeof(cose_key1_tstrcrv));
+	if (!ck2) {
+		lwsl_err("%s: unknown-curve key import fail\n", __func__);
+		lws_cose_key_destroy(&ck);
+		goto bail;
+	}
+
+	lws_lec_init(&wc, buf, sizeof(buf));
+	n = (int)lws_cose_key_export(ck2, &wc, LWSJWKF_EXPORT_PRIVATE);
+	if (n != LWS_LECPCTX_RET_FINISHED || wc.used < 9 ||
+	    memcmp(buf, "\xa6\x01\x02\x20\x65P-25X", 9) ||
+	    key_export_chunked(ck2, LWSJWKF_EXPORT_PRIVATE)) {
+		lwsl_err("%s: unknown-curve key export fail\n", __func__);
+		lws_cose_key_destroy(&ck2);
+		lws_cose_key_destroy(&ck);
+		goto bail;
+	}
+
+	lws_cose_key_destroy(&ck2);
+
+	lws_lec_init(&wc, buf, sizeof(buf));
+	n = (int)lws_cose_key_export(ck, &wc, LWSJWKF_EXPORT_PRIVATE);
+	lws_cose_key_destroy(&ck);
+	if (n != LWS_LECPCTX_RET_FINISHED) {
+		lwsl_err("%s: text-curve key export fail\n", __func__);
+		goto bail;
+	}
+
+	/*
+	 * The first two pairs out are kty then the curve; the curve has to
+	 * come out as the COSE int for P-256, not fall back to a text string
+	 * because the name lookup walked off the end of the element
+	 */
+
+	if (wc.used < 5 || buf[0] != 0xa6 || buf[1] != 0x01 || buf[2] != 0x02 ||
+	    buf[3] != 0x20 || buf[4] != LWSCOSE_WKEC_P256) {
+		lwsl_err("%s: text-curve key export wrong form\n", __func__);
+		goto bail;
+	}
+
+	/* the exported form has to import back to the same key */
+
+	ck = lws_cose_key_import(NULL, NULL, NULL, buf, wc.used);
+	if (!ck) {
+		lwsl_err("%s: text-curve round trip import fail\n", __func__);
+		goto bail;
+	}
+
+	if (ck->kty != LWSCOSE_WKKTV_EC2 ||
+	    ck->cose_curve != LWSCOSE_WKEC_P256 ||
+	    ck->cose_alg != LWSCOSE_WKAECDSA_ALG_ES256 ||
+	    ck->e[LWS_GENCRYPTO_EC_KEYEL_CRV].len != 5 ||
+	    memcmp(ck->e[LWS_GENCRYPTO_EC_KEYEL_CRV].buf, "P-256", 5) ||
+	    ck->e[LWS_GENCRYPTO_EC_KEYEL_CRV].buf[5] ||
+	    ck->e[LWS_GENCRYPTO_EC_KEYEL_X].len != sizeof(key1_x) ||
+	    memcmp(ck->e[LWS_GENCRYPTO_EC_KEYEL_X].buf, key1_x, sizeof(key1_x)) ||
+	    ck->e[LWS_GENCRYPTO_EC_KEYEL_Y].len != sizeof(key1_y) ||
+	    memcmp(ck->e[LWS_GENCRYPTO_EC_KEYEL_Y].buf, key1_y, sizeof(key1_y)) ||
+	    ck->e[LWS_GENCRYPTO_EC_KEYEL_D].len != sizeof(key1_d) ||
+	    memcmp(ck->e[LWS_GENCRYPTO_EC_KEYEL_D].buf, key1_d, sizeof(key1_d))) {
+		lwsl_err("%s: text-curve round trip checks fail\n", __func__);
+		lws_cose_key_destroy(&ck);
+		goto bail;
+	}
+
+	lws_cose_key_destroy(&ck);
 
 	/* key2 import */
 
@@ -902,10 +1121,147 @@ test_cose_keys(struct lws_context *context)
 	lwsl_user("%s: key_set1\n", __func__);
 	lws_dll2_owner_clear(&set);
 	ck = lws_cose_key_import(&set, NULL, NULL, cose_key_set1, sizeof(cose_key_set1));
-	if (!ck)
+	if (!ck) {
+		lwsl_err("%s: key_set1 import fail\n", __func__);
 		return 1;
+	}
 
 	lws_cose_key_set_destroy(&set);
+
+	/*
+	 * A nonzero return from the per-key callback halts the import, which
+	 * then fails as a whole: none of its keys are left in the set
+	 */
+
+	lwsl_user("%s: key_set1 refused by per-key callback\n", __func__);
+
+	{
+		int count = 0;
+
+		lws_dll2_owner_clear(&set);
+		ck = lws_cose_key_import(&set, key_import_refuse_second_cb,
+					 &count, cose_key_set1,
+					 sizeof(cose_key_set1));
+		if (ck || count != 2 || lws_dll2_count(&set)) {
+			lwsl_err("%s: callback refusal ignored\n", __func__);
+			lws_cose_key_set_destroy(&set);
+			goto bail;
+		}
+	}
+
+	/*
+	 * A single key map imported into a set has to meet the same unique
+	 * kid rule as the members of a set import: re-importing one of the
+	 * set's own keys, exported as a single key, must fail
+	 */
+
+	lwsl_user("%s: single key with a kid already in the set\n", __func__);
+
+	lws_dll2_owner_clear(&set);
+	if (!lws_cose_key_import(&set, NULL, NULL, cose_key_set1,
+				 sizeof(cose_key_set1)) ||
+	    !(ck = lws_cose_key_from_set(&set, (const uint8_t *)"11", 2))) {
+		lwsl_err("%s: key_set1 import fail\n", __func__);
+		lws_cose_key_set_destroy(&set);
+		goto bail;
+	}
+
+	lws_lec_init(&wc, buf, sizeof(buf));
+	if (lws_cose_key_export(ck, &wc, LWSJWKF_EXPORT_PRIVATE) !=
+						LWS_LECPCTX_RET_FINISHED ||
+	    lws_cose_key_import(&set, NULL, NULL, buf, wc.used) ||
+	    lws_dll2_count(&set) != 9) {
+		lwsl_err("%s: duplicate kid single key accepted\n", __func__);
+		lws_cose_key_set_destroy(&set);
+		goto bail;
+	}
+	lws_cose_key_set_destroy(&set);
+
+	/*
+	 * Degenerate and malformed inputs must be rejected with NULL rather
+	 * than dereferencing the never-created key or leaking the
+	 * partially-created one (F-034)
+	 */
+
+	lwsl_user("%s: degenerate import rejections\n", __func__);
+
+	{
+		static const uint8_t empty[] = { /* nothing at all */ },
+			empty_array[] = { 0x80 },	/* [] */
+			nullval[] = { 0xf6 },		/* null */
+			trueval[] = { 0xf5 },		/* true */
+			bare_int[] = { 0x01 },
+			empty_bstr[] = { 0x40 },
+			empty_map[] = { 0xa0 },		/* {}: kty never appears */
+			tagged_null[] = { 0xd8, 0x65, 0xf6 }, /* tag(101) null */
+			trunc_tag[] = { 0xd8, 0x65 };	/* tag(101), no body */
+		struct { const uint8_t *buf; size_t len; } adj[] = {
+			{ empty,		sizeof(empty) },
+			{ empty_array,		sizeof(empty_array) },
+			{ nullval,		sizeof(nullval) },
+			{ trueval,		sizeof(trueval) },
+			{ bare_int,		sizeof(bare_int) },
+			{ empty_bstr,		sizeof(empty_bstr) },
+			{ empty_map,		sizeof(empty_map) },
+			{ tagged_null,		sizeof(tagged_null) },
+			{ trunc_tag,		sizeof(trunc_tag) },
+		};
+		size_t n;
+
+		for (n = 0; n < LWS_ARRAY_SIZE(adj); n++) {
+			ck = lws_cose_key_import(NULL, NULL, NULL,
+						 adj[n].buf, adj[n].len);
+			if (ck) {
+				lwsl_err("%s: degenerate %u accepted\n",
+					 __func__, (unsigned int)n);
+				lws_cose_key_destroy(&ck);
+				goto bail;
+			}
+		}
+
+		/* the key-set form of the same thing */
+
+		lws_dll2_owner_clear(&set);
+		ck = lws_cose_key_import(&set, NULL, NULL,
+					 empty_array, sizeof(empty_array));
+		if (ck || lws_dll2_count(&set)) {
+			lwsl_err("%s: empty key set accepted\n", __func__);
+			lws_cose_key_destroy(&ck);
+			lws_cose_key_set_destroy(&set);
+			goto bail;
+		}
+
+		/*
+		 * Truncated key: the parser needs more input, the callback
+		 * never reaches its own bail cleanup, so import itself has
+		 * to destroy the partial key
+		 */
+
+		memcpy(buf, cose_key3, sizeof(cose_key3));
+		ck = lws_cose_key_import(NULL, NULL, NULL,
+					 buf, sizeof(cose_key3) - 8);
+		if (ck) {
+			lwsl_err("%s: truncated key accepted\n", __func__);
+			lws_cose_key_destroy(&ck);
+			goto bail;
+		}
+
+		/*
+		 * Malformed CBOR mid-key: a bstr header with reserved
+		 * additional info 29 makes lecp fail at parser level...
+		 * again import has to clean up the partial key itself
+		 */
+
+		memcpy(buf, cose_key3, sizeof(cose_key3));
+		buf[16] = 0x5d;
+		ck = lws_cose_key_import(NULL, NULL, NULL,
+					 buf, sizeof(cose_key3));
+		if (ck) {
+			lwsl_err("%s: malformed key accepted\n", __func__);
+			lws_cose_key_destroy(&ck);
+			goto bail;
+		}
+	}
 
 	/* generate */
 
@@ -915,21 +1271,154 @@ test_cose_keys(struct lws_context *context)
 				   (1 << LWSCOSE_WKKO_ENCRYPT) |
 				   (1 << LWSCOSE_WKKO_DECRYPT),
 				   0, "P-256", (const uint8_t *)"the-keyid", 9);
-	if (!ck)
+	if (!ck) {
+		lwsl_err("%s: EC2 P-256 keygen fail\n", __func__);
 		return 1;
+	}
 
-	lws_cose_key_destroy(&ck);
+	/*
+	 * A private export carries every kind of item: map head, kty, the
+	 * int curve, kid, the int alg, key_ops and 2-byte bstr heads for x, y
+	 * and d.  The alg is set by hand the way an application would.
+	 */
+
+	lwsl_user("%s: EC2 key export in small buffers\n", __func__);
+
+	ck->cose_alg = LWSCOSE_WKAECDSA_ALG_ES256;
+	if (key_export_chunked(ck, LWSJWKF_EXPORT_PRIVATE) ||
+	    key_export_chunked(ck, 0)) {
+		lwsl_err("%s: EC2 chunked export fail\n", __func__);
+		lws_cose_key_destroy(&ck);
+		goto bail;
+	}
+
+	/*
+	 * An import into a set that already holds keys adds to it, and one
+	 * that fails or is empty has to leave the keys already there alone,
+	 * since the application may hold pointers to them.  Importing the
+	 * same set twice fails the second time, on its kids already being in
+	 * the set.
+	 */
+
+	lwsl_user("%s: imports into a set already holding a key\n", __func__);
+
+	{
+		static const uint8_t empty_set[] = { 0x80 }; /* [] */
+
+		lws_dll2_owner_clear(&set);
+		lws_dll2_add_tail(&ck->list, &set);
+
+		if (!lws_cose_key_import(&set, NULL, NULL, cose_key_set1,
+					 sizeof(cose_key_set1)) ||
+		    lws_dll2_count(&set) != 10 ||
+		    lws_cose_key_import(&set, NULL, NULL, cose_key_set1,
+					sizeof(cose_key_set1)) ||
+		    lws_cose_key_import(&set, NULL, NULL, empty_set,
+					sizeof(empty_set)) ||
+		    lws_cose_key_import(&set, NULL, NULL, cose_key_set1,
+					sizeof(cose_key_set1) - 8) ||
+		    lws_dll2_count(&set) != 10 ||
+		    lws_container_of(lws_dll2_get_head(&set),
+				     struct lws_cose_key, list) != ck ||
+		    lws_cose_key_from_set(&set, (const uint8_t *)"the-keyid",
+					  9) != ck) {
+			lwsl_err("%s: failed import disturbed the set\n",
+				 __func__);
+			lws_cose_key_set_destroy(&set);
+			goto bail;
+		}
+
+		/* the key the application kept is still intact */
+
+		lws_lec_init(&wc, buf, sizeof(buf));
+		n = (int)lws_cose_key_export(ck, &wc, LWSJWKF_EXPORT_PRIVATE);
+		lws_cose_key_set_destroy(&set); /* ck goes with it */
+		ck = NULL;
+		if (n != LWS_LECPCTX_RET_FINISHED) {
+			lwsl_err("%s: kept key export fail\n", __func__);
+			goto bail;
+		}
+	}
+
+	/*
+	 * Some TLS backends, eg GnuTLS, do not implement EdDSA at all...
+	 * detect it via the public api and skip this part cleanly
+	 */
+
+	{
+		struct lws_genec_ctx probe;
+		memset(&probe, 0, sizeof(probe));
+
+		if (lws_geneddsa_create(&probe, context, NULL)) {
+			lwsl_notice("%s: no EdDSA backend support, skipping "
+				    "OKP keygen\n", __func__);
+			return 0;
+		}
+
+		lws_genec_destroy(&probe);
+	}
 
 	ck = lws_cose_key_generate(context, LWSCOSE_WKKTV_OKP,
 				   (1 << LWSCOSE_WKKO_SIGN) |
 				   (1 << LWSCOSE_WKKO_VERIFY),
 				   0, "Ed25519", (const uint8_t *)"ed-keyid", 8);
-	if (!ck)
+	if (!ck) {
+		lwsl_err("%s: OKP Ed25519 keygen fail\n", __func__);
 		return 1;
+	}
+
+	/*
+	 * The generated OKP key has to survive an export -> import round
+	 * trip with its EdDSA curve intact: the export converts the curve
+	 * to its COSE int form and the import has to map it back to the
+	 * same curve name the crypto backend keys off
+	 */
+
+	lwsl_user("%s: OKP key export -> import\n", __func__);
+
+	lws_lec_init(&wc, buf, sizeof(buf));
+	n = (int)lws_cose_key_export(ck, &wc, LWSJWKF_EXPORT_PRIVATE);
+	if (n != LWS_LECPCTX_RET_FINISHED)
+		goto bail;
+
+	ck2 = lws_cose_key_import(NULL, NULL, NULL, buf, wc.used);
+	if (!ck2) {
+		lwsl_err("%s: OKP round trip import fail\n", __func__);
+		goto bail1;
+	}
+
+	if (ck2->kty != LWSCOSE_WKKTV_OKP ||
+	    ck2->gencrypto_kty != LWS_GENCRYPTO_KTY_OKP ||
+	    ck2->e[LWS_GENCRYPTO_OKP_KEYEL_CRV].len != 7 ||
+	    memcmp(ck2->e[LWS_GENCRYPTO_OKP_KEYEL_CRV].buf, "Ed25519", 7) ||
+	    ck2->e[LWS_GENCRYPTO_OKP_KEYEL_X].len !=
+				ck->e[LWS_GENCRYPTO_OKP_KEYEL_X].len ||
+	    memcmp(ck2->e[LWS_GENCRYPTO_OKP_KEYEL_X].buf,
+		   ck->e[LWS_GENCRYPTO_OKP_KEYEL_X].buf,
+		   ck->e[LWS_GENCRYPTO_OKP_KEYEL_X].len) ||
+	    ck2->e[LWS_GENCRYPTO_OKP_KEYEL_D].len !=
+				ck->e[LWS_GENCRYPTO_OKP_KEYEL_D].len ||
+	    memcmp(ck2->e[LWS_GENCRYPTO_OKP_KEYEL_D].buf,
+		   ck->e[LWS_GENCRYPTO_OKP_KEYEL_D].buf,
+		   ck->e[LWS_GENCRYPTO_OKP_KEYEL_D].len) ||
+	    ck2->meta[COSEKEY_META_KID].len !=
+				ck->meta[COSEKEY_META_KID].len ||
+	    memcmp(ck2->meta[COSEKEY_META_KID].buf,
+		   ck->meta[COSEKEY_META_KID].buf,
+		   ck->meta[COSEKEY_META_KID].len)) {
+		lwsl_err("%s: OKP round trip checks fail\n", __func__);
+		lws_cose_key_destroy(&ck2);
+		goto bail1;
+	}
+
+	lws_cose_key_destroy(&ck2);
 
 	lws_cose_key_destroy(&ck);
 
 	return 0;
+
+bail1:
+	lws_cose_key_destroy(&ck);
 
 bail:
 	lwsl_err("%s: selftest failed ++++++++++++++++++++\n", __func__);

@@ -9,6 +9,29 @@ The DHT functionality is physically split into client and backend blocks to allo
 *   `LWS_WITH_DHT`: Enables the DHT frontend and client API. This provides the core functionality to manage a DHT node ID (`dht-id.c`), serialize and parse base DHT protocol messages (`dht-bencode.c`), and manage networking and queries (`dht-tx.c`, `dht.c`).
 *   `LWS_WITH_DHT_BACKEND`: Enables the full DHT backend. This includes managing buckets, maintaining the complex routing table, coordinating decentralized searches, maintaining in-memory storage, and automatically responding to incoming RPCs like `ping`, `find_node`, `get_peers`, and `announce_peer`. This is automatically enabled by default when `LWS_WITH_DHT` is enabled, but can be forced off with `-DLWS_WITH_DHT_BACKEND=0`.
 
+## lwsws configuration
+
+A vhost's `"dht": [{...}]` block in lwsws JSON takes `"v"` (version string),
+`"name"`, `"port"` (default 7682), `"ipv6"`, `"hash"` (`sha1`, `sha256`,
+`sha512` or `blake3`), `"legacy"` and `"allow-private"`.  `"legacy"` selects
+the original fixed 20-byte id wire encoding for peers that predate the
+multihash one; it is off by default and needs a sha1 hash.  `"allow-private"`
+admits peers at private, loopback or link-local addresses, for a LAN
+deployment; by default only public addresses are kept, as BEP42 expects.
+
+## Node ids and BEP42
+
+A node that is not given an id starts with a random one and, once a quorum of
+peers has told it its external address, replaces it with one bound to that
+address as BEP42 describes (the first 21 bits derive from the masked IP and a
+random byte that ends the id).  Peers' ids are checked the same way when they
+enter the routing table: an id that is not bound to its address is still kept
+while a bucket has room, since a node may not know its address yet, but a
+bound one displaces it when the bucket is full, and no address may hold more
+than two entries in a bucket however many ids it presents.
+`lws_dht_bep42_id()` and `lws_dht_bep42_check()` are available to applications
+that supply their own ids.
+
 ## Configuration Options (`lws_dht_info_t`)
 
 To interact with the DHT, you must declare and configure an instance of `lws_dht_info` and pass it to `lws_dht_create()`, which allocates the active `lws_dht_ctx` tracking structural state.

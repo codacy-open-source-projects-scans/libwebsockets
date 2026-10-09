@@ -46,6 +46,7 @@ if (LWS_WITH_NETWORK)
 	if (LWS_WITH_SYS_ASYNC_DNS)
 		list(APPEND SOURCES
 			system/async-dns/async-dns.c
+			system/async-dns/async-dns-direct.c
 			system/async-dns/async-dns-parse.c)
 
 		if (LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
@@ -67,7 +68,13 @@ if (LWS_WITH_NETWORK)
 	
 	if (LWS_WITH_SYS_WHOIS)
 		list(APPEND SOURCES
-			system/whois/whois.c)
+			system/whois/whois.c
+			system/whois/whois-json.c)
+	endif()
+
+	if (LWS_WITH_EMAIL)
+		list(APPEND SOURCES
+			system/smtp/smtpc.c)
 	endif()
 
 	if (LWS_WITH_SYS_DHCP_CLIENT)

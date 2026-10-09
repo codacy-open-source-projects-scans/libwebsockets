@@ -41,6 +41,15 @@ struct vhd_login {
 	const char              *cookie_name;
 	const char              *service_name;
 	const char              *auth_server_url;
+	/*
+	 * The absolute base of the auth server's own API surface, used for
+	 * the sso_exchange side channel, /api/logout, the SSO origin check
+	 * and the widget's auth-server links.  Defaults to auth-server-url;
+	 * needs its own PVO when auth-server-url is deliberately a local
+	 * BFF entry (eg the oauth2-client's "/oauth/login").
+	 */
+	const char              *auth_api_url;
+	const char              *unauth_protocols;
 	int                     min_grant_level;
 
 	char                    db_path[256];
@@ -48,8 +57,20 @@ struct vhd_login {
 	char                    auth_domain[128];
 	char                    cookie_domain[128];
 	uint64_t                jwt_validity_secs;
+	uint64_t                csrf_max_age_secs;	/* auth_csrf cookie lifetime
+							 * minted/renewed by this bouncer;
+							 * default 30d. Decoupled from
+							 * jwt_validity_secs because the
+							 * csrf cookie must outlive the
+							 * short JWT to guard renewal. */
 
 	int                     unauth_allow;
+	int                     trust_forwarded_proto;	/* honour a proxy's
+							 * X-Forwarded-Proto at
+							 * all; it can only ever
+							 * upgrade to https, and
+							 * never overrides a real
+							 * TLS link */
 
 	struct lws_jwk          jwk;
 	lws_dll2_owner_t        pending_refresh_list;
@@ -61,7 +82,27 @@ struct pss_login {
 	char                    *silent_update_jwt;
 	struct lws_spa          *spa;
 	struct lws_buflist      *tx_buflist;
+	size_t                  tx_remaining; /* body bytes not yet written, so the
+					       * FINAL write can be identified
+					       * correctly (see WRITEABLE) */
 };
+
+/*
+ * Renewal completion mode.  Both the background BFF (POST .lws-login-refresh from
+ * the page's widget JS) and the cold-load bouncer path run the exact same
+ * /api/sso_exchange side channel; they differ only in what we do with the result.
+ */
+#define LWS_LOGIN_REFRESH_BFF      0 /* 200+set-cookie on success, 401 on dead */
+#define LWS_LOGIN_REFRESH_COLDLOAD 1 /* 302-to-self with new cookie, else 303 to auth */
+
+/*
+ * COLDLOAD renewal has to send the browser back to the exact URL it asked
+ * for, query string included: app pages deep-link through the query (eg
+ * sai's ?project=X&branch=Y&event=Z&task=<uuid>), so losing it lands the
+ * freshly re-logged-in user on a shortened, unusable URL.  Sized with
+ * headroom over any realistic deep link.
+ */
+#define LWS_LOGIN_MAX_URI 512
 
 struct pending_login_refresh {
 	lws_dll2_t              list;
@@ -71,22 +112,104 @@ struct pending_login_refresh {
 	struct lws              *wsi_server;
 	struct lws              *wsi_client;
 
-	char                    cookie_hdr[1024];
+	/*
+	 * The browser's Cookie header we forward verbatim to the auth server.
+	 * Real jars carry several cookies plus parallel host-only / Domain=
+	 * duplicates of the auth ones, so this needs LWS_SSO_MAX_COOKIE (4096):
+	 * at 1024 a large jar truncated silently, and the truncated tail could
+	 * contain exactly the auth_refresh_session the exchange needs.
+	 */
+	char                    cookie_hdr[LWS_SSO_MAX_COOKIE];
 
-	char                    payload[1024];
+	/*
+	 * POST body for the renewal exchange.  The body proper starts
+	 * LWS_PRE bytes into payload[]: lws_write() composes the h2/h3 DATA
+	 * frame header into the bytes immediately BEFORE the pointer it is
+	 * given, so a body buffer without LWS_PRE headroom gets scribbled
+	 * into (for h1 nothing is prepended, which is how this used to get
+	 * away with it).
+	 */
+	char                    payload[LWS_PRE + 1024];
 	int                     payload_len;
 	int                     payload_pos;
 
-	char                    token[2048];
+	/*
+	 * The minted JWT from the auth server's {"token":"..."} response.
+	 * Sized to the same LWS_SSO_MAX_COOKIE cap the whole SSO pipeline
+	 * uses (spa param, session cookie compose): any valid token the
+	 * auth server can issue must fit, or the renewal fails loudly
+	 * rather than planting a truncated cookie.
+	 */
+	char                    token[LWS_SSO_MAX_COOKIE];
+
+	/*
+	 * Chunked tokenizer state for the /api/sso_exchange JSON body,
+	 * persisting across LWS_CALLBACK_RECEIVE_CLIENT_HTTP_READ chunks.
+	 * Real JWTs are far bigger than the tokenizer's internal collect[]
+	 * limit, and the body can arrive split across any number of reads:
+	 * the token ("token" member) and the denial reason ("error" member)
+	 * must be accumulated as concatenations of tokenizer _CHUNK results.
+	 * tok_state: 0 = want "token" name, 1 = want ':', 2 = in value,
+	 * 3 = value complete; err_state mirrors that for "error".
+	 */
+	lws_tokenize_t          ts;
+	size_t                  tok_len;
+	size_t                  err_len;
+	unsigned char           ts_active;
+	unsigned char           tok_state;
+	unsigned char           err_state;
+	unsigned char           tok_overflow;	/* token didn't fit: deny */
+
+	/*
+	 * What the auth server actually said, so the browser-leg completion
+	 * log can state the real denial reason instead of an anonymous
+	 * "denied by Server": the HTTP status, the JSON "error" member of the
+	 * response body, and -- when the side channel died before any
+	 * response -- the client connection error string.
+	 */
+	unsigned                resp_status;
+	char                    resp_error[96];
+	char                    conn_error[160];
+
+	/* COLDLOAD: the original request URI (path + query), so the success
+	 * self-redirect lands the browser back on the protected URL it
+	 * asked for. */
+	char                    orig_path[LWS_LOGIN_MAX_URI];
+	/* COLDLOAD: the pre-built auth-form URL (with service_name + redirect_uri),
+	 * used only on renewal failure to land the user on the login form. */
+	char                    authform_url[512];
+	/*
+	 * COLDLOAD: the authority and scheme the browser used, ie, the Host:
+	 * (or :authority) and whatever x-forwarded-proto let us conclude.  The
+	 * renewal completion composes its absolute self-redirect Location:
+	 * from the HTTP_WRITEABLE of a wsi whose request headers were released
+	 * when the request was dispatched (C-460), so, exactly like orig_path
+	 * and authform_url, these are captured while the request is in hand.
+	 */
+	char                    orig_host[128];
+	char                    orig_scheme[8];
+	int                     mode; /* LWS_LOGIN_REFRESH_* */
 };
 
+/*
+ * Everything the widget depends on for readability is asserted here, because
+ * it renders inside arbitrary host pages: any property left to inherit comes
+ * from the page.  The status box's colour scheme is one static choice -- a
+ * fully-opaque background behind the asserted text colour -- rather than
+ * following the browser's prefers-color-scheme: pages that ignore the dark
+ * mode preference render light, and a preference-following widget showed up
+ * as a dark box on their white background (translucent backgrounds were
+ * worse still: unreadable whenever the page's colours disagreed with the
+ * widget's asserted text colour).  A host page that wants the widget to match
+ * its own theme can override these rules in its own stylesheet.  The
+ * property is fenced against the actually-served css by the widget-css-fence
+ * scenario of api-test-lws-login-bff.
+ */
 static const char * const canned_css =
         ".lws-login-box{position:relative;font-family:-apple-system,system-ui,sans-serif;padding:"
-        "16px;border-radius:8px;background:rgba(0,0,0,0.02);border:1px solid "
-        "rgba(0,0,0,0.08);display:inline-block;font-size:14px;line-height:1.4;"
+        "16px;border-radius:8px;background:#fff;border:1px solid "
+        "#e0e0e0;display:inline-block;font-size:14px;line-height:1.4;"
         "color:#333;}\n"
-        "@media(prefers-color-scheme:dark){.lws-login-box{background:rgba(255,255,"
-        "255,0.05);border-color:rgba(255,255,255,0.1);color:#888;}}\n"
         ".lws-login-btn{display:inline-block;padding:8px "
         "16px;background:#007bff;color:#fff!important;text-decoration:none;border-"
         "radius:6px;font-weight:600;font-size:13px;transition:background "
@@ -102,18 +225,61 @@ static const char * const canned_css =
         ".lws-login-identity{font-size:16px;margin:0 12px 0 "
         "0;display:inline-block;font-weight:600;}\n"
         ".lws-login-mt{margin-top:10px;}\n"
-        ".lws-login-mb{margin-bottom:8px;font-weight:500;}\n";
+        ".lws-login-mb{margin-bottom:8px;font-weight:500;}\n"
+        ".lws-preauth-banner{position:relative;margin-top:10px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.2);padding:12px;border-radius:8px;display:flex;align-items:center;justify-content:space-between;box-shadow:0 4px 12px rgba(0,0,0,0.15);}"
+        ".lws-preauth-info{display:flex;flex-direction:column;}"
+        ".lws-preauth-title{font-weight:600;font-size:14px;margin-bottom:4px;}"
+        ".lws-preauth-desc{font-size:12px;color:#aaa;}"
+        ".lws-preauth-link{background:#28a745;color:#fff!important;text-decoration:none;padding:6px 12px;border-radius:4px;font-weight:600;font-size:13px;transition:background 0.2s;display:flex;align-items:center;gap:8px;}"
+        ".lws-preauth-link:hover{background:#218838;}"
+        ".pie-timer{width:20px;height:20px;transform:rotate(-90deg);border-radius:50%;}"
+        ".pie-timer circle{fill:none;stroke:#fff;stroke-width:10;stroke-dasharray:31.4;transition:stroke-dashoffset 1s linear;}"
+        ".lws-login-refgirl{position:absolute;bottom:0px;right:-10px;height:120px;opacity:0.8;pointer-events:none;z-index:1;}"
+        ".lws-preauth-widget{display:none;position:absolute;top:0;left:100%;margin-left:15px;border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:8px;max-height:200px;overflow-y:auto;background:#2b2d31;color:#e0e0e0;box-shadow:0 8px 16px rgba(0,0,0,0.3);z-index:1000;min-width:280px;}"
+        ".lws-preauth-widget.active{display:block;}"
+        ".lws-login-avatar-admin{color:#007bff;margin-right:6px;display:inline-block;vertical-align:middle;}"
+        ".lws-login-avatar-user{color:#333;margin-right:6px;display:inline-block;vertical-align:middle;}";
 
 static const char * const canned_js =
+        /* lwsLoginSilentRefresh: attempt a side-channel renewal via the BFF.
+         * Returns a tri-state so callers can distinguish a hard failure (the
+         * long-term login session is genuinely gone -> the auth server returns
+         * 401) from a transient failure (network blip, 5xx, captive-portal
+         * re-establishing on a freshly-woken device).  Only the hard failure
+         * should escalate to the login page; transient failures are
+         * retry-worthy because the long-term session may still be valid. */
         "window.lwsLoginSilentRefresh=async function(){"
         "try{"
-        "var r=await fetch('/.lws-login-refresh',{method:'POST',credentials:'include'});"
-        "return r.ok;"
-        "}catch(e){return false;}"
+        "var r=await fetch('.lws-login-refresh',{method:'POST',credentials:'include'});"
+        "if(r.status===401)return 'dead';"
+        "return r.ok?'ok':'transient';"
+        "}catch(e){return 'transient';}"
         "};"
+        /* lwsLoginEscalate: give up on silent renewal and send the user to the
+         * auth server login page, preserving the current location for the
+         * post-login redirect.  Idempotent via a guard flag so multiple
+         * concurrent 'dead' results only navigate once. */
+        "window.lwsLoginEscalate=function(login_url){"
+        "if(window.__lwsLoginEscalated)return;"
+        "window.__lwsLoginEscalated=1;"
+        "var s=login_url.split('redirect_uri=')[0]+'redirect_uri='+encodeURIComponent(window.location.href);"
+        "window.location.href=s;"
+        "};"
+        /* lwsLoginEsc: HTML-escape for the innerHTML render boundary.  Every
+         * dynamic string composed into the widget's markup passes through
+         * this (or, for URL query values like device_code,
+         * encodeURIComponent).  Not all producers are trusted here: the
+         * preauth widget renders device-provided name / user_code that
+         * arrived over an UNauthenticated websocket, so the rule is that
+         * dynamic data can inject text, never markup. */
+        "window.lwsLoginEsc=function(s){var m={'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'};"
+        "return String(s).replace(/[&<>\"']/g,function(c){return m[c];});};"
         "window.renderLwsLoginStatus=async function(d){"
+        "window.__lwsLoginDiv=d;"
         "var e=document.getElementById(d);"
         "if(!e)return;"
+        "if(window.__lwsLoginInflight)return;"
+        "window.__lwsLoginInflight=1;"
         "if(!document.getElementById('lws-login-css')){"
         "var l=document.createElement('link');"
         "l.id='lws-login-css';l.rel='stylesheet';l.href='lws-login.css';"
@@ -123,48 +289,174 @@ static const char * const canned_js =
         "let r=await fetch('.lws-login-status');"
         "let st=await r.json();"
         "if(!st.logged_in){"
-        "if(await window.lwsLoginSilentRefresh()){"
+        "var sr=await window.lwsLoginSilentRefresh();"
+        "if(sr==='ok'){"
         "r=await fetch('.lws-login-status');"
         "st=await r.json();"
+        "}else if(sr==='dead'){"
+        /* long-term login gone.  If this mount allows anonymous access
+         * (unauth_allow), do NOT bounce to the auth server -- the user can
+         * legitimately use the page unauthenticated, and escalating them
+         * (especially a user whose JWT simply expired but who lacks the grant)
+         * traps them on the auth server's denial page.  Just render the
+         * anonymous state; they can click Login themselves if they want. */
+        "if(!st.unauth_allow){"
+        "window.__lwsLoginInflight=0;"
+        "window.lwsLoginEscalate(st.login_url);"
+        "return;"
+        "}"
         "}"
         "}"
         "var c='<div class=\"lws-login-box\">';"
         "if(st.server_now){"
-        "var d=Math.abs(st.server_now-(Date.now()/1000));"
-        "if(d>300){"
-        "c+='<div class=\"lws-login-err\">Warning: Device clock off by '+Math.round(d/60)+' mins</div><br>';"
-        "c+='<img src=\"'+st.auth_server_url+'/refgirl-time.png\" style=\"position:absolute;bottom:0px;right:-10px;height:120px;opacity:0.8;pointer-events:none;z-index:1\">';"
+        "var skew=Math.abs(st.server_now-(Date.now()/1000));"
+        "if(skew>300){"
+        "c+='<div class=\"lws-login-err\">Warning: Device clock off by '+Math.round(skew/60)+' mins</div><br>';"
+        "c+='<img src=\"'+window.lwsLoginEsc(st.auth_server_url)+'/refgirl-time.png\" class=\"lws-login-refgirl\">';"
         "}"
         "}"
         "if(st.logged_in){"
+        "window.lwsLoginRetry=0;"
         "var u='.lws-login-logout?redirect_uri='+encodeURIComponent(window.location.href);"
-        "var a=st.is_admin?'<a class=\"lws-login-link\" href=\"'+st.auth_server_url+'/api/admin\">Admin Console</a>':'';"
-        "c+='<strong class=\"lws-login-identity\">'+st.identity+'</strong><br>';"
-        "c+=a+' <a class=\"lws-login-link lws-login-logout\" href=\"'+u+'\">Logout</a>';"
+        "var a=st.is_admin?'<a class=\"lws-login-link\" href=\"'+window.lwsLoginEsc(st.auth_server_url)+'/api/admin\">Admin Console</a>':'';"
+        "var av='<svg viewBox=\"0 0 24 24\" width=\"16\" height=\"16\" stroke=\"currentColor\" stroke-width=\"2\" fill=\"none\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2\"></path><circle cx=\"12\" cy=\"7\" r=\"4\"></circle></svg>';"
+        "var gl=st.is_admin?255:(st.grant_level||0);"
+        "var ac=gl>=2?'lws-login-avatar-admin':'lws-login-avatar-user';"
+        "c+='<span class=\"'+ac+'\">'+av+'</span>';"
+        "c+='<strong class=\"lws-login-identity\">'+window.lwsLoginEsc(st.identity)+'</strong><br>';"
+        "c+=a+' <a class=\"lws-login-link lws-login-logout\" href=\"'+window.lwsLoginEsc(u)+'\">Logout</a>';"
         "if(!st.has_grant&&!st.is_admin)c+='<div class=\"lws-login-err\">login lacks grant</div><br>';"
         "if(st.exp){"
         "var n=st.server_now?st.server_now:(Date.now()/1000);"
         "var m=st.exp-n;"
-        "if(m>0&&m<86400){"
+        /* Schedule a silent refresh before expiry.  The upper bound must be
+         * larger than any realistic cookie lifetime, otherwise long-lived
+         * sessions (eg the 24h default jwt-validity-secs) never schedule a
+         * refresh and the status div goes stale until a manual page reload.
+         * 30d (2592000s) is well past any sensible session token lifetime
+         * while still guarding against nonsensical multi-year exp values. */
+        "if(m>0&&m<2592000){"
         "setTimeout(async function(){"
-        "if(await window.lwsLoginSilentRefresh()){"
-        "window.renderLwsLoginStatus(d);"
-        "}else{"
-        "/*alert('canned_js redirecting to auth!');*/"
-        "var s=st.login_url.split('redirect_uri=')[0]+'redirect_uri='+encodeURIComponent(window.location.href);"
-        "window.location.href=s;"
-        "}"
+        "var sr=await window.lwsLoginSilentRefresh();"
+        /* On a successful renewal, re-render to pick up the fresh exp.  On any
+         * failure ('dead' or 'transient'), do NOT escalate or immediately
+         * re-render: we are still rendering a LOGGED-IN box and the JWT is
+         * (or was very recently) valid.  Escalating a logged-in user -- eg
+         * one who merely lacks the grant on an unauth-allow mount, or whose
+         * refresh cookie simply expired -- traps them on the auth server's
+         * denial page.  Instead let the JWT ride out: the expiry timer below
+         * fires at actual expiry, re-fetches status, and only then (if the
+         * session is genuinely dead) does the not-logged-in branch escalate. */
+        "if(sr==='ok')window.renderLwsLoginStatus(d);"
         "},(m>60?m-60:0)*1000);"
+        /* Safety net: at actual expiry, re-render regardless.  If the JWT has
+         * expired and refresh never succeeded, this transitions cleanly to the
+         * not-logged-in branch (which decides escalation) rather than leaving
+         * a stale logged-in box. */
+        "setTimeout(function(){window.renderLwsLoginStatus(d);},(m+1)*1000);"
         "}"
         "}"
         "}else{"
         "var s=st.login_url.split('redirect_uri=')[0]+'redirect_uri='+encodeURIComponent(window.location.href);"
         "c+='<div class=\"lws-login-mb\">Not logged in</div>';"
-        "c+='<a class=\"lws-login-btn\" href=\"'+s+'\">Login &rarr;</a>';"
+        "c+='<a class=\"lws-login-btn\" href=\"'+window.lwsLoginEsc(s)+'\">Login &rarr;</a>';"
+        /* We reach here only when silent refresh returned 'transient' (a hard
+         * 'dead' already escalated out of the function above).  Back off and
+         * retry; if the long-term session is actually dead, the next
+         * renderLwsLoginStatus will get 'dead' from the silent-refresh attempt
+         * in the not-logged-in branch and escalate then. */
+        "let iv=[1,2,5,10,30,60,300,600,1200,3600];let rt=window.lwsLoginRetry||0;let d_s=iv[rt]||3600;window.lwsLoginRetry=rt+1;"
+        "setTimeout(function(){window.renderLwsLoginStatus(d);},d_s*1000);"
         "}"
+        "var pc=document.getElementById('lws-preauth-container');"
         "e.innerHTML=c+'</div>';"
-        "}catch(er){console.log('lws-login fetch:',er);}"
-        "};";
+        "if(st.logged_in){"
+        "if(!pc){pc=document.createElement('div');pc.id='lws-preauth-container';pc.className='lws-preauth-widget';}"
+        "e.style.position='relative';e.appendChild(pc);"
+        "if(!window.lwsPreauthWS){"
+        "var asu=st.auth_server_url || st.login_url.split('/login')[0];"
+        "var u=asu.replace('https','wss').replace('http','ws');"
+        "var ws=new WebSocket(u,'lws-oauth-preauth');"
+        "window.lwsPreauthWS=ws;"
+        "var devs={};"
+        "function draw(){"
+        "var h='';var now=Date.now()/1000;"
+        "for(var k in devs){"
+        "var d=devs[k];var left=d.expires-now;if(left<=0){delete devs[k];continue;}"
+        "var pct=left/300.0;var dash=(1-pct)*31.4;"
+        "h+='<div class=\"lws-preauth-banner\"><div class=\"lws-preauth-info\">';"
+        "h+='<span class=\"lws-preauth-title\">New Device: '+window.lwsLoginEsc(d.name)+'</span>';"
+        "h+='<span class=\"lws-preauth-desc\">Requires authorization</span></div>';"
+        "h+='<a class=\"lws-preauth-link\" href=\"'+window.lwsLoginEsc(st.auth_server_url)+'/?device_code='+encodeURIComponent(d.user_code)+'\" target=\"_blank\">';"
+        "h+='<svg class=\"pie-timer\" viewBox=\"0 0 10 10\"><circle cx=\"5\" cy=\"5\" r=\"5\" stroke-dashoffset=\"'+dash+'\"></circle></svg>';"
+        "h+='Authorize</a></div>';"
+        "}"
+        "pc.innerHTML=h;"
+        "if(Object.keys(devs).length>0){pc.classList.add('active');setTimeout(draw,1000);}else{pc.classList.remove('active');}"
+        "}"
+        "ws.onmessage=function(e){"
+        "var m=JSON.parse(e.data);"
+        "if(m.event==='device_joined'){devs[m.serial]=m;draw();}"
+        "else if(m.event==='device_left'){delete devs[m.serial];draw();}"
+        "};"
+        "}"
+        "}"
+        "window.__lwsLoginInflight=0;"
+        "}catch(er){"
+        "console.log('lws-login fetch:',er);"
+        "window.__lwsLoginInflight=0;"
+        "let iv=[1,2,5,10,30,60,300,600,1200,3600];let rt=window.lwsLoginRetry||0;let d_s=iv[rt]||3600;window.lwsLoginRetry=rt+1;"
+        "setTimeout(function(){window.renderLwsLoginStatus(d);},d_s*1000);"
+        "}"
+        "};"
+        /* Wake trigger: when the device/tab wakes (eg an Android tablet that
+         * slept through its renewal slot), fire a status check on visibility
+         * change or bfcache restore so the not-logged-in -> silent-refresh ->
+         * escalate flow runs without needing a manual page interaction.
+         * Debounced to 1s to coalesce rapid visibility flips, and skipped if a
+         * check is already in flight or we've already escalated to login. */
+        "window.__lwsLoginWake=function(){"
+        "if(window.__lwsLoginEscalated||window.__lwsLoginInflight)return;"
+        "if(!window.__lwsLoginDiv)return;"
+        "if(window.__lwsLoginWakeTimer)return;"
+        "window.__lwsLoginWakeTimer=setTimeout(function(){"
+        "window.__lwsLoginWakeTimer=null;"
+        "if(!window.__lwsLoginEscalated&&!window.__lwsLoginInflight)"
+        "window.renderLwsLoginStatus(window.__lwsLoginDiv);"
+        "},1000);"
+        "};"
+        "document.addEventListener('visibilitychange',function(){"
+        "if(!document.hidden)window.__lwsLoginWake();});"
+        "window.addEventListener('pageshow',function(ev){"
+        /* ev.persisted===true => restored from bfcache (a frozen tab reactivated,
+         * eg after the device slept) -> worth a wake check.  A fresh load
+         * (persisted===false) already runs its own initial render. */
+        "if(ev.persisted)window.__lwsLoginWake();});";
+
+/*
+ * Tear down ps wherever we decided its life is over (server response done,
+ * refresh timed out, creation unwinding).  The side-channel client wsi, if
+ * still alive, has ps as its user_space: clear that and close it off before
+ * freeing ps, or its later callbacks (RECEIVE_CLIENT_HTTP_READ, COMPLETED,
+ * CLOSED, CCE) would dereference freed ps.  Mirrors pending_auth_release()
+ * in protocol_lws_oauth2_client.c.
+ */
+static void
+pending_login_release(struct pending_login_refresh *ps)
+{
+	if (!ps)
+		return;
+
+	if (ps->wsi_client) {
+		lws_set_wsi_user(ps->wsi_client, NULL);
+		lws_wsi_close(ps->wsi_client, LWS_TO_KILL_ASYNC);
+		ps->wsi_client = NULL;
+	}
+
+	lws_sul_cancel(&ps->sul);
+	lws_dll2_remove(&ps->list);
+	free(ps);
+}
 
 static void
 sul_pending_refresh_cb(lws_sorted_usec_list_t *sul)
@@ -172,9 +464,524 @@ sul_pending_refresh_cb(lws_sorted_usec_list_t *sul)
 	struct pending_login_refresh *ps = lws_container_of(sul,
 					struct pending_login_refresh, sul);
 
-	lwsl_info("%s: auth refresh timed out\n", __func__);
-	lws_dll2_remove(&ps->list);
-	free(ps);
+	/*
+	 * Log against the suspended browser leg where possible, so the timeout
+	 * is attributable to the peer that is waiting on it.
+	 */
+	lwsl_wsi_info(ps->wsi_server, "auth refresh timed out");
+	/*
+	 * The renewal exchange is taking too long: drop it and free ps via the
+	 * common path, which first detaches and closes the still-live client
+	 * leg (freeing directly here left the client wsi's user_space
+	 * dangling).
+	 */
+	pending_login_release(ps);
+}
+
+/*
+ * Kick off a silent side-channel renewal against the auth server's
+ * /api/sso_exchange, forwarding the browser's full cookie jar (so the server
+ * sees auth_refresh_session + auth_csrf exactly as it would for a direct call).
+ *
+ * Used by both:
+ *  - the background BFF (.lws-login-refresh, mode=BFF), and
+ *  - the cold-load bouncer path (mode=COLDLOAD), which tries renewal before
+ *    bouncing the user to the login form.
+ *
+ * The browser wsi is suspended (we return without finalising headers); the
+ * side-channel client (callback_lws_login_client) parses {"token":...} into
+ * ps->token, and COMPLETED_CLIENT_HTTP wakes wsi_server, whose WRITEABLE
+ * completes the response according to ps->mode.
+ *
+ * Returns 1 if the renewal was kicked off (caller must stop processing and
+ * suspend), 0 if it could not start (no valid auth_refresh_session / auth_csrf
+ * present, or the auth-server URL won't parse) -- in the 0 case the caller
+ * proceeds with its existing fallback (303 to login form, or BFF 401).
+ *
+ * `ck_len` is lws_hdr_total_length(wsi, WSI_TOKEN_HTTP_COOKIE).  `cookie` is the
+ * caller-owned copy of that header (we lws_strncpy it into ps).  `orig_path` is
+ * NULL for BFF mode.  `authform_url` is the pre-built login-form URL to land on
+ * if a COLDLOAD renewal fails (NULL for BFF mode).
+ */
+/*
+ * Mint a fresh auth_csrf value (32 hex chars + NUL) into out[33].  Used at
+ * renewal success to rotate the csrf cookie so its lifetime resets every
+ * renewal rather than dying on the original login's fixed schedule (which is
+ * what causes the background-timer redirect flash once it lapses).  Pure
+ * double-submit: the server stores nothing about csrf, so re-minting here
+ * needs no server-side change -- the next renewal reads the new cookie value
+ * and submits it as the matching csrf_token= form field.
+ */
+static void
+lws_login_mint_csrf(struct vhd_login *vhd, char *out)
+{
+	uint8_t rnd[16];
+	lws_get_random(vhd->context, rnd, sizeof(rnd));
+	lws_hex_from_byte_array(rnd, sizeof(rnd), out, 33);
+}
+
+/*
+ * Worst-case auth_csrf Set-Cookie string: "auth_csrf=" (10) + 32 hex chars
+ * + "; Path=/; Domain=" (17) + cookie_domain (<= 127, vhd cap) + "; Max-Age="
+ * (10) + u64 decimal (<= 20) + "; HttpOnly; SameSite=Lax; Secure" (32).
+ * 256 covers it with headroom.  Callers MUST size their buffers with this:
+ * at one point the BFF rotation used a 96-byte buffer, and the 30d default
+ * Max-Age (2592000) alone grows the string to 100 bytes -- the truncated
+ * string embedded its NUL into the response headers (over h1 the client
+ * parser rejected it; over h2 the rotated cookie never reached the browser
+ * at all, so renewals never refreshed the csrf sidecar's lifetime and it
+ * died on the original login's schedule).  Composition itself now goes
+ * through lws_http_cookie_compose() (F-022), which fails closed rather than
+ * truncate if the inputs ever outgrow this derivation: a Set-Cookie missing
+ * its trailing HttpOnly / SameSite / Secure attributes is JS-readable and
+ * http-sendable.
+ */
+#define LWS_LOGIN_CSRF_COOKIE_SZ 256
+
+/*
+ * F-022: worst-case composed auth_session Set-Cookie: cookie-name (<= 63,
+ * enforced at protocol init) + '=' + value (<= LWS_SSO_MAX_COOKIE - 1) +
+ * "; Path=/" (8) + "; Domain=" (9) + cookie_domain (<= 127, vhd cap) +
+ * "; Max-Age=" (10) + u64 decimal (<= 20) + "; HttpOnly; SameSite=Lax;
+ * Secure" (32) + NUL.
+ */
+#define LWS_LOGIN_SESSION_COOKIE_SZ \
+	(63 + 1 + (LWS_SSO_MAX_COOKIE - 1) + 8 + 9 + 127 + 10 + 20 + 32 + 1)
+
+/*
+ * F-022: worst-case composed cookie *clearing* Set-Cookie (empty value +
+ * Expires):  name (<= 63) + '=' + "; Path=/" (8) + "; Domain=" (9) +
+ * cookie_domain (<= 127) + "; Expires=" (10) + RFC 1123 date (29) +
+ * "; Max-Age=0" (11) + "; HttpOnly; SameSite=Lax; Secure" (32) + NUL.
+ */
+#define LWS_LOGIN_CLEAR_COOKIE_SZ \
+	(63 + 1 + 8 + 9 + 127 + 10 + 29 + 11 + 32 + 1)
+
+/*
+ * F-022: response-header staging for the paths that emit the composed
+ * session Set-Cookie: it must fit status line + common headers + Location
+ * (cold-load serves an absolute fq_uri: LWS_LOGIN_MAX_URI + 192) + the
+ * session cookie at its worst case + the csrf sidecar + framing, so a
+ * header write can never fail for room and cost a cookie its tail.
+ */
+#define LWS_LOGIN_HTTP_BUFL \
+	(LWS_PRE + 192 + (LWS_LOGIN_MAX_URI + 192) + \
+	 LWS_LOGIN_SESSION_COOKIE_SZ + LWS_LOGIN_CSRF_COOKIE_SZ + 64)
+
+/*
+ * Format an auth_csrf Set-Cookie string into out (caller buffer,
+ * LWS_LOGIN_CSRF_COOKIE_SZ bytes) using vhd's csrf_max_age_secs, and return
+ * its length.  Same shape/scoping as the auth_session cookie: HttpOnly;
+ * Secure; SameSite=Lax; optional Domain=.
+ *
+ * Returns strlen(out), or -1 if the complete string would not fit (in which
+ * case out is empty): callers must skip the cookie, never emit a truncated
+ * attribute tail.
+ */
+static int
+lws_login_build_csrf_cookie(struct vhd_login *vhd, const char *csrf, char *out,
+			    size_t out_len)
+{
+	return lws_http_cookie_compose(out, out_len, "auth_csrf", csrf,
+				       vhd->cookie_domain,
+				       (unsigned long long)
+							vhd->csrf_max_age_secs,
+				       NULL);
+}
+
+/*
+ * The scheme to compose our own https/http URLs (the redirect_uri handed to
+ * the auth server, and the cold-load self-redirect Location:) with.
+ *
+ * X-Forwarded-Proto is settable by any peer that talks to us directly, and
+ * this used to be an if/else on the header being PRESENT, so
+ * "X-Forwarded-Proto: http" sent over a genuine TLS connection downgraded the
+ * login round trip to cleartext.  A proxy header can only ever be evidence
+ * that the leg WE cannot see was TLS, so let it upgrade and never let it (or
+ * its absence) contradict lws_is_ssl().  A vhost with no reverse proxy in
+ * front should set trust-forwarded-proto 0 and have it ignored entirely.
+ *
+ * Reads the request headers, so it can only run while the request is being
+ * handled (C-460).
+ */
+static const char *
+lws_login_scheme(struct lws *wsi, struct vhd_login *vhd)
+{
+#if defined(LWS_WITH_CUSTOM_HEADERS)
+	char proto[16] = "";
+#endif
+
+	if (lws_is_ssl(lws_get_network_wsi(wsi)))
+		return "https";
+
+#if defined(LWS_WITH_CUSTOM_HEADERS)
+	if (vhd && vhd->trust_forwarded_proto &&
+	    lws_hdr_custom_copy(wsi, proto, sizeof(proto),
+				"x-forwarded-proto:", 18) > 0 &&
+	    !strcasecmp(proto, "https"))
+		return "https";
+#else
+	(void)vhd;
+#endif
+
+	return "http";
+}
+
+/*
+ * The authority the browser addressed us by.  Reads the request headers, so
+ * it can only run while the request is being handled (C-460); the deferred
+ * renewal completion passes the copy it took at kick time instead.
+ */
+
+static void
+lws_login_orig_host(struct lws *wsi, char *out, size_t out_len)
+{
+	out[0] = '\0';
+
+	if (lws_hdr_copy(wsi, out, (int)out_len, WSI_TOKEN_HOST) > 0)
+		return;
+#if defined(LWS_ROLE_H2)
+	if (lws_hdr_copy(wsi, out, (int)out_len,
+			 WSI_TOKEN_HTTP_COLON_AUTHORITY) > 0)
+		return;
+#endif
+
+	out[0] = '\0';
+}
+
+static int
+lws_login_kick_refresh(struct vhd_login *vhd, struct lws *wsi, const char *cookie,
+		       const char *csrf, int mode, const char *orig_path,
+		       const char *authform_url)
+{
+	struct pending_login_refresh *ps;
+	struct lws_client_connect_info i;
+	lws_parse_uri_t *puri;
+
+	/*
+	 * The side channel binds to THIS vhost and resolves its protocol by
+	 * name, so lws_login_client must be enabled on the same vhost the
+	 * interceptor runs on.  If it is not, lws silently binds the wsi to
+	 * the vhost's protocols[0] while still attaching ps as its user data:
+	 * every client callback (including the CLIENT_CONNECTION_ERROR when
+	 * the wsi is later freed) is then misrouted, ps->wsi_client dangles,
+	 * and pending_login_release() writes into freed memory.  Refuse to
+	 * start the exchange at all instead.
+	 */
+	if (!lws_vhost_name_to_protocol(vhd->vhost, "lws_login_client")) {
+		lwsl_wsi_err(wsi, "%s: vhost %s does not have the "
+			     "lws_login_client protocol enabled: refusing to "
+			     "start the renewal side channel (enable it in "
+			     "this vhost's ws-protocols)",
+			     __func__, lws_get_vhost_name(vhd->vhost));
+		return 0;
+	}
+
+	ps = malloc(sizeof(*ps));
+	if (!ps)
+		return 0;
+	memset(ps, 0, sizeof(*ps));
+	ps->vhd = vhd;
+	ps->wsi_server = wsi;
+	ps->mode = mode;
+	lws_strncpy(ps->cookie_hdr, cookie, sizeof(ps->cookie_hdr));
+	if (orig_path)
+		lws_strncpy(ps->orig_path, orig_path, sizeof(ps->orig_path));
+	if (authform_url)
+		lws_strncpy(ps->authform_url, authform_url,
+			    sizeof(ps->authform_url));
+
+	/*
+	 * The renewal completion composes an absolute self-redirect from its
+	 * HTTP_WRITEABLE, by which time the request headers are gone (C-460).
+	 * Capture the authority and scheme here, while we are still inside the
+	 * request that kicked the exchange... without them a
+	 * TLS-terminating reverse proxy deployment silently emitted
+	 * http://<vhost-name><path>.
+	 */
+
+	lws_login_orig_host(wsi, ps->orig_host, sizeof(ps->orig_host));
+	lws_strncpy(ps->orig_scheme, lws_login_scheme(wsi, vhd),
+		    sizeof(ps->orig_scheme));
+
+	ps->payload_len = lws_snprintf(ps->payload + LWS_PRE,
+				       sizeof(ps->payload) - LWS_PRE,
+				       "csrf_token=%s", csrf);
+	ps->payload_pos = 0;
+
+	lws_dll2_add_tail(&ps->list, &vhd->pending_refresh_list);
+	lws_sul_schedule(vhd->context, 0, &ps->sul, sul_pending_refresh_cb,
+			 5 * 60 * LWS_US_PER_SEC);
+
+	puri = lws_parse_uri_create(vhd->auth_api_url);
+	if (!puri) {
+		pending_login_release(ps);
+		return 0;
+	}
+
+	/*
+	 * A relative auth-api-url (the BFF-delegate shape, where the PVO is
+	 * missing and auth-server-url is a local "/oauth/login" entry) parses
+	 * "successfully" into an empty host with port 0: the side channel is
+	 * kicked against nothing and dies later as an anonymous "no auth
+	 * server response (connection failed)", with nothing in the auth
+	 * server's logs.  Refuse it here so the failure is immediate and
+	 * names the PVO to fix.
+	 */
+	if (!puri->host[0] || !puri->port) {
+		lwsl_wsi_err(wsi, "auth-api-url '%s' is not an absolute "
+			     "http(s) URL: set the auth-api-url PVO on this "
+			     "vhost to the auth server's absolute base URL to "
+			     "enable silent renewal", vhd->auth_api_url);
+		pending_login_release(ps);
+		lws_parse_uri_destroy(&puri);
+
+		return 0;
+	}
+
+	lwsl_wsi_notice(wsi, "initiating silent renewal via "
+			"%s/api/sso_exchange (%s)", vhd->auth_api_url,
+			mode == LWS_LOGIN_REFRESH_COLDLOAD ? "cold-load" : "bff");
+
+	memset(&i, 0, sizeof(i));
+	i.context        = vhd->context;
+	/*
+	 * Bind the outbound client connection to the SAME vhost the lws-login
+	 * protocol is mounted on: lws resolves the named protocol
+	 * (lws_login_client) only from the bound vhost's protocols[] array,
+	 * and without i.vhost it falls back to _ss_default (which doesn't have
+	 * lws_login_client enabled), misrouting every CLIENT_* callback.  This
+	 * is the same bug class that stalled lws-oauth2-client's /api/token
+	 * fetch -- the vhost must be set explicitly.
+	 */
+	i.vhost          = vhd->vhost;
+	i.address        = puri->host;
+	i.port           = puri->port;
+	i.ssl_connection = !strcmp(puri->scheme, "http") ? 0 : LCCSCF_USE_SSL;
+	i.path           = "/api/sso_exchange";
+	i.host           = i.address;
+	i.origin         = i.address;
+	i.method         = "POST";
+	i.protocol       = "lws_login_client";
+	i.pwsi           = &ps->wsi_client;
+	i.userdata       = ps;
+
+	if (!lws_client_connect_via_info(&i)) {
+		/*
+		 * The side channel could not even start (lws NULLs *pwsi on
+		 * synchronous failure).  Unwind ps now rather than leaving
+		 * the suspended browser leg to time out against a pending
+		 * exchange that will never complete.
+		 */
+		pending_login_release(ps);
+		lws_parse_uri_destroy(&puri);
+
+		return 0;
+	}
+
+	lws_set_timeout(wsi, PENDING_TIMEOUT_HTTP_CONTENT, 30);
+	lws_parse_uri_destroy(&puri);
+
+	return 1;
+}
+
+/*
+ * Kick a side-channel renewal when the browser's jar has the
+ * auth_refresh_session cookie but not its auth_csrf sidecar.  That state is
+ * reachable without anything being wrong server-side: the two cookies are
+ * minted by different flows (the delegate /oauth/callback pairs them, but a
+ * native login on the auth server's own host plants an unpaired Domain-scoped
+ * refresh cookie, and browser-side eviction or a device sleeping past the
+ * csrf cookie's expiry can age the sidecar out first).  Treating it as a hard
+ * denial made the login widget classify a live session as dead and navigate
+ * the whole page to the auth form.
+ *
+ * The auth server's csrf check on /api/sso_exchange is a double-submit
+ * comparison between the csrf_token= form field and the auth_csrf cookie in
+ * the forwarded jar -- both of which this side channel itself produces.  So
+ * when the jar lacks auth_csrf, mint a fresh value and inject the matching
+ * pair into the exchange: a browser without access to the HttpOnly cookies
+ * cannot reach this code, and a cross-site form POST cannot carry the
+ * SameSite=Lax auth_refresh_session, so the browser-side csrf cookie was not
+ * adding protection the refresh cookie does not already provide.  If the
+ * refresh session is genuinely invalid the auth server still 401s the
+ * exchange and the caller sees exactly the outcome it saw before.
+ *
+ * On exchange success the BFF / cold-load completion paths rotate a fresh
+ * auth_csrf cookie into the browser jar themselves, healing the underlying
+ * state.
+ *
+ * The minted cookie is prepended to the forwarded jar so that even if a very
+ * large jar has to be truncated into ps->cookie_hdr, the pair we are about to
+ * double-submit survives intact.
+ */
+static int
+lws_login_kick_refresh_selfheal(struct vhd_login *vhd, struct lws *wsi,
+				const char *cookie, int mode,
+				const char *orig_path, const char *authform_url)
+{
+	char minted[33];
+	size_t alen = strlen(cookie) + sizeof(minted) + 16;
+	char *jar;
+	int kicked;
+
+	jar = malloc(alen);
+	if (!jar)
+		return 0;
+
+	lws_login_mint_csrf(vhd, minted);
+	lws_snprintf(jar, alen, "auth_csrf=%s; %s", minted, cookie);
+
+	kicked = lws_login_kick_refresh(vhd, wsi, jar, minted, mode,
+					orig_path, authform_url);
+	free(jar);
+
+	return kicked;
+}
+
+/*
+ * Max-Age for a cookie carrying token: the smaller of jwt-validity-secs and
+ * the token's own remaining lifetime.  A cookie that outlives the JWT inside
+ * it is pure liability: it can only ever fail verification, and if the
+ * browser orders it ahead of a live same-named cookie (host-only vs Domain=
+ * scope) it shadows that one.  A token we cannot verify or that carries no
+ * exp falls back to jwt-validity-secs, exactly as before.
+ */
+static unsigned long long
+lws_login_token_max_age(struct lws *wsi, struct vhd_login *vhd,
+			const char *token)
+{
+	uint64_t now = (uint64_t)lws_now_secs(), exp;
+	char temp[2048], out[2048];
+	size_t out_len = sizeof(out), alen;
+	const char *v;
+
+	if (lws_jwt_signed_validate(lws_get_context(wsi), &vhd->jwk,
+			"ES256,ES384,ES512,RS256,RS384,RS512,HS256", token,
+			strlen(token), temp, sizeof(temp), out, &out_len))
+		return (unsigned long long)vhd->jwt_validity_secs;
+
+	v = lws_json_simple_find(out, out_len, "\"exp\":", &alen);
+	if (!v)
+		return (unsigned long long)vhd->jwt_validity_secs;
+
+	exp = (uint64_t)atoll(v);
+	if (exp <= now + 1)
+		return 1;
+	if (exp - now < vhd->jwt_validity_secs)
+		return (unsigned long long)(exp - now);
+
+	return (unsigned long long)vhd->jwt_validity_secs;
+}
+
+/*
+ * Serve the protected page to the browser by re-issuing the JWT cookie and
+ * 302-ing back to the same URL the browser originally asked for.  Used by:
+ *  - the grant-mismatch "silent update" path (logged in, but grants changed),
+ *    and
+ *  - the cold-load renewal success path (was logged-out, just re-minted the
+ *    JWT server-side).
+ *
+ * In both cases the effect from the browser's POV is identical: the request
+ * completes as if it had been authenticated all along -- no navigation away,
+ * no flash of any other page.  `path` is the request's GET/POST URI.
+ *
+ * On any header-build failure returns non-zero so the caller can surface an
+ * error; on success the response is fully written and the transaction is
+ * completed, returning 0.
+ */
+/*
+ * `host_in` and `scheme` let a caller that no longer has the request headers
+ * hand in what they were; NULL means "resolve them from the request now".
+ */
+
+static int
+lws_login_serve_self_redirect_with_cookie(struct lws *wsi, struct pss_login *pss,
+					  struct vhd_login *vhd,
+					  const char *token, const char *path,
+					  unsigned char *buf, unsigned char **pp,
+					  unsigned char *end,
+					  const char *extra_set_cookie,
+					  const char *host_in, const char *scheme)
+{
+	/* path can be a full path + query (LWS_LOGIN_MAX_URI); add room for
+	 * scheme://host so composing the absolute Location cannot truncate */
+	char cookie[LWS_LOGIN_SESSION_COOKIE_SZ], host[128],
+	      fq_uri[LWS_LOGIN_MAX_URI + 192];
+	unsigned char *p = *pp;
+	const char *h = NULL;
+
+	/*
+	 * F-022: compose through the fail-closed helper.  A session cookie
+	 * whose HttpOnly / SameSite / Secure tail was truncated is
+	 * JS-readable and http-sendable; refuse to serve the redirect with
+	 * a mangled cookie (the caller treats nonzero as header-build
+	 * failure).
+	 */
+	if (lws_http_cookie_compose(cookie, sizeof(cookie),
+				     vhd->cookie_name, token,
+				     vhd->cookie_domain,
+				     lws_login_token_max_age(wsi, vhd, token),
+				     NULL) < 0) {
+		lwsl_wsi_err(wsi, "%s: %s Set-Cookie too large for the "
+			     "composed buffer (token %d, domain %d)",
+			     __func__, vhd->cookie_name, (int)strlen(token),
+			     (int)strlen(vhd->cookie_domain));
+		return 1;
+	}
+
+	host[0] = '\0';
+	if (host_in && host_in[0])
+		h = host_in;
+	else {
+		lws_login_orig_host(wsi, host, sizeof(host));
+		if (host[0])
+			h = host;
+	}
+
+	if (!h) {
+		struct lws_vhost *vh = lws_get_vhost(wsi);
+		if (vh) {
+			const char *vname = lws_get_vhost_name(vh);
+			if (vname)
+				h = vname;
+		}
+	}
+
+	{
+		const char *sch = scheme && scheme[0] ? scheme :
+					lws_login_scheme(wsi, vhd);
+
+		lws_snprintf(fq_uri, sizeof(fq_uri), "%s://%s%s", sch,
+			     h ? h : "localhost", path);
+	}
+
+	if (lws_add_http_common_headers(wsi, HTTP_STATUS_FOUND, "text/html", 0,
+					&p, end))
+		return 1;
+	if (lws_add_http_header_by_name(wsi, (const uint8_t *)"set-cookie:",
+					(const uint8_t *)cookie,
+					(int)strlen(cookie), &p, end))
+		return 1;
+	if (extra_set_cookie &&
+	    lws_add_http_header_by_name(wsi, (const uint8_t *)"set-cookie:",
+					(const uint8_t *)extra_set_cookie,
+					(int)strlen(extra_set_cookie), &p, end))
+		return 1;
+	if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_LOCATION,
+					 (const uint8_t *)fq_uri,
+					 (int)strlen(fq_uri), &p, end))
+		return 1;
+	if (lws_finalize_http_header(wsi, &p, end))
+		return 1;
+
+	lws_write(wsi, (unsigned char *)buf + LWS_PRE,
+		  (size_t)lws_ptr_diff(p, buf + LWS_PRE),
+		  LWS_WRITE_HTTP_HEADERS | LWS_WRITE_H2_STREAM_END);
+
+	*pp = p;
+	(void)pss;
+	return 0;
 }
 
 static const char * const param_names[] = {
@@ -187,6 +994,36 @@ enum enum_param_names {
 	EPN_TARGET,
 };
 
+/*
+ * Release everything a transaction may have hung off the pss.  Idempotent, so
+ * it can run from both LWS_CALLBACK_HTTP_DROP_PROTOCOL (per transaction) and
+ * the CLOSED reasons.
+ */
+static void
+lws_login_pss_reset(struct pss_login *pss)
+{
+	if (!pss)
+		return;
+
+	if (pss->tx_buflist) {
+		lws_buflist_destroy_all_segments(&pss->tx_buflist);
+		pss->tx_remaining = 0;
+	}
+
+	if (pss->ja)
+		lws_jwt_auth_destroy(&pss->ja);
+
+	if (pss->silent_update_jwt) {
+		free(pss->silent_update_jwt);
+		pss->silent_update_jwt = NULL;
+	}
+
+	if (pss->spa) {
+		lws_spa_destroy(pss->spa);
+		pss->spa = NULL;
+	}
+}
+
 static int
 lws_login_ends_with(const char *str, const char *suffix)
 {
@@ -197,6 +1034,215 @@ lws_login_ends_with(const char *str, const char *suffix)
 		return 0;
 
 	return !strcmp(str + len_str - len_suffix, suffix);
+}
+
+#define LWS_LOGIN_PROT_TOKZ_FLAGS (LWS_TOKENIZE_F_COMMA_SEP_LIST | \
+				   LWS_TOKENIZE_F_MINUS_NONTERM | \
+				   LWS_TOKENIZE_F_DOT_NONTERM | \
+				   LWS_TOKENIZE_F_PLUS_NONTERM | \
+				   LWS_TOKENIZE_F_RFC7230_DELIMS)
+
+/*
+ * Does any name the client offered appear as a WHOLE entry in the configured
+ * comma-separated list?
+ *
+ * This used to be strstr(list, offers), ie, an unanchored substring test with
+ * the client's string as the needle, so any name that merely occurs inside a
+ * configured entry ("auth" inside "lws-oauth-preauth") passed the
+ * unauth-protocols bypass and reached the protected mount with no JWT at all.
+ * Both sides are lists (lws_hdr_copy() joins the client's
+ * Sec-WebSocket-Protocol fragments with ','), so tokenize both and compare
+ * whole names, using the same tokenizer flags the ws role uses for
+ * subprotocol names.
+ */
+static int
+lws_login_name_in_list(const char *list, const char *offers)
+{
+	lws_tokenize_t to, tl;
+	int eo, el;
+
+	lws_tokenize_init(&to, offers, LWS_LOGIN_PROT_TOKZ_FLAGS);
+
+	do {
+		eo = lws_tokenize(&to);
+		if (eo != LWS_TOKZE_TOKEN)
+			continue;
+
+		lws_tokenize_init(&tl, list, LWS_LOGIN_PROT_TOKZ_FLAGS);
+
+		do {
+			el = lws_tokenize(&tl);
+			if (el == LWS_TOKZE_TOKEN &&
+			    tl.token_len == to.token_len &&
+			    !strncmp(tl.token, to.token, to.token_len))
+				return 1;
+		} while (el > 0);
+	} while (eo > 0);
+
+	return 0;
+}
+
+/*
+ * Is the subprotocol this ws upgrade is going to BIND one of the configured
+ * unauth-protocols?
+ *
+ * The client's Sec-WebSocket-Protocol is an ordered list of offers, but only
+ * one of them gets bound: the ws role takes the first offered name the vhost
+ * has a protocol for, in the client's order (RFC 6455 4.2.2), and never looks
+ * at the rest.  So "does any offered name appear in the list" is the wrong
+ * question: an offer of "<privileged>, lws-oauth-preauth" passed the bouncer
+ * on the strength of its second name and then bound the privileged first one,
+ * with no JWT at all.  Mirror the ws role's selection (same tokenizer flags,
+ * same name length, same vhost protocol table) and judge the name it will
+ * pick, so the exemption is about what the peer will actually get.
+ *
+ * On a proxied mount the origin server does the picking against a protocol
+ * table we cannot see, so there every offered name must be exempt: then
+ * whatever the origin binds is covered.  A malformed or over-long list is
+ * refused by the ws role anyway, so it is not exempt either.
+ */
+static int
+lws_login_unauth_upgrade(struct lws *wsi, const char *list, const char *offers,
+			 int proxied)
+{
+	struct lws_vhost *vh = lws_get_vhost(wsi);
+	lws_tokenize_t ts;
+	char name[64];
+	int e, any = 0;
+
+	lws_tokenize_init(&ts, offers, LWS_LOGIN_PROT_TOKZ_FLAGS);
+
+	do {
+		e = lws_tokenize(&ts);
+		if (e < 0)
+			return 0;
+		if (e != LWS_TOKZE_TOKEN)
+			continue;
+
+		if (lws_tokenize_cstr(&ts, name, sizeof(name)))
+			return 0;
+
+		if (proxied) {
+			if (!lws_login_name_in_list(list, name))
+				return 0;
+			any = 1;
+			continue;
+		}
+
+		if (!lws_vhost_name_to_protocol(vh, name))
+			/* the ws role skips names it has no protocol for */
+			continue;
+
+		/* this is the one the ws role will bind */
+		return lws_login_name_in_list(list, name);
+	} while (e > 0);
+
+	/* local: nothing offered that the vhost serves, the ws role will refuse
+	 * it; proxied: every offer was exempt (and there was at least one) */
+	return any;
+}
+
+/*
+ * Copy this request's URI (path only, args are sealed off at the '?') into
+ * uri[], scanning the method tokens the same way the core's
+ * lws_http_get_uri_and_method() does, so PUT / PATCH / DELETE / OPTIONS /
+ * HEAD are covered too and not just GET and POST.
+ *
+ * Returns 0 with uri[] filled (possibly "" if the request carries no URI
+ * token at all), or 1 if a URI IS present but does not fit.
+ *
+ * The distinction matters for security: lws_hdr_copy() does not truncate, it
+ * sets *dst = '\0' and returns -1.  Every caller here uses uri[] to find the
+ * mount and pick up its "service-name" / "unauth-allow" PMOs, so treating a
+ * too-long URI as "no URI" silently evaluates the request against the
+ * vhost-wide defaults instead of the mount's (deliberately stricter) policy.
+ * The core routes the request to the real mount regardless, from its own copy
+ * of the URI with no such length limit.  Callers must therefore fail closed
+ * on 1.
+ */
+static int
+lws_login_request_uri(struct lws *wsi, char *uri, size_t len)
+{
+	static const unsigned char tokens[] = {
+		WSI_TOKEN_GET_URI,
+		WSI_TOKEN_POST_URI,
+#if defined(LWS_WITH_HTTP_UNCOMMON_HEADERS)
+		WSI_TOKEN_OPTIONS_URI,
+		WSI_TOKEN_PUT_URI,
+		WSI_TOKEN_PATCH_URI,
+		WSI_TOKEN_DELETE_URI,
+#endif
+		WSI_TOKEN_HEAD_URI,
+	};
+	size_t n;
+
+	uri[0] = '\0';
+
+	for (n = 0; n < LWS_ARRAY_SIZE(tokens); n++) {
+		enum lws_token_indexes h = (enum lws_token_indexes)tokens[n];
+
+		if (!lws_hdr_total_length(wsi, h))
+			continue;
+
+		if (lws_hdr_copy(wsi, uri, (int)len, h) < 0) {
+			uri[0] = '\0';
+			return 1;
+		}
+
+		return 0;
+	}
+
+	return 0;
+}
+
+/*
+ * Reconstruct the full request URI (path + query string) into dest.
+ *
+ * lws seals WSI_TOKEN_GET_URI at the '?': the args live on in the
+ * WSI_TOKEN_HTTP_URI_ARGS fragment chain, one "name=value" fragment per
+ * query parameter.  Walking the fragments (like the CGI env code) recovers
+ * the URL the browser asked for, so re-login redirects can round-trip deep
+ * links like "/sai/?project=X&branch=Y&task=<uuid>" instead of landing on
+ * the bare path.
+ *
+ * The fragments have already been percent-decoded by the URI parser, so
+ * each is re-encoded on the way out: joining the decoded forms directly
+ * would let a value that contained an encoded '&' or '=' (say
+ * task=a%26b) re-emerge as a query STRUCTURE change (task=a&b).  If the
+ * joined URI would not fit, the query is dropped rather than silently
+ * truncated mid-parameter.
+ */
+static void
+lws_login_copy_uri_with_args(struct lws *wsi, const char *path, char *dest,
+			     size_t len)
+{
+	char arg[256], enc[768];
+	size_t ol;
+	int m = 0;
+
+	lws_strncpy(dest, path, len);
+	ol = strlen(dest);
+
+	while (ol < len - 1) {
+		int al = lws_hdr_copy_fragment(wsi, arg, (int)sizeof(arg),
+					       WSI_TOKEN_HTTP_URI_ARGS, m);
+		int n;
+
+		if (al <= 0)
+			break;
+
+		lws_urlencode(enc, arg, (int)sizeof(enc));
+		n = lws_snprintf(dest + ol, len - ol, "%s%s",
+				 m ? "&" : "?", enc);
+		if (n < 0 || ol + (size_t)n >= len) {
+			lwsl_wsi_notice(wsi, "%s: uri + query too long, "
+					 "dropping query", __func__);
+			dest[ol] = '\0';
+			break;
+		}
+		ol += (size_t)n;
+		m++;
+	}
 }
 
 static int
@@ -230,51 +1276,184 @@ callback_lws_login_client(struct lws *wsi, enum lws_callback_reasons reason,
 						 (int)strlen(ps->cookie_hdr), p, end))
 			return -1;
 
+		/*
+		 * Arm the POST body write -- same canonical pattern as
+		 * minimal-http-client-post and lws-oauth2-client: set body-pending
+		 * and request WRITEABLE after appending the headers.  On h2 this
+		 * is required (no h1-style auto-arm fallback).
+		 */
+		lws_client_http_body_pending(wsi, 1);
+		lws_callback_on_writable(wsi);
+
 		break;
 	}
 
 	case LWS_CALLBACK_CLIENT_HTTP_WRITEABLE: {
+		size_t chunk;
 		int n;
 
 		if (!ps || ps->payload_pos >= ps->payload_len)
 			break;
 
-		n = lws_write(wsi, (unsigned char *)ps->payload + ps->payload_pos,
-			      (size_t)(ps->payload_len - ps->payload_pos), LWS_WRITE_HTTP);
+		chunk = (size_t)(ps->payload_len - ps->payload_pos);
+
+		/*
+		 * Final body chunk: pair lws_client_http_body_pending(,0) with
+		 * LWS_WRITE_HTTP_FINAL so h2 puts END_STREAM on the last DATA
+		 * frame and the server knows the request body is complete.
+		 */
+		lws_client_http_body_pending(wsi, 0);
+		n = lws_write(wsi,
+			      (unsigned char *)ps->payload + LWS_PRE +
+			      ps->payload_pos,
+			      chunk, LWS_WRITE_HTTP_FINAL);
 		if (n < 0)
 			return -1;
 		ps->payload_pos += n;
 
 		if (ps->payload_pos < ps->payload_len)
 			lws_callback_on_writable(wsi);
-		else
-			lws_client_http_body_pending(wsi, 0);
 		break;
 	}
 
-	case LWS_CALLBACK_RECEIVE_CLIENT_HTTP_READ: {
-		struct lws_tokenize ts;
-		lws_tokenize_elem e;
-		int state = 0;
+	case LWS_CALLBACK_RECEIVE_CLIENT_HTTP: {
+		char buffer[4096];
+		char *px = buffer + LWS_PRE;
+		int plen = (int)sizeof(buffer) - LWS_PRE;
 
-		if (!ps || !in || !len)
+		if (!ps)
 			break;
 
-		lws_tokenize_init(&ts, (char *)in, LWS_TOKENIZE_F_DOT_NONTERM | LWS_TOKENIZE_F_MINUS_NONTERM);
-		ts.len = len;
+		/*
+		 * For h1, response body delivery requires the callback to
+		 * drain it itself (h2 delivers RECEIVE_CLIENT_HTTP_READ
+		 * directly from its mux polling) -- the canonical pattern
+		 * from minimal-http-client(-post) and lws-oauth2-client.
+		 * Without this, over h1 the /api/sso_exchange response was
+		 * never read: the suspended browser leg hung until its
+		 * timeout.
+		 */
+		if (lws_http_client_read(wsi, &px, &plen) < 0)
+			return -1;
+		break;
+	}
 
-		while ((e = lws_tokenize(&ts)) != LWS_TOKZE_ENDED) {
-			if (state == 0 && e == LWS_TOKZE_QUOTED_STRING &&
-			    ts.token_len == 5 && !strncmp(ts.token, "token", 5)) {
-				state = 1;
-			} else if (state == 1 && e == LWS_TOKZE_DELIMITER && ts.token[0] == ':') {
-				state = 2;
-			} else if (state == 2 && e == LWS_TOKZE_QUOTED_STRING) {
-				if (ts.token_len < sizeof(ps->token)) {
-					lws_strncpy(ps->token, ts.token, ts.token_len + 1);
-					lwsl_notice("%s: Extracted OAuth token natively via BFF\n", __func__);
+	case LWS_CALLBACK_ESTABLISHED_CLIENT_HTTP:
+		if (!ps)
+			break;
+		/*
+		 * Capture the auth server's actual verdict so the browser-leg
+		 * completion can log WHY the renewal was denied (401 Invalid
+		 * session vs 403 CSRF vs 5xx) instead of an anonymous "denied".
+		 */
+		ps->resp_status = lws_http_client_http_response(wsi);
+		break;
+
+	case LWS_CALLBACK_RECEIVE_CLIENT_HTTP_READ: {
+		lws_tokenize_elem e;
+
+		if (!ps || !in || !len || ps->tok_state == 3)
+			break;
+
+		/*
+		 * The JSON body can arrive split across any number of READ
+		 * chunks, and any real JWT dwarfs the tokenizer's internal
+		 * collect[] limit, so the tokenizer state lives in ps and is
+		 * driven with the chunked API: re-arm .start/.len at each new
+		 * chunk and keep going.  Long quoted strings (the token, or a
+		 * denial reason) arrive as one or more _CHUNK results followed
+		 * by the completed QUOTED_STRING, which we concatenate.
+		 *
+		 * This used to create the tokenizer per chunk with no chunked
+		 * flag: a >255-byte token came back as a "valid" quoted string
+		 * holding only the token's TAIL (lws_tokenize's non-chunked
+		 * overflow behavior), which was then planted verbatim as the
+		 * browser's auth_session cookie... an undecodable session that
+		 * bounced straight back to another renewal, forever.
+		 */
+		if (!ps->ts_active) {
+			memset(&ps->ts, 0, sizeof(ps->ts));
+			lws_tokenize_init(&ps->ts, (char *)in,
+					  LWS_TOKENIZE_F_DOT_NONTERM |
+					  LWS_TOKENIZE_F_MINUS_NONTERM |
+					  LWS_TOKENIZE_F_CHUNK |
+					  LWS_TOKENIZE_F_EXPECT_MORE);
+			ps->ts_active = 1;
+		} else {
+			ps->ts.start = (const char *)in;
+		}
+		ps->ts.len = len;
+
+		while ((e = lws_tokenize(&ps->ts)) != LWS_TOKZE_ENDED &&
+		       e != LWS_TOKZE_WANT_READ) {
+
+			if (ps->tok_state == 0 && e == LWS_TOKZE_QUOTED_STRING &&
+			    ps->ts.token_len == 5 &&
+			    !strncmp(ps->ts.token, "token", 5)) {
+				ps->tok_state = 1;
+			} else if (ps->tok_state == 1 &&
+				   e == LWS_TOKZE_DELIMITER &&
+				   ps->ts.token[0] == ':') {
+				ps->tok_state = 2;
+				ps->tok_len = 0;
+			} else if (ps->tok_state == 2 &&
+				   (e == LWS_TOKZE_QUOTED_STRING ||
+				    e == LWS_TOKZE_QUOTED_STRING_CHUNK)) {
+				size_t c = ps->tok_len + ps->ts.token_len;
+
+				if (!ps->tok_overflow) {
+					if (c >= sizeof(ps->token)) {
+						ps->tok_overflow = 1;
+						ps->token[0] = '\0';
+						lwsl_wsi_err(wsi, "renewal token "
+							"%llu bytes exceeds "
+							"buffer %llu, denying",
+							(unsigned long long)c,
+							(unsigned long long)
+								sizeof(ps->token));
+					} else {
+						memcpy(ps->token + ps->tok_len,
+						       ps->ts.token,
+						       ps->ts.token_len);
+						ps->tok_len = c;
+						ps->token[c] = '\0';
+					}
 				}
-				break;
+				if (e == LWS_TOKZE_QUOTED_STRING) {
+					ps->tok_state = 3;
+					if (!ps->tok_overflow)
+						lwsl_wsi_info(wsi, "Extracted "
+							"OAuth token natively "
+							"via BFF (%llu bytes)",
+							(unsigned long long)
+								ps->tok_len);
+					break;
+				}
+			} else if (ps->err_state == 0 &&
+				   e == LWS_TOKZE_QUOTED_STRING &&
+				   ps->ts.token_len == 5 &&
+				   !strncmp(ps->ts.token, "error", 5)) {
+				ps->err_state = 1;
+			} else if (ps->err_state == 1 &&
+				   e == LWS_TOKZE_DELIMITER &&
+				   ps->ts.token[0] == ':') {
+				ps->err_state = 2;
+				ps->err_len = 0;
+			} else if (ps->err_state == 2 &&
+				   (e == LWS_TOKZE_QUOTED_STRING ||
+				    e == LWS_TOKZE_QUOTED_STRING_CHUNK)) {
+				/* denial reason, eg {"error":"Invalid session"}:
+				 * capture once for the browser-leg log */
+				size_t room = sizeof(ps->resp_error) - 1 - ps->err_len;
+				size_t c = ps->ts.token_len < room ?
+						ps->ts.token_len : room;
+
+				memcpy(ps->resp_error + ps->err_len,
+				       ps->ts.token, c);
+				ps->err_len += c;
+				ps->resp_error[ps->err_len] = '\0';
+				if (e == LWS_TOKZE_QUOTED_STRING)
+					ps->err_state = 3;
 			}
 		}
 		break;
@@ -286,18 +1465,40 @@ callback_lws_login_client(struct lws *wsi, enum lws_callback_reasons reason,
 
 		if (ps->wsi_server)
 			lws_callback_on_writable(ps->wsi_server);
+		/* detach us from the wsi: CLOSED can still fire after this */
+		lws_set_wsi_user(wsi, NULL);
 		ps->wsi_client = NULL;
 		break;
 	}
 
 	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
-	case LWS_CALLBACK_CLOSED_CLIENT_HTTP: {
 		if (!ps)
 			break;
-		lwsl_notice("%s: client connection closed or errored\n", __func__);
+		/*
+		 * in carries the human-readable connection failure: keep it
+		 * for the browser-leg denial log, since "denied" with no
+		 * response at all is usually this (unreachable auth server,
+		 * TLS problem, IP ban on the auth server side...).
+		 */
+		lws_snprintf(ps->conn_error, sizeof(ps->conn_error), "%s",
+			     in ? (const char *)in : "unknown");
+		lwsl_wsi_notice(wsi, "renewal side channel failed: %s",
+				ps->conn_error);
 		if (ps->wsi_server && !ps->token[0]) {
 			lws_callback_on_writable(ps->wsi_server);
 		}
+		lws_set_wsi_user(wsi, NULL);
+		ps->wsi_client = NULL;
+		break;
+
+	case LWS_CALLBACK_CLOSED_CLIENT_HTTP: {
+		if (!ps)
+			break;
+		lwsl_wsi_info(wsi, "renewal side channel closed");
+		if (ps->wsi_server && !ps->token[0]) {
+			lws_callback_on_writable(ps->wsi_server);
+		}
+		lws_set_wsi_user(wsi, NULL);
 		ps->wsi_client = NULL;
 		break;
 	}
@@ -318,6 +1519,82 @@ lws_login_jwt_auth_cb(struct lws_jwt_auth *ja, int state, void *user)
 	return 0;
 }
 
+/*
+ * lws_jwt_auth_create() is documented to hand back a token that verified but
+ * has already expired, leaving "what an expired token means" to the caller
+ * (it can only tell us the cookie is authentic, not that the session is still
+ * live).  Every gate that grants access therefore has to make that decision
+ * explicitly, or a copy of any once-valid session cookie is good forever.
+ *
+ * Returns 1 (and destroys *pja, NULLing it) when the token is not live.
+ */
+static int
+lws_login_jwt_expired(struct lws *wsi, struct lws_jwt_auth **pja)
+{
+	uint64_t exp, now = (uint64_t)lws_now_secs();
+
+	if (!pja || !*pja)
+		return 1;
+
+	/* lws_jwt_auth_update() requires a nonzero exp, so 0 means "unknown" */
+	exp = lws_jwt_auth_get_exp(*pja);
+	if (exp && exp > now)
+		return 0;
+
+	lwsl_wsi_info(wsi, "%s: JWT expired (exp %llu, now %llu)", __func__,
+		      (unsigned long long)exp, (unsigned long long)now);
+	lws_jwt_auth_destroy(pja);
+
+	return 1;
+}
+
+/*
+ * Sanity fence for an SSO "target" before it is used as a Location:.
+ *
+ * The two ways the same-host test below can be walked past:
+ *
+ *  - a backslash.  "/\evil.com" is not caught by the "starts / but not //"
+ *    relative test, yet the WHATWG URL parser treats \ as / for special
+ *    schemes, so a browser resolves it to //evil.com.
+ *
+ *  - userinfo.  lws_parse_uri_create() has no '@' handling and stops the host
+ *    at the first ':', so "https://good.example:80@evil.com/" parses as host
+ *    "good.example" and passes the strcasecmp against our own Host, while the
+ *    browser reads "good.example:80" as userinfo and goes to evil.com.
+ *
+ * Also refuse control bytes and DEL outright: nothing legitimate needs them
+ * in a redirect target.
+ */
+static int
+lws_login_target_sane(const char *t)
+{
+	const char *p = t, *slash;
+
+	/* no control bytes, DEL, or backslash anywhere */
+	for (p = t; *p; p++)
+		if ((unsigned char)*p < 0x20 || (unsigned char)*p == 0x7f ||
+		    *p == '\\')
+			return 0;
+
+	/* a path-absolute target has no authority to hide anything in */
+	if (t[0] == '/' && t[1] != '/')
+		return 1;
+
+	/* otherwise refuse userinfo in the authority */
+	p = strstr(t, "//");
+	if (!p)
+		return 1;
+
+	p += 2;
+	slash = strchr(p, '/');
+
+	for (; *p && (!slash || p < slash); p++)
+		if (*p == '@')
+			return 0;
+
+	return 1;
+}
+
 static int
 auth_verify_redirect_uri(struct vhd_login *vhd, const char *redirect_uri)
 {
@@ -327,9 +1604,9 @@ auth_verify_redirect_uri(struct vhd_login *vhd, const char *redirect_uri)
 	if (!redirect_uri || !redirect_uri[0])
 		return 0;
 
-	if (strstr(redirect_uri, "../") ||
-	    strstr(redirect_uri, "..%2F") ||
-	    strstr(redirect_uri, "..%2f"))
+	if ((char *)strstr(redirect_uri, "../") ||
+	    (char *)strstr(redirect_uri, "..%2F") ||
+	    (char *)strstr(redirect_uri, "..%2f"))
 		return 0;
 
 	if (sqlite3_prepare_v2(vhd->db, "SELECT redirect_uris FROM oauth_clients", -1, &stmt, NULL) == SQLITE_OK) {
@@ -338,13 +1615,13 @@ auth_verify_redirect_uri(struct vhd_login *vhd, const char *redirect_uri)
 			if (uris) {
 				const char *p = uris;
 				while (p && *p) {
-					while (*p == ' ') p++;
+					while (*p == ' ' || *p == '\r' || *p == '\n') p++;
 					const char *comma = strchr(p, ',');
 					size_t len = comma ? lws_ptr_diff_size_t(comma, p) : strlen(p);
-					while (len > 0 && p[len - 1] == ' ') len--;
+					while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\r' || p[len - 1] == '\n')) len--;
 					while (len > 0 && p[len - 1] == '/') len--;
 					if (len > 0) {
-						if (!strncmp(redirect_uri, p, len)) {
+						if (!strncasecmp(redirect_uri, p, len)) {
 							char next = redirect_uri[len];
 							if (next == '\0' || next == '/' || next == '?' || next == '#') {
 								valid = 1;
@@ -379,10 +1656,255 @@ simple_response(struct lws *wsi, struct pss_login *pss, const char *msg, const c
 
 	if (lws_buflist_append_segment(&pss->tx_buflist, (unsigned char*)eb + LWS_PRE, (size_t)l) < 0)
 		return -1;
+	pss->tx_remaining = (size_t)l;
 
 	lws_callback_on_writable(wsi);
 
 	return 0;
+}
+
+
+/*
+ * Explain, at notice level, why this request did not yield a usable JWT in
+ * terms of what the browser actually presented.  Only emitted for the
+ * widget's .lws-login-status probe: that is the one request a "Not logged
+ * in" widget always makes, and bots scanning the mount never do, so it
+ * cannot become log spam.
+ *
+ * Browsers legitimately hold several same-named cookies at once (host-only
+ * alongside Domain=, or leftovers minted under an earlier cookie-domain
+ * config), ordered oldest-first per RFC 6265.  lws_jwt_auth_create() walks
+ * them all and prefers a live one, but a jar full of stale duplicates is
+ * still worth knowing about, so walk every occurrence and verify each
+ * against our JWK: the log then says which of "no cookie", "signature does
+ * not verify" or "expired" applies, per cookie.  None of that is observable
+ * on the device (eg a tablet), and without it the not-logged-in widget is
+ * undiagnosable.
+ */
+static void
+lws_login_diag_jar(struct lws *wsi, struct vhd_login *vhd)
+{
+	uint64_t now = (uint64_t)lws_now_secs();
+	int n = 0, ck_len, expired = 0;
+
+	ck_len = lws_hdr_total_length(wsi, WSI_TOKEN_HTTP_COOKIE);
+	if (ck_len <= 0) {
+		lwsl_wsi_notice(wsi, "status probe: no JWT: request carries no "
+				     "Cookie header at all");
+		return;
+	}
+
+	for (;;) {
+		char jwt[8192], temp[2048], out[2048], sub[64];
+		size_t jwt_len = sizeof(jwt), out_len = sizeof(out), alen;
+		const char *v;
+		uint64_t exp = 0;
+
+		if (lws_http_cookie_get_nth(wsi, vhd->cookie_name, n, jwt,
+					    &jwt_len)) {
+			if (n)
+				break;
+
+			/*
+			 * No cookie of our name at all: say which names the
+			 * browser did send (names and value lengths only, the
+			 * values may be credentials for something else)
+			 */
+			{
+				char names[512], *ck, *q, *e;
+				int nl = 0;
+
+				ck = malloc((size_t)ck_len + 1);
+				if (!ck)
+					return;
+				if (lws_hdr_copy(wsi, ck, ck_len + 1,
+						 WSI_TOKEN_HTTP_COOKIE) <= 0) {
+					free(ck);
+					return;
+				}
+				names[0] = '\0';
+				q = ck;
+				while (q && *q) {
+					while (*q == ' ' || *q == ';')
+						q++;
+					e = strchr(q, ';');
+					if (e)
+						*e++ = '\0';
+					v = strchr(q, '=');
+					if (*q)
+						nl += lws_snprintf(names + nl,
+							sizeof(names) - (size_t)nl,
+							"%s%.*s(%d)", nl ? ", " : "",
+							v ? (int)(v - q) : (int)strlen(q),
+							q, v ? (int)strlen(v + 1) : 0);
+					q = e;
+					if ((size_t)nl >= sizeof(names) - 8)
+						break;
+				}
+				free(ck);
+				lwsl_wsi_notice(wsi, "status probe: no JWT: no "
+					"'%s' cookie in a %d-byte Cookie header "
+					"(cookies presented: %s)",
+					vhd->cookie_name, ck_len, names);
+			}
+			return;
+		}
+
+		if (lws_jwt_signed_validate(lws_get_context(wsi), &vhd->jwk,
+			"ES256,ES384,ES512,RS256,RS384,RS512,HS256", jwt,
+			jwt_len, temp, sizeof(temp), out, &out_len)) {
+			lwsl_wsi_notice(wsi, "status probe: '%s' cookie #%d "
+				"(%u bytes): signature does not verify against "
+				"jwt-jwk", vhd->cookie_name, n,
+				(unsigned int)jwt_len);
+			n++;
+			continue;
+		}
+
+		v = lws_json_simple_find(out, out_len, "\"exp\":", &alen);
+		if (v)
+			exp = (uint64_t)atoll(v);
+		sub[0] = '\0';
+		v = lws_json_simple_find(out, out_len, "\"sub\":", &alen);
+		if (v)
+			lws_strnncpy(sub, v, alen, sizeof(sub));
+
+		if (!exp || exp <= now) {
+			expired++;
+			lwsl_wsi_notice(wsi, "status probe: '%s' cookie #%d: "
+				"sub '%s' EXPIRED %llus ago (exp %llu)",
+				vhd->cookie_name, n, sub,
+				(unsigned long long)(exp ? now - exp : 0),
+				(unsigned long long)exp);
+		} else
+			lwsl_wsi_notice(wsi, "status probe: '%s' cookie #%d: "
+				"sub '%s' live for another %llus",
+				vhd->cookie_name, n, sub,
+				(unsigned long long)(exp - now));
+		n++;
+	}
+
+	if (n > 1)
+		lwsl_wsi_notice(wsi, "status probe: %d same-named '%s' cookies "
+			"presented, none live (host-only vs Domain= scope, or "
+			"a leftover from an earlier cookie-domain config)",
+			n, vhd->cookie_name);
+	else if (expired)
+		lwsl_wsi_notice(wsi, "status probe: single expired '%s' JWT, "
+			"expect the widget's silent renewal to re-mint it next",
+			vhd->cookie_name);
+}
+
+/*
+ * A "global admin" is solely the holder of the "*" wildcard grant -- the
+ * established "god" grant, the TOFU bootstrap account that can manage every
+ * user and account on the system.  This is the ONLY grant that unlocks the
+ * central auth-server Admin Console (/api/admin, which itself gates on the
+ * literal "*") and is the ONLY thing that should drive the "Admin Console"
+ * link in the status widget and x-lws-login-admin:1 for backends.
+ *
+ * A named, app-scoped grant at level >= 2 (eg lws-sai:2) makes the user an
+ * admin of *that one app*; it must NOT be reported as a global admin here,
+ * or the user gets shown an Admin Console link they cannot actually open.
+ * The app-local admin level is carried separately by x-lws-login-grant-level
+ * / "grant_level", so backends and the widget can apply their own threshold
+ * (eg the avatar badge at grant_level >= 2).
+ */
+static int
+lws_login_is_global_admin(struct lws_jwt_auth *ja)
+{
+	return lws_jwt_auth_query_grant(ja, "*") >= 1;
+}
+
+/*
+ * Reduce the verified grants for this request to a single \ref
+ * lws_login_state, the role injected as x-lws-login-state for the backend.
+ *
+ * The "*" wildcard is checked FIRST, so a global admin (god) is always
+ * LWS_LOGIN_STATE_GLOBAL_ADMIN regardless of any named grant on the token
+ * (any "*" level >= 1 qualifies, per lws_login_is_global_admin).  Below that,
+ * the named grant level for this mount decides USER vs APP_ADMIN, and a valid
+ * JWT with no usable grant here is NO_GRANT.  |level| may be -1 when no
+ * service grant (and no "*") was found.  A NULL ja (no/invalid JWT, only
+ * reachable on an unauth-allow mount) yields ANON.
+ */
+static enum lws_login_state
+lws_login_state_from_grants(struct lws_jwt_auth *ja, int level)
+{
+	if (lws_login_is_global_admin(ja))
+		return LWS_LOGIN_STATE_GLOBAL_ADMIN;
+	if (level >= 2)
+		return LWS_LOGIN_STATE_APP_ADMIN;
+	if (level >= 1)
+		return LWS_LOGIN_STATE_USER;
+	if (ja)
+		return LWS_LOGIN_STATE_NO_GRANT;
+	return LWS_LOGIN_STATE_ANON;
+}
+
+/*
+ * Remove every client-supplied copy of the x-lws-login-* headers from the
+ * request.  These names mean "the bouncer vouches for this" to whatever is
+ * behind the mount, so the peer's own versions must be gone on every path
+ * through the interceptor check, not only the ones that go on to stamp
+ * trusted values (lws_http_add_onward_header() zaps the name it stamps
+ * itself; this covers the refusals and bypasses that stamp nothing).
+ * lws_http_zap_header() takes the bare name and removes all duplicates.
+ */
+static void
+lws_login_snip_headers(struct lws *wsi)
+{
+	lws_http_zap_header(wsi, LWS_LOGIN_HDR_STATE);
+	lws_http_zap_header(wsi, LWS_LOGIN_HDR_ADMIN);
+	lws_http_zap_header(wsi, LWS_LOGIN_HDR_GRANT_LEVEL);
+	lws_http_zap_header(wsi, LWS_LOGIN_HDR_SUB);
+}
+
+/*
+ * Stamp the cooked login state onto the browser-side wsi as "extra onward
+ * headers" so the proxy (HTTP or WS) forwards them to the backend app.  The
+ * app then reads x-lws-login-state (the authoritative summary role) with no
+ * JWT/grant logic of its own.
+ *
+ *   x-lws-login-state:        stringified lws_login_state (authoritative)
+ *   x-lws-login-admin:        1 iff state == GLOBAL_ADMIN (back-compat)
+ *   x-lws-login-grant-level:  raw integer grant level used for this mount
+ *   x-lws-login-sub:          subject identity ("" if anonymous)
+ *
+ * x-lws-login-admin is derived from |state| so it stays consistent with
+ * x-lws-login-state by construction; a backend that wants "admin of my own
+ * app" should instead check `state >= LWS_LOGIN_STATE_APP_ADMIN` or read
+ * x-lws-login-grant-level.
+ *
+ * Mirrors lib/sansio/http/server/interceptor.c lws_interceptor_inject_header:
+ * append "Name: value\r\n" lines to wsi->http.extra_onward_headers, each
+ * zapping the client-supplied copy of its name first (done inside
+ * lws_http_add_onward_header(), and again for every path by
+ * lws_login_snip_headers() at the top of the check).  The backend trusts
+ * these because only the interceptor (which holds the JWK) can set them --
+ * a browser cannot elevate itself.
+ *
+ * sub/level may be NULL/-1 for the anonymous (unauth-allow) case; we still
+ * inject the headers (with x-lws-login-state:0 / x-lws-login-admin:0) so the
+ * backend sees an explicit "anonymous" rather than ambiguous absence.
+ */
+static void
+lws_login_inject_state(struct lws *wsi, const char *sub, int level,
+		       enum lws_login_state state)
+{
+	char buf[32];
+
+	lws_snprintf(buf, sizeof(buf), "%d", (int)state);
+	lws_http_add_onward_header(wsi, LWS_LOGIN_HDR_STATE, buf);
+
+	lws_http_add_onward_header(wsi, LWS_LOGIN_HDR_ADMIN,
+				   state == LWS_LOGIN_STATE_GLOBAL_ADMIN
+					   ? "1" : "0");
+
+	lws_snprintf(buf, sizeof(buf), "%d", level);
+	lws_http_add_onward_header(wsi, LWS_LOGIN_HDR_GRANT_LEVEL, buf);
+
+	lws_http_add_onward_header(wsi, LWS_LOGIN_HDR_SUB, sub ? sub : "");
 }
 
 static int
@@ -392,11 +1914,13 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 	struct vhd_login *vhd = (struct vhd_login *)lws_protocol_vh_priv_get(
 			lws_get_vhost(wsi), reason == LWS_CALLBACK_HTTP_INTERCEPTOR_CHECK ? (const struct lws_protocols *)in : lws_get_protocol(wsi));
 	struct pss_login *pss = (struct pss_login *)user;
-	char buf[LWS_PRE + LWS_SSO_MAX_COOKIE], *p = buf + LWS_PRE, *end = buf + sizeof(buf) - 1;
+	char buf[LWS_LOGIN_HTTP_BUFL], *p = buf + LWS_PRE, *end = buf + sizeof(buf) - 1;
 	const char *cp;
 
 	switch ((int)reason) {
 	case LWS_CALLBACK_PROTOCOL_INIT:
+		if (lws_cmdline_option_cx(lws_get_context(wsi), "--lws-stub"))
+			return 0;
 		if (!in)
 			return 0;
 		vhd = lws_protocol_vh_priv_zalloc(lws_get_vhost(wsi),
@@ -413,9 +1937,23 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 		lws_strncpy(vhd->auth_domain, "auth.warmcat.com", sizeof(vhd->auth_domain));
 		lws_strncpy(vhd->db_path, "/var/db/lws-auth.sqlite3", sizeof(vhd->db_path));
 		vhd->jwt_validity_secs = 86400;
+		vhd->csrf_max_age_secs = 30 * 24 * 3600; /* 30d: csrf must outlive JWT */
 
 		if (lws_pvo_get_str(in, "cookie-name", &vhd->cookie_name))
 			lwsl_info("%s: default cookie-name %s\n", __func__, vhd->cookie_name);
+
+		/*
+		 * F-022: the Set-Cookie buffers are sized for a cookie-name
+		 * up to 63 chars (LWS_LOGIN_SESSION_COOKIE_SZ /
+		 * LWS_LOGIN_CLEAR_COOKIE_SZ); refuse a longer name at init
+		 * rather than discover it mid-login
+		 */
+		if (!vhd->cookie_name || !vhd->cookie_name[0] ||
+		    strlen(vhd->cookie_name) > 63) {
+			lwsl_err("%s: cookie-name must be 1..63 chars\n",
+				 __func__);
+			return -1;
+		}
 
 		{
 			const struct lws_protocol_vhost_options *pvo = (const struct lws_protocol_vhost_options *)in;
@@ -446,6 +1984,27 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 			return -1;
 		}
 
+		/*
+		 * auth-api-url is where the auth server's APIs actually live.
+		 * It defaults to auth-server-url, which is correct when the
+		 * login entry is on the auth server itself.  But
+		 * auth-server-url may deliberately be a local BFF entry like
+		 * the oauth2-client's "/oauth/login" so the Login button goes
+		 * through the PKCE delegate flow -- such a relative URL can
+		 * never reach /api/sso_exchange, /api/logout or provide the
+		 * origin for the SSO check, so those must use this PVO set to
+		 * the real absolute auth server URL instead.
+		 */
+		if (lws_pvo_get_str(in, "auth-api-url", &vhd->auth_api_url))
+			vhd->auth_api_url = vhd->auth_server_url;
+
+		if (!strstr(vhd->auth_api_url, "://"))
+			lwsl_err("%s: auth-api-url '%s' is not an absolute "
+				 "http(s) URL: silent renewal, logout and "
+				 "the SSO origin check cannot work -- set "
+				 "auth-api-url to the auth server's absolute "
+				 "base URL\n", __func__, vhd->auth_api_url);
+
 		if (!lws_pvo_get_str(in, "min-grant-level", &cp))
 			vhd->min_grant_level = atoi(cp);
 
@@ -471,19 +2030,34 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 		if (!lws_pvo_get_str(in, "jwt-validity-secs", &cp))
 			vhd->jwt_validity_secs = (uint64_t)atoll(cp);
 
+		if (!lws_pvo_get_str(in, "csrf-max-age-secs", &cp))
+			vhd->csrf_max_age_secs = (uint64_t)atoll(cp);
+
 		vhd->unauth_allow = 0;
 		if (!lws_pvo_get_str(in, "unauth-allow", &cp))
 			vhd->unauth_allow = atoi(cp);
 
+		if (!lws_pvo_get_str(in, "unauth-protocols", &vhd->unauth_protocols))
+			lwsl_notice("%s: unauth-protocols: %s\n", __func__, vhd->unauth_protocols);
+
+		/*
+		 * X-Forwarded-Proto is client-settable on any direct
+		 * connection; it is only meaningful when a TLS-terminating
+		 * reverse proxy in front of us sets it.  Default on for the
+		 * usual BFF deployment, but let a directly-exposed vhost
+		 * refuse it (see the scheme selection in
+		 * lws_login_serve_self_redirect_with_cookie() and the bounce).
+		 */
+		vhd->trust_forwarded_proto = 1;
+		if (!lws_pvo_get_str(in, "trust-forwarded-proto", &cp))
+			vhd->trust_forwarded_proto = atoi(cp);
+
 		if (!lws_pvo_get_str(in, "db-path", &cp))
 			lws_strncpy(vhd->db_path, cp, sizeof(vhd->db_path));
 
-		lwsl_notice("%s: opening local database at %s\n", __func__, vhd->db_path);
 		if (lws_struct_sq3_open(vhd->context, vhd->db_path, 1, &vhd->db)) {
-			lwsl_warn("%s: could not open local database at %s. Dynamic grant revocation disabled.\n", __func__, vhd->db_path);
+			lwsl_err("%s: could not open local database at %s. Dynamic grant revocation disabled.\n", __func__, vhd->db_path);
 			vhd->db = NULL;
-		} else {
-			lwsl_notice("%s: Local database bound to %s\n", __func__, vhd->db_path);
 		}
 
 
@@ -491,7 +2065,7 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 
 	case LWS_CALLBACK_PROTOCOL_DESTROY:
 		if (vhd) {
-			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, vhd->wl.head) {
+			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, lws_dll2_get_head(&vhd->wl)) {
 				struct login_whitelist *w = lws_container_of(d, struct login_whitelist, list);
 				lws_dll2_remove(d);
 				free(w);
@@ -508,7 +2082,9 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 		struct lws_jwt_auth *ja;
 		const char *service_name;
 		const struct lws_http_mount *mount;
-		char uri[256];
+		/* LWS_LOGIN_MAX_URI so realistic deep links still resolve
+		 * their mount; anything longer is denied, not defaulted */
+		char uri[LWS_LOGIN_MAX_URI];
 
 		vhd = (struct vhd_login *)lws_protocol_vh_priv_get(
 				lws_get_vhost(wsi),
@@ -518,39 +2094,60 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 			return 1;
 
 		service_name = vhd->service_name;
-		uri[0] = '\0';
-		if (lws_hdr_copy(wsi, uri, sizeof(uri), WSI_TOKEN_GET_URI) > 0 ||
-		    lws_hdr_copy(wsi, uri, sizeof(uri), WSI_TOKEN_POST_URI) > 0) {
-			if (uri[0]) {
-				mount = lws_find_mount(wsi, uri, (int)strlen(uri));
-				if (mount) {
-					if (!lws_pmo_get_str(mount, "service-name", &service_name)) {
-						lwsl_info("%s: using service_name %s from target pmo for bypass api\n", __func__, service_name);
-					}
+		/* fail closed: an unfetchable URI must not silently fall back
+		 * to the vhost-wide service-name (see lws_login_request_uri) */
+		if (lws_login_request_uri(wsi, uri, sizeof(uri))) {
+			lwsl_notice("%s: DENYING bypass api, request URI too long\n",
+				    __func__);
+			return 1;
+		}
+		if (uri[0]) {
+			mount = lws_find_mount(wsi, uri, (int)strlen(uri));
+			if (mount) {
+				if (!lws_pmo_get_str(mount, "service-name", &service_name)) {
+					lwsl_info("%s: using service_name %s from target pmo for bypass api\n", __func__, service_name);
+				}
 #if defined(LWS_WITH_JOSE)
-					else if (mount->interceptor_path) {
-						const struct lws_http_mount *im = mount;
-						while (im && im->interceptor_path) {
-							im = lws_find_mount(wsi, im->interceptor_path, (int)strlen(im->interceptor_path));
-							if (im && !lws_pmo_get_str(im, "service-name", &service_name)) {
-								lwsl_info("%s: using service_name %s from interceptor pmo for bypass api\n", __func__, service_name);
-								break;
-							}
+				else if (mount->interceptor_path) {
+					const struct lws_http_mount *im = mount;
+					while (im && im->interceptor_path) {
+						im = lws_find_mount(wsi, im->interceptor_path, (int)strlen(im->interceptor_path));
+						if (im && !lws_pmo_get_str(im, "service-name", &service_name)) {
+							lwsl_info("%s: using service_name %s from interceptor pmo for bypass api\n", __func__, service_name);
+							break;
 						}
 					}
-#endif
 				}
+#endif
 			}
 		}
 
 		if (!service_name)
 			service_name = "";
 
-		ja = lws_jwt_auth_create(wsi, &vhd->jwk, vhd->cookie_name, lws_login_jwt_auth_cb, wsi);
+		ja = lws_jwt_auth_create(wsi, &vhd->jwk, vhd->cookie_name, lws_login_jwt_auth_cb, wsi, NULL);
+		if (ja && lws_login_jwt_expired(wsi, &ja))
+			return 1; /* the session has run out: unauthenticated */
 		if (ja) {
+			int epoch_ok = 1;
+			if (vhd->db) {
+				uint32_t uid = lws_jwt_auth_get_uid(ja);
+				if (uid) {
+					sqlite3_stmt *stmt;
+					if (sqlite3_prepare_v2(vhd->db, "SELECT session_epoch FROM users WHERE uid = ?", -1, &stmt, NULL) == SQLITE_OK) {
+						sqlite3_bind_int(stmt, 1, (int)uid);
+						if (sqlite3_step(stmt) == SQLITE_ROW) {
+							uint32_t db_epoch = (uint32_t)sqlite3_column_int(stmt, 0);
+							if (db_epoch != lws_jwt_auth_get_sec(ja))
+								epoch_ok = 0;
+						}
+						sqlite3_finalize(stmt);
+					}
+				}
+			}
 			level = lws_jwt_auth_query_grant(ja, service_name);
 			lws_jwt_auth_destroy(&ja);
-			if (level >= vhd->min_grant_level)
+			if (epoch_ok && level >= vhd->min_grant_level)
 				return 0; /* Authentic and authorized */
 		}
 		return 1; /* Unauthenticated */
@@ -558,38 +2155,64 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 
 	case LWS_CALLBACK_HTTP_INTERCEPTOR_CHECK:
 	{
-		int level = -1;
+		int level = -1, unauth_proto = 0;
 		struct lws_jwt_auth *ja;
-		char uri[256];
+		/* see the LWS_CALLBACK_USER + 1 note on this size */
+		char uri[LWS_LOGIN_MAX_URI];
 		const char *service_name;
-		const struct lws_http_mount *mount;
+		const struct lws_http_mount *mount = NULL;
 
-		uri[0] = '\0';
-		if (lws_hdr_copy(wsi, uri, sizeof(uri), WSI_TOKEN_GET_URI) > 0 ||
-		    lws_hdr_copy(wsi, uri, sizeof(uri), WSI_TOKEN_POST_URI) > 0) {
-			if (lws_login_ends_with(uri, "/.lws-login-status") ||
-			    lws_login_ends_with(uri, "/lws-login.js") ||
-			    lws_login_ends_with(uri, "/lws-login.css") ||
-			    lws_login_ends_with(uri, "/.lws-login-sso") ||
-			    lws_login_ends_with(uri, "/.lws-login-logout") ||
-			    lws_login_ends_with(uri, "/.lws-login-refresh"))
-				return 1;
+		/*
+		 * The peer's own copies of the headers we stamp onward go
+		 * first, before any decision: lws_http_add_onward_header()
+		 * zaps them again when we stamp, but the paths that refuse the
+		 * request, or let it through without stamping, must not leave
+		 * a client-supplied x-lws-login-* in the ah for anything
+		 * downstream to read either.
+		 */
+		lws_login_snip_headers(wsi);
+
+		/* fail closed: continuing with an empty uri[] would apply the
+		 * vhost-wide policy instead of this mount's PMO overrides
+		 * (see lws_login_request_uri) */
+		if (lws_login_request_uri(wsi, uri, sizeof(uri))) {
+			lwsl_notice("%s: DENYING, request URI too long\n",
+				    __func__);
+			return 1;
 		}
 
+		if (uri[0] &&
+		    (lws_login_ends_with(uri, "/.lws-login-status") ||
+		     lws_login_ends_with(uri, "/lws-login.js") ||
+		     lws_login_ends_with(uri, "/lws-login.css") ||
+		     lws_login_ends_with(uri, "/.lws-login-sso") ||
+		     lws_login_ends_with(uri, "/.lws-login-logout") ||
+		     lws_login_ends_with(uri, "/.lws-login-refresh")))
+			return 1;
+
 		if (!vhd) {
-			lwsl_info("%s: ALLOWING (vhd is NULL !!! protocol init failed?)\n", __func__);
-			return 0;
+			lwsl_err("%s: DENYING (vhd is NULL !!! protocol init failed or unconfigured)\n", __func__);
+			return 1;
 		}
 
 		service_name = vhd->service_name;
+		int unauth_allow = vhd->unauth_allow;
 		if (uri[0]) {
 			mount = lws_find_mount(wsi, uri, (int)strlen(uri));
 			if (mount) {
-				if (!lws_pmo_get_str(mount, "service-name", &service_name)) {
+				const char *pmo_val;
+				int target_sn = !lws_pmo_get_str(mount, "service-name", &service_name);
+				int target_ua = !lws_pmo_get_str(mount, "unauth-allow", &pmo_val);
+
+				if (target_sn)
 					lwsl_info("%s: using service_name %s from target pmo\n", __func__, service_name);
+				if (target_ua) {
+					unauth_allow = atoi(pmo_val);
+					lwsl_info("%s: using unauth_allow %d from target pmo\n", __func__, unauth_allow);
 				}
+
 #if defined(LWS_WITH_JOSE)
-				else if (mount->interceptor_path) {
+				if (!target_sn && mount->interceptor_path) {
 					const struct lws_http_mount *im = mount;
 					while (im && im->interceptor_path) {
 						im = lws_find_mount(wsi, im->interceptor_path, (int)strlen(im->interceptor_path));
@@ -599,18 +2222,60 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 						}
 					}
 				}
+				if (!target_ua && mount->interceptor_path) {
+					const struct lws_http_mount *im = mount;
+					while (im && im->interceptor_path) {
+						im = lws_find_mount(wsi, im->interceptor_path, (int)strlen(im->interceptor_path));
+						if (im && !lws_pmo_get_str(im, "unauth-allow", &pmo_val)) {
+							unauth_allow = atoi(pmo_val);
+							lwsl_info("%s: using unauth_allow %d from interceptor pmo\n", __func__, unauth_allow);
+							break;
+						}
+					}
+				}
 #endif
 			}
 		}
 
-		if (vhd->wl.count) {
+		/*
+		 * A ws upgrade that is going to bind an unauth-protocols
+		 * subprotocol is let through whatever we find below, exempt
+		 * from the whitelist as it always was.  But it is not waved
+		 * past the JWT evaluation: the peer may well be a logged-in
+		 * admin joining the waiting room, and the backend deserves the
+		 * same stamped x-lws-login-* state it gets on any other
+		 * request, ANON when there is no live session, rather than
+		 * nothing at all.
+		 *
+		 * The exemption is judged on the subprotocol the upgrade will
+		 * bind, not on the offer list as a whole (see
+		 * lws_login_unauth_upgrade): this needs the mount, since on
+		 * a proxied one the origin does the binding.
+		 */
+		if (vhd->unauth_protocols) {
+			char ws_prot[256];
+			int proxied = mount &&
+				(mount->origin_protocol == LWSMPRO_HTTP ||
+				 mount->origin_protocol == LWSMPRO_HTTPS);
+
+			if (lws_hdr_copy(wsi, ws_prot, sizeof(ws_prot),
+					 WSI_TOKEN_PROTOCOL) > 0 &&
+			    lws_login_unauth_upgrade(wsi, vhd->unauth_protocols,
+						     ws_prot, proxied)) {
+				lwsl_notice("%s: unauth protocol '%s': JWT not required\n",
+					    __func__, ws_prot);
+				unauth_proto = 1;
+			}
+		}
+
+		if (!unauth_proto && lws_dll2_count(&vhd->wl)) {
 			char ip[64];
 			lws_sockaddr46 sa46;
 			int match = 0;
 
 			lws_get_peer_simple(wsi, ip, sizeof(ip));
 			if (!lws_sa46_parse_numeric_address(ip, &sa46)) {
-				lws_start_foreach_dll(struct lws_dll2 *, d, vhd->wl.head) {
+				lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&vhd->wl)) {
 					struct login_whitelist *w = lws_container_of(d, struct login_whitelist, list);
 					if (!lws_sa46_on_net(&sa46, &w->sa46, w->net_len)) {
 						match = 1;
@@ -625,8 +2290,32 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 			}
 		}
 
-		ja = lws_jwt_auth_create(wsi, &vhd->jwk, vhd->cookie_name, lws_login_jwt_auth_cb, wsi);
+		ja = lws_jwt_auth_create(wsi, &vhd->jwk, vhd->cookie_name, lws_login_jwt_auth_cb, wsi, NULL);
+		/* an authentic but expired cookie is not a live session: this
+		 * is the gate that grants access, it must decide it here just
+		 * as the LWS_CALLBACK_HTTP path does */
+		if (ja)
+			lws_login_jwt_expired(wsi, &ja);
 		if (ja) {
+			const char *did = lws_jwt_auth_get_did(ja);
+			if (did && vhd->db) {
+				sqlite3_stmt *stmt;
+				int found_device = 0;
+				if (sqlite3_prepare_v2(vhd->db, "SELECT 1 FROM devices WHERE device_id = ?", -1, &stmt, NULL) == SQLITE_OK) {
+					sqlite3_bind_text(stmt, 1, did, -1, SQLITE_STATIC);
+					if (sqlite3_step(stmt) == SQLITE_ROW)
+						found_device = 1;
+					sqlite3_finalize(stmt);
+				}
+				if (!found_device) {
+					lwsl_notice("%s: Device %s rejected (not found in DB %s), rejecting JWT\n", __func__, did, vhd->db_path);
+					lws_jwt_auth_destroy(&ja);
+					if (unauth_proto)
+						goto anon;
+					return 1; /* Request to intercept */
+				}
+			}
+
 			lwsl_info("%s: Valid cookie found! User authenticated.\n", __func__);
 			level = lws_jwt_auth_query_grant(ja, service_name);
 			if (level >= vhd->min_grant_level) {
@@ -652,34 +2341,77 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 							sqlite3_finalize(stmt);
 						}
 
+						if (sqlite3_prepare_v2(vhd->db, "SELECT session_epoch FROM users WHERE uid = ?", -1, &stmt, NULL) == SQLITE_OK) {
+							sqlite3_bind_int(stmt, 1, (int)uid);
+							if (sqlite3_step(stmt) == SQLITE_ROW) {
+								uint32_t db_epoch = (uint32_t)sqlite3_column_int(stmt, 0);
+								if (db_epoch != lws_jwt_auth_get_sec(ja)) {
+									lwsl_info("%s: session epoch mismatch! DB=%u JWT=%u\n", __func__, db_epoch, lws_jwt_auth_get_sec(ja));
+									mismatch = 1;
+								}
+							}
+							sqlite3_finalize(stmt);
+						}
+
 						if (count_db != (int)lws_jwt_auth_count_grants(ja))
 							mismatch = 1;
 
 						if (mismatch) {
 							lws_jwt_auth_destroy(&ja);
 							lwsl_info("%s: Need dynamic JWT rewrite\n", __func__);
+							if (unauth_proto)
+								goto anon;
 							return 1; /* Request to intercept */
-						}
 					}
 				}
+			}
+
+			{
+				/* capture login state before destroying ja, and
+				 * stamp it for the proxy to forward to backend.
+				 * The single lws_login_state encodes the role
+				 * (anon/user/app-admin/global-admin); the bouncer
+				 * no longer leaks a separate is_admin boolean.
+				 *
+				 * lws_jwt_auth_get_sub() points into the ja
+				 * allocation itself, so it must be copied out
+				 * before ja is destroyed: the value is consumed
+				 * synchronously here, a stack copy is enough.
+				 * Sized to match ja's internal sub[]. */
+				char sub[128];
+				const char *s;
+				enum lws_login_state state =
+					lws_login_state_from_grants(ja, level);
+
+				s = lws_jwt_auth_get_sub(ja);
+				sub[0] = '\0';
+				if (s)
+					lws_strncpy(sub, s, sizeof(sub));
 
 				lws_jwt_auth_destroy(&ja);
-				lwsl_info("%s: ALLOWING (User has required grant)\n", __func__);
-				return 0; /* Let traffic through to the real mount */
+
+				lws_login_inject_state(wsi, sub, level, state);
 			}
-			lwsl_info("%s: JWT valid but lacks required %s grant (has %d), INTERCEPTING\n", __func__, service_name, level);
-			lws_jwt_auth_destroy(&ja);
+			lwsl_info("%s: ALLOWING (User has required grant)\n", __func__);
+			return 0; /* Let traffic through to the real mount */
 		}
-
-		lwsl_info("%s: INTERCEPTING (NO VALID COOKIE FOUND)\n", __func__);
-
-		if (vhd->unauth_allow) {
-			lwsl_info("%s: ALLOWING UNAUTH (unauth-allow enabled)\n", __func__);
-			return 0;
-		}
-
-		return 1; /* Unauthorized, intercept */
+		lwsl_info("%s: JWT valid but lacks required %s grant (has %d), INTERCEPTING\n", __func__, service_name, level);
+		lws_jwt_auth_destroy(&ja);
 	}
+
+	lwsl_info("%s: INTERCEPTING (NO VALID COOKIE FOUND)\n", __func__);
+
+	if (!unauth_allow && !unauth_proto)
+		return 1; /* Unauthorized, intercept */
+
+anon:
+	/* anonymous: explicit ANON state for the backend */
+	lws_login_inject_state(wsi, NULL, -1, LWS_LOGIN_STATE_ANON);
+	lwsl_info("%s: ALLOWING UNAUTH (%s)\n", __func__,
+		  unauth_proto ? "unauth-protocols" : "unauth-allow");
+
+	return 0;
+}
 
 	case LWS_CALLBACK_HTTP:
 	{
@@ -687,26 +2419,47 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 		const struct lws_http_mount *mount;
 		int whitelist_failed = 0;
 		const char *service_name;
+		const char *pmo_val;
 		int n;
 
 		if (!vhd)
 			return 1;
 
+		/*
+		 * Must come after the vhd NULL check: a protocol enabled on
+		 * the vhost with a NULL options chain never initializes its
+		 * vhd, dereferencing it here crashed the service instead of
+		 * refusing the transaction cleanly
+		 */
+		int unauth_allow = vhd->unauth_allow;
+
 		service_name = vhd->service_name;
 
-		path[0] = '\0';
-		n = lws_hdr_copy(wsi, path, sizeof(path), WSI_TOKEN_GET_URI);
-		if (n <= 0)
-			n = lws_hdr_copy(wsi, path, sizeof(path), WSI_TOKEN_POST_URI);
+		/* fail closed: without the real URI we cannot find the mount,
+		 * and unauth-allow would resolve to the vhost default rather
+		 * than this mount's PMO (see lws_login_request_uri) */
+		if (lws_login_request_uri(wsi, path, sizeof(path))) {
+			lwsl_notice("%s: DENYING, request URI too long\n",
+				    __func__);
+			return 1;
+		}
+		n = (int)strlen(path);
 
 		if (n > 0) {
 			mount = lws_find_mount(wsi, path, n);
 			if (mount) {
-				if (!lws_pmo_get_str(mount, "service-name", &service_name))
+				int target_sn = !lws_pmo_get_str(mount, "service-name", &service_name);
+				int target_ua = !lws_pmo_get_str(mount, "unauth-allow", &pmo_val);
+
+				if (target_sn)
 					lwsl_info("%s: using service_name %s from target pmo\n", __func__, service_name);
+				if (target_ua) {
+					unauth_allow = atoi(pmo_val);
+					lwsl_info("%s: using unauth_allow %d from target pmo\n", __func__, unauth_allow);
+				}
 
 #if defined(LWS_WITH_JOSE)
-				else if (mount->interceptor_path) {
+				if (!target_sn && mount->interceptor_path) {
 					const struct lws_http_mount *im = mount;
 					while (im && im->interceptor_path) {
 						im = lws_find_mount(wsi, im->interceptor_path, (int)strlen(im->interceptor_path));
@@ -716,18 +2469,29 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 						}
 					}
 				}
+				if (!target_ua && mount->interceptor_path) {
+					const struct lws_http_mount *im = mount;
+					while (im && im->interceptor_path) {
+						im = lws_find_mount(wsi, im->interceptor_path, (int)strlen(im->interceptor_path));
+						if (im && !lws_pmo_get_str(im, "unauth-allow", &pmo_val)) {
+							unauth_allow = atoi(pmo_val);
+							lwsl_info("%s: using unauth_allow %d from interceptor pmo\n", __func__, unauth_allow);
+							break;
+						}
+					}
+				}
 #endif
 			}
 		}
 
-		if (vhd->wl.count) {
+		if (lws_dll2_count(&vhd->wl)) {
 			char ip[64];
 			lws_sockaddr46 sa46;
 			int match = 0;
 
 			lws_get_peer_simple(wsi, ip, sizeof(ip));
 			if (!lws_sa46_parse_numeric_address(ip, &sa46)) {
-				lws_start_foreach_dll(struct lws_dll2 *, d, vhd->wl.head) {
+				lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&vhd->wl)) {
 					struct login_whitelist *w = lws_container_of(d, struct login_whitelist, list);
 					if (!lws_sa46_on_net(&sa46, &w->sa46, w->net_len)) {
 						match = 1;
@@ -751,7 +2515,13 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 			return 0; /* Fall through to LWS_CALLBACK_HTTP_BODY */
 
 		if (!pss->ja)
-			pss->ja = lws_jwt_auth_create(wsi, &vhd->jwk, vhd->cookie_name, lws_login_jwt_auth_cb, wsi);
+			pss->ja = lws_jwt_auth_create(wsi, &vhd->jwk, vhd->cookie_name, lws_login_jwt_auth_cb, wsi, NULL);
+
+		if (pss->ja)
+			lws_login_jwt_expired(wsi, &pss->ja);
+
+		if (!pss->ja && lws_login_ends_with(path, "/.lws-login-status"))
+			lws_login_diag_jar(wsi, vhd);
 
 		if (pss->ja) {
 			int level = lws_jwt_auth_query_grant(pss->ja, service_name);
@@ -760,6 +2530,7 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 					uint32_t uid = lws_jwt_auth_get_uid(pss->ja);
 					if (uid) {
 						char current_grants[512];
+						char svc_esc[256];
 						char *g_p = current_grants;
 						char *g_end = current_grants + sizeof(current_grants);
 						sqlite3_stmt *stmt;
@@ -784,7 +2555,13 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 								if (!first)
 									g_p += lws_snprintf(g_p, lws_ptr_diff_size_t(g_end, g_p), ",");
 								first = 0;
-								g_p += lws_snprintf(g_p, lws_ptr_diff_size_t(g_end, g_p), "\"%s\":%d", svc_name, gl);
+								/*
+								 * The service name is db content: a '"'
+								 * in it would inject extra members (eg
+								 * "*":9) into a payload WE then sign.
+								 */
+								lws_json_purify(svc_esc, svc_name, (int)sizeof(svc_esc), NULL);
+								g_p += lws_snprintf(g_p, lws_ptr_diff_size_t(g_end, g_p), "\"%s\":%d", svc_esc, gl);
 							}
 							sqlite3_finalize(stmt);
 						}
@@ -800,12 +2577,42 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 							uint64_t now = (uint64_t)time(NULL);
 							uint64_t exp = now + vhd->jwt_validity_secs;
 							const char *sub = lws_jwt_auth_get_sub(pss->ja);
+							/* sub is JWT content: escape it, or it can
+							 * append its own claims to a payload we
+							 * are about to SIGN (6x for \u00XX of
+							 * ja's sub[128]) */
+							char sub_esc[6 * 128];
+							uint32_t session_epoch = 0;
+							sqlite3_stmt *stmt2;
+
+							lws_json_purify(sub_esc, sub ? sub : "Unknown",
+									(int)sizeof(sub_esc), NULL);
+
+							/*
+							 * The rewritten JWT must carry the
+							 * CURRENT session_epoch from the db:
+							 * the interceptor gates every later
+							 * request on sec matching the db, so a
+							 * sec-less rewrite (as this used to
+							 * mint) could never satisfy the gate
+							 * again -> redirect loop.
+							 */
+							if (sqlite3_prepare_v2(vhd->db,
+									"SELECT session_epoch FROM users WHERE uid = ?",
+									-1, &stmt2, NULL) == SQLITE_OK) {
+								sqlite3_bind_int(stmt2, 1, (int)uid);
+								if (sqlite3_step(stmt2) == SQLITE_ROW)
+									session_epoch = (uint32_t)sqlite3_column_int(stmt2, 0);
+								sqlite3_finalize(stmt2);
+							}
 
 							if (!lws_jwt_sign_compact(vhd->context, &vhd->jwk, "ES256",
 													  out, &out_len, temp, sizeof(temp),
 													  "{\"iss\":\"%s\",\"sub\":\"%s\",\"uid\":%u,"
+													  "\"sec\":%u,"
 													  "\"iat\":%llu,\"exp\":%llu,%s}",
-													  vhd->auth_domain, sub ? sub : "Unknown", uid,
+													  vhd->auth_domain, sub_esc, uid,
+													  session_epoch,
 													  (unsigned long long)now, (unsigned long long)exp,
 													  current_grants)) {
 								pss->silent_update_jwt = strdup(out);
@@ -816,58 +2623,45 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 			}
 
 			if (pss->silent_update_jwt) {
-				char cookie[LWS_SSO_MAX_COOKIE], host[128], fq_uri[512];
-				const char *h = NULL;
+				/*
+				 * Re-mint the cookie and bounce him back to
+				 * the SAME url.  It must come from whichever
+				 * method token this request actually used: the
+				 * interceptor gates every method, so taking
+				 * only WSI_TOKEN_GET_URI left an intercepted
+				 * POST / PUT / PATCH self-redirecting to an
+				 * empty Location.
+				 */
+				if (lws_login_request_uri(wsi, path,
+							 sizeof(path)))
+					lwsl_debug("%s: URI copy failed\n",
+						   __func__);
 
-				if (vhd->cookie_domain[0])
-					lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Domain=%s; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
-							 vhd->cookie_name, pss->silent_update_jwt, vhd->cookie_domain, (unsigned long long)vhd->jwt_validity_secs);
-				else
-					lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
-							 vhd->cookie_name, pss->silent_update_jwt, (unsigned long long)vhd->jwt_validity_secs);
-
-				path[0] = '\0';
-				if (lws_hdr_copy(wsi, path, sizeof(path), WSI_TOKEN_GET_URI) < 0)
-					lwsl_debug("%s: URI copy failed\n", __func__);
-
-				host[0] = '\0';
-				if (lws_hdr_copy(wsi, host, sizeof(host), WSI_TOKEN_HOST) > 0)
-					h = host;
-#if defined(LWS_ROLE_H2)
-				else if (lws_hdr_copy(wsi, host, sizeof(host), WSI_TOKEN_HTTP_COLON_AUTHORITY) > 0)
-					h = host;
-#endif
-				if (!h) {
-					struct lws_vhost *vh = lws_get_vhost(wsi);
-					if (vh) {
-						const char *vname = lws_get_vhost_name(vh);
-						if (vname)
-							h = vname;
-					}
+				if (!lws_login_serve_self_redirect_with_cookie(
+						wsi, pss, vhd, pss->silent_update_jwt,
+						path, (unsigned char *)buf,
+						(unsigned char **)&p,
+						(unsigned char *)end, NULL,
+						NULL, NULL)) {
+					free(pss->silent_update_jwt);
+					pss->silent_update_jwt = NULL;
+					return lws_http_transaction_completed(wsi);
 				}
-
-				lws_snprintf(fq_uri, sizeof(fq_uri), "%s://%s%s",
-					     lws_is_ssl(wsi) ? "https" : "http",
-					     h ? h : "localhost", path);
-
-				if (lws_add_http_common_headers(wsi, HTTP_STATUS_FOUND, "text/html", 0, (unsigned char **)&p, (unsigned char *)end)) return 1;
-				if (lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie, (int)strlen(cookie), (unsigned char **)&p, (unsigned char *)end)) return 1;
-				if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_LOCATION, (unsigned char *)fq_uri, (int)strlen(fq_uri), (unsigned char **)&p, (unsigned char *)end)) return 1;
-				if (lws_finalize_http_header(wsi, (unsigned char **)&p, (unsigned char *)end)) return 1;
-
-				lws_write(wsi, (unsigned char *)buf + LWS_PRE, lws_ptr_diff_size_t(p, buf + LWS_PRE), LWS_WRITE_HTTP_HEADERS | LWS_WRITE_H2_STREAM_END);
-
-				free(pss->silent_update_jwt);
-				pss->silent_update_jwt = NULL;
-
-				return lws_http_transaction_completed(wsi);
+				/* header build failed */
+				return 1;
 			}
 		}
 
-		path[0] = '\0';
-		if (lws_hdr_copy(wsi, path, sizeof(path), WSI_TOKEN_GET_URI) <= 0)
-			if (lws_hdr_copy(wsi, path, sizeof(path), WSI_TOKEN_POST_URI) < 0)
-				lwsl_debug("%s: URI copy failed\n", __func__);
+		/*
+		 * From here on, path is the url this request asked for, for
+		 * both our own endpoints (matched by suffix) and the bounce
+		 * target below.  Every method the interceptor gates has to
+		 * resolve it, not just GET and POST: a gated PUT / PATCH /
+		 * DELETE used to fall through to the bounce with an empty
+		 * path and get sent to a redirect_uri of just the vhost root.
+		 */
+		if (lws_login_request_uri(wsi, path, sizeof(path)))
+			lwsl_debug("%s: URI copy failed\n", __func__);
 
 		if (lws_login_ends_with(path, "/lws-login.css")) {
 			if (lws_add_http_common_headers(wsi, HTTP_STATUS_OK, "text/css",
@@ -880,6 +2674,7 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 			int res = lws_buflist_append_segment(&pss->tx_buflist, (const uint8_t *)canned_css, len);
 			if (res < 0)
 				return -1;
+			pss->tx_remaining = len;
 			lws_callback_on_writable(wsi);
 
 			return 0;
@@ -896,6 +2691,7 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 			int res = lws_buflist_append_segment(&pss->tx_buflist, (const uint8_t *)canned_js, len);
 			if (res < 0)
 				return -1;
+			pss->tx_remaining = len;
 			lws_callback_on_writable(wsi);
 
 			return 0;
@@ -904,7 +2700,7 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 		if (lws_login_ends_with(path, "/.lws-login-refresh")) {
 			char csrf[64] = {0};
 			size_t csrf_len = sizeof(csrf);
-			char refresh_session[16] = {0};
+			char refresh_session[128] = {0};
 			size_t refresh_session_len = sizeof(refresh_session);
 			int ck_len;
 
@@ -913,59 +2709,80 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 			if (ck_len > 0) {
 				char *cookie = malloc((size_t)ck_len + 1);
 				if (cookie) {
-					if (lws_hdr_copy(wsi, cookie, ck_len + 1, WSI_TOKEN_HTTP_COOKIE) > 0) {
-						lws_http_cookie_get(wsi, "auth_csrf", csrf, &csrf_len);
-						
-						/* We just need to know it exists to proceed */
-						if (lws_http_cookie_get(wsi, "auth_refresh_session", refresh_session, &refresh_session_len) == 0 && csrf[0]) {
-							struct pending_login_refresh *ps = malloc(sizeof(*ps));
-							if (ps) {
-								struct lws_client_connect_info i;
-								lws_parse_uri_t *puri;
-
-								memset(ps, 0, sizeof(*ps));
-								ps->vhd = vhd;
-								ps->wsi_server = wsi;
-								lws_strncpy(ps->cookie_hdr, cookie, sizeof(ps->cookie_hdr));
-
-								ps->payload_len = lws_snprintf(ps->payload, sizeof(ps->payload), "csrf_token=%s", csrf);
-								ps->payload_pos = 0;
-
-								lws_dll2_add_tail(&ps->list, &vhd->pending_refresh_list);
-								lws_sul_schedule(vhd->context, 0, &ps->sul, sul_pending_refresh_cb, 5 * 60 * LWS_US_PER_SEC);
-
-								puri = lws_parse_uri_create(vhd->auth_server_url);
-								if (puri) {
-									lwsl_notice("%s: Intercepted background refresh request, initiating proxy to %s/api/sso_exchange\n", __func__, vhd->auth_server_url);
-									memset(&i, 0, sizeof(i));
-									i.context        = vhd->context;
-									i.address        = puri->host;
-									i.port           = puri->port;
-									i.ssl_connection = !strcmp(puri->scheme, "http") ? 0 : LCCSCF_USE_SSL;
-									i.path           = "/api/sso_exchange";
-									i.host           = i.address;
-									i.origin         = i.address;
-									i.method         = "POST";
-									i.protocol       = "lws_login_client";
-									i.pwsi           = &ps->wsi_client;
-									i.userdata       = ps;
-
-									lws_client_connect_via_info(&i);
-									lws_set_timeout(wsi, PENDING_TIMEOUT_HTTP_CONTENT, 30);
-									lws_parse_uri_destroy(&puri);
-
-									free(cookie);
-									return 0; // Suspend!
-								}
-								free(ps);
-							}
+					int kicked = 0;
+					if (lws_hdr_copy(wsi, cookie, ck_len + 1,
+							 WSI_TOKEN_HTTP_COOKIE) > 0) {
+						int got_csrf = lws_http_cookie_get(
+								wsi, "auth_csrf",
+								csrf, &csrf_len) == 0
+								&& csrf[0];
+						int got_refresh = lws_http_cookie_get(
+								wsi, "auth_refresh_session",
+								refresh_session,
+								&refresh_session_len) == 0
+								&& refresh_session[0];
+						if (got_csrf && got_refresh)
+							kicked = lws_login_kick_refresh(
+									vhd, wsi,
+									cookie, csrf,
+									LWS_LOGIN_REFRESH_BFF,
+									NULL, NULL);
+						else if (got_refresh) {
+							/*
+							 * Refresh session present but its csrf
+							 * sidecar is gone: self-heal instead of
+							 * denying, or the widget classifies a live
+							 * session as dead and trashes the page.
+							 * Diagnose with the jar's cookie NAMES and
+							 * value lengths only: the jar itself holds
+							 * auth_session and the long-term
+							 * auth_refresh_session credential, and
+							 * anything logged verbatim is replayable by
+							 * whoever can read the log.
+							 */
+							lwsl_wsi_notice(wsi,
+								"background refresh self-heal: "
+								"auth_csrf cookie missing but "
+								"auth_refresh_session present, "
+								"minting side-channel csrf pair");
+							lws_login_diag_jar(wsi, vhd);
+							kicked = lws_login_kick_refresh_selfheal(
+									vhd, wsi, cookie,
+									LWS_LOGIN_REFRESH_BFF,
+									NULL, NULL);
+						} else if (got_csrf) {
+							lwsl_wsi_notice(wsi,
+								"background refresh denied: "
+								"auth_refresh_session cookie "
+								"missing (not logged in via "
+								"refreshable session)");
+							lws_login_diag_jar(wsi, vhd);
+						} else {
+							lwsl_wsi_notice(wsi,
+								"background refresh denied: no "
+								"auth_csrf and no "
+								"auth_refresh_session");
+							lws_login_diag_jar(wsi, vhd);
 						}
+					} else {
+						lwsl_wsi_notice(wsi,
+							"background refresh denied: "
+							"malformed Cookie header");
 					}
 					free(cookie);
+					if (kicked)
+						return 0; /* suspend */
 				}
+			} else {
+				/*
+				 * No Cookie header at all: normal for an
+				 * anonymous visitor whose page widget just fired
+				 * a renewal probe.  Info, not notice.
+				 */
+				lwsl_wsi_info(wsi, "background refresh with no "
+					      "Cookie header (anonymous visitor)");
 			}
 			/* Failure or no cookies, 401 Unauthorized */
-			lwsl_notice("%s: Missing or malformed cookies for background refresh\n", __func__);
                         return simple_response(wsi, pss, "Missing Authorization", "text/plain",
                                             HTTP_STATUS_UNAUTHORIZED, (unsigned char *)buf + LWS_PRE,
                                             (unsigned char **)&p, (unsigned char *)end);
@@ -993,14 +2810,17 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 		}
 
 		lws_snprintf(fq_uri, sizeof(fq_uri), "%s://%s%s",
-			     lws_is_ssl(wsi) ? "https" : "http",
+			     lws_login_scheme(wsi, vhd),
 			     h ? h : "localhost",
 			     path);
 
 		lws_urlencode(urlenc_path, fq_uri, sizeof(urlenc_path));
 
-		lws_snprintf(dest, sizeof(dest), "%s?service_name=%s&redirect_uri=%s",
-			vhd->auth_server_url, service_name, urlenc_path);
+		size_t asu_len = strlen(vhd->auth_server_url);
+		lws_snprintf(dest, sizeof(dest), "%s%s?service_name=%s&redirect_uri=%s",
+			vhd->auth_server_url,
+			(asu_len > 0 && vhd->auth_server_url[asu_len - 1] == '/') ? "" : "/",
+			service_name, urlenc_path);
 
 		if (lws_login_ends_with(path, "/.lws-login-status")) {
 			char pl[1024];
@@ -1008,12 +2828,39 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 			if (pss && pss->ja) {
 				const char *sub = lws_jwt_auth_get_sub(pss->ja);
 				int level = lws_jwt_auth_query_grant(pss->ja, service_name);
-				int is_admin = lws_jwt_auth_query_grant(pss->ja, "*") >= 1;
-				int has_grant = level >= 1;
-				lws_snprintf(pl, sizeof(pl), "{\"logged_in\":1,\"server_now\":%llu,\"exp\":%llu,\"has_grant\":%d,\"grant_level\":%d,\"identity\":\"%s\",\"auth_server_url\":\"%s\",\"login_url\":\"%s\",\"is_admin\":%d}",
-					(unsigned long long)lws_now_secs(), (unsigned long long)lws_jwt_auth_get_exp(pss->ja), has_grant, level, sub ? sub : "Unknown", vhd->auth_server_url, dest, is_admin);
+				/*
+				 * Compute the single lws_login_state for this
+				 * request (same mapping as the backend header
+				 * injection) and derive the JSON booleans from
+				 * it so they can't drift apart.  is_admin means
+				 * a GLOBAL system admin only (the "*" wildcard),
+				 * the one thing that unlocks the auth-server
+				 * Admin Console and the "Admin Console" link in
+				 * the widget; an app-scoped level >= 2 is an
+				 * APP_ADMIN, reflected by login_state and
+				 * grant_level but not is_admin.
+				 */
+				enum lws_login_state state =
+					lws_login_state_from_grants(pss->ja, level);
+				int is_admin = state == LWS_LOGIN_STATE_GLOBAL_ADMIN;
+				int has_grant = state >= LWS_LOGIN_STATE_USER;
+				/*
+				 * The identity comes out of the JWT and may
+				 * contain '"' or a control char; interpolated
+				 * raw it closes the string and appends its own
+				 * JSON members (a later duplicate "is_admin"
+				 * wins in JSON.parse()).  6x for the \u00XX
+				 * worst case of ja's sub[128].
+				 */
+				char sub_esc[6 * 128];
+
+				lws_json_purify(sub_esc, sub ? sub : "Unknown",
+						(int)sizeof(sub_esc), NULL);
+
+				lws_snprintf(pl, sizeof(pl), "{\"logged_in\":1,\"server_now\":%llu,\"exp\":%llu,\"has_grant\":%d,\"grant_level\":%d,\"login_state\":%d,\"identity\":\"%s\",\"auth_server_url\":\"%s\",\"login_url\":\"%s\",\"is_admin\":%d,\"unauth_allow\":%d}",
+					(unsigned long long)lws_now_secs(), (unsigned long long)lws_jwt_auth_get_exp(pss->ja), has_grant, level, (int)state, sub_esc, vhd->auth_api_url ? vhd->auth_api_url : "", dest, is_admin, unauth_allow);
 			} else
-				lws_snprintf(pl, sizeof(pl), "{\"logged_in\":0,\"server_now\":%llu,\"auth_server_url\":\"%s\",\"login_url\":\"%s\"}", (unsigned long long)lws_now_secs(), vhd->auth_server_url, dest);
+				lws_snprintf(pl, sizeof(pl), "{\"logged_in\":0,\"login_state\":%d,\"server_now\":%llu,\"auth_server_url\":\"%s\",\"login_url\":\"%s\",\"unauth_allow\":%d}", (int)LWS_LOGIN_STATE_ANON, (unsigned long long)lws_now_secs(), vhd->auth_api_url ? vhd->auth_api_url : "", dest, unauth_allow);
 
                         return simple_response(wsi, pss, pl, "application/json",
                                                HTTP_STATUS_OK, (unsigned char *)buf + LWS_PRE, (unsigned char **)&p,
@@ -1023,40 +2870,88 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 		if (lws_login_ends_with(path, "/.lws-login-logout")) {
 			char redirect_uri[512];
 			char u[1024];
-			char cookie_hdr1[256], cookie_hdr1_host[256];
+			char cookie_hdr1[LWS_LOGIN_CLEAR_COOKIE_SZ],
+			     cookie_hdr1_host[LWS_LOGIN_CLEAR_COOKIE_SZ];
 			char exp[64];
 			time_t t = 0;
-			struct tm *tm = gmtime(&t);
-			strftime(exp, sizeof(exp), "%a, %d %b %Y %H:%M:%S GMT", tm);
+#if defined(WIN32) || defined(_WIN32)
+			struct tm tmp;
+			struct tm *tm = gmtime_s(&tmp, &t) == 0 ? &tmp : NULL;
+#else
+			struct tm tmp;
+			struct tm *tm = gmtime_r(&t, &tmp);
+#endif
+			if (tm)
+				strftime(exp, sizeof(exp), "%a, %d %b %Y %H:%M:%S GMT", tm);
+			else
+				exp[0] = '\0';
 
+			/*
+			 * The URI parser has ALREADY percent-decoded the arg
+			 * fragments, so the lws_urldecode() that used to be
+			 * here decoded them a second time: "%252e%252e%252f"
+			 * arrived at the auth server's /api/logout as "../",
+			 * a form its own validator never saw.  Take the value
+			 * as-is, and only pass on something that cannot leave
+			 * this origin.  (The widget hands us an absolute
+			 * window.location.href, so absolute URLs have to keep
+			 * working; the auth server validates it too.)
+			 */
 			redirect_uri[0] = '\0';
-			if (lws_get_urlarg_by_name_safe(wsi, "redirect_uri=", redirect_uri, sizeof(redirect_uri)) >= 0)
-				lws_urldecode(redirect_uri, redirect_uri, sizeof(redirect_uri));
-			if (!redirect_uri[0])
+			if (lws_get_urlarg_by_name_safe(wsi, "redirect_uri=",
+							redirect_uri,
+							sizeof(redirect_uri)) < 0 ||
+			    !redirect_uri[0] ||
+			    !lws_login_target_sane(redirect_uri))
 				lws_strncpy(redirect_uri, "/", sizeof(redirect_uri));
 
-			if (vhd->cookie_domain[0])
-				lws_snprintf(cookie_hdr1, sizeof(cookie_hdr1), "%s=; Path=/; Domain=%s; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", vhd->cookie_name, vhd->cookie_domain, exp);
-			else
-				lws_snprintf(cookie_hdr1, sizeof(cookie_hdr1), "%s=; Path=/; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", vhd->cookie_name, exp);
-
-			lws_snprintf(cookie_hdr1_host, sizeof(cookie_hdr1_host), "%s=; Path=/; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", vhd->cookie_name, exp);
+			/*
+			 * F-022: clearing cookies compose through the same
+			 * fail-closed helper -- a truncated clear-string
+			 * silently fails to log the session out.
+			 */
+			if (lws_http_cookie_compose(cookie_hdr1,
+					sizeof(cookie_hdr1), vhd->cookie_name,
+					"", vhd->cookie_domain[0] ?
+							vhd->cookie_domain : NULL,
+					0, exp) < 0 ||
+			    lws_http_cookie_compose(cookie_hdr1_host,
+					sizeof(cookie_hdr1_host),
+					vhd->cookie_name, "", NULL, 0,
+					exp) < 0) {
+				lwsl_wsi_err(wsi, "%s: %s clearing Set-Cookie "
+					     "too large (domain %d)", __func__,
+					     vhd->cookie_name,
+					     (int)strlen(vhd->cookie_domain));
+				return 1;
+			}
 
 			char urlenc_path[512];
 			lws_urlencode(urlenc_path, redirect_uri, sizeof(urlenc_path));
 
-			if (vhd->auth_server_url && vhd->auth_server_url[0]) {
-				lws_snprintf(u, sizeof(u), "%s/api/logout?redirect_uri=%s", vhd->auth_server_url, urlenc_path);
-			} else {
-				/* Fallback if auth_server_url somehow missing */
-				lws_strncpy(u, redirect_uri, sizeof(u));
-			}
+			if (vhd->auth_api_url && vhd->auth_api_url[0]) {
+				lws_snprintf(u, sizeof(u), "%s/api/logout?redirect_uri=%s", vhd->auth_api_url, urlenc_path);
+			} else
+				/*
+				 * Fallback if auth_server_url somehow missing.
+				 * Here redirect_uri would be BOTH the Location:
+				 * and an href in the html below, with none of
+				 * the urlencoding the branch above relies on,
+				 * so accept only a path-absolute value: an
+				 * open redirect plus markup injection is not an
+				 * acceptable price for a fallback.
+				 */
+				lws_strncpy(u, redirect_uri[0] == '/' &&
+					       redirect_uri[1] != '/' ?
+							redirect_uri : "/",
+					    sizeof(u));
 
 			char html[1024];
 			int html_len = lws_snprintf(html, sizeof(html),
 				"<html lang=\"en\"><head><meta http-equiv=\"refresh\" content=\"0; url=%s\"></head><body>Redirecting to <a href=\"%s\">%s</a></body></html>",
 				u, u, u);
 			if (lws_buflist_append_segment(&pss->tx_buflist, (uint8_t *)html, (size_t)html_len) < 0) return -1;
+			pss->tx_remaining = (size_t)html_len;
 
 			if (lws_add_http_common_headers(wsi, HTTP_STATUS_SEE_OTHER, "text/html", (unsigned int)html_len, (unsigned char **)&p, (unsigned char *)end)) return 1;
 			if (lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie_hdr1, (int)strlen(cookie_hdr1), (unsigned char **)&p, (unsigned char *)end)) return 1;
@@ -1065,13 +2960,113 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 			goto fin_hdrs;
 		}
 
+		/*
+		 * If unauth-allow is set on this mount, let the request fall
+		 * through to the real mount content instead of bouncing to the
+		 * auth server.  This applies both to anonymous visitors and to
+		 * logged-in users who simply lack the required grant: the login
+		 * widget (.lws-login-status) reports their actual state so the
+		 * app can show itself with no admin rights, rather than trapping
+		 * them on an auth-server "you lack the grant" page they cannot
+		 * escape.  (CONFIRM_REQ_OK already let them through; this keeps
+		 * the HTTP path consistent with that decision.)
+		 */
+		if (unauth_allow) {
+			lwsl_info("%s: ALLOWING unauth-allow fall-through\n",
+				  __func__);
+			return 0;
+		}
+
 		lwsl_info("%s: bouncing unauth to %s\n", __func__, dest);
+
+		/*
+		 * Cold-load silent renewal: this is a genuine page request whose JWT
+		 * is missing/expired, but the browser may still carry the long-term
+		 * auth_refresh_session + auth_csrf cookies.  Before bouncing the
+		 * user's main document to the auth server login form (which would
+		 * lose in-page state and flash a login page for nothing), try a
+		 * server-side renewal through the same /api/sso_exchange side channel
+		 * the background BFF uses.  On success we re-mint the JWT cookie and
+		 * 302 back to this same URL -- the page just loads, no navigation.
+		 * Only on a hard failure (long-term session genuinely gone) do we
+		 * fall through to the 303 below, landing the user on the form to
+		 * actually log in again.  Cookieless requests skip the hop entirely.
+		 */
+			{
+				int ck_len2 = lws_hdr_total_length(wsi,
+							WSI_TOKEN_HTTP_COOKIE);
+				if (ck_len2 > 0) {
+					char csrf2[64] = {0};
+					size_t csrf2_len = sizeof(csrf2);
+					char refresh2[128] = {0};
+					size_t refresh2_len = sizeof(refresh2);
+					int got_csrf2 = lws_http_cookie_get(wsi,
+							"auth_csrf", csrf2,
+							&csrf2_len) == 0 && csrf2[0];
+					int got_refresh2 =
+						lws_http_cookie_get(wsi,
+							"auth_refresh_session",
+							refresh2,
+							&refresh2_len) == 0 &&
+							refresh2[0];
+
+					if (got_refresh2) {
+						char *cookie2 = malloc((size_t)ck_len2 + 1);
+						if (cookie2) {
+							char orig_uri[LWS_LOGIN_MAX_URI];
+							int kicked;
+							/* the self-redirect target must
+							 * include the query string, or
+							 * the user's deep link comes
+							 * back shortened */
+							lws_login_copy_uri_with_args(
+									wsi, path,
+									orig_uri,
+									sizeof(orig_uri));
+							if (lws_hdr_copy(wsi, cookie2,
+									 ck_len2 + 1,
+									 WSI_TOKEN_HTTP_COOKIE) > 0) {
+								if (got_csrf2)
+									kicked = lws_login_kick_refresh(
+										vhd, wsi, cookie2,
+										csrf2,
+										LWS_LOGIN_REFRESH_COLDLOAD,
+										orig_uri, dest);
+								else {
+									/* csrf sidecar missing:
+									 * self-heal rather than
+									 * bounce (see
+									 * ..._selfheal comment) */
+									lwsl_wsi_notice(wsi,
+										"cold-load renewal self-heal: "
+										"auth_csrf cookie missing but "
+										"auth_refresh_session present, "
+										"minting side-channel csrf pair");
+									/* names + lengths only, never
+									 * the credential values */
+									lws_login_diag_jar(wsi, vhd);
+									kicked = lws_login_kick_refresh_selfheal(
+											vhd, wsi, cookie2,
+											LWS_LOGIN_REFRESH_COLDLOAD,
+											orig_uri, dest);
+								}
+							}
+							else
+								kicked = 0;
+							free(cookie2);
+							if (kicked)
+								return 0; /* suspend */
+						}
+					}
+				}
+			}
 
 		char html[1024];
 		int html_len = lws_snprintf(html, sizeof(html),
 			"<html lang=\"en\"><head><meta http-equiv=\"refresh\" content=\"0; url=%s\"></head><body>Redirecting to <a href=\"%s\">%s</a></body></html>",
 			dest, dest, dest);
 		if (lws_buflist_append_segment(&pss->tx_buflist, (uint8_t *)html, (size_t)html_len) < 0) return -1;
+		pss->tx_remaining = (size_t)html_len;
 
 		if (lws_add_http_common_headers(wsi, HTTP_STATUS_SEE_OTHER, "text/html", (unsigned int)html_len, (unsigned char **)&p, (unsigned char *)end))
 			return 1;
@@ -1128,20 +3123,95 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 				const char *token = lws_spa_get_string(pss->spa, EPN_TOKEN);
 				const char *target = lws_spa_get_string(pss->spa, EPN_TARGET);
 
-				char origin[128];
-				if (token && vhd && vhd->auth_server_url && lws_hdr_copy(wsi, origin, sizeof(origin), WSI_TOKEN_ORIGIN) > 0) {
-					size_t olen = strlen(origin);
-					if (olen == 4 && !strcmp(origin, "null")) {
-						lwsl_notice("%s: allowing null origin due to redirect bounce\n", __func__);
-					} else if (strncmp(origin, vhd->auth_server_url, olen) ||
-						   (vhd->auth_server_url[olen] != '\0' && vhd->auth_server_url[olen] != '/')) {
-						lwsl_err("%s: blocking SSO CSRF from origin %s\n", __func__, origin);
-						token = NULL; /* Nullify to force failure */
+				char origin[128], referer[256];
+				const char *chk_url = NULL;
+				int has_origin = lws_hdr_copy(wsi, origin, sizeof(origin), WSI_TOKEN_ORIGIN) > 0;
+				int has_referer = lws_hdr_copy(wsi, referer, sizeof(referer), WSI_TOKEN_HTTP_REFERER) > 0;
+
+				if (has_origin && strcmp(origin, "null")) {
+					chk_url = origin;
+				} else if (has_referer) {
+					chk_url = referer;
+				}
+
+				/*
+				 * A presented token gets planted as the
+				 * browser's session cookie, so it must come
+				 * with positive proof it originated at the
+				 * configured auth server: an Origin (non-"null",
+				 * sandboxed iframes send "null") or a Referer
+				 * matching auth-server-url's scheme+host+port.
+				 * Fail closed on every path where a positive
+				 * match cannot be made.  A cross-site form POST
+				 * suppressing both headers used to skip the
+				 * check entirely and plant its token: login
+				 * CSRF.  The legit flow, the auth server's
+				 * auto-submitting form POST, always carries one
+				 * of the two.
+				 */
+				if (token && vhd) {
+					lws_parse_uri_t *puri_auth = NULL, *puri_chk = NULL;
+
+					if (!vhd->auth_api_url) {
+						lwsl_err("%s: blocking SSO token: no auth-api-url to check origin against\n",
+							 __func__);
+						token = NULL;
+					} else if (!chk_url) {
+						/*
+						 * "Origin: null" with no Referer
+						 * is what a browser sends for a
+						 * cross-origin POST from a document
+						 * under Referrer-Policy: no-referrer
+						 * -- typically a site-wide hardening
+						 * header on the auth server itself,
+						 * which the auth server's index.html
+						 * overrides with a meta referrer for
+						 * this reason.  Say so, since the
+						 * legit flow is otherwise
+						 * indistinguishable from the CSRF it
+						 * is blocked as.
+						 */
+						lwsl_err("%s: blocking SSO token: %s to check against %s (login CSRF, or auth server page sent Referrer-Policy: no-referrer?)\n",
+							 __func__,
+							 has_origin ? "Origin: null and no Referer" :
+								      "no Origin or Referer",
+							 vhd->auth_api_url);
+						token = NULL;
+					} else {
+						puri_auth = lws_parse_uri_create(vhd->auth_api_url);
+						puri_chk = lws_parse_uri_create(chk_url);
+
+						if (!puri_auth || !puri_chk ||
+						    strcmp(puri_auth->scheme, puri_chk->scheme) ||
+						    strcasecmp(puri_auth->host, puri_chk->host) ||
+						    puri_auth->port != puri_chk->port) {
+							lwsl_err("%s: blocking SSO CSRF from origin/referer %s (expected %s)\n",
+								 __func__, chk_url, vhd->auth_api_url);
+							token = NULL;
+						} else {
+							lwsl_notice("%s: allowing SSO request matching auth server origin %s\n",
+								    __func__, chk_url);
+						}
 					}
+
+					if (puri_auth)
+						lws_parse_uri_destroy(&puri_auth);
+					if (puri_chk)
+						lws_parse_uri_destroy(&puri_chk);
 				}
 
 				if (token && target && vhd) {
-					char temp[2048], out[2048];
+					/*
+					 * F-022: the spa already accepts
+					 * tokens up to LWS_SSO_MAX_COOKIE;
+					 * the validate scratch must accept
+					 * them too, or large-but-valid JWTs
+					 * are silently rejected (and the
+					 * cookie compose below could never
+					 * run at its sizing limit).
+					 */
+					char temp[LWS_SSO_MAX_COOKIE],
+					     out[LWS_SSO_MAX_COOKIE];
 					size_t out_len = sizeof(out);
 
 					/* Ensure signature is authentic using broad algorithms. */
@@ -1152,26 +3222,70 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 				}
 
 				const char *final_target = "/";
-				if (target && target[0]) {
+				if (target && target[0] && lws_login_target_sane(target)) {
 					if (target[0] == '/' && target[1] != '/') {
 						final_target = target;
-					} else if (vhd->db) {
-						if (auth_verify_redirect_uri(vhd, target)) {
-							final_target = target;
-						} else {
-							lwsl_err("%s: untrusted absolute target %s\n", __func__, target);
+					} else {
+						lws_parse_uri_t *puri_tgt = lws_parse_uri_create(target);
+						if (puri_tgt) {
+							char host[128] = "";
+							const char *h = NULL;
+							if (lws_hdr_copy(wsi, host, sizeof(host), WSI_TOKEN_HOST) > 0)
+								h = host;
+#if defined(LWS_ROLE_H2)
+							else if (lws_hdr_copy(wsi, host, sizeof(host), WSI_TOKEN_HTTP_COLON_AUTHORITY) > 0)
+								h = host;
+#endif
+							if (!h) {
+								struct lws_vhost *vh = lws_get_vhost(wsi);
+								if (vh) h = lws_get_vhost_name(vh);
+							}
+							if (h && !strcasecmp(puri_tgt->host, h)) {
+								final_target = target;
+							} else if (vhd->db) {
+								if (auth_verify_redirect_uri(vhd, target)) {
+									final_target = target;
+								} else {
+									lwsl_err("%s: untrusted absolute target %s\n", __func__, target);
+								}
+							}
+							lws_parse_uri_destroy(&puri_tgt);
 						}
 					}
 				}
 
 				if (pss->silent_update_jwt && final_target) {
-					char cookie[LWS_SSO_MAX_COOKIE];
-					if (vhd->cookie_domain[0]) {
-						lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Domain=%s; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
-							     vhd->cookie_name, pss->silent_update_jwt, vhd->cookie_domain, (unsigned long long)vhd->jwt_validity_secs);
-					} else {
-						lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
-							     vhd->cookie_name, pss->silent_update_jwt, (unsigned long long)vhd->jwt_validity_secs);
+					char cookie[LWS_LOGIN_SESSION_COOKIE_SZ];
+
+					/*
+					 * F-022: fail-closed composition; a
+					 * session cookie missing its
+					 * HttpOnly / SameSite / Secure tail
+					 * is JS-readable and http-sendable,
+					 * so refuse to plant a truncated one
+					 */
+					if (lws_http_cookie_compose(
+							cookie, sizeof(cookie),
+							vhd->cookie_name,
+							pss->silent_update_jwt,
+							vhd->cookie_domain,
+							lws_login_token_max_age(
+								wsi, vhd,
+								pss->silent_update_jwt),
+							NULL) < 0) {
+						lwsl_wsi_err(wsi, "%s: %s "
+							     "Set-Cookie too "
+							     "large for the "
+							     "composed buffer "
+							     "(token %d, "
+							     "domain %d)",
+							     __func__,
+							     vhd->cookie_name,
+							     (int)strlen(pss->silent_update_jwt),
+							     (int)strlen(vhd->cookie_domain));
+						free(pss->silent_update_jwt);
+						pss->silent_update_jwt = NULL;
+						return 1;
 					}
 
 					if (lws_add_http_common_headers(wsi, HTTP_STATUS_FOUND, "text/html", 0, (unsigned char **)&p, (unsigned char *)end)) return 1;
@@ -1189,6 +3303,7 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 					lws_write(wsi, (unsigned char *)buf + LWS_PRE, lws_ptr_diff_size_t(p, buf + LWS_PRE), LWS_WRITE_HTTP_HEADERS);
 					int res = lws_buflist_append_segment(&pss->tx_buflist, (const uint8_t *)err, (size_t)err_len);
 					if (res < 0) return -1;
+					pss->tx_remaining = (size_t)err_len;
 					lws_callback_on_writable(wsi);
 					return 0;
 				}
@@ -1199,7 +3314,7 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 
 	case LWS_CALLBACK_HTTP_WRITEABLE:
 	{
-		unsigned char buf[LWS_SSO_MAX_COOKIE + LWS_PRE], *p = buf + LWS_PRE, *end = buf + sizeof(buf) - 1;
+		unsigned char ubuf[LWS_LOGIN_HTTP_BUFL], *up = ubuf + LWS_PRE, *uend = ubuf + sizeof(ubuf) - 1;
 		struct pending_login_refresh *ps = NULL;
 
 		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
@@ -1213,36 +3328,261 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 		} lws_end_foreach_dll_safe(d, d1);
 
 		if (ps) {
-			if (ps->token[0]) {
-				char cookie[LWS_SSO_MAX_COOKIE];
-				int n;
+			/*
+			 * Only the side channel's own end (COMPLETED /
+			 * CONNECTION_ERROR / CLOSED, each of which detaches
+			 * ps->wsi_client before waking us) or the sul timeout
+			 * may settle the parked request.  lws is free to hand
+			 * us WRITEABLE for other reasons while the exchange is
+			 * still in flight -- over h3 the parked quic stream
+			 * gets one promptly -- and treating that as the
+			 * completion killed the live exchange and answered 401
+			 * "no auth server response (connection failed)" within
+			 * the same second as the kick, so every silent renewal
+			 * failed and the session died with its first JWT.
+			 */
+			if (ps->wsi_client)
+				return 0;
 
-				if (vhd->cookie_domain[0]) {
-					n = lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Domain=%s; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
-							 vhd->cookie_name, ps->token, vhd->cookie_domain, (unsigned long long)vhd->jwt_validity_secs);
-				} else {
-					n = lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
-							 vhd->cookie_name, ps->token, (unsigned long long)vhd->jwt_validity_secs);
+			if (ps->mode == LWS_LOGIN_REFRESH_COLDLOAD) {
+				/*
+				 * Cold-load renewal completion.  On success we
+				 * re-mint the JWT cookie and 302 back to the URL
+				 * the browser originally asked for -- the page
+				 * just loads, no navigation, no flash.  On failure
+				 * (long-term session genuinely gone) we issue the
+				 * 303 to the auth server login form we pre-built,
+				 * landing the user where they can actually log in.
+				 */
+				if (ps->token[0]) {
+					/*
+					 * Rotate auth_csrf alongside the re-minted
+					 * JWT, same rationale as the BFF path: the
+					 * csrf cookie must reset its lifetime every
+					 * renewal or it dies on the original login's
+					 * schedule and the next renewal fails.
+					 */
+					char new_csrf[33];
+					char csrf_cookie[LWS_LOGIN_CSRF_COOKIE_SZ];
+					int cn;
+
+					lws_login_mint_csrf(vhd, new_csrf);
+					cn = lws_login_build_csrf_cookie(
+							vhd, new_csrf,
+							csrf_cookie,
+							sizeof(csrf_cookie));
+					if (cn < 0) {
+						/* F-022: never a truncated
+						 * attribute tail */
+						lwsl_wsi_err(wsi, "%s: auth_csrf "
+							     "Set-Cookie too "
+							     "large (domain "
+							     "%d)", __func__,
+							     (int)strlen(vhd->cookie_domain));
+						pending_login_release(ps);
+						return 1;
+					}
+					if (!lws_login_serve_self_redirect_with_cookie(
+							wsi, pss, vhd, ps->token,
+							ps->orig_path, ubuf, &up, uend,
+							csrf_cookie,
+							ps->orig_host,
+							ps->orig_scheme)) {
+						lwsl_wsi_notice(wsi, "cold-load "
+							"renewal ok, re-served %s",
+							ps->orig_path);
+						pending_login_release(ps);
+						return lws_http_transaction_completed(wsi);
+					}
+					/* header build failed */
+					pending_login_release(ps);
+					return 1;
 				}
 
-				if (lws_add_http_common_headers(wsi, HTTP_STATUS_OK, "application/json", 13, (unsigned char **)&p, (unsigned char *)end)) return 1;
-				if (lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie, n, (unsigned char **)&p, (unsigned char *)end)) return 1;
-				if (lws_finalize_http_header(wsi, (unsigned char **)&p, (unsigned char *)end)) return 1;
+				/* failure: 303 to the auth form */
+				if (ps->authform_url[0]) {
+					char html[1024];
+					int html_len;
 
-				lws_write(wsi, buf + LWS_PRE, lws_ptr_diff_size_t(p, buf + LWS_PRE), LWS_WRITE_HTTP_HEADERS);
+					if (ps->resp_status)
+						lwsl_wsi_notice(wsi, "cold-load "
+							"renewal denied: auth server "
+							"answered HTTP %u '%s', "
+							"bouncing to auth form",
+							ps->resp_status,
+							ps->resp_error[0] ?
+								ps->resp_error :
+								"(no error detail)");
+					else
+						lwsl_wsi_notice(wsi, "cold-load "
+							"renewal denied: no auth "
+							"server response (%s), "
+							"bouncing to auth form",
+							ps->conn_error[0] ?
+								ps->conn_error :
+								"connection failed");
+					html_len = lws_snprintf(html,
+						sizeof(html),
+						"<html lang=\"en\"><head>"
+						"<meta http-equiv=\"refresh\" "
+						"content=\"0; url=%s\"></head>"
+						"<body>Redirecting to <a "
+						"href=\"%s\">%s</a></body></html>",
+						ps->authform_url,
+						ps->authform_url,
+						ps->authform_url);
+					if (lws_buflist_append_segment(
+							&pss->tx_buflist,
+							(uint8_t *)html,
+							(size_t)html_len) < 0) {
+						pending_login_release(ps);
+						return -1;
+					}
+					pss->tx_remaining = (size_t)html_len;
+
+					if (lws_add_http_common_headers(wsi,
+							HTTP_STATUS_SEE_OTHER,
+							"text/html",
+							(unsigned int)html_len,
+							(unsigned char **)&up,
+							(unsigned char *)uend) ||
+					    lws_add_http_header_by_token(wsi,
+							WSI_TOKEN_HTTP_LOCATION,
+							(unsigned char *)
+								ps->authform_url,
+							(int)strlen(ps->authform_url),
+							(unsigned char **)&up,
+							(unsigned char *)uend)) {
+						pending_login_release(ps);
+						return 1;
+					}
+					if (lws_finalize_http_header(wsi,
+							(unsigned char **)&up,
+							(unsigned char *)uend)) {
+						pending_login_release(ps);
+						return 1;
+					}
+					lws_write(wsi,
+						  (unsigned char *)ubuf + LWS_PRE,
+						  lws_ptr_diff_size_t(up, ubuf + LWS_PRE),
+						  LWS_WRITE_HTTP_HEADERS);
+					pending_login_release(ps);
+					lws_callback_on_writable(wsi);
+					return 0;
+				}
+				/* no authform URL stashed (defensive): serve a 401 */
+				lwsl_wsi_notice(wsi, "cold-load renewal failed "
+					"with no authform URL");
+				if (lws_add_http_common_headers(wsi,
+						HTTP_STATUS_UNAUTHORIZED,
+						"application/json", 13,
+						(unsigned char **)&up,
+						(unsigned char *)uend) ||
+				    lws_finalize_http_header(wsi,
+						(unsigned char **)&up,
+						(unsigned char *)uend)) {
+					pending_login_release(ps);
+					return 1;
+				}
+				lws_write(wsi, (unsigned char *)ubuf + LWS_PRE,
+					  lws_ptr_diff_size_t(up, ubuf + LWS_PRE),
+					  LWS_WRITE_HTTP_HEADERS);
+				pending_login_release(ps);
+				lws_callback_on_writable(wsi);
+				return 0;
+			} else if (ps->token[0]) {
+				char cookie[LWS_LOGIN_SESSION_COOKIE_SZ];
+				char csrf_cookie[LWS_LOGIN_CSRF_COOKIE_SZ];
+				char new_csrf[33];
+				int n, cn;
+
+				/*
+				 * F-022: both cookies compose through the
+				 * fail-closed helper; either failing to fit
+				 * fails the response rather than emitting a
+				 * cookie whose HttpOnly / SameSite / Secure
+				 * tail was truncated.
+				 */
+				n = lws_http_cookie_compose(cookie,
+							    sizeof(cookie),
+							    vhd->cookie_name,
+							    ps->token,
+							    vhd->cookie_domain,
+							    lws_login_token_max_age(
+								wsi, vhd, ps->token),
+							    NULL);
+				if (n < 0) {
+					lwsl_wsi_err(wsi, "%s: %s Set-Cookie "
+						     "too large for the composed "
+						     "buffer (token %d, domain "
+						     "%d)", __func__,
+						     vhd->cookie_name,
+						     (int)strlen(ps->token),
+						     (int)strlen(vhd->cookie_domain));
+					pending_login_release(ps);
+					return 1;
+				}
+
+				/*
+				 * Rotate auth_csrf on every successful renewal so its
+				 * lifetime resets with the session instead of dying
+				 * on the original login's fixed schedule (which is what
+				 * makes the widget escalate to a redirect flash once it
+				 * lapses).  The next renewal reads this new value and
+				 * submits it as the matching csrf_token= form field.
+				 */
+				lws_login_mint_csrf(vhd, new_csrf);
+				cn = lws_login_build_csrf_cookie(vhd, new_csrf,
+								 csrf_cookie,
+								 sizeof(csrf_cookie));
+				if (cn < 0) {
+					lwsl_wsi_err(wsi, "%s: auth_csrf "
+						     "Set-Cookie too large "
+						     "(domain %d)", __func__,
+						     (int)strlen(vhd->cookie_domain));
+					pending_login_release(ps);
+					return 1;
+				}
+
+				if (lws_add_http_common_headers(wsi, HTTP_STATUS_OK, "application/json", 13, (unsigned char **)&up, (unsigned char *)uend)) return 1;
+				if (lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)cookie, n, (unsigned char **)&up, (unsigned char *)uend)) return 1;
+				if (lws_add_http_header_by_name(wsi, (unsigned char *)"set-cookie:", (unsigned char *)csrf_cookie, cn, (unsigned char **)&up, (unsigned char *)uend)) return 1;
+				if (lws_finalize_http_header(wsi, (unsigned char **)&up, (unsigned char *)uend)) return 1;
+
+				lws_write(wsi, ubuf + LWS_PRE, lws_ptr_diff_size_t(up, ubuf + LWS_PRE), LWS_WRITE_HTTP_HEADERS);
 				if (lws_buflist_append_segment(&pss->tx_buflist, (const uint8_t *)"{\"success\":1}", 13) < 0) return -1;
-				lwsl_notice("%s: Successfully issued refreshed token to browser via BFF\n", __func__);
+				pss->tx_remaining = 13;
+				lwsl_wsi_info(wsi, "Successfully issued refreshed token to browser via BFF");
 			} else {
-				if (lws_add_http_common_headers(wsi, HTTP_STATUS_UNAUTHORIZED, "application/json", 13, (unsigned char **)&p, (unsigned char *)end)) return 1;
-				if (lws_finalize_http_header(wsi, (unsigned char **)&p, (unsigned char *)end)) return 1;
-				lws_write(wsi, buf + LWS_PRE, lws_ptr_diff_size_t(p, buf + LWS_PRE), LWS_WRITE_HTTP_HEADERS);
+				if (lws_add_http_common_headers(wsi, HTTP_STATUS_UNAUTHORIZED, "application/json", 13, (unsigned char **)&up, (unsigned char *)uend)) return 1;
+				if (lws_finalize_http_header(wsi, (unsigned char **)&up, (unsigned char *)uend)) return 1;
+				lws_write(wsi, ubuf + LWS_PRE, lws_ptr_diff_size_t(up, ubuf + LWS_PRE), LWS_WRITE_HTTP_HEADERS);
 				if (lws_buflist_append_segment(&pss->tx_buflist, (const uint8_t *)"{\"success\":0}", 13) < 0) return -1;
-				lwsl_notice("%s: BFF SSO Exchange denied by Server\n", __func__);
+				pss->tx_remaining = 13;
+				/*
+				 * No token came back.  Say WHY, using what the
+				 * side channel captured: the auth server's HTTP
+				 * status + JSON error member when it answered,
+				 * or the connection failure when it never did.
+				 */
+				if (ps->resp_status)
+					lwsl_wsi_notice(wsi,
+						"BFF renewal denied: auth "
+						"server answered HTTP %u '%s'",
+						ps->resp_status,
+						ps->resp_error[0] ?
+							ps->resp_error :
+							"(no error detail)");
+				else
+					lwsl_wsi_notice(wsi,
+						"BFF renewal denied: no "
+						"auth server response (%s)",
+						ps->conn_error[0] ?
+							ps->conn_error :
+							"connection failed");
 			}
 
-			lws_sul_cancel(&ps->sul);
-			lws_dll2_remove(&ps->list);
-			free(ps);
+			pending_login_release(ps);
 
 			lws_callback_on_writable(wsi);
 
@@ -1258,19 +3598,31 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 		if (!bytes)
 			break;
 
+		/*
+		 * We must set LWS_WRITE_HTTP_FINAL on the write that sends the last
+		 * bytes of the body, so that under HTTP/2 the END_STREAM flag lands on
+		 * the final DATA frame.  Comparing chunk to lws_buflist_total_len() is
+		 * wrong once a segment is partly consumed: total_len() sums each
+		 * segment's original len without subtracting pos, so the second chunk
+		 * of a body larger than the write buffer never compares equal, FINAL
+		 * is never set, and browsers report NS_ERROR_NET_PARTIAL_TRANSFER.
+		 * struct lws_buflist is opaque to plugins, so we track the remaining
+		 * body length in pss->tx_remaining and mark FINAL when this chunk
+		 * brings it to zero.
+		 */
 		size_t chunk = bytes;
-		if (chunk > sizeof(buf) - LWS_PRE)
-			chunk = sizeof(buf) - LWS_PRE;
+		if (chunk > sizeof(ubuf) - LWS_PRE)
+			chunk = sizeof(ubuf) - LWS_PRE;
 
-		memcpy(p, pout, chunk);
+		memcpy(up, pout, chunk);
 
-		int flags = LWS_WRITE_HTTP;
-		if (chunk == lws_buflist_total_len(&pss->tx_buflist))
-			flags = LWS_WRITE_HTTP_FINAL;
+		int flags = (chunk >= pss->tx_remaining) ?
+				LWS_WRITE_HTTP_FINAL : LWS_WRITE_HTTP;
 
-		int m = lws_write(wsi, p, (unsigned int)chunk, (enum lws_write_protocol)flags);
+		int m = lws_write(wsi, up, (unsigned int)chunk, (enum lws_write_protocol)flags);
 		if (m < 0) return -1;
 
+		pss->tx_remaining -= (size_t)m;
 		lws_buflist_use_segment(&pss->tx_buflist, (size_t)m);
 
 		if (lws_buflist_next_segment_len(&pss->tx_buflist, &pout)) {
@@ -1281,23 +3633,23 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 		return lws_http_transaction_completed(wsi);
 	}
 
-	case LWS_CALLBACK_CLOSED_HTTP:
-	case LWS_CALLBACK_CLOSED:
-		if (pss && pss->tx_buflist)
-			lws_buflist_destroy_all_segments(&pss->tx_buflist);
+		/*
+		 * lws_bind_protocol() frees and re-zallocs user_space for
+		 * EVERY http transaction, so on a keepalive connection request
+		 * N + 1 destroys request N's pss.  Without a DROP_PROTOCOL
+		 * teardown that silently abandons this request's ja (and the
+		 * expiry sul it left scheduled on the context), spa, buflist
+		 * and silent_update_jwt -- an unbounded leak driven by nothing
+		 * more exotic than the widget polling .lws-login-status.
+		 * Mirrors lib/sansio/http/server/interceptor.c.
+		 */
+		case LWS_CALLBACK_HTTP_DROP_PROTOCOL:
+			lws_login_pss_reset(pss);
+			break;
 
-		if (pss && pss->ja)
-			lws_jwt_auth_destroy(&pss->ja);
-
-                if (pss && pss->silent_update_jwt) {
-			free(pss->silent_update_jwt);
-			pss->silent_update_jwt = NULL;
-		}
-
-		if (pss && pss->spa) {
-			lws_spa_destroy(pss->spa);
-			pss->spa = NULL;
-		}
+		case LWS_CALLBACK_CLOSED_HTTP:
+		case LWS_CALLBACK_CLOSED:
+			lws_login_pss_reset(pss);
 
 		if (vhd) {
 			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
@@ -1306,7 +3658,8 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 
                                 if (s->wsi_server == wsi) {
 					s->wsi_server = NULL;
-					lwsl_notice("%s: cleared dangling wsi_server from pending refresh\n", __func__);
+					lwsl_wsi_notice(wsi, "cleared dangling "
+						"wsi_server from pending refresh");
 				}
 			} lws_end_foreach_dll_safe(d, d1);
 		}

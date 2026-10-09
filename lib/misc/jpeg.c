@@ -50,6 +50,14 @@
 #define MARKER_SCAN_LIMIT	1536
 
 /*
+ * When the bit reader's lookahead meets the EOI, the bits it already holds
+ * are still to be decoded: at most 16 of them (the octet being consumed and
+ * one more), and every MCU takes at least one bit.  So this many MCUs after
+ * the EOI is seen are enough to decode everything the image really has.
+ */
+#define EOI_GRACE_MCUS		16
+
+/*
  * Set to 1 if right shifts on signed ints are always unsigned (logical) shifts
  * When 1, arithmetic right shifts will be emulated by using a logical shift
  * with special case code to ensure the sign bit is replicated.
@@ -194,7 +202,7 @@ struct lws_jpeg {
 	pjpeg_scan_type_t	scan_type;
 	
 	const uint8_t		*inbuf;
-	uint8_t			*lines;
+	lws_fragbuf_t		*lines; /* mcu_max_size_y + 8 rows */
 	size_t			insize;
 
 	lws_jpeg_decode_state_t	dstate;
@@ -214,6 +222,8 @@ struct lws_jpeg {
 
 	uint16_t		mcu_ofs_x;
 	uint16_t		mcu_ofs_y;
+
+	uint16_t		rows_out; /* rows issued, up to image_height */
 
 	uint16_t		mcu_count_left_x;
 	uint16_t		mcu_count_left_y;
@@ -255,6 +265,7 @@ struct lws_jpeg {
 	uint8_t			quant_valid;
 
 	uint8_t			seen_eoi;
+	uint8_t			eoi_mcus; /* MCUs still allowed after EOI */
 
 	uint8_t			bits_left;
 
@@ -272,6 +283,7 @@ struct lws_jpeg {
 	uint16_t		fs_sos_left;
 	uint16_t		fs_sof_left;
 	uint16_t		fs_ir_i;
+	uint16_t		fs_gb16_ret; /* get_bits16() */
 	uint8_t			fs_gb16; /* get_bits16() */
 	uint8_t			fs_hd;   /* huff_decode() */
 	uint8_t			fs_hd_i; /* huff_decode() */
@@ -304,6 +316,14 @@ struct lws_jpeg {
 	uint8_t			is_progressive_tiny;
 	uint8_t			Ss, Se, Ah, Al;
 
+	/*
+	 * Nonzero once any FATAL has been returned, and it is that FATAL:
+	 * every later call returns it again without touching anything.
+	 * Every fine state above is only meaningful on the path it was
+	 * interrupted on, so a failed call leaves the decoder in a state
+	 * nothing can safely resume from.
+	 */
+	lws_stateful_ret_t	failed;
 };
 
 static const int8_t ZAG[] = { 0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18,
@@ -338,6 +358,18 @@ get_octet(lws_jpeg_t *j, uint8_t *c, uint8_t ffcheck)
 	lws_stateful_ret_t r;
 	uint8_t c1;
 
+	if (j->seen_eoi) {
+		/*
+		 * Past the EOI there is no more image, and whatever follows
+		 * it is not ours to read: pad with 1 bits, as the encoder
+		 * did, while the last MCUs are decoded from the bits already
+		 * taken
+		 */
+		*c = 0xff;
+
+		return LWS_SRET_OK;
+	}
+
 	if (!j->ff_skip) {
 		r = get_char(j, c);
 		if (r)
@@ -352,15 +384,36 @@ get_octet(lws_jpeg_t *j, uint8_t *c, uint8_t ffcheck)
 		j->ff_skip = 0;
 		if (c1) {
 			if (c1 == PJM_EOI) {
+				/* *c is the 0xff: the first of the padding */
 				j->seen_eoi = 1;
+				j->eoi_mcus = EOI_GRACE_MCUS;
+
 				return LWS_SRET_OK;
 			}
-			lwsl_jpeg("%s: nonzero stuffed 0x%02X\n", __func__, c1);
 
 			/* we stashed c1, but it was a marker... put it and the 0xff back */
 			j->stash[0] = 0xff;
 			j->stash[1] = c1;
 			j->stashc = 2;
+
+			if (j->restart_interval &&
+			    c1 >= PJM_RST0 && c1 <= PJM_RST7) {
+				/*
+				 * The bit reader looks up to two octets
+				 * ahead, so it meets the RSTn at the end of a
+				 * restart interval while the last MCU of the
+				 * interval is still being decoded from the
+				 * bits it already has.  Pad with 1 bits, as
+				 * the encoder did, and leave the marker for
+				 * interval_restart() to find when the MCU
+				 * count says it is due
+				 */
+				*c = 0xff;
+
+				return LWS_SRET_OK;
+			}
+
+			lwsl_jpeg("%s: nonzero stuffed 0x%02X\n", __func__, c1);
 
 			return LWS_SRET_FATAL + 35;
 		}
@@ -418,9 +471,18 @@ get_bits16(lws_jpeg_t *j, uint16_t *v, uint8_t numBits, uint8_t ffcheck)
 		j->bits = (uint16_t)(j->bits << j->bits_left);
 		j->bits = (uint16_t)(j->bits | c);
 		j->bits = (uint16_t)(j->bits << (8 - j->bits_left));
+
+		/*
+		 * The result's top byte is what j->bits held before the
+		 * shift above: if the second part below has to wait for
+		 * input, a retry skips to it with j->bits already shifted,
+		 * so keep the result for it rather than recompute it
+		 */
+
+		j->fs_gb16_ret = (uint16_t)((ret & 0xff00) | (j->bits >> 8));
 	}
 
-	ret = (uint16_t)((ret & 0xff00) | (j->bits >> 8));
+	ret = j->fs_gb16_ret;
 
 	if (j->bits_left < numBits) {
 		
@@ -507,8 +569,6 @@ huff_decode(lws_jpeg_t *j, uint8_t *v, const huff_table_t *ht, const uint8_t *p)
 		r = get_bit(j, &j->fs_hd_code);
 		if (r)
 			return r;
-		if (j->seen_eoi)
-			return LWS_SRET_OK;
 		j->fs_hd = 1;
 		j->fs_hd_i = 0;
 	}
@@ -529,9 +589,6 @@ huff_decode(lws_jpeg_t *j, uint8_t *v, const huff_table_t *ht, const uint8_t *p)
 		r = get_bit(j, &c);
 		if (r)
 			return r;
-
-		if (j->seen_eoi)
-			return LWS_SRET_OK;
 
 		j->fs_hd_i++;
 		j->fs_hd_code = (uint16_t)((j->fs_hd_code << 1) | c);
@@ -679,7 +736,7 @@ read_sof_marker(lws_jpeg_t *j)
 			return LWS_SRET_FATAL + 4;
 		}
 
-		lwsl_warn("%s: %d x %d\n", __func__, j->image_width, j->image_height);
+		lwsl_info("%s: %d x %d\n", __func__, j->image_width, j->image_height);
 
 		j->fs_sof_phase++;
 		
@@ -934,12 +991,14 @@ process_markers(lws_jpeg_t *j, uint8_t *pMarker)
 		}
 
 		switch (j->fs_pm_c) {
+		/*
+		 * Only report the marker: what kind of frame it starts is the
+		 * caller's business, since only one caller is expecting a
+		 * frame header
+		 */
 		case PJM_SOF0:
 		case PJM_SOF1:
 		case PJM_SOF2:
-			if (j->fs_pm_c == PJM_SOF2)
-				j->is_progressive_tiny = 1;
-			/* fallthru */
 		case PJM_SOF3:
 		case PJM_SOF5:
 		case PJM_SOF6:
@@ -1053,6 +1112,17 @@ process_markers(lws_jpeg_t *j, uint8_t *pMarker)
 						(j->fs_pm_skip_budget - totalRead);
 	
 					huffCreate(j->fs_pm_bits, ht);
+
+					/*
+					 * A DHT segment may hold several
+					 * tables; go back to reading the next
+					 * table's index byte, or the enclosing
+					 * while() re-enters case 3 with no
+					 * bytes left to read and burns the
+					 * budget on repeated huffCreate()
+					 */
+
+					j->fs_pm_skip = 1;
 					break;
 				}
 			}
@@ -1257,7 +1327,7 @@ static lws_stateful_ret_t
 interval_restart(lws_jpeg_t *j)
 {
 	lws_stateful_ret_t r;
-	uint8_t c;
+	uint8_t c = 0;
 
 	switch (j->fs_ir_phase) {
 	case 0:
@@ -1336,6 +1406,14 @@ interval_restart(lws_jpeg_t *j)
 		if (r)
 			return r;
 
+		/*
+		 * fs_ir_i is the per-restart-interval budget for the marker
+		 * scan; it has to go back to zero along with the phase, or it
+		 * accumulates across restarts and every stream using DRI/RSTn
+		 * fails once 1536 bytes have cumulatively been skipped
+		 */
+
+		j->fs_ir_i = 0;
 		j->fs_ir_phase = 0;
 		break;
 	}
@@ -1399,6 +1477,12 @@ init_scan(lws_jpeg_t *j)
 			return LWS_SRET_FATAL + 23;
 		}
 
+		/*
+		 * This includes a second SOFn: the frame geometry and mode
+		 * were fixed by init_frame() at the first one, and the band
+		 * sizing and the blit depend on them staying fixed
+		 */
+
 		if (c != PJM_SOS) {
 			lwsl_jpeg("%s: not SOS\n", __func__);
 
@@ -1435,6 +1519,14 @@ init_scan(lws_jpeg_t *j)
 			j->restarts_left = j->restart_interval;
 			j->restart_num = 0;
 		}
+
+		/*
+		 * We're priming the entropy stash for a new scan; stashc is
+		 * provably 0 here today, but the two pushes below have no
+		 * bound of their own and stash[2] aliases stashc itself
+		 */
+
+		j->stashc = 0;
 
 		if (j->bits_left > 0)
 			j->stash[j->stashc++] = (uint8_t)j->bits;
@@ -2397,19 +2489,32 @@ transform_block(lws_jpeg_t *j, uint8_t mb)
 static lws_stateful_ret_t
 lws_jpeg_mcu_next(lws_jpeg_t *j)
 {
-	unsigned int x, y, row_pitch = (unsigned int)(j->frame_comps *
-						      j->image_width);
+	unsigned int x, y;
 	lws_stateful_ret_t r;
 
 	if (!j->fs_mcu_phase) {
-		if (j->restart_interval) {
-			if (j->restarts_left == 0) {
-				lwsl_err("%s: process_restart\n", __func__);
+		/*
+		 * After the EOI there are no more markers to find: the last
+		 * MCUs come from the bits already taken and the padding
+		 */
+		if (j->restart_interval && !j->seen_eoi) {
+			/*
+			 * A restart is due before this MCU when the last
+			 * interval has used up its MCUs, or a restart was
+			 * already underway and had to wait for input: by its
+			 * phase 2 it has reset restarts_left, but it still has
+			 * to prime the bit reader again.
+			 *
+			 * Either way this MCU is the first of the new
+			 * interval and counts against it.
+			 */
+			if (!j->restarts_left || j->fs_ir_phase) {
 				r = interval_restart(j);
 				if (r)
 					return r;
-			} else
-				j->restarts_left--;
+			}
+
+			j->restarts_left--;
 		}
 		
 		j->fs_mcu_mb = 0;
@@ -2450,9 +2555,6 @@ lws_jpeg_mcu_next(lws_jpeg_t *j)
 				}
 				return r;
 			}
-
-			if (j->seen_eoi)
-				return LWS_SRET_OK;
 
 			j->fs_mcu_phase++;
 			
@@ -2499,8 +2601,6 @@ lws_jpeg_mcu_next(lws_jpeg_t *j)
 							&j->huff_tab3 : &j->huff_tab2,
 								compACTab ?
 							j->huff_val3 : j->huff_val2);
-						if (j->seen_eoi)
-							return LWS_SRET_OK;
 						if (r)
 							return r;
 
@@ -2582,8 +2682,7 @@ lws_jpeg_mcu_next(lws_jpeg_t *j)
 	 * Place the MCB into the allocated, MCU-height pixel buffer
 	 */
 
-	 uint8_t *dr = j->lines + (j->mcu_ofs_x * j->mcu_max_size_x *
-				   j->frame_comps);
+	size_t xo = (size_t)(j->mcu_ofs_x * j->mcu_max_size_x * j->frame_comps);
 	unsigned int step = j->is_progressive_tiny ? 1 : 8;
 
          for (y = 0; y < j->mcu_max_size_y; y += step) {
@@ -2596,7 +2695,7 @@ lws_jpeg_mcu_next(lws_jpeg_t *j)
 			by_limit = 8;
 
 		for (x = 0; x < j->mcu_max_size_x; x += step) {
-			uint8_t *db = dr + (x * j->frame_comps);
+			size_t dbo = xo + (size_t)(x * j->frame_comps);
 			uint8_t src_ofs;
 			const uint8_t *pSrcR, *pSrcG, *pSrcB;
 			unsigned int bx_limit = (unsigned int)(
@@ -2618,21 +2717,27 @@ lws_jpeg_mcu_next(lws_jpeg_t *j)
 			if (bx_limit > 8)
 				bx_limit = 8;
 
+			/*
+			 * The row step is the only thing that changed: the
+			 * inner loop is inside one row, which the fragbuf
+			 * guarantees contiguous
+			 */
+
 			if (j->scan_type == PJPG_GRAYSCALE) {
 				for (by = 0; by < by_limit; by++) {
-					uint8_t *pDst = db;
+					uint8_t *pDst = lws_fragbuf_unit(
+						j->lines, y + by) + dbo;
 
 					for (bx = 0; bx < bx_limit; bx++)
 						*pDst++ = *pSrcR++;
 
 					if (!j->is_progressive_tiny)
 						pSrcR += (8 - bx_limit);
-
-					db += row_pitch;
 				}
 			} else {
 				for (by = 0; by < by_limit; by++) {
-					uint8_t *pDst = db;
+					uint8_t *pDst = lws_fragbuf_unit(
+						j->lines, y + by) + dbo;
 
 					for (bx = 0; bx < bx_limit; bx++) {
 						pDst[0] = *pSrcR++;
@@ -2646,16 +2751,9 @@ lws_jpeg_mcu_next(lws_jpeg_t *j)
 						pSrcG += (8 - bx_limit);
 						pSrcB += (8 - bx_limit);
 					}
-
-					db += row_pitch;
 				}
 			}
 		} /* x */
-
-		if (j->is_progressive_tiny)
-			dr += row_pitch;
-		else
-			dr += (row_pitch * 8);
 	} /* y */
 
 	if (j->mcu_ofs_x++ == j->mcu_max_row - 1) {
@@ -2682,7 +2780,10 @@ lws_jpeg_new(void)
 void
 lws_jpeg_free(lws_jpeg_t **j)
 {
-	lws_free_set_NULL((*j)->lines);
+	if (!*j)
+		return;
+
+	lws_fragbuf_destroy(&(*j)->lines);
 	lws_free_set_NULL(*j);
 }
 
@@ -2692,6 +2793,9 @@ lws_jpeg_emit_next_line(lws_jpeg_t *j, const uint8_t **ppix,
 {
 	lws_stateful_ret_t r = 0;
 	size_t mcu_buf_len;
+
+	if (j->failed)
+		return j->failed;
 
 	j->inbuf = *buf;
 	j->insize = *size;
@@ -2736,8 +2840,8 @@ lws_jpeg_emit_next_line(lws_jpeg_t *j, const uint8_t **ppix,
 				if (--j->fs_emit_budget == 0) {
 					lwsl_jpeg("%s: SOI emit budget gone\n",
 								__func__);
-
-					return LWS_SRET_FATAL + 28;
+					r = LWS_SRET_FATAL + 28;
+					goto fin;
 				}
 	
 				if (j->fs_emit_lc == 0xFF) {
@@ -2746,8 +2850,8 @@ lws_jpeg_emit_next_line(lws_jpeg_t *j, const uint8_t **ppix,
 					if (j->fs_emit_tc == PJM_EOI) {
 						lwsl_jpeg("%s: SOI reached EOI\n",
 								__func__);
-
-						return LWS_SRET_FATAL + 29;
+						r = LWS_SRET_FATAL + 29;
+						goto fin;
 					}
 					lwsl_jpeg("%s: skipping 0x%02x\n", __func__, j->fs_emit_lc);
 				}
@@ -2763,8 +2867,8 @@ lws_jpeg_emit_next_line(lws_jpeg_t *j, const uint8_t **ppix,
 	
 			if (j->fs_emit_tc != 0xFF) {
 				lwsl_jpeg("%s: not marker\n", __func__);
-
-				return LWS_SRET_FATAL + 30;
+				r = LWS_SRET_FATAL + 30;
+				goto fin;
 			}
 			
 			j->dstate = LWSJDS_FIND_SOF1;
@@ -2779,10 +2883,19 @@ lws_jpeg_emit_next_line(lws_jpeg_t *j, const uint8_t **ppix,
 			
 			if (j->fs_emit_c != PJM_SOF0 && j->fs_emit_c != PJM_SOF2) {
 				lwsl_jpeg("%s: not SOF0/2 (%d)\n", __func__, (int)j->fs_emit_c);
-
-				return LWS_SRET_FATAL + 31;
+				r = LWS_SRET_FATAL + 31;
+				goto fin;
 			}
-			
+
+			/*
+			 * The frame mode is decided here and only here, before
+			 * read_sof_marker() and init_frame() size everything
+			 * for it
+			 */
+
+			if (j->fs_emit_c == PJM_SOF2)
+				j->is_progressive_tiny = 1;
+
 			j->dstate++;
 	
 			/* fallthru */
@@ -2813,13 +2926,26 @@ lws_jpeg_emit_next_line(lws_jpeg_t *j, const uint8_t **ppix,
 			/* fallthru */
 			
 		case LWSJDS_INIT_SCAN:
-			
+
+			/*
+			 * If we're only after the metadata, stop here, before
+			 * init_scan() consumes the SOS and primes the entropy
+			 * stash.  We must go via fin: so the input we already
+			 * consumed is published to the caller, otherwise he
+			 * replays it into a different parser state; and by
+			 * stopping before init_scan() rather than after it, the
+			 * retry can't run init_scan() a second time over bytes
+			 * the first run already ate.
+			 */
+
+			if (j->hold_at_metadata) {
+				r = LWS_SRET_AWAIT_RETRY;
+				goto fin;
+			}
+
 			r = init_scan(j);
 			if (r)
 				goto fin;
-
-			if (j->hold_at_metadata)
-				return LWS_SRET_AWAIT_RETRY;
 
 			/*
 			 * 8, or 16 lines of 24-bpp according to MCU height
@@ -2838,16 +2964,43 @@ lws_jpeg_emit_next_line(lws_jpeg_t *j, const uint8_t **ppix,
 			 *
 			 * max by_limit and bx_limit = 8
 			*/
-			mcu_buf_len = (size_t)(j->mcu_max_row * j->mcu_max_size_x * j->frame_comps)
-				+ (size_t)(j->image_width * j->frame_comps * j->mcu_max_size_y)
-				+ (size_t)(j->mcu_max_size_x * j->frame_comps)
-				+ (size_t)(8 * j->frame_comps * j->image_width)
-				+ (size_t)(8 * 3);
+			/*
+			 * The MCU-height band of pixels, a row at a time.
+			 *
+			 * The slack the old single allocation carried is now
+			 * per row and per band: a block write at the right
+			 * hand edge can run up to one MCU past the end of its
+			 * row when the width is not a multiple of the MCU
+			 * width, and a block write on the last row of the
+			 * band can run up to 8 rows past the end of it.  Both
+			 * used to land in the tail of one big buffer; now
+			 * each row carries its own tail and the band carries
+			 * 8 spare rows, so neither can reach another row's
+			 * pixels.
+			 *
+			 * Being per row is also what lets this be a fragbuf:
+			 * the band is tens of KB, which on a small target is
+			 * exactly the size that stops being available before
+			 * the heap is anywhere near full.
+			 *
+			 * The fragbuf starts zeroed, and that matters: an EOI
+			 * or a marker ends the decode early, and the band is
+			 * emitted with whatever MCUs were never blitted into
+			 * it.  Those must be black, not old heap.
+			 */
 
-			j->lines = lws_zalloc(mcu_buf_len, __func__);
+			mcu_buf_len = (size_t)(j->image_width * j->frame_comps) +
+				      (size_t)(j->mcu_max_size_x * j->frame_comps);
+
+			j->lines = lws_fragbuf_create(
+					(size_t)j->mcu_max_size_y + 8,
+					mcu_buf_len);
 			if (!j->lines) {
-				lwsl_jpeg("%s: OOM (%d)\n", __func__, (int)mcu_buf_len);
-				return LWS_SRET_FATAL + 32;
+				lwsl_jpeg("%s: OOM (%d x %d)\n", __func__,
+					  (int)j->mcu_max_size_y + 8,
+					  (int)mcu_buf_len);
+				r = LWS_SRET_FATAL + 32;
+				goto fin;
 			}
 
 			j->dstate++;
@@ -2866,18 +3019,31 @@ lws_jpeg_emit_next_line(lws_jpeg_t *j, const uint8_t **ppix,
 			if (!j->mcu_count_left_x && !j->mcu_count_left_y)
 				return LWS_SRET_OK;
 
-			if (j->seen_eoi) {
-				r = LWS_SRET_OK;
-				goto intra;
-			}
+			/*
+			 * The bit reader sees the EOI up to two octets before
+			 * the decode has used the bits in front of it, so the
+			 * MCUs in progress and following still decode, from
+			 * those bits and then 1-bit padding.  A well-formed
+			 * image runs out of MCUs first.  One whose EOI came
+			 * early gets EOI_GRACE_MCUS, which covers every real
+			 * bit, and then no more MCUs are coming: retire the
+			 * MCU budget and emit the band we prepared; when the
+			 * ring realigns, the check above returns OK and we
+			 * stop.
+			 */
+
+			if (j->seen_eoi && !j->eoi_mcus)
+				goto retire;
 
 			r = lws_jpeg_mcu_next(j);
-			if (j->seen_eoi) {
-				r = LWS_SRET_OK;
-				goto intra;
-			}
+			if (r && j->seen_eoi)
+				/* failing on the padding is just the end */
+				goto retire;
 			if (r)
 				goto fin;
+
+			if (j->seen_eoi)
+				j->eoi_mcus--;
 
 			if (j->mcu_count_left_x)
 				j->mcu_count_left_x--;
@@ -2898,15 +3064,39 @@ lws_jpeg_emit_next_line(lws_jpeg_t *j, const uint8_t **ppix,
 		}
 	} while (1);
 
+retire:
+	j->mcu_count_left_x = 0;
+	j->mcu_count_left_y = 0;
+	r = LWS_SRET_OK;
+
 intra:
-	*ppix = j->lines + (((j->ringy++) & (j->mcu_max_size_y - 1)) *
-				j->frame_comps * j->image_width);
+	/*
+	 * The last band is a whole MCU high, but the image may end partway
+	 * down it: the rows below image_height were never written, and are
+	 * not part of the image
+	 */
+
+	if (j->rows_out == j->image_height) {
+		j->mcu_count_left_x = 0;
+		j->mcu_count_left_y = 0;
+		r = LWS_SRET_OK;
+
+		goto fin;
+	}
+
+	j->rows_out++;
+	*ppix = lws_fragbuf_unit(j->lines,
+				 (j->ringy++) & (j->mcu_max_size_y - 1u));
 
 	r |= LWS_SRET_WANT_OUTPUT;
 
 fin:
 	*buf = j->inbuf;
 	*size = j->insize;
+
+	if (r & LWS_SRET_FATAL)
+		/* see ->failed: there is no coming back from it */
+		j->failed = r;
 
 	return r;
 }

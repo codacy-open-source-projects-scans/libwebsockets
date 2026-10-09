@@ -44,8 +44,19 @@
  * reason to increase this value.
  */
 #define DHT_MAX_BLACKLISTED		10
-#define MAX_TOKEN_BUCKET_TOKENS		400
 #define TOKEN_SIZE			8
+
+/*
+ * Request admission (see lws_dht_admit_request()): each pool admits
+ * LWS_DHT_RL_POOL_RATE requests/s with bursts of LWS_DHT_RL_POOL_BURST, and
+ * each source address, tracked in a table of LWS_DHT_RL_SOURCES, gets
+ * LWS_DHT_RL_SRC_RATE/s with bursts of LWS_DHT_RL_SRC_BURST of that.
+ */
+#define LWS_DHT_RL_POOL_RATE		100
+#define LWS_DHT_RL_POOL_BURST		400
+#define LWS_DHT_RL_SRC_RATE		10
+#define LWS_DHT_RL_SRC_BURST		40
+#define LWS_DHT_RL_SOURCES		64
 /*
  * When performing a search, we search for up to SEARCH_NODES closest nodes
  * to the destination, and use the additional ones to backtrack if any of
@@ -61,6 +72,29 @@
 #define LWS_DHT_NODE_EXPIRE_SECS	7200
 #define LWS_DHT_IDLE_EXPIRE_SECS	120
 #define LWS_DHT_PACKET_SANITY_LIMIT	1500
+/*
+ * Cap on concurrent transport sequencers (one per peer address).  Each one
+ * allocates its dsh up front, and an unauthenticated inbound 'data' datagram
+ * can create one, so this is what bounds that memory.
+ */
+#define LWS_DHT_MAX_TS			64
+/*
+ * per storage object: cap subscribers, the subscribers from one source (see
+ * dht_source_key()), and peers announced by one source ip
+ */
+#define LWS_DHT_MAX_SUBSCRIBERS		32
+#define LWS_DHT_MAX_SUBSCRIBERS_PER_SRC	4
+#define LWS_DHT_MAX_PEERS_PER_SRC	8
+/*
+ * An external-address probe's tid is "ip" followed by a random nonce of its
+ * own, so a probed node learns nothing that would let it answer for another
+ * one, and the nonce is too wide to guess.  The length also keeps these
+ * replies apart from the 4-byte request tids and the 16-byte notify tids.
+ */
+#define LWS_DHT_IP_PROBE_NONCE_LEN	8
+#define LWS_DHT_IP_PROBE_TID_LEN	(2 + LWS_DHT_IP_PROBE_NONCE_LEN)
+/* subscribes we sent whose reply we are still waiting for */
+#define LWS_DHT_MAX_PENDING_SUBSCRIBES	8
 
 /* Serialization Field Sizes */
 #define LWS_DHT_IPV4_VLEN                  4
@@ -111,6 +145,12 @@
 #define MIN(x, y) ((x) <= (y) ? (x) : (y))
 #endif
 
+/* a token bucket, refilled lazily when found empty */
+typedef struct lws_dht_tb {
+	time_t			time;		/* last refill */
+	int			tokens;
+} lws_dht_tb_t;
+
 #if defined(LWS_WITH_DHT_BACKEND)
 
 struct node {
@@ -121,18 +161,21 @@ struct node {
 	time_t                  reply_time;          /* time of last correct reply received */
 	time_t                  pinged_time;         /* time of last request */
 	int                     pinged;              /* how many requests we sent since last reply */
-	struct node *next;
+	uint8_t                 bep42_ok;            /* id conforms to BEP42 for its address (or private) */
+	lws_dll2_t              list;                /* bucket ->nodes membership */
 };
+
+/* how many routing table entries one address (IPv4, or IPv6 /64) may hold in a bucket */
+#define LWS_DHT_MAX_SAME_ADS_PER_BUCKET	2
 
 struct bucket {
 	int                     af;
 	lws_dht_hash_t          *first;
-	int                     count;                  /* number of nodes */
-	int                     time;                   /* time of last reply in this bucket */
-	struct node *           nodes;
+	time_t                  time;                   /* time of last reply in this bucket */
+	lws_dll2_owner_t        nodes;                   /* node list, nodes.count is node count */
 	struct sockaddr_storage cached;			/* the address of a likely candidate */
 	size_t                  cachedlen;
-	struct bucket *         next;
+	lws_dll2_t              list;                /* ctx ->buckets / ->buckets6 membership */
 };
 
 struct search_node {
@@ -157,7 +200,7 @@ struct search {
 	int                     done;
 	struct search_node      nodes[SEARCH_NODES];
 	int                     numnodes;
-	struct search           *next;
+	lws_dll2_t              list;                /* ctx ->searches membership */
 };
 
 struct peer {
@@ -168,7 +211,7 @@ struct peer {
 };
 
 struct subscriber {
-	struct subscriber       *next;
+	lws_dll2_t              list;                /* storage ->subscribers membership */
 	struct sockaddr_storage ss;
 	size_t                  sslen;
 	uint8_t                 tid[16];
@@ -185,8 +228,8 @@ struct storage {
 	lws_dht_hash_t          *id;
 	int                     numpeers, maxpeers;
 	struct peer             *peers;
-	struct subscriber       *subscribers;
-	struct storage          *next;
+	lws_dll2_owner_t        subscribers;
+	lws_dll2_t              list;                /* ctx ->storage membership */
 };
 
 #endif
@@ -214,13 +257,11 @@ struct lws_dht_ctx {
 	lws_dht_hash_t		*myid;
 
 #if defined(LWS_WITH_DHT_BACKEND)
-	struct bucket		*buckets;
-	struct bucket		*buckets6;
-	struct storage		*storage;
-	int			numstorage;
+	lws_dll2_owner_t	buckets;
+	lws_dll2_owner_t	buckets6;
+	lws_dll2_owner_t	storage;
 
-	struct search		*searches;
-	int			numsearches;
+	lws_dll2_owner_t	searches;
 	unsigned short		search_id;
 #endif
 
@@ -232,11 +273,41 @@ struct lws_dht_ctx {
 		size_t			sslen;
 		int			count;
 		int			num_peers;
-		struct sockaddr_storage peer_ss[8];
+		struct sockaddr_storage peer_ss[8]; /* one per voting IP */
+		uint8_t			confirmed; /* reached the quorum */
 	} reported_ads[8];
 
 	int			num_reported_ads;
 	int			external_ads_set;
+
+	/*
+	 * The nodes the current external-address probe round was sent to: a
+	 * reply about our address counts only from one of these, once each,
+	 * and only carrying the random nonce that was sent to that node.
+	 */
+	struct {
+		struct sockaddr_storage ss;
+		size_t			sslen;
+		uint8_t			nonce[LWS_DHT_IP_PROBE_NONCE_LEN];
+		uint8_t			answered;
+	} ip_probes[16];
+	int			ip_probe_count;
+
+	/*
+	 * The subscribes we sent and have had no reply to: a reply surfaces
+	 * its token only if it answers one of these, from the node it went
+	 * to, so nobody can make us react to a token we never asked for.
+	 */
+	struct {
+		struct sockaddr_storage ss;
+		size_t			sslen;	/* 0 = free */
+		time_t			sent;
+		unsigned short		seq;
+		/* the hash subscribed to, reported with the token */
+		uint8_t			ih_type;
+		uint8_t			ih_len;
+		uint8_t			ih[LWS_GENHASH_LARGEST];
+	} sb_pending[LWS_DHT_MAX_PENDING_SUBSCRIBES];
 
 #if defined(LWS_WITH_DHT_BACKEND)
 	time_t			search_time;
@@ -245,27 +316,39 @@ struct lws_dht_ctx {
 	time_t			mybucket_grow_time;
 	time_t			mybucket6_grow_time;
 	time_t			expire_stuff_time;
-
-	time_t			token_bucket_time;
-	int			token_bucket_tokens;
 #endif
+
+	/*
+	 * Request admission: a bucket per recent source address (IPv4
+	 * address, IPv6 /64), then one pool for the good nodes of our
+	 * routing table at their known endpoint and one for everybody else
+	 */
+	struct {
+		lws_dht_tb_t		tb;
+		time_t			last;	/* last request, for LRU */
+		uint8_t			key[16];
+		uint8_t			af;	/* 0 = free */
+	} rl_src[LWS_DHT_RL_SOURCES];
+	lws_dht_tb_t		rl_known;
+	lws_dht_tb_t		rl_general;
 
 	struct lws_dht_stats	stats_history[LWS_DHT_STAT_BUCKETS];
 	struct lws_dht_stats	stats_current;
 	int			stats_history_head;
 	lws_sorted_usec_list_t	sul_stats;
 	lws_sorted_usec_list_t	sul_ip_monitor;
-	uint16_t		ip_monitor_seqno;
 
-	struct timeval		now;
+	time_t			now;
 
-	uint8_t			secret[8];
-	uint8_t			oldsecret[8];
+	uint8_t			secret[16]; /* token key, rotated */
+	uint8_t			oldsecret[16];
 	uint8_t			my_v[9];
 	uint8_t			aux;
 
 	uint8_t			have_v:1;
 	uint8_t			legacy:1;
+	uint8_t			allow_private_ads:1;
+	uint8_t			id_random:1; /* myid was not given: BEP42 may replace it */
 
 	const char		*fallback_nodes_path;
 	const char		*iface;
@@ -277,6 +360,30 @@ struct lws_dht_ctx {
 	lws_dll2_owner_t	verb_owner;
 };
 
+#if defined(LWS_WITH_DHT_BACKEND)
+/*
+ * The bucket chains are dll2 owners, but the code needs to walk them in
+ * id order by struct bucket *.  These helpers hide the container_of dance.
+ */
+
+static LWS_INLINE struct bucket *
+bucket_head(struct lws_dht_ctx *ctx, int af)
+{
+	lws_dll2_t *d = lws_dll2_get_head(af == AF_INET ? &ctx->buckets :
+							  &ctx->buckets6);
+
+	return d ? lws_container_of(d, struct bucket, list) : NULL;
+}
+
+static LWS_INLINE struct bucket *
+bucket_next(struct bucket *b)
+{
+	return lws_dll2_get_next(
+		&b->list) ? lws_container_of(lws_dll2_get_next(&b->list), struct bucket, list)
+			    : NULL;
+}
+#endif
+
 
 typedef struct lws_dht_ts {
 	lws_dll2_t			list;
@@ -284,6 +391,7 @@ typedef struct lws_dht_ts {
 	struct sockaddr_storage		sa;
 	size_t				salen;
 	struct lws_dht_ctx		*ctx;
+	lws_sorted_usec_list_t		sul_idle;
 } lws_dht_ts_t;
 
 struct lws_dht_mparams {
@@ -319,6 +427,11 @@ struct lws_dht_mparams {
 
 	lws_transport_sequencer_sack_block_t sack[4];
 	uint8_t			num_sack;
+
+	/* DHT_ERROR only: the "e" list, message pointing into the datagram */
+	const uint8_t		*error_msg;
+	size_t			error_msg_len;
+	int			error_code;
 };
 
 int lws_dht_hash_validate(int type, int len);
@@ -333,16 +446,17 @@ int lowbit(const lws_dht_hash_t *id);
 int common_bits(const lws_dht_hash_t *id1, const lws_dht_hash_t *id2);
 #if defined(LWS_WITH_DHT_BACKEND)
 struct bucket * find_bucket(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id, int af);
-struct bucket * previous_bucket(struct lws_dht_ctx *ctx, struct bucket *b);
+struct bucket * previous_bucket(struct bucket *b);
 struct node * find_node(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id, int af);
 int node_good(struct lws_dht_ctx *ctx, struct node *node);
 void blacklist_node(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id, const struct sockaddr *sa, size_t salen);
 struct node * maybe_new_node(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id, const struct sockaddr *sa, size_t salen, int confirm);
-int expire_buckets(struct lws_dht_ctx *ctx, struct bucket *b);
+int expire_buckets(struct lws_dht_ctx *ctx, lws_dll2_owner_t *bo);
 void lws_dht_dump_tables(struct lws_dht_ctx *ctx);
 int bucket_maintenance(struct lws_dht_ctx *ctx, int af);
 int neighbourhood_maintenance(struct lws_dht_ctx *ctx, int af);
 struct search * find_search(struct lws_dht_ctx *ctx, unsigned short tid, int af);
+int search_awaiting_reply_from(struct lws_dht_ctx *ctx, struct search *sr, const struct sockaddr *sa);
 int insert_search_node(struct lws_dht_ctx *ctx, lws_dht_hash_t *id, const struct sockaddr *sa, size_t salen, struct search *sr, int replied, const uint8_t *token, size_t token_len);
 void expire_searches(struct lws_dht_ctx *ctx);
 int search_send_get_peers(struct lws_dht_ctx *ctx, struct search *sr, struct search_node *n);
@@ -353,14 +467,67 @@ int expire_storage(struct lws_dht_ctx *ctx);
 void lws_dht_periodic_cb(lws_sorted_usec_list_t *sul);
 #endif
 int lws_dht_process_packet(struct lws_dht_ctx *ctx, const void *buf, size_t buflen, const struct sockaddr *from, size_t fromlen);
-int dht_tx_check(size_t size, size_t offset, size_t delta);
-int dht_tx_skip(size_t *offset, size_t size, size_t delta);
+
+/*
+ * Compare two socket addresses by family, address and port; 1 if they are
+ * the same peer endpoint.  Uses the lws sa46 address comparison (which
+ * normalizes v4 to v4-in-v6) plus the port: the sequencer table and the
+ * search reply matching key on the full endpoint, so they must not alias
+ * two peers behind one NAT address, or accept a reply from the same
+ * address on a different port.
+ */
+
+static LWS_INLINE int
+dht_sa_same_peer(const struct sockaddr *a, const struct sockaddr *b)
+{
+	const lws_sockaddr46 *x = (const lws_sockaddr46 *)a,
+			      *y = (const lws_sockaddr46 *)b;
+
+	if (lws_sa46_compare_ads(x, y))
+		return 0;
+
+#if defined(LWS_WITH_IPV6)
+	if (x->sa4.sin_family == AF_INET6)
+		return x->sa6.sin6_port == y->sa6.sin6_port;
+#endif
+
+	return x->sa4.sin_port == y->sa4.sin_port;
+}
+
+/* the port of a v4 or v6 socket address, in network order */
+
+static LWS_INLINE uint16_t
+dht_sa_port(const struct sockaddr *a)
+{
+#if defined(LWS_WITH_IPV6)
+	if (a->sa_family == AF_INET6)
+		return ((const struct sockaddr_in6 *)a)->sin6_port;
+#endif
+
+	return ((const struct sockaddr_in *)a)->sin_port;
+}
+/*
+ * Bencode emission cursor.  All TX builders compose into a fixed buffer
+ * through these bounds-checked appends; a failed append refuses the whole
+ * datagram.
+ */
+
+typedef struct dht_txbuf {
+	char	*buf;	/**< packet buffer being composed into */
+	size_t	 len;	/**< bytes composed so far */
+	size_t	 size;	/**< bytes available at buf */
+} dht_txbuf_t;
+
+int dht_tx_raw(dht_txbuf_t *t, const void *v, size_t vl);
+int dht_tx_lit(dht_txbuf_t *t, const char *lit);
+int dht_tx_str(dht_txbuf_t *t, const void *v, size_t vl);
+int dht_tx_int(dht_txbuf_t *t, uint64_t n);
 int dht_tx_id_len(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id);
-void * dht_memmem(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen);
-int dht_tx_copy__advance_offset(char *buf, size_t *offset, size_t size, const void *src, size_t delta);
-int dht_tx_add_v(char *buf, size_t *offset, size_t size, struct lws_dht_ctx *ctx);
-int dht_tx_add_ip(char *buf, size_t *offset, size_t size, const struct sockaddr *sa);
-int dht_put_id__advance_offset(struct lws_dht_ctx *ctx, char *buf, size_t *offset, size_t size, const lws_dht_hash_t *id);
+int dht_tx_id_raw(struct lws_dht_ctx *ctx, dht_txbuf_t *t, const lws_dht_hash_t *id);
+int dht_tx_id(struct lws_dht_ctx *ctx, dht_txbuf_t *t, const lws_dht_hash_t *id);
+int dht_tx_v(struct lws_dht_ctx *ctx, dht_txbuf_t *t);
+int dht_tx_ip(dht_txbuf_t *t, const struct sockaddr *sa);
+int dht_tx_want(dht_txbuf_t *t, int want);
 void make_tid(uint8_t *tid_return, const char *prefix, unsigned short seqno);
 int tid_match(const uint8_t *tid, const char *prefix, unsigned short *seqno_return);
 int node_blacklisted(struct lws_dht_ctx *ctx, const struct sockaddr *sa, size_t salen);
@@ -379,11 +546,16 @@ int token_match(struct lws_dht_ctx *ctx, const uint8_t *token, size_t token_len,
 int send_find_node(struct lws_dht_ctx *ctx, const struct sockaddr *sa, size_t salen, const uint8_t *tid, size_t tid_len, const lws_dht_hash_t *target, int want, int confirm);
 int send_closest_nodes(struct lws_dht_ctx *ctx, const struct sockaddr *sa, size_t salen, struct lws_dht_mparams *mp, const lws_dht_hash_t *id, int af, struct storage *st);
 int send_error(struct lws_dht_ctx *ctx, const struct sockaddr *sa, size_t salen, const uint8_t *tid, size_t tid_len, int code, const char *message);
-void lws_dht_clear_pending_notify(struct lws_dht_ctx *ctx, const uint8_t *tid, size_t tid_len);
-int token_bucket(struct lws_dht_ctx *ctx);
+void lws_dht_clear_pending_notify(struct lws_dht_ctx *ctx, const uint8_t *tid, size_t tid_len, const struct sockaddr *from);
 void lws_dht_capture_announce(struct lws_dht_ctx *ctx, lws_dht_hash_t *hash, const struct sockaddr *fromaddr, unsigned short prt);
 #endif
-int is_martian(const struct sockaddr *sa);
+int is_martian(const struct lws_dht_ctx *ctx, const struct sockaddr *sa);
+int lws_dht_ads_is_private(const struct sockaddr *sa);
+void lws_dht_bep42_own_id(struct lws_dht_ctx *ctx, const struct sockaddr *sa);
+int dht_source_key(const struct sockaddr *sa, uint8_t key[16]);
+int lws_dht_peer_known(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id, const struct sockaddr *from);
+int lws_dht_admit_request(struct lws_dht_ctx *ctx, const lws_dht_hash_t *id, const struct sockaddr *from);
+struct lws_transport_sequencer * lws_dht_ts_rx(struct lws_dht_ctx *ctx, const struct sockaddr *from, size_t fromlen, const lws_dht_hash_t *id);
 int lws_dht_get_external_addr(struct lws_dht_ctx *ctx, struct sockaddr_storage *ss, size_t *sslen);
 struct lws_dht_ctx * lws_dht_create(const lws_dht_info_t *info);
 void * lws_dht_get_closure(struct lws_dht_ctx *ctx);

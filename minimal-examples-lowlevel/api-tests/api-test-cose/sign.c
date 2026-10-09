@@ -41,6 +41,32 @@ static const uint8_t
 		0x64, 0x07, 0x2b, 0xeb, 0x44,
 		0x86, 0xbd, 0xa4, 0x03, 0x1d,
 		0x27, 0x24, 0x4f },
+	/*
+	 * sign1_pass_01 with the kid changed to "22", which matches no key
+	 * in keyset1: validation must survive with the no-key result (-1001)
+	 */
+	sign1_kid_mismatch_01[] = {
+		0xd2, 0x84, 0x41, 0xa0, 0xa2,
+		0x01, 0x26, 0x04, 0x42, 0x32,
+		0x32, 0x54, 0x54, 0x68, 0x69,
+		0x73, 0x20, 0x69, 0x73, 0x20,
+		0x74, 0x68, 0x65, 0x20, 0x63,
+		0x6f, 0x6e, 0x74, 0x65, 0x6e,
+		0x74, 0x2e, 0x58, 0x40, 0x87,
+		0xdb, 0x0d, 0x2e, 0x55, 0x71,
+		0x84, 0x3b, 0x78, 0xac, 0x33,
+		0xec, 0xb2, 0x83, 0x0d, 0xf7,
+		0xb6, 0xe0, 0xa4, 0xd5, 0xb7,
+		0x37, 0x6d, 0xe3, 0x36, 0xb2,
+		0x3c, 0x59, 0x1c, 0x90, 0xc4,
+		0x25, 0x31, 0x7e, 0x56, 0x12,
+		0x7f, 0xbe, 0x04, 0x37, 0x00,
+		0x97, 0xce, 0x34, 0x70, 0x87,
+		0xb2, 0x33, 0xbf, 0x72, 0x2b,
+		0x64, 0x07, 0x2b, 0xeb, 0x44,
+		0x86, 0xbd, 0xa4, 0x03, 0x1d,
+		0x27, 0x24, 0x4f },
+
 	sign1_pass_02[] = {
 		0xd2, 0x84, 0x43, 0xa1, 0x01,
 		0x26, 0xa1, 0x04, 0x42, 0x31,
@@ -665,6 +691,513 @@ xcb(lws_cose_sig_ext_pay_t *x)
 	return LCOSESIGEXTCB_RET_FINISHED;
 }
 
+/*
+ * Optionally checks that the payload the validator reports is exactly ref
+ */
+
+struct pay_check {
+	const uint8_t		*ref;
+	size_t			len;
+	size_t			pos;
+	char			bad;
+};
+
+static int
+pay_check_cb(struct lws_cose_validate_context *cps, void *opaque,
+	     const uint8_t *paychunk, size_t paychunk_len)
+{
+	struct pay_check *pc = (struct pay_check *)opaque;
+
+	(void)cps;
+
+	if (paychunk_len > pc->len - pc->pos ||
+	    memcmp(pc->ref + pc->pos, paychunk, paychunk_len))
+		pc->bad = 1;
+	else
+		pc->pos += paychunk_len;
+
+	return 0;
+}
+
+/*
+ * Validates in against set, returning 0 only if the object produced exactly
+ * want results, and all of them are a pass
+ */
+
+static int
+validate_all_pass(struct lws_context *cx, lws_dll2_owner_t *set,
+		  enum lws_cose_sig_types sigtype, const uint8_t *in,
+		  size_t in_len, uint32_t want, struct pay_check *pc)
+{
+	lws_cose_validate_create_info_t info;
+	struct lws_cose_validate_context *cps;
+	lws_dll2_owner_t *o;
+	int n = 1;
+
+	memset(&info, 0, sizeof(info));
+	info.cx		= cx;
+	info.keyset	= set;
+	info.sigtype	= sigtype;
+	if (pc) {
+		info.pay_cb	= pay_check_cb;
+		info.pay_opaque	= pc;
+	}
+
+	cps = lws_cose_validate_create(&info);
+	if (!cps)
+		return 1;
+
+	if (lws_cose_validate_chunk(cps, in, in_len, NULL)) {
+		lwsl_err("%s: validate_chunk failed\n", __func__);
+		goto bail;
+	}
+
+	o = lws_cose_validate_results(cps);
+	if (lws_dll2_count(o) != want) {
+		lwsl_err("%s: %d results\n", __func__, lws_dll2_count(o));
+		goto bail;
+	}
+
+	n = 0;
+	lws_start_foreach_dll(struct lws_dll2 *, p, lws_dll2_get_head(o)) {
+		lws_cose_validate_res_t *res = lws_container_of(p,
+						lws_cose_validate_res_t, list);
+
+		if (res->result) {
+			lwsl_err("%s: result %d\n", __func__, res->result);
+			n = 1;
+		}
+	} lws_end_foreach_dll(p);
+
+	if (pc && (pc->bad || pc->pos != pc->len)) {
+		lwsl_err("%s: payload differs\n", __func__);
+		n = 1;
+	}
+
+bail:
+	lws_cose_validate_destroy(&cps);
+
+	return n;
+}
+
+/*
+ * Arrays in the unprotected bucket of a cose_signature or a COSE_recipient,
+ * like an RFC9360 x5chain (label 33), are just header values: the end of one
+ * of their items is not the end of the bucket.  The unprotected bucket is not
+ * covered by the signature or MAC, so a cose-wg example with such a bucket
+ * spliced in instead of its own must still validate.
+ *
+ * in[ofs] is the start of the old bucket, which is old_len long.
+ */
+
+static int
+splice_validate(struct lws_context *cx, lws_dll2_owner_t *set,
+		enum lws_cose_sig_types sigtype, const uint8_t *in,
+		size_t in_len, size_t ofs, size_t old_len,
+		const uint8_t *bucket, size_t bucket_len)
+{
+	uint8_t obj[640];
+	size_t tail = in_len - ofs - old_len;
+
+	if (ofs + bucket_len + tail > sizeof(obj))
+		return 1;
+
+	memcpy(obj, in, ofs);
+	memcpy(obj + ofs, bucket, bucket_len);
+	memcpy(obj + ofs + bucket_len, in + ofs + old_len, tail);
+
+	return validate_all_pass(cx, set, sigtype, obj,
+				 ofs + bucket_len + tail, 1, NULL);
+}
+
+/* where the signer's unprotected {4: '11'} is in sign_pass_01 */
+#define SP01_UNPROT_OFS		33
+#define SP01_UNPROT_LEN		5
+/* where the recipient's unprotected {1: -6, 4: 'our-secret'} is in
+ * sign_hmac_01 */
+#define SH01_UNPROT_OFS		66
+#define SH01_UNPROT_LEN		15
+
+static const uint8_t
+	/* {33: [h'01020304', h'05060708'], 4: '11'} */
+	unprot_x5c2_kid[] = {
+		0xa2, 0x18, 0x21, 0x82, 0x44, 0x01, 0x02, 0x03,
+		0x04, 0x44, 0x05, 0x06, 0x07, 0x08, 0x04, 0x42,
+		0x31, 0x31 },
+	/* {4: '11', 33: [h'01020304', h'05060708']} */
+	unprot_kid_x5c2[] = {
+		0xa2, 0x04, 0x42, 0x31, 0x31, 0x18, 0x21, 0x82,
+		0x44, 0x01, 0x02, 0x03, 0x04, 0x44, 0x05, 0x06,
+		0x07, 0x08 },
+	/* {33: [h'01020304'], 4: '11'} */
+	unprot_x5c1_kid[] = {
+		0xa2, 0x18, 0x21, 0x81, 0x44, 0x01, 0x02, 0x03,
+		0x04, 0x04, 0x42, 0x31, 0x31 },
+	/* {1: -6, 4: 'our-secret', 33: [h'01020304', h'05060708']} */
+	unprot_rcpt_x5c2[] = {
+		0xa3, 0x01, 0x25, 0x04, 0x4a, 0x6f, 0x75, 0x72,
+		0x2d, 0x73, 0x65, 0x63, 0x72, 0x65, 0x74, 0x18,
+		0x21, 0x82, 0x44, 0x01, 0x02, 0x03, 0x04, 0x44,
+		0x05, 0x06, 0x07, 0x08 };
+
+static int
+test_cose_nested_unprotected(struct lws_context *cx)
+{
+	uint8_t big[512], *p = big;
+	lws_dll2_owner_t set;
+	int n;
+
+	lwsl_user("%s: arrays in signer / recipient unprotected buckets\n",
+		  __func__);
+
+	lws_dll2_owner_clear(&set);
+	if (!lws_cose_key_import(&set, NULL, NULL, keyset1.set, keyset1.len)) {
+		lwsl_notice("%s: key import fail\n", __func__);
+		return 1;
+	}
+
+	/*
+	 * An x5chain whose two certificates, like real ones, are much bigger
+	 * than any protected bucket: {33: [h'30...', h'31...'], 4: '11'}
+	 */
+
+	*p++ = 0xa2;
+	*p++ = 0x18;
+	*p++ = 0x21;
+	*p++ = 0x82;
+	for (n = 0; n < 2; n++) {
+		*p++ = 0x58;
+		*p++ = 200;
+		memset(p, 0x30 + n, 200);
+		p += 200;
+	}
+	*p++ = 0x04;
+	*p++ = 0x42;
+	*p++ = 0x31;
+	*p++ = 0x31;
+
+	/* the cases are independent, run and report them all */
+
+	n = splice_validate(cx, &set, SIGTYPE_MULTI, sign_pass_01,
+			    sizeof(sign_pass_01), SP01_UNPROT_OFS,
+			    SP01_UNPROT_LEN, unprot_x5c2_kid,
+			    sizeof(unprot_x5c2_kid));
+	n |= splice_validate(cx, &set, SIGTYPE_MULTI, sign_pass_01,
+			     sizeof(sign_pass_01), SP01_UNPROT_OFS,
+			     SP01_UNPROT_LEN, unprot_kid_x5c2,
+			     sizeof(unprot_kid_x5c2)) << 1;
+	n |= splice_validate(cx, &set, SIGTYPE_MULTI, sign_pass_01,
+			     sizeof(sign_pass_01), SP01_UNPROT_OFS,
+			     SP01_UNPROT_LEN, unprot_x5c1_kid,
+			     sizeof(unprot_x5c1_kid)) << 2;
+	n |= splice_validate(cx, &set, SIGTYPE_MULTI, sign_pass_01,
+			     sizeof(sign_pass_01), SP01_UNPROT_OFS,
+			     SP01_UNPROT_LEN, big,
+			     lws_ptr_diff_size_t(p, big)) << 3;
+	n |= splice_validate(cx, &set, SIGTYPE_MAC, sign_hmac_01,
+			     sizeof(sign_hmac_01), SH01_UNPROT_OFS,
+			     SH01_UNPROT_LEN, unprot_rcpt_x5c2,
+			     sizeof(unprot_rcpt_x5c2)) << 4;
+
+	lws_cose_key_set_destroy(&set);
+
+	if (n)
+		lwsl_err("%s: failed cases 0x%x\n", __func__, n);
+
+	return !!n;
+}
+
+/*
+ * Signs pay into obj the way a streaming application does: the payload is
+ * passed in seg-sized chunks, and the object comes out through an output
+ * buffer of only out_room bytes, drained whenever the signer says AGAIN
+ */
+
+static int
+sign_streamed(struct lws_context *cx, lws_dll2_owner_t *set,
+	      enum lws_cose_sig_types sigtype, const cose_param_t *algs,
+	      const lws_cose_key_t * const *keys, int nkeys,
+	      const uint8_t *pay, size_t pay_len, size_t seg, size_t out_room,
+	      uint8_t *obj, size_t obj_max, size_t *obj_len)
+{
+	struct lws_cose_sign_context *csc;
+	lws_cose_sign_create_info_t i;
+	enum lws_lec_pctx_ret r;
+	size_t ofs = 0, s;
+	lws_lec_pctx_t lec;
+	uint8_t out[128];
+	int k;
+
+	if (out_room > sizeof(out))
+		return 1;
+
+	memset(&i, 0, sizeof(i));
+	i.cx			= cx;
+	i.keyset		= set;
+	i.lec			= &lec;
+	i.sigtype		= sigtype;
+	i.inline_payload_len	= pay_len;
+	i.flags			= LCSC_FL_ADD_CBOR_TAG;
+
+	lws_lec_init(&lec, out, out_room);
+
+	csc = lws_cose_sign_create(&i);
+	if (!csc)
+		return 1;
+
+	for (k = 0; k < nkeys; k++)
+		if (lws_cose_sign_add(csc, algs[k], keys[k]))
+			goto bail;
+
+	*obj_len = 0;
+
+	do {
+		s = pay_len - ofs;
+		if (s > seg)
+			s = seg;
+
+		do {
+			r = lws_cose_sign_payload_chunk(csc, pay + ofs, s);
+			if (r == LWS_LECPCTX_RET_FAIL)
+				goto bail;
+
+			if (lec.used > obj_max - *obj_len ||
+			    (r == LWS_LECPCTX_RET_AGAIN && !lec.used))
+				/* too big, or no progress */
+				goto bail;
+
+			memcpy(obj + *obj_len, out, lec.used);
+			*obj_len += lec.used;
+			lws_lec_setbuf(&lec, out, out_room);
+
+		} while (r == LWS_LECPCTX_RET_AGAIN);
+
+		ofs += s;
+	} while (ofs < pay_len);
+
+	lws_cose_sign_destroy(&csc);
+
+	return 0;
+
+bail:
+	lws_cose_sign_destroy(&csc);
+
+	return 1;
+}
+
+/*
+ * A payload much bigger than the output buffer, passed in chunks that are
+ * bigger or smaller than the output buffer, or all at once, through output
+ * windows of every size from 1 to 80 bytes: the object must carry the payload
+ * exactly once, in order, with one good signature over it per signer, for
+ * COSE_Sign1, COSE_Mac0 and a two-signer COSE_Sign
+ */
+
+static int
+test_cose_sign_streamed(struct lws_context *cx)
+{
+	static const size_t segs[] = { 7, 256, 1000 };
+	const lws_cose_key_t *keys[2], *hkey[1];
+	uint8_t pay[1000], obj[1400];
+	struct pay_check pc;
+	lws_dll2_owner_t set;
+	cose_param_t algs[2];
+	lws_cose_key_t *ck;
+	size_t n, ol, room;
+	int ret = 1;
+
+	lwsl_user("%s: streamed payload bigger than the output\n", __func__);
+
+	for (n = 0; n < sizeof(pay); n++)
+		pay[n] = (uint8_t)(n * 7 + 3);
+
+	lws_dll2_owner_clear(&set);
+	if (!lws_cose_key_import(&set, NULL, NULL, keyset1.set, keyset1.len)) {
+		lwsl_notice("%s: key import fail\n", __func__);
+		return 1;
+	}
+
+	/* a second signing key, of another curve, for the COSE_Sign */
+
+	ck = lws_cose_key_generate(cx, LWSCOSE_WKKTV_EC2,
+				   (1 << LWSCOSE_WKKO_SIGN) |
+				   (1 << LWSCOSE_WKKO_VERIFY),
+				   0, "P-384", (const uint8_t *)"p384", 4);
+	if (!ck) {
+		lwsl_err("%s: P-384 keygen fail\n", __func__);
+		goto bail;
+	}
+	lws_dll2_add_tail(&ck->list, &set);
+
+	keys[0] = lws_cose_key_from_set(&set, (const uint8_t *)"11", 2);
+	keys[1] = ck;
+	hkey[0] = lws_cose_key_from_set(&set, (const uint8_t *)"our-secret",
+					10);
+	if (!keys[0] || !hkey[0])
+		goto bail;
+
+	for (room = 1; room <= 80; room++) {
+		size_t seg = segs[room % LWS_ARRAY_SIZE(segs)];
+
+		/* COSE_Sign1, ES256 */
+
+		algs[0] = LWSCOSE_WKAECDSA_ALG_ES256;
+		if (sign_streamed(cx, &set, SIGTYPE_SINGLE, algs, keys, 1,
+				  pay, sizeof(pay), seg, room, obj,
+				  sizeof(obj), &ol)) {
+			lwsl_err("%s: sign1 room %d fail\n", __func__,
+				 (int)room);
+			goto bail;
+		}
+
+		memset(&pc, 0, sizeof(pc));
+		pc.ref = pay;
+		pc.len = sizeof(pay);
+		if (validate_all_pass(cx, &set, SIGTYPE_SINGLE, obj, ol, 1,
+				      &pc)) {
+			lwsl_err("%s: sign1 room %d invalid\n", __func__,
+				 (int)room);
+			goto bail;
+		}
+
+		/* COSE_Mac0, HMAC 256/256 */
+
+		algs[0] = LWSCOSE_WKAHMAC_256_256;
+		if (sign_streamed(cx, &set, SIGTYPE_MAC0, algs, hkey, 1,
+				  pay, sizeof(pay), seg, room, obj,
+				  sizeof(obj), &ol)) {
+			lwsl_err("%s: mac0 room %d fail\n", __func__,
+				 (int)room);
+			goto bail;
+		}
+
+		memset(&pc, 0, sizeof(pc));
+		pc.ref = pay;
+		pc.len = sizeof(pay);
+		if (validate_all_pass(cx, &set, SIGTYPE_MAC0, obj, ol, 1,
+				      &pc)) {
+			lwsl_err("%s: mac0 room %d invalid\n", __func__,
+				 (int)room);
+			goto bail;
+		}
+
+		/* COSE_Sign, ES256 + ES384 */
+
+		algs[0] = LWSCOSE_WKAECDSA_ALG_ES256;
+		algs[1] = LWSCOSE_WKAECDSA_ALG_ES384;
+		if (sign_streamed(cx, &set, SIGTYPE_MULTI, algs, keys, 2,
+				  pay, sizeof(pay), seg, room, obj,
+				  sizeof(obj), &ol)) {
+			lwsl_err("%s: sign room %d fail\n", __func__,
+				 (int)room);
+			goto bail;
+		}
+
+		memset(&pc, 0, sizeof(pc));
+		pc.ref = pay;
+		pc.len = sizeof(pay);
+		if (validate_all_pass(cx, &set, SIGTYPE_MULTI, obj, ol, 2,
+				      &pc)) {
+			lwsl_err("%s: sign room %d invalid\n", __func__,
+				 (int)room);
+			goto bail;
+		}
+	}
+
+	ret = 0;
+
+bail:
+	lws_cose_key_set_destroy(&set);
+
+	return ret;
+}
+
+/*
+ * An RSA key with only its public elements cannot sign: that must be an
+ * error from the signing api, never an object carrying an empty signature
+ */
+
+static int
+test_cose_sign_rsa_public_only(struct lws_context *cx)
+{
+	struct lws_cose_sign_context *csc;
+	lws_cose_sign_create_info_t i;
+	static const uint8_t pay[] = "payload";
+	enum lws_lec_pctx_ret r;
+	lws_cose_key_t *ck;
+	lws_dll2_owner_t set;
+	uint8_t kb[600], out[800];
+	lws_lec_pctx_t lec;
+	int ret = 1;
+
+	lwsl_user("%s: sign with a public-only RSA key\n", __func__);
+
+	ck = lws_cose_key_generate(cx, LWSCOSE_WKKTV_RSA,
+				   (1 << LWSCOSE_WKKO_SIGN) |
+				   (1 << LWSCOSE_WKKO_VERIFY),
+				   2048, NULL, (const uint8_t *)"rsa", 3);
+	if (!ck) {
+		lwsl_err("%s: RSA keygen fail\n", __func__);
+		return 1;
+	}
+
+	/* export and reimport only the public elements */
+
+	lws_lec_init(&lec, kb, sizeof(kb));
+	r = lws_cose_key_export(ck, &lec, 0);
+	lws_cose_key_destroy(&ck);
+	if (r != LWS_LECPCTX_RET_FINISHED) {
+		lwsl_err("%s: RSA key export fail\n", __func__);
+		return 1;
+	}
+
+	ck = lws_cose_key_import(NULL, NULL, NULL, kb, lec.used);
+	if (!ck) {
+		lwsl_err("%s: RSA public key import fail\n", __func__);
+		return 1;
+	}
+
+	lws_dll2_owner_clear(&set);
+	lws_dll2_add_tail(&ck->list, &set);
+
+	memset(&i, 0, sizeof(i));
+	i.cx			= cx;
+	i.keyset		= &set;
+	i.lec			= &lec;
+	i.sigtype		= SIGTYPE_SINGLE;
+	i.inline_payload_len	= sizeof(pay) - 1;
+
+	lws_lec_init(&lec, out, sizeof(out));
+
+	csc = lws_cose_sign_create(&i);
+	if (!csc)
+		goto bail;
+
+	if (lws_cose_sign_add(csc, LWSCOSE_WKARSA_ALG_RS256, ck)) {
+		/* refusing the key up front is also fine */
+		ret = 0;
+		goto bail1;
+	}
+
+	do {
+		r = lws_cose_sign_payload_chunk(csc, pay, sizeof(pay) - 1);
+		lws_lec_setbuf(&lec, out, sizeof(out));
+	} while (r == LWS_LECPCTX_RET_AGAIN);
+
+	if (r == LWS_LECPCTX_RET_FAIL)
+		ret = 0;
+	else
+		lwsl_err("%s: signing with no private key succeeded\n",
+			 __func__);
+
+bail1:
+	lws_cose_sign_destroy(&csc);
+bail:
+	lws_cose_key_set_destroy(&set);
+
+	return ret;
+}
+
 
 
 int
@@ -678,6 +1211,7 @@ test_cose_sign(struct lws_context *context)
 	int n;
 
 	memset(&info, 0, sizeof(info));
+
 	info.cx = context;
 	info.keyset = &set;
 
@@ -720,10 +1254,10 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1)
+	if (lws_dll2_count(o) != 1)
 		goto bail1;
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (res->result)
 		goto bail1;
 
@@ -753,11 +1287,51 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1)
+	if (lws_dll2_count(o) != 1)
 		goto bail1;
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (!res->result)
+		goto bail1;
+
+	lws_cose_validate_destroy(&cps);
+	lws_cose_key_set_destroy(&set);
+
+	/*
+	 * valid sign1 whose kid is in no key of the keyset, so it can't be
+	 * matched to an alg: this must produce the -1001 result, not crash
+	 * at payload or signature time with an empty alg list (F-032)
+	 */
+
+	lwsl_user("%s: sign1/sign-pass-01 - kid mismatch\n", __func__);
+
+	lws_dll2_owner_clear(&set);
+	if (!lws_cose_key_import(&set, NULL, NULL, keyset1.set, keyset1.len)) {
+		lwsl_notice("%s: key import fail\n", __func__);
+		return 1;
+	}
+
+	info.sigtype = SIGTYPE_SINGLE;
+	cps = lws_cose_validate_create(&info);
+	if (!cps) {
+		lwsl_notice("%s: sign_val_create fail\n", __func__);
+		goto bail;
+	}
+
+	n = lws_cose_validate_chunk(cps, sign1_kid_mismatch_01,
+				    sizeof(sign1_kid_mismatch_01), NULL);
+	if (n) {
+		lwsl_notice("%s: sign_val_chunk failed\n", __func__);
+		goto bail1;
+	}
+
+	o = lws_cose_validate_results(cps);
+	if (lws_dll2_count(o) != 1)
+		goto bail1;
+
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
+	if (res->result != -1001)
+		/* must be the no-key result, not a pass */
 		goto bail1;
 
 	lws_cose_validate_destroy(&cps);
@@ -792,10 +1366,10 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1)
+	if (lws_dll2_count(o) != 1)
 		goto bail1;
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (res->result)
 		goto bail1;
 
@@ -831,10 +1405,10 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1)
+	if (lws_dll2_count(o) != 1)
 		goto bail1;
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (res->result)
 		goto bail1;
 
@@ -897,10 +1471,10 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1)
+	if (lws_dll2_count(o) != 1)
 		goto bail1;
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (!res->result)
 		/* validation result must be fail */
 		goto bail1;
@@ -935,10 +1509,10 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1)
+	if (lws_dll2_count(o) != 1)
 		goto bail1;
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (!res->result)
 		/* validation result must be fail */
 		goto bail1;
@@ -973,10 +1547,10 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1)
+	if (lws_dll2_count(o) != 1)
 		goto bail1;
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (!res->result)
 		/* validation result must be fail */
 		goto bail1;
@@ -1011,10 +1585,10 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1)
+	if (lws_dll2_count(o) != 1)
 		goto bail1;
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (!res->result)
 		/* validation result must be fail */
 		goto bail1;
@@ -1049,10 +1623,10 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1)
+	if (lws_dll2_count(o) != 1)
 		goto bail1;
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (!res->result)
 		/* validation result must be fail */
 		goto bail1;
@@ -1087,12 +1661,12 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_notice("%s: results: %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_notice("%s: results: %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (res->result)
 		goto bail1;
 
@@ -1128,12 +1702,12 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_notice("%s: results: %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_notice("%s: results: %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (res->result)
 		goto bail1;
 
@@ -1169,12 +1743,12 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_notice("%s: results: %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_notice("%s: results: %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (res->result)
 		goto bail1;
 
@@ -1237,12 +1811,12 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_notice("%s: results: %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_notice("%s: results: %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (!res->result)
 		goto bail1;
 
@@ -1276,8 +1850,8 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_notice("%s: results: %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_notice("%s: results: %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
@@ -1311,8 +1885,8 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_notice("%s: results: %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_notice("%s: results: %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
@@ -1346,12 +1920,12 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_notice("%s: results: %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_notice("%s: results: %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (!res->result)
 		goto bail1;
 
@@ -1385,12 +1959,12 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_notice("%s: results: %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_notice("%s: results: %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (!res->result)
 		goto bail1;
 
@@ -1425,12 +1999,12 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_err("%s: count %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_err("%s: count %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (res->result) {
 		lwsl_err("%s: result is fail\n", __func__);
 		goto bail1;
@@ -1466,12 +2040,12 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_err("%s: count %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_err("%s: count %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (res->result) {
 		lwsl_err("%s: result is fail\n", __func__);
 		goto bail1;
@@ -1508,12 +2082,12 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_err("%s: count %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_err("%s: count %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (res->result) {
 		lwsl_err("%s: result is fail\n", __func__);
 		goto bail1;
@@ -1549,12 +2123,12 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_err("%s: count %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_err("%s: count %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (!res->result) {
 		lwsl_err("%s: result is wrongly succeeding\n", __func__);
 		goto bail1;
@@ -1590,12 +2164,12 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_err("%s: count %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_err("%s: count %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (res->result) {
 		lwsl_err("%s: result is fail\n", __func__);
 		goto bail1;
@@ -1631,12 +2205,12 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_err("%s: count %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_err("%s: count %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (res->result) {
 		lwsl_err("%s: result is fail\n", __func__);
 		goto bail1;
@@ -1672,12 +2246,12 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_err("%s: count %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_err("%s: count %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (res->result) {
 		lwsl_err("%s: result is fail\n", __func__);
 		goto bail1;
@@ -1713,12 +2287,12 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_err("%s: count %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_err("%s: count %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (res->result) {
 		lwsl_err("%s: result is fail\n", __func__);
 		goto bail1;
@@ -1754,12 +2328,12 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_err("%s: count %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_err("%s: count %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (!res->result) {
 		lwsl_err("%s: result wrongly succeeds\n", __func__);
 		goto bail1;
@@ -1795,12 +2369,12 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_err("%s: count %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_err("%s: count %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (res->result) {
 		lwsl_err("%s: result is fail\n", __func__);
 		goto bail1;
@@ -1808,6 +2382,16 @@ test_cose_sign(struct lws_context *context)
 
 	lws_cose_validate_destroy(&cps);
 	lws_cose_key_set_destroy(&set);
+
+	if (test_cose_nested_unprotected(context))
+		return 1;
+
+	if (test_cose_sign_streamed(context))
+		return 1;
+
+	if (test_cose_sign_rsa_public_only(context))
+		return 1;
+
 #if 0
 	/*
 	 * valid Ed25519 signature with countersignature from same key + alg
@@ -1836,12 +2420,12 @@ test_cose_sign(struct lws_context *context)
 	}
 
 	o = lws_cose_validate_results(cps);
-	if (o->count != 1) {
-		lwsl_err("%s: result count %d\n", __func__, o->count);
+	if (lws_dll2_count(o) != 1) {
+		lwsl_err("%s: result count %d\n", __func__, lws_dll2_count(o));
 		goto bail1;
 	}
 
-	res = lws_container_of(o->head, lws_cose_validate_res_t, list);
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
 	if (res->result) {
 		lwsl_err("%s: result is fail\n", __func__);
 		goto bail1;
@@ -1857,6 +2441,239 @@ bail1:
 	lws_cose_validate_destroy(&cps);
 bail:
 	lws_cose_key_set_destroy(&set);
+
+	return 1;
+}
+
+/*
+ * EdDSA end-to-end: F-033 found EdDSA COSE crashed in key checks on both
+ * sign and validate, so it had plausibly never worked.  These sign a sign1
+ * with EdDSA and validate the result, for both a freshly-generated key and
+ * an imported OKP key that arrives with an int curve (cose_key10, kid "11").
+ */
+
+static const uint8_t eddsa_payload[] = "This is the content.";
+
+static int
+eddsa_sign1(struct lws_context *cx, lws_dll2_owner_t *set,
+	    const lws_cose_key_t *ck, uint8_t *out, size_t out_len,
+	    size_t *out_total)
+{
+	lws_cose_sign_create_info_t i;
+	struct lws_cose_sign_context *csc;
+	lws_lec_pctx_t lec;
+	size_t tot = 0;
+	enum lws_lec_pctx_ret n = LWS_LECPCTX_RET_FINISHED;
+
+	memset(&i, 0, sizeof(i));
+	i.cx			= cx;
+	i.keyset		= set;
+	i.lec			= &lec;
+	i.sigtype		= SIGTYPE_SINGLE;
+	i.inline_payload_len	= sizeof(eddsa_payload) - 1;
+	i.flags			= LCSC_FL_ADD_CBOR_TAG;
+
+	lws_lec_init(&lec, out, out_len);
+
+	csc = lws_cose_sign_create(&i);
+	if (!csc)
+		return 1;
+
+	if (lws_cose_sign_add(csc, LWSCOSE_WKAEDDSA_ALG_EDDSA, ck)) {
+		lws_cose_sign_destroy(&csc);
+		return 1;
+	}
+
+	do {
+		n = lws_cose_sign_payload_chunk(csc, eddsa_payload,
+						 i.inline_payload_len);
+		if (n == LWS_LECPCTX_RET_FAIL)
+			goto bail;
+
+		if (!lec.used)
+			continue;
+
+		tot += lec.used;
+		if (tot >= out_len && n == LWS_LECPCTX_RET_AGAIN)
+			/* no room left for the rest of it */
+			goto bail;
+
+		lws_lec_setbuf(&lec, out + tot, out_len - tot);
+
+	} while (n == LWS_LECPCTX_RET_AGAIN);
+
+	lws_cose_sign_destroy(&csc);
+
+	*out_total = tot;
+
+	return 0;
+
+bail:
+	lws_cose_sign_destroy(&csc);
+
+	return 1;
+}
+
+/*
+ * Validates the sign1 in against keyset... non-zero return means the
+ * result was not what want_fail asks for (0: signature must validate,
+ * 1: validation of the object must fail)
+ */
+
+static int
+eddsa_validate(struct lws_context *cx, lws_dll2_owner_t *set,
+	       const uint8_t *in, size_t in_len, int want_fail)
+{
+	lws_cose_validate_create_info_t info;
+	struct lws_cose_validate_context *cps;
+	lws_cose_validate_res_t *res;
+	lws_dll2_owner_t *o;
+	int n = 1;
+
+	memset(&info, 0, sizeof(info));
+	info.cx		= cx;
+	info.keyset	= set;
+	info.sigtype	= SIGTYPE_SINGLE;
+
+	cps = lws_cose_validate_create(&info);
+	if (!cps)
+		return 1;
+
+	if (lws_cose_validate_chunk(cps, in, in_len, NULL))
+		goto bail;
+
+	o = lws_cose_validate_results(cps);
+	if (lws_dll2_count(o) != 1)
+		goto bail;
+
+	res = lws_container_of(lws_dll2_get_head(o), lws_cose_validate_res_t, list);
+
+	/* non-zero result is a validation failure */
+
+	n = res->result ? 1 : 0;
+	if (want_fail)
+		n = !n;
+
+bail:
+	lws_cose_validate_destroy(&cps);
+
+	return n;
+}
+
+static int
+eddsa_sign1_ok(struct lws_context *cx, lws_dll2_owner_t *set,
+	       const lws_cose_key_t *ck)
+{
+	uint8_t out[512];
+	size_t ol;
+
+	if (eddsa_sign1(cx, set, ck, out, sizeof(out), &ol)) {
+		lwsl_err("%s: EdDSA sign1 fail\n", __func__);
+		return 1;
+	}
+
+	/* we need at least the trailing signature byte to tamper with */
+
+	if (!ol || ol > sizeof(out))
+		return 1;
+
+	if (eddsa_validate(cx, set, out, ol, 0)) {
+		lwsl_err("%s: EdDSA sign1 does not validate\n", __func__);
+		return 1;
+	}
+
+	/* a tampered trailing signature byte must fail validation */
+
+	out[ol - 1] ^= 0x80;
+	if (eddsa_validate(cx, set, out, ol, 1)) {
+		lwsl_err("%s: tampered EdDSA sign1 wrongly validated\n",
+				__func__);
+		return 1;
+	}
+
+	return 0;
+}
+
+int
+test_cose_sign_eddsa(struct lws_context *context)
+{
+	lws_cose_key_t *ck;
+	lws_dll2_owner_t set;
+	cose_param_t alg;
+
+	/*
+	 * Some TLS backends, eg GnuTLS, do not implement EdDSA at all...
+	 * detect it via the public api and skip this part cleanly
+	 */
+
+	{
+		struct lws_genec_ctx probe;
+		memset(&probe, 0, sizeof(probe));
+
+		if (lws_geneddsa_create(&probe, context, NULL)) {
+			lwsl_notice("%s: no EdDSA backend support, skipping "
+				    "EdDSA sign tests\n", __func__);
+			return 0;
+		}
+
+		lws_genec_destroy(&probe);
+	}
+
+	/* the alg name lookup has to be able to find EdDSA */
+
+	alg = lws_cose_name_to_alg("EdDSA");
+	if (alg != LWSCOSE_WKAEDDSA_ALG_EDDSA) {
+		lwsl_err("%s: EdDSA alg name lookup fail\n", __func__);
+		return 1;
+	}
+
+	/*
+	 * Sign and validate with a freshly-generated Ed25519 key
+	 */
+
+	lwsl_user("%s: eddsa/sign1 generated key\n", __func__);
+
+	ck = lws_cose_key_generate(context, LWSCOSE_WKKTV_OKP,
+				   (1 << LWSCOSE_WKKO_SIGN) |
+				   (1 << LWSCOSE_WKKO_VERIFY),
+				   0, "Ed25519", (const uint8_t *)"ed-keyid", 8);
+	if (!ck) {
+		lwsl_err("%s: OKP Ed25519 keygen fail\n", __func__);
+		return 1;
+	}
+
+	lws_dll2_owner_clear(&set);
+	lws_dll2_add_tail(&ck->list, &set);
+
+	if (eddsa_sign1_ok(context, &set, ck))
+		goto bail;
+
+	lws_cose_key_set_destroy(&set);
+
+	/*
+	 * Sign and validate with an imported OKP key using an int curve
+	 */
+
+	lwsl_user("%s: eddsa/sign1 imported int-crv key\n", __func__);
+
+	lws_dll2_owner_clear(&set);
+	ck = lws_cose_key_import(&set, NULL, NULL, key10.set, key10.len);
+	if (!ck) {
+		lwsl_err("%s: key10 import fail\n", __func__);
+		return 1;
+	}
+
+	if (eddsa_sign1_ok(context, &set, ck))
+		goto bail;
+
+	lws_cose_key_set_destroy(&set);
+
+	return 0;
+
+bail:
+	lws_cose_key_set_destroy(&set);
+
+	lwsl_err("%s: selftest failed ++++++++++++++++++++\n", __func__);
 
 	return 1;
 }

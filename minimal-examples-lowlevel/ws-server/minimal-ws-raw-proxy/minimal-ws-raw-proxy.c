@@ -165,7 +165,7 @@ callback_proxy_ws_server(struct lws *wsi, enum lws_callback_reasons reason,
 		 * Onward conn still alive...
 		 * does he have stuff left to deliver?
 		 */
-		if (pc->pending_msg_to_raw.count) {
+		if (lws_dll2_count(&pc->pending_msg_to_raw)) {
 			/*
 			 * Yes, let him get on with trying to send
 			 * the remaining pieces... but put a time limit
@@ -187,10 +187,10 @@ callback_proxy_ws_server(struct lws *wsi, enum lws_callback_reasons reason,
 		break;
 
 	case LWS_CALLBACK_SERVER_WRITEABLE:
-		if (!pc || !pc->pending_msg_to_ws.count)
+		if (!pc || !lws_dll2_count(&pc->pending_msg_to_ws))
 			break;
 
-		msg = lws_container_of(pc->pending_msg_to_ws.head,
+		msg = lws_container_of(lws_dll2_get_head(&pc->pending_msg_to_ws),
 				       proxy_msg_t, list);
 		data = (uint8_t *)&msg[1] + LWS_PRE;
 
@@ -208,7 +208,7 @@ callback_proxy_ws_server(struct lws *wsi, enum lws_callback_reasons reason,
 		/*
 		 * If more to do...
 		 */
-		if (pc->pending_msg_to_ws.count)
+		if (lws_dll2_count(&pc->pending_msg_to_ws))
 			lws_callback_on_writable(wsi);
 		break;
 
@@ -299,7 +299,7 @@ callback_proxy_raw_client(struct lws *wsi, enum lws_callback_reasons reason,
 		 * Original ws conn still alive...
 		 * does he have stuff left to deliver?
 		 */
-		if (pc->pending_msg_to_ws.count) {
+		if (lws_dll2_count(&pc->pending_msg_to_ws)) {
 			/*
 			 * Yes, let him get on with trying to send
 			 * the remaining pieces... but put a time limit
@@ -347,10 +347,10 @@ callback_proxy_raw_client(struct lws *wsi, enum lws_callback_reasons reason,
 
 	case LWS_CALLBACK_RAW_WRITEABLE:
 		lwsl_user("LWS_CALLBACK_RAW_WRITEABLE\n");
-		if (!pc || !pc->pending_msg_to_raw.count)
+		if (!pc || !lws_dll2_count(&pc->pending_msg_to_raw))
 			break;
 
-		msg = lws_container_of(pc->pending_msg_to_raw.head,
+		msg = lws_container_of(lws_dll2_get_head(&pc->pending_msg_to_raw),
 				       proxy_msg_t, list);
 		data = (uint8_t *)&msg[1] + LWS_PRE;
 
@@ -368,7 +368,7 @@ callback_proxy_raw_client(struct lws *wsi, enum lws_callback_reasons reason,
 		/*
 		 * If more to do...
 		 */
-		if (pc->pending_msg_to_raw.count)
+		if (lws_dll2_count(&pc->pending_msg_to_raw))
 			lws_callback_on_writable(wsi);
 		break;
 	default:
@@ -390,7 +390,7 @@ static const lws_retry_bo_t retry = {
 	.secs_since_valid_hangup = 10,
 };
 
-static int interrupted;
+static struct lws_context *context;
 
 static const struct lws_http_mount mount = {
 	.mountpoint		= "/",			/* mountpoint URL */
@@ -402,21 +402,13 @@ static const struct lws_http_mount mount = {
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	struct lws_context *context;
-	const char *p;
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE
-			/* for LLL_ verbosity above NOTICE to be built into lws,
-			 * lws must have been configured and built with
-			 * -DCMAKE_BUILD_TYPE=DEBUG instead of =RELEASE */
-			/* | LLL_INFO */ /* | LLL_PARSER */ /* | LLL_HEADER */
-			/* | LLL_EXT */ /* | LLL_CLIENT */ /* | LLL_LATENCY */
-			/* | LLL_DEBUG */;
+	int n = 0;
 	(void)switches;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
@@ -427,13 +419,13 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal ws-raw proxy | visit http://localhost:7681 (-s = use TLS / https)\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	/* a server: size the fds tables to the process limit */
+	info.fd_limit_per_thread = 0;
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.port = 7681;
 	info.mounts = &mount;
 	info.protocols = protocols;
@@ -462,7 +454,7 @@ int main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

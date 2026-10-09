@@ -1,0 +1,3308 @@
+/*
+ * lws-api-test-http-transfer
+ *
+ * Written in 2010-2026 by Andy Green <andy@warmcat.com>
+ *
+ * This file is made available under the Creative Commons CC0 1.0
+ * Universal Public Domain Dedication.
+ *
+ * Exercises the http body transfer framings lws is expected to handle, in
+ * both directions, with an lws server and an lws client in one context.
+ *
+ * Request bodies (client -> server) on h1:
+ *
+ *  - Content-Length, in one write and in many
+ *  - Transfer-Encoding: chunked, chunks of assorted sizes, in one write, in
+ *    many, and with the framing itself split across writes
+ *  - chunked with chunk extensions and trailer fields
+ *  - chunked on a GET, where the server answers before the body has been
+ *    read, followed by a pipelined request on the same connection
+ *  - a Content-Length POST with a GET pipelined behind it in the same write,
+ *    answered some time after its body completed: the body must complete
+ *    once, and the GET wait parked for the answer without keeping the event
+ *    loop busy, then be served (direct, and through the http proxy mount);
+ *    and two GETs the same way to a callback mount naming its protocol as
+ *    its origin, where the second must be dispatched as itself, once, and
+ *    to a mount with a body limit, where the first, bodyless, must not
+ *    take the second as its body; and the two GETs to the callback mount
+ *    with the second sent in its own write while the first is awaited,
+ *    which must equally wait parked and then be served
+ *  - a GET whose one-shot answer is larger than the socket buffers, from a
+ *    raw client that does not read it for a while, so the server completes
+ *    the transaction with most of the answer still queued: the client's
+ *    next GET, sent in its own write meanwhile, must not have the server
+ *    spin on its readable socket while the answer waits to drain, and must
+ *    be answered once it has
+ *  - refusals: an unsupported Transfer-Encoding (501), Transfer-Encoding
+ *    together with Content-Length (400), a chunked body over the mount's
+ *    body limit (connection dropped), a Content-Length over it (413)
+ *  - Expect: 100-continue on Content-Length and chunked bodies (the server
+ *    sends the interim 100, the client swallows it), an over-limit body
+ *    refused instead of continued, an unknown expectation (417)
+ *
+ * Request bodies on h2 (cleartext, prior knowledge): Content-Length, no
+ * Content-Length (END_STREAM delimited), and no body at all.  On h3, one
+ * whose DATA goes beyond its Content-Length is refused as malformed.
+ *
+ * Response bodies (server -> client): Content-Length; hand-framed chunked
+ * with extensions and trailers, also with a Content-Length it overrides;
+ * unknown length (h1: delimited by the close, h2: by END_STREAM)... each
+ * also split across many writes.
+ *
+ * Mount interceptors (LWS_WITH_JOSE): a mount with an interceptor_path hands
+ * every request to the interceptor protocol first, which either lets it
+ * through to the mount or takes it over.  That decision must be identical
+ * for every method and every role -- a POST that the interceptor blocks must
+ * not reach the app on h2 any more than it does on h1, and a blocked
+ * body-bearing request must leave the h1 connection resynchronized (the body
+ * is discarded) rather than desynced.  The gated legs check both outcomes,
+ * for GET and for POST, over h1 and h2.
+ *
+ * A 302 from the server must be followed by the client on the same wsi:
+ * the wsi is retargeted, its connection torn down without the user hearing
+ * about it, and the request reissued on a fresh connection.  Checked over
+ * h1 and from an h2 stream.  The reissued request is still the user's: one
+ * that did not ask to pipeline still says "connection: close", and a
+ * multipart POST sent again after a 307 starts again at its first boundary.
+ *
+ * A client connection kept warm is joined by the next request to the same
+ * place, unless its own request said "connection: close": a pipelining
+ * request made as that one completes, before the client has heard the
+ * server close it, must open its own connection.
+ *
+ * A redirect may not take the client into the unix socket namespace: only
+ * the app can name a unix socket ("+path") to connect to.  The server
+ * redirects to its own unix socket vhost, which would answer the request;
+ * the client must refuse to follow it, over h1 and from an h2 stream.
+ *
+ * The server echoes what it decoded: a summary line "len=<n> sum=<x>\n"
+ * followed by n bytes of the same deterministic pattern the client sent,
+ * so the client can confirm the server saw exactly the payload it sent, and
+ * that it received exactly what the server sent.
+ *
+ * The http proxy mount relays the same server's responses, to h1 in the
+ * clear and, on a tls vhost set up the way lwsws does it, to h2 and h3; the
+ * relay's body-less FINAL at the end of the onward response must end a
+ * stream that is still open, and be nothing on one a Content-Length already
+ * ended.  On h1 a response the relay frames as chunked is ended by its own
+ * last-chunk, the second one on a kept-alive connection as much as the first.
+ * A request body the proxy has no length for (h1 chunked, h2 without
+ * content-length) goes onward chunked and must arrive whole; a POST with no
+ * body goes onward saying Content-Length: 0; an h3 body with no length,
+ * which the proxy could not end onward, is refused.  Every request the proxy
+ * sends on carries its X-Forwarded-For, alongside a Cookie it forwards for
+ * the client intact.  A server response that is chunked and also says
+ * Content-Length is relayed by its chunks, without that Content-Length.
+ *
+ * On an h3 stream, a response write lws took whole is in quic's hands: it
+ * must not be reported back to the app as a partial or a choked pipe just
+ * because quic has not sent it, or had it acked, yet.  That gated a writer to
+ * one write per round trip, and a lossy long-rtt path stalled it for good.
+ *
+ * A file mount serves only what it has a mimetype for: a file with an
+ * extension neither the mount nor the server knows is refused with 415, over
+ * h1 and h2, rather than sent as application/octet-stream.
+ *
+ * The test fails if any case does not complete as expected inside the
+ * watchdog period.
+ */
+
+#include <libwebsockets.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <signal.h>
+#if defined(LWS_WITH_UNIX_SOCK) && !defined(WIN32)
+#include <unistd.h>
+#endif
+
+#define CASE_TIMEOUT_S	30
+
+/*
+ * The "later" requests are answered this long after they were dispatched,
+ * or after their body completed if they have one.  A
+ * connection waiting for that answer with a pipelined request parked must
+ * not keep the event loop busy meanwhile: the case fails if the loop turned
+ * more than RAW3_MAX_TURNS times in the wait.  Waiting properly takes a
+ * handful of turns, or up to a thousand or so when the loop polls without
+ * waiting through the last millisecond before the answer's timer; spinning
+ * for the whole wait takes a hundred thousand.
+ */
+#define RAW3_LATER_MS	500
+#define RAW3_MAX_TURNS	10000
+
+/* how the client frames the request body */
+
+enum xf_req {
+	XR_NONE,	/* no body, no framing headers */
+	XR_NOLEN,	/* POST with neither Content-Length nor Transfer-Encoding */
+	XR_CL,		/* Content-Length */
+	XR_BODY_NOHDR,	/* body but no framing header (h2: END_STREAM delimits) */
+	XR_CHUNKED,	/* Transfer-Encoding: chunked */
+	XR_CHUNKED_EXT,	/* chunked with chunk extensions and trailer fields */
+	XR_TE_BAD,	/* Transfer-Encoding: gzip, no body */
+	XR_TE_AND_CL,	/* Transfer-Encoding: chunked with a Content-Length */
+	XR_MULTIPART,	/* one multipart/form-data part the client makes with
+			 * lws_client_http_multipart(), sent chunked */
+};
+
+/* what the mount interceptor is expected to do with the request */
+
+enum xf_gate {
+	XG_NONE,	/* the case does not involve an interceptor */
+	XG_BLOCK,	/* the interceptor must take the request: the app
+			 * protocol must see no request and no body at all */
+	XG_PASS,	/* the interceptor must let it through to the app */
+};
+
+struct xcase {
+	const char	*name;
+	const char	*method;
+	const char	*path;
+	enum xf_req	req;
+	size_t		body_len;	/* payload bytes actually sent */
+	size_t		claim_len;	/* Content-Length header value if != body_len */
+	size_t		write_sz;	/* bytes per client write, framing included */
+	int		h2;		/* 1: h2 prior knowledge, 2: h3 over quic */
+	int		pipeline;	/* issue two pipelined requests */
+	int		expect_status;	/* 0: expect no completed 200 response,
+					 * -1: expect no response at all, the
+					 * request refused as malformed */
+	long		expect_server_rx; /* -1: don't check; else payload bytes the server saw */
+	enum xf_gate	gate;
+	int		expect;		/* 1: Expect: 100-continue, 2: Expect: nope */
+	int		via_proxy;	/* through the http proxy mount to srv-h1:
+					 * h1 to srv-proxy, h2 and h3 to the tls
+					 * srv-proxy-tls */
+	int		reuse;		/* 1: the second request goes 150ms after
+					 * the first completed, on the kept-warm
+					 * connection; 2: it goes 1500ms later,
+					 * after the connection idled out (1s);
+					 * 3: the first does not pipeline, and
+					 * the second goes from the first's
+					 * completion, and must not ride the
+					 * connection the first said to close */
+	int		raw;		/* 1: a raw client does an Upgrade: h2c
+					 * and reads stream 1's response as h2
+					 * frames; 2: a raw client sends two h1
+					 * requests in one write and reads the
+					 * chunked responses; 3: a raw client
+					 * sends a POST with its Content-Length
+					 * body and a GET in one write, and
+					 * reads the two responses; 4: the
+					 * same with two GETs; 5: a raw client
+					 * GETs a one-shot answer larger than
+					 * the socket buffers, sends another
+					 * GET in its own write while not
+					 * reading it, and reads both later;
+					 * 6: as 4, but the second GET goes
+					 * in its own write 100ms after the
+					 * first, while it is awaited */
+	int		conn_close;	/* every request the server sees must
+					 * say "connection: close" */
+};
+
+static const struct xcase cases[] = {
+	{ "h1 POST Content-Length 100KB, 8KB writes, CL response",
+	  "POST", "/echo-cl", XR_CL, 100000, 0, 8192, 0, 0, 200, 100000, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h1 POST 600KB, response in one write completed at once (deferred "
+	  "completion), second request pipelined on the same connection",
+	  "POST", "/echo-oneshot", XR_CL, 600000, 0, 65536, 0, 1, 200,
+	  -1, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h1 POST Content-Length 5KB, one write, chunked response",
+	  "POST", "/echo-chunked", XR_CL, 5000, 0, 8192, 0, 0, 200, 5000, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h1 POST Content-Length 30KB, 4KB writes, close-delimited response",
+	  "POST", "/echo-nolen", XR_CL, 30000, 0, 4096, 0, 0, 200, 30000, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h1 POST Content-Length 60KB, chunked response in many chunks",
+	  "POST", "/echo-chunked", XR_CL, 60000, 0, 8192, 0, 0, 200, 60000, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h1 POST chunked 100KB, 8KB writes, CL response",
+	  "POST", "/echo-cl", XR_CHUNKED, 100000, 0, 8192, 0, 0, 200, 100000, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h1 POST chunked 5KB, one write, chunked response",
+	  "POST", "/echo-chunked", XR_CHUNKED, 5000, 0, 8192, 0, 0, 200, 5000, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h1 POST chunked 300B, framing split into 3-byte writes",
+	  "POST", "/echo-cl", XR_CHUNKED, 300, 0, 3, 0, 0, 200, 300, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h1 POST chunked 2KB with extensions and trailers, 7-byte writes",
+	  "POST", "/echo-cl", XR_CHUNKED_EXT, 2000, 0, 7, 0, 0, 200, 2000, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h1 POST chunked 5KB, 1KB writes, close-delimited response",
+	  "POST", "/echo-nolen", XR_CHUNKED, 5000, 0, 1000, 0, 0, 200, 5000, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h1 POST chunked 3KB, two requests pipelined on one connection",
+	  "POST", "/echo-cl", XR_CHUNKED, 3000, 0, 8192, 0, 1, 200, -1, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h1 GET with a chunked body, two requests pipelined on one connection",
+	  "GET", "/echo-cl", XR_CHUNKED, 1000, 0, 8192, 0, 1, 200, -1, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h1 GET with a Content-Length body, two requests pipelined",
+	  "GET", "/echo-cl", XR_CL, 1000, 0, 8192, 0, 1, 200, -1, XG_NONE, 0, 0, 0, 0, 0 },
+	/*
+	 * A POST whose Content-Length body is followed, in the same write,
+	 * by the next request on the connection.  The app answers the POST
+	 * some time after its body completed ("later": from a timer, then its
+	 * writeable): meanwhile the GET must wait parked, not be offered back
+	 * to the connection every loop turn, and the body must complete
+	 * exactly once.  Then the GET is served on the same connection.
+	 */
+	{ "h1 POST Content-Length 100B and a GET pipelined in the same write, "
+	  "answered some time after the body",
+	  "POST", "/echo-cl-later", XR_CL, 100, 0, 8192, 0, 0, 200, 100, XG_NONE,
+	  0, 0, 0, 3, 0 },
+	/*
+	 * The same with two GETs to /cb, a callback mount that names its
+	 * protocol as its origin: the first is answered some time later, and
+	 * the second must wait parked for that, then be dispatched as itself,
+	 * not have the first dispatched again in its place
+	 */
+	{ "h1 GET answered some time later and a GET pipelined in the same "
+	  "write, to a callback mount",
+	  "GET", "/cb/echo-cl-later", XR_NONE, 0, 0, 8192, 0, 0, 200, 0, XG_NONE,
+	  0, 0, 0, 4, 0 },
+	/*
+	 * The same, but the second GET arrives in its own tcp segment while
+	 * the first is awaited: it must wait parked for the answer just as
+	 * one that came in the first's segment does, and then be served,
+	 * rather than be taken for an unhandled state and close the connection
+	 */
+	{ "h1 GET answered some time later and a GET sent in its own write "
+	  "while it waits, to a callback mount",
+	  "GET", "/cb/echo-cl-later", XR_NONE, 0, 0, 8192, 0, 0, 200, 0, XG_NONE,
+	  0, 0, 0, 6, 0 },
+	/*
+	 * The same to /small, whose mount has a body limit: a GET with no
+	 * body still has none, not one of the limit's size, which would take
+	 * the GET behind it as its body
+	 */
+	{ "h1 GET with no body to a mount with a body limit, answered some "
+	  "time later, and a GET pipelined in the same write",
+	  "GET", "/small/echo-cl-later", XR_NONE, 0, 0, 8192, 0, 0, 200, 0,
+	  XG_NONE, 0, 0, 0, 4, 0 },
+	/*
+	 * A one-shot answer larger than the socket buffers, to a raw client
+	 * that does not read it for a while: the server completes the
+	 * transaction with most of the answer still queued (TXN_COMPLETING).
+	 * The client sends its next GET meanwhile, in its own write, so the
+	 * server's socket is readable with nothing reading it until the
+	 * answer has drained: that wait must be spent in poll(), not spinning
+	 * on the readable socket, and the GET must be answered after
+	 */
+	{ "h1 GET a one-shot answer larger than the socket buffers, a GET sent "
+	  "while it waits unread to drain",
+	  "GET", "/big-oneshot", XR_NONE, 0, 0, 8192, 0, 0, 200, 0, XG_NONE,
+	  0, 0, 0, 5, 0 },
+	/*
+	 * A chunked response that also carries a Content-Length is framed by
+	 * its chunks: the client must read the body to its last-chunk, not
+	 * take the response as ended at its headers and hand the connection,
+	 * body and all, to the second request pipelined on it
+	 */
+	{ "h1 POST 3KB, chunked response also carrying a Content-Length, two "
+	  "requests pipelined",
+	  "POST", "/echo-chunked-cl", XR_CL, 3000, 0, 8192, 0, 1, 200, -1, XG_NONE, 0, 0, 0, 0, 0 },
+	/*
+	 * No h1 "POST with neither header" case: by lws convention such a body
+	 * is delimited by the multipart closing boundary (lws_spa) or the
+	 * close, not treated as empty, so it would only wait here.  The h2
+	 * variant below is END_STREAM delimited and does complete.
+	 */
+	{ "h1 GET, no body",
+	  "GET", "/echo-cl", XR_NONE, 0, 0, 8192, 0, 0, 200, 0, XG_NONE, 0, 0, 0, 0, 0 },
+	/*
+	 * The server answers /redir-cl with a 302 to /echo-cl: the client must
+	 * follow it on the same wsi (a new connection underneath) and complete
+	 * the second request normally
+	 */
+	{ "h1 GET 302, redirect followed on the same wsi",
+	  "GET", "/redir-cl", XR_NONE, 0, 0, 8192, 0, 0, 200, 0, XG_NONE, 0, 0, 0, 0, 0 },
+	/*
+	 * The client did not ask to pipeline, so each of its requests says
+	 * "connection: close"... the one reissued to follow the 302 as much
+	 * as the first
+	 */
+	{ "h1 GET 302 without pipelining, both requests say connection: close",
+	  "GET", "/redir-cl", XR_NONE, 0, 0, 8192, 0, 0, 200, 0, XG_NONE, 0, 0,
+	  0, 0, 1 },
+#if defined(LWS_WITH_UNIX_SOCK) && !defined(WIN32)
+	/*
+	 * The server answers /redir-uds with a 302 to "http://+<path>:80/..."
+	 * naming its own unix socket vhost, which would answer it with a 200:
+	 * the client must refuse to follow a redirect to a unix socket
+	 */
+	{ "h1 GET 302 to a unix socket is refused",
+	  "GET", "/redir-uds", XR_NONE, 0, 0, 8192, 0, 0, 0, 0, XG_NONE, 0, 0,
+	  0, 0, 0 },
+#endif
+	/*
+	 * The server takes the whole multipart body of /redir307-cl, then
+	 * answers 307 to /echo-cl: the client must send the body again, from
+	 * its first boundary, not from where the part it sent last left off
+	 */
+	{ "h1 POST multipart 307, the body sent again from its first boundary",
+	  "POST", "/redir307-cl", XR_MULTIPART, 3000, 0, 8192, 0, 0, 200, -1,
+	  XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h1 POST Transfer-Encoding: gzip is refused with 501",
+	  "POST", "/echo-cl", XR_TE_BAD, 0, 0, 8192, 0, 0, 501, -1, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h1 POST Transfer-Encoding with Content-Length is refused with 400",
+	  "POST", "/echo-cl", XR_TE_AND_CL, 0, 5, 8192, 0, 0, 400, -1, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h1 POST chunked body over the mount limit is dropped",
+	  "POST", "/small/echo-cl", XR_CHUNKED, 200, 0, 8192, 0, 0, 0, -1, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h1 POST Content-Length over the mount limit gets 413",
+	  "POST", "/small/echo-cl", XR_CL, 0, 200, 8192, 0, 0, 413, -1, XG_NONE, 0, 0, 0, 0, 0 },
+	/*
+	 * Expect: 100-continue.  The server answers an h1.1 request it is
+	 * about to read the body of with an interim 100 Continue; the lws
+	 * client swallows any 1xx and waits for the final response (it does
+	 * not hold its body back, so the exchange is only observable in that
+	 * the transaction still completes correctly through the interim).
+	 * A request refused before its body gets the refusal instead, and any
+	 * other expectation is 417.
+	 */
+	{ "h1 POST Content-Length 20KB with Expect: 100-continue",
+	  "POST", "/echo-cl", XR_CL, 20000, 0, 4096, 0, 0, 200, 20000, XG_NONE, 1, 0, 0, 0, 0 },
+	{ "h1 POST chunked 5KB with Expect: 100-continue",
+	  "POST", "/echo-cl", XR_CHUNKED, 5000, 0, 1000, 0, 0, 200, 5000, XG_NONE, 1, 0, 0, 0, 0 },
+	{ "h1 POST chunked with Expect, two requests pipelined",
+	  "POST", "/echo-cl", XR_CHUNKED, 3000, 0, 8192, 0, 1, 200, -1, XG_NONE, 1, 0, 0, 0, 0 },
+	{ "h1 POST over the mount limit with Expect gets 413, no 100",
+	  "POST", "/small/echo-cl", XR_CL, 0, 200, 8192, 0, 0, 413, -1, XG_NONE, 1, 0, 0, 0, 0 },
+	{ "h1 POST with an unknown Expect gets 417",
+	  "POST", "/echo-cl", XR_CL, 0, 5, 8192, 0, 0, 417, -1, XG_NONE, 2, 0, 0, 0, 0 },
+#if defined(LWS_WITH_JOSE)
+	/*
+	 * Mount interceptor gating.  "/gated" is guarded by the "/bouncer"
+	 * mount's protocol, which lets a request through only if it carries
+	 * ?auth=1 and otherwise answers it itself with 403.
+	 */
+	{ "h1 GET to an interceptor-gated mount is blocked",
+	  "GET", "/gated/echo-cl", XR_NONE, 0, 0, 8192, 0, 0, 403, 0, XG_BLOCK, 0, 0, 0, 0, 0 },
+	{ "h1 GET the interceptor passes reaches the app",
+	  "GET", "/gated/echo-cl?auth=1", XR_NONE, 0, 0, 8192, 0, 0, 200, 0,
+	  XG_PASS, 0, 0, 0, 0, 0 },
+	{ "h1 POST to an interceptor-gated mount is blocked",
+	  "POST", "/gated/echo-cl", XR_CL, 4000, 0, 8192, 0, 0, 403, 0,
+	  XG_BLOCK, 0, 0, 0, 0, 0 },
+	{ "h1 POST the interceptor passes reaches the app with its body",
+	  "POST", "/gated/echo-cl?auth=1", XR_CL, 4000, 0, 8192, 0, 0, 200,
+	  4000, XG_PASS, 0, 0, 0, 0, 0 },
+	{ "h1 POST chunked to an interceptor-gated mount is blocked",
+	  "POST", "/gated/echo-cl", XR_CHUNKED, 2000, 0, 512, 0, 0, 403, 0,
+	  XG_BLOCK, 0, 0, 0, 0, 0 },
+	/*
+	 * Blocking a request whose body is still arriving must leave the h1
+	 * connection resynchronized: the body of the refused request is
+	 * discarded, so the second, pipelined request on the same connection
+	 * is parsed as a request and not as the tail of the first one's body
+	 */
+	{ "h1 POST blocked by the interceptor, second request pipelined on the "
+	  "same connection",
+	  "POST", "/gated/echo-cl", XR_CL, 4000, 0, 8192, 0, 1, 403, 0,
+	  XG_BLOCK, 0, 0, 0, 0, 0 },
+#endif
+	/*
+	 * A second request issued only after the first completed, on a
+	 * connection that offered pipelining.  On h1 the first wsi is idle in
+	 * keep-alive and, being the only one queued on it, the new request is
+	 * handed its connection on the spot (the idle leader dies).  On h2 the
+	 * new request joins the established connection as another stream.
+	 * The server byte count covers both requests, so is not checked.
+	 */
+	{ "h1 GET, then a second GET handed the idle keep-alive connection",
+	  "GET", "/echo-cl", XR_NONE, 0, 0, 8192, 0, 1, 200, 0, XG_NONE, 0, 0, 1, 0, 0 },
+	{ "h1 POST Content-Length 5KB, then a second handed the idle connection",
+	  "POST", "/echo-cl", XR_CL, 5000, 0, 8192, 0, 1, 200, -1, XG_NONE, 0, 0, 1, 0, 0 },
+	/*
+	 * The same with the keep-warm time (1s) expired before the second
+	 * request: the idle connection has been closed and the second
+	 * request must open a fresh one, the server sees two connections.
+	 */
+	{ "h1 GET, then a second GET after the kept-warm connection expired",
+	  "GET", "/echo-cl", XR_NONE, 0, 0, 8192, 0, 1, 200, 0, XG_NONE, 0, 0, 2, 0, 0 },
+	/*
+	 * A first request that did not ask to pipeline says "connection:
+	 * close", and the server closes its connection after answering it.
+	 * A second request that may pipeline, to the same place, made as the
+	 * first completes (before the client can have heard the close), must
+	 * open its own connection: queued on the first's, it is sent on a
+	 * connection already closing, and never answered.
+	 */
+	{ "h1 GET saying connection: close, then a pipelining GET made as it "
+	  "completes",
+	  "GET", "/echo-cl", XR_NONE, 0, 0, 8192, 0, 1, 200, 0, XG_NONE, 0, 0, 3, 0, 0 },
+#if defined(LWS_WITH_HTTP2)
+	{ "h2 GET, then a second GET joining the kept-warm connection",
+	  "GET", "/echo-cl", XR_NONE, 0, 0, 8192, 1, 1, 200, 0, XG_NONE, 0, 0, 1, 0, 0 },
+	{ "h2 POST Content-Length 5KB, then a second joining the connection",
+	  "POST", "/echo-cl", XR_CL, 5000, 0, 8192, 1, 1, 200, -1, XG_NONE, 0, 0, 1, 0, 0 },
+	{ "h2 GET, then a second GET after the kept-warm connection expired",
+	  "GET", "/echo-cl", XR_NONE, 0, 0, 8192, 1, 1, 200, 0, XG_NONE, 0, 0, 2, 0, 0 },
+#endif
+#if defined(LWS_ROLE_H3)
+	/*
+	 * The same over h3: the quic connection is kept warm after its last
+	 * request stream closes, the h3 control and qpack streams on it do
+	 * not count.  Connections are counted as the quic listener creates
+	 * their connection wsi, quic has no accept to count.
+	 */
+	/*
+	 * Both asked for at once, pipelining, with no h3 connection yet
+	 * (the first h3 case): the second queues on the first
+	 * while its quic handshake is still going, and is let onto it once
+	 * that has chosen h3
+	 */
+	{ "h3 GET, two requests pipelined from the start",
+	  "GET", "/echo-cl", XR_NONE, 0, 0, 8192, 2, 1, 200, 0, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h3 GET, no body",
+	  "GET", "/echo-cl", XR_NONE, 0, 0, 8192, 2, 0, 200, 0, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h3 POST Content-Length 5KB, CL response",
+	  "POST", "/echo-cl", XR_CL, 5000, 0, 8192, 2, 0, 200, 5000, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h3 GET, then a second GET joining the kept-warm connection",
+	  "GET", "/echo-cl", XR_NONE, 0, 0, 8192, 2, 1, 200, 0, XG_NONE, 0, 0, 1, 0, 0 },
+	{ "h3 GET, then a second GET after the kept-warm connection expired",
+	  "GET", "/echo-cl", XR_NONE, 0, 0, 8192, 2, 1, 200, 0, XG_NONE, 0, 0, 2, 0, 0 },
+	/*
+	 * RFC 9114 4.2: Transfer-Encoding is connection-specific, and a
+	 * request carrying one is malformed.  Let through to an onward h1 leg
+	 * it is the downgrade request-smuggling primitive, so the server must
+	 * refuse it outright, not answer it the way h1 does (501)
+	 */
+	{ "h3 POST with Transfer-Encoding is refused as malformed",
+	  "POST", "/echo-cl", XR_TE_BAD, 0, 0, 8192, 2, 0, -1, 0, XG_NONE, 0, 0, 0, 0, 0 },
+	/*
+	 * RFC 9114 4.1.2: a request whose DATA goes beyond its Content-Length
+	 * is malformed.  The 6 bytes go in one DATA frame, saying 3: the
+	 * server must refuse it, not answer the first 3 as the body and take
+	 * what follows as more body, or as another
+	 */
+	{ "h3 POST with more DATA than its Content-Length is refused",
+	  "POST", "/echo-cl", XR_CL, 6, 3, 8192, 2, 0, -1, -1, XG_NONE, 0, 0, 0, 0, 0 },
+#endif
+	/*
+	 * The server answers /nope with lws_return_http_status(404, text):
+	 * on h1 one write; on a stream HEADERS now and the body as a DATA
+	 * frame on the next writeable, regenerated from the kept code and a
+	 * bounded copy of the text
+	 */
+	{ "h1 GET /nope: 404 status page",
+	  "GET", "/nope", XR_NONE, 0, 0, 8192, 0, 0, 404, 0,
+	  XG_NONE, 0, 0, 0, 0, 0 },
+#if defined(LWS_WITH_HTTP2)
+	{ "h2 GET /nope: 404 status page in two frames",
+	  "GET", "/nope", XR_NONE, 0, 0, 8192, 1, 0, 404, 0,
+	  XG_NONE, 0, 0, 0, 0, 0 },
+	/*
+	 * The 404 is the whole answer before the body has gone: the client
+	 * takes it while still sending, and the server's reset, NO_ERROR,
+	 * stopping the rest of the body, is no failure
+	 */
+	{ "h2 POST 300KB to /nope: answered 404 while the body still goes",
+	  "POST", "/nope", XR_CL, 300000, 0, 8192, 1, 0, 404, -1,
+	  XG_NONE, 0, 0, 0, 0, 0 },
+	/*
+	 * Answered, and completed, from the body's first piece; a file
+	 * answering the body's completion; and a file answer the app gives up
+	 * on while it is still going, whose stream is reset, so it never
+	 * completes
+	 */
+	{ "h2 POST 300KB to /body-done: answered 202 from the first piece",
+	  "POST", "/body-done", XR_CL, 300000, 0, 8192, 1, 0, 202, -1,
+	  XG_NONE, 0, 0, 0, 0, 0 },
+#if defined(LWS_WITH_FILE_OPS)
+	{ "h2 POST 300KB to /file-at-end: a file answers the completion",
+	  "POST", "/file-at-end", XR_CL, 300000, 0, 8192, 1, 0, 200, -1,
+	  XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h2 GET /abandon: the app gives up on its file answer",
+	  "GET", "/abandon", XR_NONE, 0, 0, 8192, 1, 0, 0, -1,
+	  XG_NONE, 0, 0, 0, 0, 0 },
+#endif
+#endif
+#if defined(LWS_ROLE_H3)
+	{ "h3 GET /nope: 404 status page in two frames",
+	  "GET", "/nope", XR_NONE, 0, 0, 8192, 2, 0, 404, 0,
+	  XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h3 POST 300KB to /nope: answered 404 while the body still goes",
+	  "POST", "/nope", XR_CL, 300000, 0, 8192, 2, 0, 404, -1,
+	  XG_NONE, 0, 0, 0, 0, 0 },
+	/*
+	 * Answered whole and completed at once: the answer is acknowledged
+	 * while the body is still coming, which is then discarded
+	 */
+	{ "h3 POST 300KB to /early: answered and completed at once",
+	  "POST", "/early", XR_CL, 300000, 0, 8192, 2, 0, 202, -1,
+	  XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h3 POST 300KB to /body-done: answered 202 from the first piece",
+	  "POST", "/body-done", XR_CL, 300000, 0, 8192, 2, 0, 202, -1,
+	  XG_NONE, 0, 0, 0, 0, 0 },
+#if defined(LWS_WITH_FILE_OPS)
+	{ "h3 POST 300KB to /file-at-end: a file answers the completion",
+	  "POST", "/file-at-end", XR_CL, 300000, 0, 8192, 2, 0, 200, -1,
+	  XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h3 GET /abandon: the app gives up on its file answer",
+	  "GET", "/abandon", XR_NONE, 0, 0, 8192, 2, 0, 0, -1,
+	  XG_NONE, 0, 0, 0, 0, 0 },
+#endif
+#endif
+#if defined(LWS_WITH_HTTP2) && defined(LWS_WITH_FILE_OPS)
+	/*
+	 * A cleartext h1 request carrying Upgrade: h2c: the server answers
+	 * 101, takes the request as stream 1 of the new h2 connection and
+	 * serves it from a file mount, so stream 1 goes from reading its
+	 * request straight to serving a file (the only h2 stream that acts
+	 * without deferring).  A raw client speaks just enough h2 to see the
+	 * response: it sends the preface after the 101 and reads frames until
+	 * a DATA frame ends the stream.
+	 */
+	{ "h1 Upgrade: h2c, stream 1 served from a file mount",
+	  "GET", "/file/README.md", XR_NONE, 0, 0, 8192, 0, 0, 200, 0,
+	  XG_NONE, 0, 0, 0, 1, 0 },
+#endif
+#if defined(LWS_WITH_FILE_OPS)
+	/*
+	 * The file mount only serves what it has a mimetype for: main.c is
+	 * there to be opened, but .c is in neither the mount's extra
+	 * mimetypes nor the server's table, so it must be refused with 415,
+	 * not sent as application/octet-stream.
+	 */
+	{ "h1 GET a file with no mimetype on the mount: 415",
+	  "GET", "/file/main.c", XR_NONE, 0, 0, 8192, 0, 0, 415, 0,
+	  XG_NONE, 0, 0, 0, 0, 0 },
+#if defined(LWS_WITH_HTTP2)
+	{ "h2 GET a file with no mimetype on the mount: 415",
+	  "GET", "/file/main.c", XR_NONE, 0, 0, 8192, 1, 0, 415, 0,
+	  XG_NONE, 0, 0, 0, 0, 0 },
+#endif
+#endif
+#if defined(LWS_WITH_HTTP_PROXY)
+	/*
+	 * The same server behind the http proxy mount: the proxy's onward
+	 * client forwards the request (and its body from the stash it keeps
+	 * for it) and relays the response.  These pass through the proxied
+	 * client's own request-sent / body-sent transitions, which nothing
+	 * else here exercises.
+	 */
+	{ "h1 GET via the http proxy mount",
+	  "GET", "/echo-cl", XR_NONE, 0, 0, 8192, 0, 0, 200, 0, XG_NONE, 0, 1, 0, 0, 0 },
+	{ "h1 POST Content-Length 5KB via the http proxy mount",
+	  "POST", "/echo-cl", XR_CL, 5000, 0, 8192, 0, 0, 200, 5000, XG_NONE, 0, 1, 0, 0, 0 },
+	{ "h1 POST Content-Length 100KB, 8KB writes, via the http proxy mount",
+	  "POST", "/echo-cl", XR_CL, 100000, 0, 8192, 0, 0, 200, 100000, XG_NONE, 0, 1, 0, 0, 0 },
+	{ "h1 POST Content-Length 20KB, no-length response, via the http proxy mount",
+	  "POST", "/echo-nolen", XR_CL, 20000, 0, 8192, 0, 0, 200, 20000, XG_NONE, 0, 1, 0, 0, 0 },
+	/*
+	 * A request body whose length is not a Content-Length goes onward
+	 * chunked, ended by a last-chunk when the body completes: the server
+	 * behind the proxy must see all of it, not a bodyless request.  An h1
+	 * POST with neither header has an empty body, and goes onward saying
+	 * so, or the server behind would wait for the body to the close.
+	 */
+	{ "h1 POST chunked 30KB, 4KB writes, via the http proxy mount",
+	  "POST", "/echo-cl", XR_CHUNKED, 30000, 0, 4096, 0, 0, 200, 30000, XG_NONE, 0, 1, 0, 0, 0 },
+	{ "h1 POST chunked 2KB with extensions and trailers, via the http proxy mount",
+	  "POST", "/echo-chunked", XR_CHUNKED_EXT, 2000, 0, 512, 0, 0, 200, 2000, XG_NONE, 0, 1, 0, 0, 0 },
+	{ "h1 POST with neither header via the http proxy mount: empty body",
+	  "POST", "/echo-cl", XR_NOLEN, 0, 0, 8192, 0, 0, 200, 0, XG_NONE, 0, 1, 0, 0, 0 },
+	/*
+	 * The proxy's own X-Forwarded-For is on every request it sends on (the
+	 * server checks that for every proxied case), with a Cookie it
+	 * forwards for the client, which must arrive intact, as much as
+	 * without one.  A path with "cookie" in it has the client send one of
+	 * COOKIE_LEN bytes.
+	 */
+	{ "h1 POST Content-Length 5KB with a 2KB Cookie via the http proxy "
+	  "mount, Cookie and X-Forwarded-For both arrive",
+	  "POST", "/echo-cl-cookie", XR_CL, 5000, 0, 8192, 0, 0, 200, 5000, XG_NONE, 0, 1, 0, 0, 0 },
+	/*
+	 * The relay frames a response without a Content-Length as chunked on
+	 * h1.  When the onward response ended by its own framing (not by the
+	 * onward server's close, which ends the parent connection too) the
+	 * parent connection is kept, and a second request pipelined on it
+	 * must get its last-chunk as well
+	 */
+	/*
+	 * The server's chunked response also says Content-Length, which the
+	 * chunks override: the proxy must relay the body its onward client
+	 * read by the chunks, framed its own way, and not pass that
+	 * Content-Length on to a client that would go by it
+	 */
+	{ "h1 POST 3KB via the http proxy mount, chunked response also "
+	  "carrying a Content-Length",
+	  "POST", "/echo-chunked-cl", XR_CL, 3000, 0, 8192, 0, 0, 200, 3000, XG_NONE, 0, 1, 0, 0, 0 },
+	{ "h1 two GETs pipelined via the http proxy mount, chunked "
+	  "responses, each one ends",
+	  "GET", "/echo-chunked", XR_NONE, 0, 0, 8192, 0, 0, 200, 0, XG_NONE, 0, 1,
+	  0, 2, 0 },
+	/*
+	 * The proxy's parent connection has the whole POST body before the
+	 * relayed answer comes: the GET behind it waits parked until the
+	 * relayed response completed the transaction
+	 */
+	{ "h1 POST Content-Length 100B and a GET pipelined in the same write, "
+	  "via the http proxy mount, answered some time after the body",
+	  "POST", "/echo-cl-later", XR_CL, 100, 0, 8192, 0, 0, 200, 100, XG_NONE,
+	  0, 1, 0, 3, 0 },
+#if defined(LWS_ROLE_H3)
+	/*
+	 * The same proxy mount on a tls vhost whose alpn offers h3, as lwsws
+	 * sets one up: the quic listener comes with it.  The relay ends the
+	 * parent stream with a body-less FINAL when the onward response ends.
+	 * With a Content-Length response the last body write already ended
+	 * the stream and that FINAL has nothing to do; with a no-length
+	 * response it is the only thing that ends it, and the client must see
+	 * the body complete from the bare FIN / END_STREAM.
+	 */
+#if defined(LWS_WITH_HTTP2)
+	{ "h2 GET via the http proxy mount",
+	  "GET", "/echo-cl", XR_NONE, 0, 0, 8192, 1, 0, 200, 0, XG_NONE, 0, 1, 0, 0, 0 },
+	{ "h2 POST Content-Length 20KB via the http proxy mount",
+	  "POST", "/echo-cl", XR_CL, 20000, 0, 8192, 1, 0, 200, 20000, XG_NONE, 0, 1, 0, 0, 0 },
+	{ "h2 POST Content-Length 20KB, no-length response, via the http proxy mount",
+	  "POST", "/echo-nolen", XR_CL, 20000, 0, 8192, 1, 0, 200, 20000, XG_NONE, 0, 1, 0, 0, 0 },
+	{ "h2 POST no Content-Length 20KB (END_STREAM delimited) via the http "
+	  "proxy mount",
+	  "POST", "/echo-cl", XR_BODY_NOHDR, 20000, 0, 4096, 1, 0, 200, 20000, XG_NONE, 0, 1, 0, 0, 0 },
+	{ "h2 POST with neither header via the http proxy mount: empty body",
+	  "POST", "/echo-cl", XR_NOLEN, 0, 0, 8192, 1, 0, 200, 0, XG_NONE, 0, 1, 0, 0, 0 },
+	{ "h2 POST 3KB via the http proxy mount, chunked response also "
+	  "carrying a Content-Length",
+	  "POST", "/echo-chunked-cl", XR_CL, 3000, 0, 8192, 1, 0, 200, 3000, XG_NONE, 0, 1, 0, 0, 0 },
+#endif
+	{ "h3 GET via the http proxy mount",
+	  "GET", "/echo-cl", XR_NONE, 0, 0, 8192, 2, 0, 200, 0, XG_NONE, 0, 1, 0, 0, 0 },
+	{ "h3 POST Content-Length 20KB via the http proxy mount",
+	  "POST", "/echo-cl", XR_CL, 20000, 0, 8192, 2, 0, 200, 20000, XG_NONE, 0, 1, 0, 0, 0 },
+	{ "h3 POST Content-Length 20KB, no-length response, via the http proxy mount",
+	  "POST", "/echo-nolen", XR_CL, 20000, 0, 8192, 2, 0, 200, 20000, XG_NONE, 0, 1, 0, 0, 0 },
+	/*
+	 * An h3 body with no content-length is ended by the FIN alone, which
+	 * the proxy could not end the onward body at: the request is refused
+	 * with 411, the whole of it, though the body goes on arriving after
+	 * the refusal's head went, and nothing of it reaches the server behind
+	 */
+	{ "h3 POST no Content-Length via the http proxy mount is refused",
+	  "POST", "/echo-cl", XR_BODY_NOHDR, 2000, 0, 8192, 2, 0, 411, 0, XG_NONE, 0, 1, 0, 0, 0 },
+#endif
+#endif
+#if defined(LWS_WITH_HTTP2)
+	{ "h2 POST Content-Length 50KB, 8KB writes, CL response",
+	  "POST", "/echo-cl", XR_CL, 50000, 0, 8192, 1, 0, 200, 50000, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h2 POST no Content-Length 20KB (END_STREAM delimited)",
+	  "POST", "/echo-cl", XR_BODY_NOHDR, 20000, 0, 4096, 1, 0, 200, 20000, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h2 POST Content-Length 20KB, no-length response (END_STREAM)",
+	  "POST", "/echo-nolen", XR_CL, 20000, 0, 8192, 1, 0, 200, 20000, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h2 GET, no body",
+	  "GET", "/echo-cl", XR_NONE, 0, 0, 8192, 1, 0, 200, 0, XG_NONE, 0, 0, 0, 0, 0 },
+	{ "h2 GET 302, redirect followed on the same wsi",
+	  "GET", "/redir-cl", XR_NONE, 0, 0, 8192, 1, 0, 200, 0, XG_NONE, 0, 0, 0, 0, 0 },
+#if defined(LWS_WITH_UNIX_SOCK) && !defined(WIN32)
+	{ "h2 GET 302 to a unix socket is refused",
+	  "GET", "/redir-uds", XR_NONE, 0, 0, 8192, 1, 0, 0, 0, XG_NONE, 0, 0, 0, 0, 0 },
+#endif
+	{ "h2 POST with neither header: zero-length body",
+	  "POST", "/echo-cl", XR_NOLEN, 0, 0, 8192, 1, 0, 200, 0, XG_NONE, 0, 0, 0, 0, 0 },
+	/*
+	 * No h2 Transfer-Encoding refusal case: the lws h2 client does not
+	 * forward a Transfer-Encoding header, so it cannot provoke one
+	 */
+#if defined(LWS_WITH_JOSE)
+	/*
+	 * The same gating on h2.  h2 dispatches a POST to a callback mount
+	 * from its own path (it must bind the protocol before the body can
+	 * arrive), which used to be a way past the mount's interceptor that
+	 * did not exist on h1.  Both the bodyless and the body-bearing shapes
+	 * of that path are covered.
+	 */
+	{ "h2 GET to an interceptor-gated mount is blocked",
+	  "GET", "/gated/echo-cl", XR_NONE, 0, 0, 8192, 1, 0, 403, 0,
+	  XG_BLOCK, 0, 0, 0, 0, 0 },
+	{ "h2 POST to an interceptor-gated mount is blocked",
+	  "POST", "/gated/echo-cl", XR_CL, 4000, 0, 8192, 1, 0, 403, 0,
+	  XG_BLOCK, 0, 0, 0, 0, 0 },
+	{ "h2 POST with no body to an interceptor-gated mount is blocked",
+	  "POST", "/gated/echo-cl", XR_NOLEN, 0, 0, 8192, 1, 0, 403, 0,
+	  XG_BLOCK, 0, 0, 0, 0, 0 },
+	{ "h2 POST with no Content-Length to a gated mount is blocked",
+	  "POST", "/gated/echo-cl", XR_BODY_NOHDR, 2000, 0, 512, 1, 0, 403, 0,
+	  XG_BLOCK, 0, 0, 0, 0, 0 },
+	{ "h2 POST the interceptor passes reaches the app with its body",
+	  "POST", "/gated/echo-cl?auth=1", XR_CL, 4000, 0, 8192, 1, 0, 200,
+	  4000, XG_PASS, 0, 0, 0, 0, 0 },
+#endif
+#endif
+};
+
+/* per client connection */
+
+#define RAW_BUF_MAX (64 * 1024)
+
+struct conn {
+	struct conn		*next;
+	const struct xcase	*c;
+	int			case_idx;
+	uint8_t			*framed;	/* framed request body */
+	size_t			framed_len;
+	size_t			sent;
+	size_t			rx_len;		/* response payload bytes */
+	uint32_t		rx_sum;
+	char			line[64];	/* response summary line */
+	size_t			line_len;
+	int			line_done;
+	uint8_t			*raw_buf;	/* raw clients: rx so far */
+	size_t			mp_len;		/* the multipart body last sent */
+	uint32_t		mp_sum;
+	int			mp_bad;		/* a body did not start at its
+						 * first boundary */
+	size_t			raw_len;
+	int			h2c_phase;	/* 0: awaiting 101, 1: frames */
+	int			raw_phase;	/* raw 5: timer steps taken */
+	size_t			r5_remain;	/* raw 5: body bytes still to come */
+	uint32_t		r5_sum;		/* ... and the sum of it so far */
+	size_t			r5_lens[2];	/* raw 5: the answers' body lengths */
+	uint32_t		r5_sums[2];	/* ... and sums, as they came */
+	int			r5_done;	/* raw 5: whole answers so far */
+	unsigned int		turns_start;	/* raw 5: loop turns while the
+						 * first answer waited unread... */
+	unsigned int		turns_waited;	/* ... until we read it */
+	int			status;
+	int			completed;
+	int			closed;
+	int			error;
+};
+
+/* server side, per connection */
+
+enum resp_mode {
+	RM_CL,
+	RM_CHUNKED,	/* hand-framed, h1 only */
+	RM_CHUNKED_CL,	/* the same, with a Content-Length that it overrides */
+	RM_NOLEN,	/* h1: close-delimited; h2: END_STREAM */
+	RM_ONESHOT,	/* CL, whole body in one write, completed at once */
+};
+
+/*
+ * The one-shot case shrinks the accepted socket's send buffer so that most
+ * of a single write of this size has to be queued as a partial, while
+ * staying well under the buflist's 2MB sanity limit
+ */
+#define ONESHOT_MAX (1024 * 1024)
+#define ONESHOT_SNDBUF 16384
+
+/* what a GET of /big-oneshot is answered with: this much of the pattern */
+#define BIG_ONESHOT 600000
+
+/*
+ * the file /file-at-end and /abandon answer with: this test's source, which
+ * is big enough not to be gone with the headers when /abandon's app gives up
+ * on it
+ */
+#define XFER_FILE "main.c"
+
+struct pss_srv {
+	enum resp_mode		mode;
+	size_t			rx_len;
+	uint32_t		rx_sum;
+	char			line[64];
+	size_t			line_len;
+	size_t			tx_total;
+	size_t			tx_pos;
+	int			chunk_idx;
+	int			responding;
+	int			redir307;	/* 307 once the body is read */
+	int			later;		/* answer RAW3_LATER_MS after
+						 * the request, or its body */
+	int			body_done;	/* /body-done: 202 from the
+						 * body's first piece */
+	int			file_at_end;	/* /file-at-end: a file once
+						 * the body is all here */
+};
+
+/* server-side view of the current case */
+
+static struct {
+	long		body_len;	/* decoded payload bytes, all requests */
+	int		http_cbs;	/* LWS_CALLBACK_HTTP count */
+	int		conns;		/* accepted connections */
+	int		conns_first;	/* ... when a reuse case's first request
+					 * completed */
+	int		gate_blocks;	/* requests the mount interceptor took */
+	int		not_close;	/* requests without connection: close */
+	int		no_xff;		/* proxied requests without the
+					 * proxy's X-Forwarded-For */
+	int		bad_cookie;	/* requests whose Cookie was not the
+					 * one the case sent */
+	int		held;		/* whole h3 writes reported as held back */
+	int		body_completions; /* HTTP_BODY_COMPLETION deliveries */
+	unsigned int	turns_wait_start; /* event loop turns when a "later"
+					   * answer began to wait... */
+	unsigned int	turns_waited;	/* ... and until it was answered */
+	char		paths[2][48];	/* the first requests, as dispatched */
+} srv;
+
+static struct lws_context *context;
+static struct lws_vhost *vh_cli;
+static lws_sorted_usec_list_t sul_next, sul_watchdog, sul_reuse;
+static struct conn *conn_list, *conns[2];
+static int result, cur = -1, failures, port_h1 = 7681,
+	   port_h2 = 7682, port_proxy = 7683, only_case = -1, case_done;
+/* event loop turns */
+static unsigned int turns;
+
+static const char *server_addr = "127.0.0.1";
+
+#if defined(LWS_WITH_UNIX_SOCK) && !defined(WIN32)
+/* the unix socket vhost, and the redirect aimed at it */
+static char uds_path[64], uds_location[96];
+#endif
+
+#if defined(LWS_ROLE_H3)
+/* the h3 server vhost: quic needs tls, a self-signed test cert does */
+
+static struct lws_vhost *vh_h3;
+static int port_h3 = 7684;
+#if defined(LWS_WITH_HTTP_PROXY)
+static int port_proxy_tls = 7685;
+#endif
+
+static const char * const test_cert =
+"-----BEGIN CERTIFICATE-----\n"
+"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\n"
+"e2Hl/7M0c/lbZ4FvXgARlex2rkgS0Ka06HE=\n"
+"-----END CERTIFICATE-----\n";
+
+static const char * const test_key =
+"-----BEGIN PRIVATE KEY-----\n"
+"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\n"
+"fBrpEY1IATtPq1taBZZogRqI3rOkkPk=\n"
+"-----END PRIVATE KEY-----\n";
+#endif
+
+/* deterministic payload and checksum, shared by both sides */
+
+static uint8_t
+pat(size_t i)
+{
+	return (uint8_t)(0x30 + ((i * 7) % 61));
+}
+
+static uint32_t
+sum_add(uint32_t s, const uint8_t *b, size_t len)
+{
+	while (len--)
+		s = (s * 31u) + *b++;
+
+	return s;
+}
+
+static uint32_t
+sum_pat(size_t len)
+{
+	uint32_t s = 0;
+	size_t i;
+
+	for (i = 0; i < len; i++)
+		s = (s * 31u) + pat(i);
+
+	return s;
+}
+
+/* chunk sizes cycle through these, so the framing lands everywhere */
+
+static const size_t chunk_sizes[] = { 1, 7, 100, 1000, 4095, 17, 300, 2 };
+
+/*
+ * Frame len bytes of pattern as a chunked body into out.  With ext, every
+ * other chunk carries a chunk extension and the last-chunk is followed by
+ * trailer fields.
+ */
+
+static size_t
+frame_chunked(uint8_t *out, size_t out_max, size_t len, int ext)
+{
+	size_t o = 0, done = 0, i, n = 0;
+
+	while (done < len) {
+		size_t cl = chunk_sizes[n++ % LWS_ARRAY_SIZE(chunk_sizes)];
+
+		if (cl > len - done)
+			cl = len - done;
+
+		o += (size_t)lws_snprintf((char *)out + o, out_max - o,
+				  ext && (n & 1) ? "%x;lws=test\x0d\x0a" :
+						   "%x\x0d\x0a", (unsigned int)cl);
+		for (i = 0; i < cl; i++)
+			out[o++] = pat(done + i);
+		done += cl;
+		out[o++] = '\x0d';
+		out[o++] = '\x0a';
+	}
+
+	o += (size_t)lws_snprintf((char *)out + o, out_max - o, ext ?
+			/* "\x0a" "a": a hex escape takes all the hex digits */
+			"0\x0d\x0ax-trailer: yes\x0d\x0a"
+			"another: one\x0d\x0a\x0d\x0a" :
+			"0\x0d\x0a\x0d\x0a");
+
+	return o;
+}
+
+/*
+ * A case whose path mentions "cookie" sends a Cookie of COOKIE_LEN bytes,
+ * "k=" and then letters, which the server must see intact
+ */
+
+#define COOKIE_LEN 2000
+
+static int
+case_cookie(void)
+{
+	return cur >= 0 && cur < (int)LWS_ARRAY_SIZE(cases) &&
+	       !!strstr(cases[cur].path, "cookie");
+}
+
+static void
+cookie_make(char *buf)
+{
+	size_t i;
+
+	for (i = 0; i < COOKIE_LEN; i++)
+		buf[i] = i == 0 ? 'k' : (i == 1 ? '=' : (char)('a' + (i % 26)));
+	buf[COOKIE_LEN] = '\0';
+}
+
+/* ---- server side ---- */
+
+static int
+srv_start_response(struct lws *wsi, struct pss_srv *pss)
+{
+	uint8_t hbuf[LWS_PRE + 512], *start = &hbuf[LWS_PRE], *p = start,
+		*end = &hbuf[sizeof(hbuf) - 1];
+
+	pss->line_len = (size_t)lws_snprintf(pss->line, sizeof(pss->line),
+					     "len=%u sum=%08x\n",
+					     (unsigned int)pss->rx_len,
+					     (unsigned int)pss->rx_sum);
+	pss->tx_total = pss->line_len + pss->rx_len;
+	pss->tx_pos = 0;
+	pss->chunk_idx = 0;
+	pss->responding = 1;
+
+	switch (pss->mode) {
+	case RM_CL:
+	case RM_ONESHOT:
+		if (lws_add_http_common_headers(wsi, HTTP_STATUS_OK,
+						"text/plain",
+						(lws_filepos_t)pss->tx_total,
+						&p, end))
+			return 1;
+		break;
+	case RM_NOLEN:
+		if (lws_add_http_common_headers(wsi, HTTP_STATUS_OK,
+						"text/plain",
+						LWS_ILLEGAL_HTTP_CONTENT_LEN,
+						&p, end))
+			return 1;
+		break;
+	case RM_CHUNKED:
+	case RM_CHUNKED_CL:
+		/* h1 only: we frame the chunks ourselves */
+		if (lws_add_http_header_status(wsi, HTTP_STATUS_OK, &p, end) ||
+		    lws_add_http_header_by_token(wsi,
+					WSI_TOKEN_HTTP_CONTENT_TYPE,
+					(const uint8_t *)"text/plain", 10,
+					&p, end) ||
+		    lws_add_http_header_by_token(wsi,
+					WSI_TOKEN_HTTP_TRANSFER_ENCODING,
+					(const uint8_t *)"chunked", 7,
+					&p, end))
+			return 1;
+		/*
+		 * RFC 9112 6.3: with both, Transfer-Encoding overrides the
+		 * Content-Length, whatever it says... the recipient must go by
+		 * the chunks, and an intermediary must not pass it on
+		 */
+		if (pss->mode == RM_CHUNKED_CL &&
+		    lws_add_http_header_by_token(wsi,
+					WSI_TOKEN_HTTP_CONTENT_LENGTH,
+					(const uint8_t *)"1", 1, &p, end))
+			return 1;
+		break;
+	}
+
+	if (lws_finalize_write_http_header(wsi, start, &p, end))
+		return 1;
+
+	lws_callback_on_writable(wsi);
+
+	return 0;
+}
+
+/* the response body byte at position pos */
+
+static uint8_t
+srv_tx_byte(struct pss_srv *pss, size_t pos)
+{
+	if (pos < pss->line_len)
+		return (uint8_t)pss->line[pos];
+
+	return pat(pos - pss->line_len);
+}
+
+static int
+srv_writeable(struct lws *wsi, struct pss_srv *pss)
+{
+	static uint8_t wbuf[LWS_PRE + 8192];
+	uint8_t *p = &wbuf[LWS_PRE];
+	size_t rem = pss->tx_total - pss->tx_pos, n, i, o = 0;
+	int final;
+
+	if (!pss->responding)
+		return 0;
+
+	if (pss->mode == RM_ONESHOT) {
+		/*
+		 * Hand lws the whole response in one write and complete the
+		 * transaction in the same callback, the way a naive app does.
+		 * Most of it can only be queued as a partial, so the
+		 * completion must be deferred until the partial has drained,
+		 * and the connection must still take the next request after.
+		 */
+		static uint8_t obuf[LWS_PRE + ONESHOT_MAX];
+		uint8_t *q = &obuf[LWS_PRE];
+
+		if (pss->tx_total > ONESHOT_MAX)
+			return -1;
+		for (i = 0; i < pss->tx_total; i++)
+			q[i] = srv_tx_byte(pss, i);
+		if (lws_write(wsi, q, pss->tx_total, LWS_WRITE_HTTP_FINAL) !=
+							(int)pss->tx_total)
+			return -1;
+		pss->tx_pos = pss->tx_total;
+		pss->responding = 0;
+
+		if (lws_http_transaction_completed(wsi))
+			return -1;
+
+		return 0;
+	}
+
+	if (pss->mode == RM_CHUNKED || pss->mode == RM_CHUNKED_CL) {
+		n = chunk_sizes[(size_t)pss->chunk_idx++ %
+					LWS_ARRAY_SIZE(chunk_sizes)];
+		if (n > rem)
+			n = rem;
+		final = n == rem;
+
+		/*
+		 * A chunk extension on the odd chunks, trailer fields after
+		 * the last-chunk: the client must skip both
+		 */
+		o = (size_t)lws_snprintf((char *)p, 64, (pss->chunk_idx & 1) ?
+					 "%x;srv=ext\x0d\x0a" : "%x\x0d\x0a",
+					 (unsigned int)n);
+		for (i = 0; i < n; i++)
+			p[o++] = srv_tx_byte(pss, pss->tx_pos + i);
+		p[o++] = '\x0d';
+		p[o++] = '\x0a';
+		if (final)
+			o += (size_t)lws_snprintf((char *)p + o, 64,
+				"0\x0d\x0ax-srv-trailer: yes\x0d\x0a\x0d\x0a");
+	} else {
+		n = rem > 1400 ? 1400 : rem;
+		final = n == rem;
+		for (i = 0; i < n; i++)
+			p[o++] = srv_tx_byte(pss, pss->tx_pos + i);
+	}
+
+	if (lws_write(wsi, p, o, final ? LWS_WRITE_HTTP_FINAL :
+				 LWS_WRITE_HTTP) != (int)o)
+		return -1;
+
+#if defined(LWS_ROLE_H3)
+	/* lws took it all: whatever quic does with it is not held back here */
+	if (lws_get_vhost(wsi) == vh_h3 && !final &&
+	    (lws_partial_buffered(wsi) || lws_send_pipe_choked(wsi))) {
+		lwsl_wsi_err(wsi, "whole write reported held back");
+		srv.held++;
+	}
+#endif
+
+	pss->tx_pos += n;
+
+	if (!final) {
+		lws_callback_on_writable(wsi);
+
+		return 0;
+	}
+
+	pss->responding = 0;
+
+	if (lws_http_transaction_completed(wsi))
+		return -1;
+
+	return 0;
+}
+
+/* the way an app waiting on something else answers: some time later */
+
+static int
+srv_answer_later(struct lws *wsi)
+{
+	srv.turns_wait_start = turns;
+	lws_set_timer_usecs(wsi, RAW3_LATER_MS * LWS_US_PER_MS);
+
+	return 0;
+}
+
+static int
+callback_srv(struct lws *wsi, enum lws_callback_reasons reason,
+	     void *user, void *in, size_t len)
+{
+	struct pss_srv *pss = (struct pss_srv *)user;
+	const char *path = (const char *)in;
+	uint8_t hbuf[LWS_PRE + 256], *hp = &hbuf[LWS_PRE],
+		*hend = &hbuf[sizeof(hbuf) - 1];
+	char *uri;
+	int n;
+
+	switch (reason) {
+
+	case LWS_CALLBACK_FILTER_NETWORK_CONNECTION:
+		srv.conns++;
+#if !defined(WIN32)
+		if (cur >= 0 && cur < (int)LWS_ARRAY_SIZE(cases) &&
+		    strstr(cases[cur].path, "oneshot")) {
+			struct lws_filter_network_conn_args *a =
+				(struct lws_filter_network_conn_args *)user;
+			int sb = ONESHOT_SNDBUF;
+
+			/* make the one-shot write partial, deterministically */
+			if (setsockopt(a->accept_fd, SOL_SOCKET, SO_SNDBUF,
+				       &sb, sizeof(sb)))
+				lwsl_warn("%s: SO_SNDBUF failed\n", __func__);
+		}
+#endif
+		break;
+
+#if defined(LWS_ROLE_H3)
+	case LWS_CALLBACK_WSI_CREATE:
+		/*
+		 * A quic connection is not accepted, so is not seen by
+		 * FILTER_NETWORK_CONNECTION: count it by the connection wsi
+		 * the quic listener creates for it, tagged "quic child"
+		 */
+		if (lws_get_vhost(wsi) == vh_h3 && lws_wsi_tag(wsi) &&
+		    strstr(lws_wsi_tag(wsi), "quic child")) {
+			srv.conns++;
+			lwsl_wsi_info(wsi, "quic connection %d", srv.conns);
+		}
+		break;
+#endif
+
+	case LWS_CALLBACK_HTTP:
+		if (srv.http_cbs < (int)LWS_ARRAY_SIZE(srv.paths))
+			lws_strncpy(srv.paths[srv.http_cbs], path ? path : "",
+				    sizeof(srv.paths[0]));
+		srv.http_cbs++;
+		memset(pss, 0, sizeof(*pss));
+
+		{
+			char conn[32];
+
+			if (lws_hdr_copy(wsi, conn, sizeof(conn),
+					 WSI_TOKEN_CONNECTION) <= 0 ||
+			    strcmp(conn, "close"))
+				srv.not_close++;
+		}
+
+		/* everything the proxy sends on says who it is for */
+		if (cur >= 0 && cur < (int)LWS_ARRAY_SIZE(cases) &&
+		    cases[cur].via_proxy &&
+		    lws_hdr_total_length(wsi, WSI_TOKEN_X_FORWARDED_FOR) <= 0)
+			srv.no_xff++;
+
+		if (case_cookie()) {
+			static char ck[COOKIE_LEN + 2], want[COOKIE_LEN + 1];
+
+			cookie_make(want);
+			if (lws_hdr_copy(wsi, ck, sizeof(ck),
+					 WSI_TOKEN_HTTP_COOKIE) != COOKIE_LEN ||
+			    strcmp(ck, want))
+				srv.bad_cookie++;
+		}
+
+		if (path && strstr(path, "nope")) {
+			/* a status page with text, the way an app makes one */
+			lwsl_user("%s: server: 404 for %s\n", __func__, path);
+			if (lws_return_http_status(wsi, HTTP_STATUS_NOT_FOUND,
+					"nope, and this text is longer than "
+					"the bounded copy a stream keeps of it"))
+				return -1;
+			if (lws_http_transaction_completed(wsi))
+				return -1;
+			return 0;
+		}
+
+		pss->mode = RM_CL;
+		if (path && strstr(path, "echo-chunked"))
+			pss->mode = RM_CHUNKED;
+		if (path && strstr(path, "echo-chunked-cl"))
+			pss->mode = RM_CHUNKED_CL;
+		if (path && strstr(path, "echo-nolen"))
+			pss->mode = RM_NOLEN;
+		if (path && strstr(path, "echo-oneshot"))
+			pss->mode = RM_ONESHOT;
+		if (path && strstr(path, "big-oneshot")) {
+			/* a GET answered as if it had sent this much body */
+			pss->mode = RM_ONESHOT;
+			pss->rx_len = BIG_ONESHOT;
+			pss->rx_sum = sum_pat(BIG_ONESHOT);
+		}
+
+		lwsl_user("%s: server: HTTP %s\n", __func__, path ? path : "");
+
+#if defined(LWS_WITH_UNIX_SOCK) && !defined(WIN32)
+		if (path && strstr(path, "redir-uds")) {
+			/* send him to our unix socket vhost: he must refuse */
+			if (lws_http_redirect(wsi, HTTP_STATUS_FOUND,
+					      (const unsigned char *)uds_location,
+					      (int)strlen(uds_location),
+					      &hp, hend) < 0 ||
+			    lws_http_transaction_completed(wsi))
+				return -1;
+			return 0;
+		}
+#endif
+
+		if (path && strstr(path, "redir-cl")) {
+			/* send him to the echo path, no body */
+			if (lws_http_redirect(wsi, HTTP_STATUS_FOUND,
+					      (const unsigned char *)"/echo-cl",
+					      8, &hp, hend) < 0 ||
+			    lws_http_transaction_completed(wsi))
+				return -1;
+			return 0;
+		}
+
+		pss->later = path && !!strstr(path, "later");
+		pss->body_done = path && !!strstr(path, "body-done");
+		pss->file_at_end = path && !!strstr(path, "file-at-end");
+
+		if (path && strstr(path, "early")) {
+			/*
+			 * /early: answered whole, 202 with a short body, and
+			 * completed at once, whatever body is still to come
+			 */
+			if (lws_add_http_common_headers(wsi, 202, "text/plain",
+							3, &hp, hend) ||
+			    lws_finalize_write_http_header(wsi,
+							   &hbuf[LWS_PRE],
+							   &hp, hend))
+				return -1;
+			hp = &hbuf[LWS_PRE];
+			memcpy(hp, "ok\n", 3);
+			if (lws_write(wsi, hp, 3, LWS_WRITE_HTTP_FINAL) != 3 ||
+			    lws_http_transaction_completed(wsi))
+				return -1;
+			return 0;
+		}
+
+#if defined(LWS_WITH_FILE_OPS)
+		if (path && strstr(path, "abandon")) {
+			/*
+			 * a file is the answer, but the app gives up on it as
+			 * soon as it has begun, with its headers out and none
+			 * of its body.  Not from a timer: loopback takes the
+			 * whole file within one tick of a coarse clock, such
+			 * as Windows' 15.6ms one, before any timer can fire
+			 */
+			n = lws_serve_http_file(wsi, XFER_FILE, "text/plain",
+						NULL, 0);
+			if (n)
+				return -1;
+			lwsl_user("%s: server: abandoning the file\n",
+				  __func__);
+			if (lws_http_transaction_completed(wsi))
+				return -1;
+			return 0;
+		}
+#endif
+
+		if (lws_http_get_uri_and_method(wsi, &uri, &n) == LWSHUMETH_POST) {
+			/* the body decides the response, wait for it */
+			pss->redir307 = path && !!strstr(path, "redir307");
+			return 0;
+		}
+
+		if (pss->later)
+			return srv_answer_later(wsi);
+
+		/* answer now, whether or not a body is on its way */
+		return srv_start_response(wsi, pss);
+
+	case LWS_CALLBACK_HTTP_BODY:
+		/* in only ever holds decoded payload */
+		pss->rx_sum = sum_add(pss->rx_sum, (const uint8_t *)in, len);
+		pss->rx_len += len;
+		srv.body_len += (long)len;
+		if (pss->body_done && !pss->responding) {
+			/*
+			 * /body-done: answered, and completed, from the body's
+			 * first piece, the rest of which is still to come
+			 */
+			pss->responding = 1;
+			if (lws_return_http_status(wsi, 202,
+						   NULL) ||
+			    lws_http_transaction_completed(wsi))
+				return -1;
+		}
+		return 0;
+
+	case LWS_CALLBACK_HTTP_BODY_COMPLETION:
+		srv.body_completions++;
+		lwsl_user("%s: server: body complete, %u bytes\n", __func__,
+			  (unsigned int)pss->rx_len);
+#if defined(LWS_WITH_FILE_OPS)
+		if (pss->file_at_end && !pss->responding) {
+			/* /file-at-end: a file answers once the body is here */
+			pss->responding = 1;
+			n = lws_serve_http_file(wsi, XFER_FILE, "text/plain",
+						NULL, 0);
+			if (n < 0 ||
+			    (n > 0 && lws_http_transaction_completed(wsi)))
+				return -1;
+			return 0;
+		}
+#endif
+		if (pss->responding)
+			/*
+			 * A GET with a body: we already answered from
+			 * LWS_CALLBACK_HTTP.  Do not fall through to the dummy
+			 * handler, which would answer a second time.
+			 */
+			return 0;
+		if (pss->redir307) {
+			/* 307: the client must send the same body again */
+			if (lws_http_redirect(wsi, 307,
+					      (const unsigned char *)"/echo-cl",
+					      8, &hp, hend) < 0 ||
+			    lws_http_transaction_completed(wsi))
+				return -1;
+			return 0;
+		}
+		if (pss->later)
+			return srv_answer_later(wsi);
+
+		return srv_start_response(wsi, pss);
+
+	case LWS_CALLBACK_TIMER:
+		srv.turns_waited = turns - srv.turns_wait_start;
+		return srv_start_response(wsi, pss);
+
+	case LWS_CALLBACK_HTTP_WRITEABLE:
+		return srv_writeable(wsi, pss);
+
+	default:
+		break;
+	}
+
+	return lws_callback_http_dummy(wsi, reason, user, in, len);
+}
+
+#if defined(LWS_WITH_JOSE)
+
+/*
+ * The interceptor protocol, mounted at /bouncer, which guards /gated.
+ *
+ * This is the contract the real interceptor plugins (lws-login, the captcha
+ * rate limiter) implement: LWS_CALLBACK_HTTP_INTERCEPTOR_CHECK returns 0 to
+ * let the request continue to the mount it asked for, or nonzero to take it
+ * over, in which case lws diverts the request to this mount and delivers
+ * LWS_CALLBACK_HTTP here -- before the guarded mount's protocol is bound, so
+ * the app sees nothing of the request at all.
+ *
+ * "Authorized" is just ?auth=1 on the request: what a real interceptor checks
+ * is not what is under test here, only that every method and every role goes
+ * through this decision and honours it.
+ */
+
+static int
+callback_gate(struct lws *wsi, enum lws_callback_reasons reason,
+	      void *user, void *in, size_t len)
+{
+	uint8_t hbuf[LWS_PRE + 256], *start = &hbuf[LWS_PRE], *p = start,
+		*end = &hbuf[sizeof(hbuf) - 1];
+	const char *blocked = "blocked\n";
+	char arg[16];
+
+	switch (reason) {
+
+	case LWS_CALLBACK_HTTP_INTERCEPTOR_CHECK:
+		/*
+		 * user_space belongs to whichever protocol the wsi is bound to
+		 * at this point, which is not us: only the wsi is ours to look
+		 * at
+		 */
+		if (lws_get_urlarg_by_name_safe(wsi, "auth=", arg,
+						sizeof(arg)) >= 0 &&
+		    !strcmp(arg, "1"))
+			return 0;	/* let it through to the mount */
+
+		return 1;		/* we take the request */
+
+	case LWS_CALLBACK_HTTP:
+		/*
+		 * We only ever see this for a request we took.  Answer it
+		 * ourselves: any request body still on its way is discarded
+		 * (h1, leaving the connection in sync for the next request on
+		 * it) or the stream reset (h2) by the transaction completion.
+		 */
+		srv.gate_blocks++;
+
+		lwsl_user("%s: interceptor blocking %s\n", __func__,
+			  in ? (const char *)in : "");
+
+		if (lws_add_http_common_headers(wsi, HTTP_STATUS_FORBIDDEN,
+						"text/plain",
+						(lws_filepos_t)strlen(blocked),
+						&p, end) ||
+		    lws_finalize_write_http_header(wsi, start, &p, end))
+			return 1;
+
+		memcpy(start, blocked, strlen(blocked));
+		if (lws_write(wsi, start, strlen(blocked),
+			      LWS_WRITE_HTTP_FINAL) < 0)
+			return 1;
+
+		if (lws_http_transaction_completed(wsi))
+			return -1;
+
+		return 0;
+
+	case LWS_CALLBACK_HTTP_BODY:
+	case LWS_CALLBACK_HTTP_BODY_COMPLETION:
+		/*
+		 * A blocked request that had already been answered can still
+		 * see the tail of its body: it is not ours to act on
+		 */
+		return 0;
+
+	default:
+		break;
+	}
+
+	return lws_callback_http_dummy(wsi, reason, user, in, len);
+}
+
+#endif
+
+/* ---- client side ---- */
+
+static void
+case_finish(int ok, const char *why)
+{
+	lwsl_user("--- case %d: %s: %s%s%s ---\n", cur, cases[cur].name,
+		  ok ? "PASS" : "FAIL", why ? ": " : "", why ? why : "");
+	if (!ok)
+		failures++;
+}
+
+static void
+next_case(lws_sorted_usec_list_t *sul);
+static void
+reuse_start(lws_sorted_usec_list_t *sul);
+
+static void
+case_evaluate(void)
+{
+	const struct xcase *c = &cases[cur];
+	size_t expect_len;
+	int n;
+
+	lws_sul_cancel(&sul_watchdog);
+	case_done = 1;
+
+	/* a GET is answered before its body is read */
+	expect_len = !strcmp(c->method, "POST") ? c->body_len : 0;
+
+	for (n = 0; n < 1 + c->pipeline; n++) {
+		struct conn *cn = conns[n];
+		unsigned int rlen = 0, rsum = 0;
+
+		if (c->expect_status < 0) {
+			if (cn->completed || cn->status) {
+				lwsl_err("conn %d: status %d, expected no "
+					 "response\n", n, cn->status);
+				case_finish(0, "expected the request refused, "
+					       "got a response");
+				goto next;
+			}
+			continue;
+		}
+
+		if (!c->expect_status) {
+			if (cn->completed && cn->status == 200) {
+				case_finish(0, "expected a failure, got 200");
+				goto next;
+			}
+			continue;
+		}
+
+		if (!cn->completed || cn->status != c->expect_status) {
+			lwsl_err("conn %d: completed %d status %d, expected %d\n",
+				 n, cn->completed, cn->status, c->expect_status);
+			case_finish(0, "unexpected status / completion");
+			goto next;
+		}
+
+		if (c->expect_status != 200)
+			continue;
+
+		if (strstr(c->path, "file-at-end")) {
+			/* the answer is a file, nothing to sum */
+			if (!cn->rx_len) {
+				case_finish(0, "no file");
+				goto next;
+			}
+			continue;
+		}
+
+		if (c->raw == 1) {
+			/* the file came as h2 DATA on stream 1, nothing to sum */
+			if (!cn->rx_len) {
+				case_finish(0, "no DATA on the h2c stream");
+				goto next;
+			}
+			continue;
+		}
+
+		if (c->raw >= 2)
+			/*
+			 * it completed only once both responses had ended,
+			 * and checked what they said as they did
+			 */
+			continue;
+
+		if (c->req == XR_MULTIPART) {
+			/* what the client made, not the test pattern */
+			if (cn->mp_bad) {
+				case_finish(0, "multipart body did not start "
+					       "at its first boundary");
+				goto next;
+			}
+			expect_len = cn->mp_len;
+		}
+
+		if (!cn->line_done ||
+		    sscanf(cn->line, "len=%u sum=%x", &rlen, &rsum) != 2) {
+			lwsl_err("conn %d: line_done %d, line '%s', %u payload bytes\n",
+				 n, cn->line_done, cn->line,
+				 (unsigned int)cn->rx_len);
+			case_finish(0, "no summary line in response");
+			goto next;
+		}
+
+		if (rlen != expect_len ||
+		    rsum != (c->req == XR_MULTIPART ? cn->mp_sum :
+						       sum_pat(expect_len))) {
+			lwsl_err("server saw len %u sum %08x, expected len %u\n",
+				 rlen, rsum, (unsigned int)expect_len);
+			case_finish(0, "server did not see the payload we sent");
+			goto next;
+		}
+
+		if (cn->rx_len != rlen || cn->rx_sum != sum_pat(rlen)) {
+			lwsl_err("received %u bytes sum %08x, expected %u bytes sum %08x\n",
+				 (unsigned int)cn->rx_len, cn->rx_sum, rlen,
+				 sum_pat(rlen));
+			case_finish(0, "response payload mismatch");
+			goto next;
+		}
+	}
+
+	switch (c->gate) {
+	case XG_NONE:
+		break;
+	case XG_BLOCK:
+		/*
+		 * The interceptor answered it, and the app protocol on the
+		 * guarded mount was never dispatched: no LWS_CALLBACK_HTTP,
+		 * and (checked by expect_server_rx below) no body either
+		 */
+		if (srv.gate_blocks != 1 + c->pipeline) {
+			lwsl_err("interceptor took %d requests, expected %d\n",
+				 srv.gate_blocks, 1 + c->pipeline);
+			case_finish(0, "interceptor did not take the request");
+			goto next;
+		}
+		if (srv.http_cbs) {
+			lwsl_err("app saw %d requests, expected none\n",
+				 srv.http_cbs);
+			case_finish(0, "blocked request reached the app");
+			goto next;
+		}
+		break;
+	case XG_PASS:
+		if (srv.gate_blocks) {
+			lwsl_err("interceptor took %d requests, expected none\n",
+				 srv.gate_blocks);
+			case_finish(0, "interceptor took an authorized request");
+			goto next;
+		}
+		if (srv.http_cbs != 1) {
+			lwsl_err("app saw %d requests, expected 1\n",
+				 srv.http_cbs);
+			case_finish(0, "authorized request did not reach the app");
+			goto next;
+		}
+		break;
+	}
+
+	/* a request body completes once, whatever follows it */
+	if (srv.body_completions > srv.http_cbs) {
+		lwsl_err("%d body completions for %d requests\n",
+			 srv.body_completions, srv.http_cbs);
+		case_finish(0, "a request body completed more than once");
+		goto next;
+	}
+
+	if (c->raw >= 3) {
+		int bc = c->raw == 3; /* only the POST has a body */
+		/*
+		 * The one-shot answer's wait is the client's to count, the
+		 * server answered at once; a "later" answer's is the server's
+		 */
+		const char *first = c->raw == 5 ? "oneshot" : "later";
+		unsigned int waited = c->raw == 5 ? conns[0]->turns_waited :
+						    srv.turns_waited;
+
+		if (srv.http_cbs != 2 || srv.body_completions != bc) {
+			lwsl_err("server saw %d requests, %d body completions, "
+				 "expected 2 and %d\n", srv.http_cbs,
+				 srv.body_completions, bc);
+			case_finish(0, "pipelined request count");
+			goto next;
+		}
+		/* the first, then the one pipelined behind it */
+		if (!strstr(srv.paths[0], first) ||
+		    strstr(srv.paths[1], first)) {
+			lwsl_err("server was dispatched '%s', then '%s'\n",
+				 srv.paths[0], srv.paths[1]);
+			case_finish(0, "the pipelined request was not the "
+				       "second one dispatched");
+			goto next;
+		}
+		lwsl_user("%u event loop turns while the answer was awaited\n",
+			  waited);
+		if (waited > RAW3_MAX_TURNS) {
+			case_finish(0, "the event loop spun while the "
+				       "pipelined request waited");
+			goto next;
+		}
+	}
+
+	if (c->expect_server_rx >= 0 && srv.body_len != c->expect_server_rx) {
+		lwsl_err("server decoded %ld body bytes, expected %ld\n",
+			 srv.body_len, c->expect_server_rx);
+		case_finish(0, "server body byte count");
+		goto next;
+	}
+
+	if (srv.held) {
+		lwsl_err("%d whole h3 writes reported held back\n", srv.held);
+		case_finish(0, "h3 write held back");
+		goto next;
+	}
+
+	if (srv.no_xff) {
+		lwsl_err("%d proxied requests without X-Forwarded-For\n",
+			 srv.no_xff);
+		case_finish(0, "proxied request without X-Forwarded-For");
+		goto next;
+	}
+
+	if (srv.bad_cookie) {
+		lwsl_err("%d requests without the Cookie we sent\n",
+			 srv.bad_cookie);
+		case_finish(0, "Cookie did not arrive intact");
+		goto next;
+	}
+
+	if (c->conn_close && srv.not_close) {
+		lwsl_err("%d of %d requests did not say connection: close\n",
+			 srv.not_close, srv.http_cbs);
+		case_finish(0, "request without connection: close");
+		goto next;
+	}
+
+	/*
+	 * Not reuse 3: its second request may ride a connection kept warm
+	 * from the previous case, if not the first's, so what it needs is to
+	 * have been answered (the pipelined request count below)
+	 */
+	if (c->reuse && c->reuse != 3) {
+		/*
+		 * The second request rides the kept-warm connection when it
+		 * comes within the keep-warm time, and opens a fresh one when
+		 * not.  Counted from the first request's completion: the
+		 * first request itself may have ridden a connection kept warm
+		 * from the previous case.
+		 */
+		int want = c->reuse == 2 ? 1 : 0;
+
+		if (srv.conns - srv.conns_first != want) {
+			lwsl_err("second request opened %d connections, "
+				 "expected %d\n", srv.conns - srv.conns_first,
+				 want);
+			case_finish(0, "connection reuse");
+			goto next;
+		}
+	}
+
+	if (c->pipeline) {
+		if (c->gate != XG_BLOCK && srv.http_cbs != 2) {
+			lwsl_err("server saw %d requests, expected 2\n",
+				 srv.http_cbs);
+			case_finish(0, "pipelined request count");
+			goto next;
+		}
+		/* not for the keep-warm expiry cases, nor the one whose first
+		 * request says connection: close: their two requests are
+		 * expected to use two connections when run alone */
+		if (c->reuse < 2 && srv.conns > 1) {
+			lwsl_err("pipelined requests used %d connections\n",
+				 srv.conns);
+			case_finish(0, "pipelined requests did not share a connection");
+			goto next;
+		}
+	}
+
+	case_finish(1, NULL);
+
+next:
+	lws_sul_schedule(context, 0, &sul_next, next_case,
+			 100 * LWS_US_PER_MS);
+}
+
+/* every connection of the case reached a terminal state? */
+
+static void
+case_check(void)
+{
+	const struct xcase *c = &cases[cur];
+	int n;
+
+	if (case_done)
+		return;
+
+	for (n = 0; n < 1 + c->pipeline; n++) {
+		struct conn *cn = conns[n];
+
+		if (!cn)
+			return; /* a reuse case's second request not started yet */
+
+		if (c->expect_status > 0) {
+			if (!cn->completed && !cn->closed && !cn->error)
+				return;
+		} else
+			if (!cn->closed && !cn->error)
+				return;
+	}
+
+	case_evaluate();
+}
+
+/*
+ * The whole multipart body, one part of body_len pattern bytes, made by
+ * lws_client_http_multipart() and sent as one chunk and the last-chunk.  We
+ * keep the length and sum of what we made, for the server's summary line
+ * to be checked against, since the boundary is lws' random.
+ */
+static int
+cli_multipart(struct lws *wsi, struct conn *cn)
+{
+	static char mp[8192], sbuf[LWS_PRE + 8192 + 32];
+	char *p = mp, *end = mp + sizeof(mp) - 1, *o = &sbuf[LWS_PRE];
+	size_t n, mp_len;
+
+	if (cn->c->body_len > sizeof(mp) - 512 ||
+	    lws_client_http_multipart(wsi, "f", NULL, NULL, &p, end))
+		return -1;
+	/* the first part of every body starts at the boundary */
+	if (p - mp < 2 || mp[0] != '-' || mp[1] != '-') {
+		lwsl_err("%s: body starts '%.*s'\n", __func__, 4, mp);
+		cn->mp_bad = 1;
+	}
+	for (n = 0; n < cn->c->body_len; n++)
+		*p++ = (char)pat(n);
+	if (lws_client_http_multipart(wsi, NULL, NULL, NULL, &p, end))
+		return -1;
+
+	mp_len = lws_ptr_diff_size_t(p, mp);
+	cn->mp_len = mp_len;
+	cn->mp_sum = sum_add(0, (const uint8_t *)mp, mp_len);
+
+	n = (size_t)lws_snprintf(o, 16, "%x\r\n", (unsigned int)mp_len);
+	memcpy(o + n, mp, mp_len);
+	n += mp_len;
+	memcpy(o + n, "\r\n0\r\n\r\n", 7);
+	n += 7;
+
+	lws_client_http_body_pending(wsi, 0);
+	if (lws_write(wsi, (uint8_t *)o, n, LWS_WRITE_HTTP_FINAL) != (int)n)
+		return -1;
+	cn->sent = n;
+
+	return 0;
+}
+
+static int
+callback_cli(struct lws *wsi, enum lws_callback_reasons reason,
+	     void *user, void *in, size_t len)
+{
+	struct conn *cn = (struct conn *)lws_get_opaque_user_data(wsi);
+	static uint8_t sbuf[LWS_PRE + 8192];
+	char rbuf[LWS_PRE + 2048], *px = &rbuf[LWS_PRE];
+	int lenx = sizeof(rbuf) - LWS_PRE, n;
+	const struct xcase *c;
+	uint8_t **pp, *end;
+	size_t o;
+
+	if (!cn)
+		return lws_callback_http_dummy(wsi, reason, user, in, len);
+
+	c = cn->c;
+
+	switch (reason) {
+
+	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+		lwsl_user("%s: client: connection error: %s\n", __func__,
+			  in ? (const char *)in : "(null)");
+		cn->error = 1;
+		if (cn->case_idx == cur)
+			case_check();
+		break;
+
+	case LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER:
+		pp = (uint8_t **)in;
+		end = (*pp) + len;
+		/* a request reissued after a redirect sends its body again */
+		cn->sent = 0;
+
+		switch (c->req) {
+		case XR_CL:
+			if (lws_add_http_header_content_length(wsi,
+					(lws_filepos_t)(c->claim_len ?
+						c->claim_len : c->body_len),
+					pp, end))
+				return -1;
+			break;
+		case XR_CHUNKED:
+		case XR_CHUNKED_EXT:
+			if (lws_add_http_header_by_token(wsi,
+					WSI_TOKEN_HTTP_TRANSFER_ENCODING,
+					(const uint8_t *)"chunked", 7, pp, end))
+				return -1;
+			break;
+		case XR_MULTIPART:
+			/*
+			 * lws added the multipart content-type and holds the
+			 * request open for the body; it has no length we
+			 * know in advance, so it goes chunked
+			 */
+			if (lws_add_http_header_by_token(wsi,
+					WSI_TOKEN_HTTP_TRANSFER_ENCODING,
+					(const uint8_t *)"chunked", 7, pp, end))
+				return -1;
+			lws_callback_on_writable(wsi);
+			break;
+		case XR_TE_BAD:
+			if (lws_add_http_header_by_token(wsi,
+					WSI_TOKEN_HTTP_TRANSFER_ENCODING,
+					(const uint8_t *)"gzip", 4, pp, end))
+				return -1;
+			break;
+		case XR_TE_AND_CL:
+			if (lws_add_http_header_by_token(wsi,
+					WSI_TOKEN_HTTP_TRANSFER_ENCODING,
+					(const uint8_t *)"chunked", 7, pp, end) ||
+			    lws_add_http_header_content_length(wsi,
+					(lws_filepos_t)c->claim_len, pp, end))
+				return -1;
+			break;
+		default:
+			break;
+		}
+
+		if (case_cookie()) {
+			static char ck[COOKIE_LEN + 1];
+
+			cookie_make(ck);
+			if (lws_add_http_header_by_token(wsi,
+					WSI_TOKEN_HTTP_COOKIE,
+					(const uint8_t *)ck, COOKIE_LEN,
+					pp, end))
+				return -1;
+		}
+
+		if (c->expect == 1 &&
+		    lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_EXPECT,
+					(const uint8_t *)"100-continue", 12,
+					pp, end))
+			return -1;
+		if (c->expect == 2 &&
+		    lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_EXPECT,
+					(const uint8_t *)"nope", 4, pp, end))
+			return -1;
+
+		if (cn->framed_len) {
+			lws_client_http_body_pending(wsi, 1);
+			lws_callback_on_writable(wsi);
+		}
+		break;
+
+	case LWS_CALLBACK_CLIENT_HTTP_WRITEABLE:
+		if (c->req == XR_MULTIPART) {
+			if (!cn->sent && cli_multipart(wsi, cn))
+				return -1;
+			break;
+		}
+		if (!cn->framed || cn->sent >= cn->framed_len)
+			break;
+
+		o = cn->framed_len - cn->sent;
+		if (o > c->write_sz)
+			o = c->write_sz;
+		if (o > sizeof(sbuf) - LWS_PRE)
+			o = sizeof(sbuf) - LWS_PRE;
+		memcpy(&sbuf[LWS_PRE], cn->framed + cn->sent, o);
+
+		n = LWS_WRITE_HTTP;
+		if (cn->sent + o == cn->framed_len) {
+			lws_client_http_body_pending(wsi, 0);
+			n = LWS_WRITE_HTTP_FINAL;
+		}
+
+		if (lws_write(wsi, &sbuf[LWS_PRE], o,
+			      (enum lws_write_protocol)n) != (int)o)
+			return -1;
+
+		cn->sent += o;
+		if (n != LWS_WRITE_HTTP_FINAL)
+			lws_callback_on_writable(wsi);
+		break;
+
+	case LWS_CALLBACK_ESTABLISHED_CLIENT_HTTP:
+		cn->status = (int)lws_http_client_http_response(wsi);
+		lwsl_user("%s: client: response status %d\n", __func__,
+			  cn->status);
+		break;
+
+	case LWS_CALLBACK_RECEIVE_CLIENT_HTTP_READ:
+		/* in only ever holds decoded payload */
+		lwsl_hexdump_info(in, len);
+		for (o = 0; o < len; o++) {
+			uint8_t b = ((const uint8_t *)in)[o];
+
+			if (cn->line_done) {
+				cn->rx_sum = (cn->rx_sum * 31u) + b;
+				cn->rx_len++;
+				continue;
+			}
+			if (cn->line_len < sizeof(cn->line) - 1)
+				cn->line[cn->line_len++] = (char)b;
+			cn->line[cn->line_len] = '\0';
+			if (b == '\n')
+				cn->line_done = 1;
+		}
+		return 0;
+
+	case LWS_CALLBACK_RECEIVE_CLIENT_HTTP:
+		if (lws_http_client_read(wsi, &px, &lenx) < 0)
+			return -1;
+		return 0;
+
+	case LWS_CALLBACK_COMPLETED_CLIENT_HTTP:
+		lwsl_user("%s: client: completed, status %d, %u payload bytes\n",
+			  __func__, cn->status, (unsigned int)cn->rx_len);
+		cn->completed = 1;
+		if (cn->case_idx == cur) {
+			/*
+			 * a reuse case's second request goes now the first is
+			 * done, after the connection has had time to idle
+			 */
+			if (cases[cur].reuse == 3 && cn == conns[0] &&
+			    !conns[1]) {
+				/*
+				 * now, before the first's connection can have
+				 * heard the server close it
+				 */
+				srv.conns_first = srv.conns;
+				reuse_start(NULL);
+			} else if (cases[cur].reuse && cn == conns[0] &&
+				   !conns[1]) {
+				srv.conns_first = srv.conns;
+				lws_sul_schedule(context, 0, &sul_reuse,
+						 reuse_start,
+						 (cases[cur].reuse == 2 ? 1500 :
+								      150) *
+							LWS_US_PER_MS);
+			}
+			case_check();
+		}
+		break;
+
+	case LWS_CALLBACK_CLOSED_CLIENT_HTTP:
+		cn->closed = 1;
+		if (cn->case_idx == cur)
+			case_check();
+		break;
+
+	default:
+		break;
+	}
+
+	return lws_callback_http_dummy(wsi, reason, user, in, len);
+}
+
+/*
+ * Connection records live on a list until we know lws has finished with the
+ * wsi (closed or errored), or until exit: a keepalive connection left over
+ * from a finished case can be handed to a later pipelined request, so we
+ * never assume anything about wsi lifetimes and never keep wsi pointers.
+ */
+
+static void
+conn_free(struct conn *cn)
+{
+	struct conn **pp = &conn_list;
+
+	while (*pp && *pp != cn)
+		pp = &(*pp)->next;
+	if (*pp)
+		*pp = cn->next;
+
+	free(cn->framed);
+	free(cn->raw_buf);
+	free(cn);
+}
+
+static void
+conn_reap(int all)
+{
+	struct conn *cn = conn_list, *nx;
+
+	while (cn) {
+		nx = cn->next;
+		if (all || (cn->case_idx < cur && (cn->closed || cn->error)))
+			conn_free(cn);
+		cn = nx;
+	}
+}
+
+static struct conn *
+conn_start(const struct xcase *c)
+{
+	struct lws_client_connect_info i;
+	struct conn *cn;
+	size_t max;
+
+	cn = calloc(1, sizeof(*cn));
+	if (!cn)
+		return NULL;
+
+	cn->c = c;
+	cn->case_idx = cur;
+	cn->next = conn_list;
+	conn_list = cn;
+
+	/* build the framed request body */
+
+	switch (c->req) {
+	case XR_CL:
+	case XR_BODY_NOHDR:
+		if (c->body_len) {
+			size_t n;
+
+			cn->framed = malloc(c->body_len);
+			if (!cn->framed)
+				goto bail;
+			for (n = 0; n < c->body_len; n++)
+				cn->framed[n] = pat(n);
+			cn->framed_len = c->body_len;
+		}
+		break;
+	case XR_CHUNKED:
+	case XR_CHUNKED_EXT:
+		/* the smallest chunks cost 5 framing bytes per payload byte */
+		max = (c->body_len * 6) + 256;
+		cn->framed = malloc(max);
+		if (!cn->framed)
+			goto bail;
+		cn->framed_len = frame_chunked(cn->framed, max, c->body_len,
+					       c->req == XR_CHUNKED_EXT);
+		break;
+	default:
+		break;
+	}
+
+	memset(&i, 0, sizeof(i));
+	i.context = context;
+	i.vhost = vh_cli;
+	i.address = server_addr;
+	i.host = server_addr;
+	i.origin = server_addr;
+	i.port = c->via_proxy ? port_proxy : (c->h2 ? port_h2 : port_h1);
+#if defined(LWS_ROLE_H3)
+	if (c->h2 == 2) {
+		i.port = port_h3;
+		i.alpn = "h3";
+		i.ssl_connection = LCCSCF_USE_SSL | LCCSCF_ALLOW_SELFSIGNED |
+				   LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK;
+	}
+#if defined(LWS_WITH_HTTP_PROXY)
+	if (c->via_proxy && c->h2) {
+		/* h2 by alpn over tls, or h3, to the tls proxy vhost */
+		i.port = port_proxy_tls;
+		i.alpn = c->h2 == 2 ? "h3" : "h2";
+		i.ssl_connection = LCCSCF_USE_SSL | LCCSCF_ALLOW_SELFSIGNED |
+				   LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK;
+	}
+#endif
+#endif
+	i.path = c->path;
+	i.method = c->method;
+	i.protocol = "http-xfer";
+	i.opaque_user_data = cn;
+	/*
+	 * Keep connections warm for 1s: a reuse case's second request comes
+	 * at 150ms (joins) or 1500ms (finds it gone), and by 1500ms every
+	 * connection an earlier case left warm has lapsed too, so the expiry
+	 * case cannot ride one of those instead of opening its own
+	 */
+	i.keep_warm_secs = 1;
+#if defined(LWS_WITH_HTTP2) && defined(LWS_WITH_FILE_OPS)
+	if (c->raw == 1) {
+		/* a raw client that speaks the upgrade and the h2 frames itself */
+		i.method = "RAW";
+		i.local_protocol_name = "http-xfer-h2c";
+	}
+#endif
+	if (c->raw >= 2) {
+		/* a raw client that pipelines two h1 requests itself */
+		i.method = "RAW";
+		i.local_protocol_name = "http-xfer-raw-h1";
+	}
+	/* reuse 3: the first request does not ask to pipeline */
+	if (c->pipeline && (c->reuse != 3 || conns[0]))
+		i.ssl_connection |= LCCSCF_PIPELINE;
+	if (c->req == XR_MULTIPART)
+		i.ssl_connection |= LCCSCF_HTTP_MULTIPART_MIME;
+#if defined(LWS_WITH_HTTP2)
+	if (c->h2 == 1 && !c->via_proxy)
+		i.ssl_connection |= LCCSCF_H2_PRIOR_KNOWLEDGE;
+#endif
+
+	if (!lws_client_connect_via_info(&i)) {
+		lwsl_err("%s: connect failed\n", __func__);
+		goto bail;
+	}
+
+	return cn;
+
+bail:
+	conn_free(cn);
+
+	return NULL;
+}
+
+static void
+watchdog_cb(lws_sorted_usec_list_t *sul)
+{
+	case_finish(0, "watchdog: case did not complete");
+	lws_sul_schedule(context, 0, &sul_next, next_case, 1);
+}
+
+static void
+reuse_start(lws_sorted_usec_list_t *sul)
+{
+	conns[1] = conn_start(&cases[cur]);
+	if (!conns[1]) {
+		case_finish(0, "could not start the second connection");
+		lws_sul_schedule(context, 0, &sul_next, next_case, 1);
+	}
+}
+
+static void
+next_case(lws_sorted_usec_list_t *sul)
+{
+	const struct xcase *c;
+	int n;
+
+	if (only_case >= 0 && cur >= 0)
+		cur = (int)LWS_ARRAY_SIZE(cases) - 1;
+	cur++;
+	if (only_case >= 0 && cur < (int)LWS_ARRAY_SIZE(cases))
+		cur = only_case;
+	conn_reap(0);
+	memset(conns, 0, sizeof(conns));
+	case_done = 0;
+	if (cur == (int)LWS_ARRAY_SIZE(cases)) {
+		result = failures ? 1 : 0;
+		lws_default_loop_exit(context);
+		return;
+	}
+
+	c = &cases[cur];
+	lwsl_user("=== case %d: %s ===\n", cur, c->name);
+
+	memset(&srv, 0, sizeof(srv));
+
+	lws_sul_schedule(context, 0, &sul_watchdog, watchdog_cb,
+			 CASE_TIMEOUT_S * LWS_US_PER_SEC);
+
+	for (n = 0; n < 1 + (c->reuse ? 0 : c->pipeline); n++) {
+		conns[n] = conn_start(c);
+		if (!conns[n]) {
+			case_finish(0, "could not start connection");
+			lws_sul_schedule(context, 0, &sul_next, next_case, 1);
+			return;
+		}
+	}
+}
+
+#if defined(LWS_WITH_HTTP2) && defined(LWS_WITH_FILE_OPS)
+
+/*
+ * The raw client of the Upgrade: h2c case.  Speaks just enough h2 to read
+ * stream 1's response: the preface and an empty SETTINGS after the 101,
+ * a SETTINGS ACK for the server's, and frames parsed until a DATA frame
+ * carries END_STREAM.  The status is read from the HEADERS frame: lws sends
+ * :status first, as a literal name and value without indexing.
+ */
+
+static int
+callback_raw_h2c(struct lws *wsi, enum lws_callback_reasons reason,
+		 void *user, void *in, size_t len)
+{
+	struct conn *cn = (struct conn *)lws_get_opaque_user_data(wsi);
+	static const uint8_t preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+					 "\x00\x00\x00\x04\x00\x00\x00\x00\x00";
+	static const uint8_t settings_ack[] =
+					 "\x00\x00\x00\x04\x01\x00\x00\x00\x00";
+	uint8_t buf[LWS_PRE + 256], *p;
+	size_t o;
+	int n;
+
+	if (!cn)
+		return lws_callback_http_dummy(wsi, reason, user, in, len);
+
+	switch (reason) {
+	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+		lwsl_user("%s: h2c client: connection error: %s\n", __func__,
+			  in ? (const char *)in : "(null)");
+		cn->error = 1;
+		if (cn->case_idx == cur)
+			case_check();
+		break;
+
+	case LWS_CALLBACK_RAW_CONNECTED:
+		n = lws_snprintf((char *)buf + LWS_PRE, sizeof(buf) - LWS_PRE,
+				 "GET %s HTTP/1.1\r\n"
+				 "Host: %s\r\n"
+				 "Connection: Upgrade, HTTP2-Settings\r\n"
+				 "Upgrade: h2c\r\n"
+				 "HTTP2-Settings: AAMAAABk\r\n\r\n",
+				 cn->c->path, server_addr);
+		if (lws_write(wsi, buf + LWS_PRE, (size_t)n, LWS_WRITE_RAW) != n)
+			return -1;
+		break;
+
+	case LWS_CALLBACK_RAW_RX:
+		if (!cn->raw_buf) {
+			cn->raw_buf = malloc(RAW_BUF_MAX);
+			if (!cn->raw_buf)
+				return -1;
+		}
+		if (cn->raw_len + len > RAW_BUF_MAX)
+			return -1;
+		memcpy(cn->raw_buf + cn->raw_len, in, len);
+		cn->raw_len += len;
+
+		if (!cn->h2c_phase) {
+			uint8_t *e = NULL;
+
+			for (o = 0; o + 4 <= cn->raw_len; o++)
+				if (!memcmp(cn->raw_buf + o, "\r\n\r\n", 4)) {
+					e = cn->raw_buf + o + 4;
+					break;
+				}
+			if (!e)
+				break;
+			if (cn->raw_len < 12 ||
+			    memcmp(cn->raw_buf, "HTTP/1.1 101", 12)) {
+				lwsl_user("%s: no 101: '%.*s'\n", __func__,
+					  (int)(e - cn->raw_buf), (const char *)cn->raw_buf);
+				return -1;
+			}
+			cn->raw_len -= (size_t)(e - cn->raw_buf);
+			memmove(cn->raw_buf, e, cn->raw_len);
+			cn->h2c_phase = 1;
+			memcpy(buf + LWS_PRE, preface, sizeof(preface) - 1);
+			if (lws_write(wsi, buf + LWS_PRE, sizeof(preface) - 1,
+				      LWS_WRITE_RAW) != (int)sizeof(preface) - 1)
+				return -1;
+		}
+
+		/*
+		 * h2 frames: o is how far into the buffer whole frames were
+		 * consumed, cn->raw_len stays what we buffered until the end
+		 */
+		o = 0;
+		while (o + 9 <= cn->raw_len) {
+			size_t flen;
+			uint8_t type, flags;
+
+			p = cn->raw_buf + o;
+			flen = ((size_t)p[0] << 16) | ((size_t)p[1] << 8) | p[2];
+			type = p[3];
+			flags = p[4];
+
+			/*
+			 * A frame bigger than our whole rx buffer can never
+			 * be assembled, so we'd stall here forever
+			 */
+			if (flen > RAW_BUF_MAX - 9) {
+				lwsl_err("%s: h2 frame len %u too big\n",
+					 __func__, (unsigned int)flen);
+				return -1;
+			}
+			if (cn->raw_len - o < 9 + flen)
+				break;
+			switch (type) {
+			case 4: /* SETTINGS: ack theirs */
+				if (!(flags & 1)) {
+					memcpy(buf + LWS_PRE, settings_ack, 9);
+					if (lws_write(wsi, buf + LWS_PRE, 9,
+						      LWS_WRITE_RAW) != 9)
+						return -1;
+				}
+				break;
+			case 1: /* HEADERS: lws sends :status first, as a
+				 * literal name and value without indexing */
+				if (!(flags & 0x28) && flen >= 13 && !p[9] &&
+				    p[10] == 7 && !memcmp(p + 11, ":status", 7) &&
+				    p[18] == 3)
+					cn->status = ((p[19] - '0') * 100) +
+						     ((p[20] - '0') * 10) +
+						      (p[21] - '0');
+				break;
+			case 0: /* DATA */
+				cn->rx_len += flen;
+				if (flags & 1) {
+					cn->completed = 1;
+					if (cn->case_idx == cur)
+						case_check();
+					return -1; /* done: close */
+				}
+				break;
+			default:
+				break;
+			}
+			o += 9 + flen;
+		}
+		/*
+		 * Only whole frames that fit were consumed, so o can't be past
+		 * what we buffered... but o is built from peer lengths, bound
+		 * it directly before it sizes the memmove
+		 */
+		if (o > cn->raw_len)
+			return -1;
+		if (o) {
+			size_t rest = cn->raw_len - o;
+
+			/*
+			 * rest is derived from o, so it is peer-derived too:
+			 * bound the length we move itself, by the buffer
+			 */
+			if (rest > RAW_BUF_MAX - o)
+				return -1;
+			memmove(cn->raw_buf, cn->raw_buf + o, rest);
+			cn->raw_len = rest;
+		}
+		break;
+
+	case LWS_CALLBACK_RAW_CLOSE:
+		cn->closed = 1;
+		if (cn->case_idx == cur)
+			case_check();
+		break;
+
+	default:
+		break;
+	}
+
+	return 0;
+}
+#endif
+
+static const struct lws_protocols protocols_srv[] = {
+	{ "http-xfer", callback_srv, sizeof(struct pss_srv), 0, 0, NULL, 0 },
+#if defined(LWS_WITH_JOSE)
+	{ "xfer-gate", callback_gate, 0, 0, 0, NULL, 0 },
+#endif
+	LWS_PROTOCOL_LIST_TERM
+};
+
+/*
+ * The raw h1 clients: two requests in one write, then the responses are
+ * read until each has ended.
+ *
+ * raw 2, the pipelined proxy case, sends two GETs.  The proxy relays a
+ * response without a Content-Length as chunked, so each ends with a
+ * last-chunk; the proxy says "connection: close", but the requests asked
+ * for keep-alive, and a server that goes on reading must frame whatever it
+ * answers.
+ *
+ * raw 3 sends a POST with its Content-Length body and a GET behind it, raw 4
+ * two GETs.  The second request asks for the case's path without its
+ * "-later", so it is answered at once.  Both responses have a
+ * Content-Length, and each body starts with the summary line of what the
+ * server decoded for that request.
+ */
+
+#define RAW3_BODY_MAX 256
+
+/* case-insensitive match of a header name at p */
+static int
+raw_hdr_is(const uint8_t *p, const uint8_t *end, const char *name)
+{
+	size_t n = strlen(name), i;
+
+	if ((size_t)(end - p) < n)
+		return 0;
+
+	for (i = 0; i < n; i++) {
+		uint8_t c = p[i];
+
+		if (c >= 'A' && c <= 'Z')
+			c = (uint8_t)(c + ('a' - 'A'));
+		if (c != (uint8_t)name[i])
+			return 0;
+	}
+
+	return 1;
+}
+
+/*
+ * The head of a 200 response with a Content-Length under max at the start
+ * of p: its length (the blank line included) with the Content-Length in cl,
+ * 0 if it is not all there yet, -1 if it is not that
+ */
+static int
+raw_head(const uint8_t *p, const uint8_t *end, long *cl, long max)
+{
+	const uint8_t *h, *e;
+
+	*cl = -1;
+
+	/* the end of this response's headers */
+	for (e = p; e + 4 <= end; e++)
+		if (!memcmp(e, "\r\n\r\n", 4))
+			break;
+	if (e + 4 > end)
+		return 0;
+
+	if (end - p < 12 || memcmp(p, "HTTP/1.1 200", 12))
+		return -1;
+
+	/* its Content-Length, at the start of one of its lines */
+	for (h = p; h < e; h++)
+		if (h[0] == '\n' &&
+		    raw_hdr_is(h + 1, e, "content-length:")) {
+			h += 1 + strlen("content-length:");
+			while (h < e && *h == ' ')
+				h++;
+			*cl = 0;
+			while (h < e && *h >= '0' && *h <= '9' && *cl < max)
+				*cl = (*cl * 10) + (*h++ - '0');
+			break;
+		}
+	if (*cl < 0 || *cl >= max)
+		return -1;
+
+	return lws_ptr_diff(e + 4, p);
+}
+
+/*
+ * How many whole Content-Length responses are at the start of b, 0 .. 2,
+ * their bodies' starts in body[]; -1 if a response is not one we can frame
+ */
+static int
+raw3_responses(const uint8_t *b, size_t len, const uint8_t *body[2],
+	       size_t blen[2])
+{
+	const uint8_t *p = b, *end = b + len;
+	int count = 0;
+
+	while (count < 2) {
+		long cl;
+		int n = raw_head(p, end, &cl, RAW_BUF_MAX);
+
+		if (n < 0)
+			return -1;
+		if (!n)
+			break;
+
+		p += n;
+		if ((size_t)(end - p) < (size_t)cl)
+			break;
+
+		body[count] = p;
+		blen[count++] = (size_t)cl;
+		p += cl;
+	}
+
+	return count;
+}
+
+/*
+ * The response body is the summary line of what the server decoded, want
+ * bytes of the pattern, then those bytes again
+ */
+static int
+raw3_summary_ok(const uint8_t *body, size_t blen, size_t want)
+{
+	char line[40];
+	size_t n;
+
+	n = (size_t)lws_snprintf(line, sizeof(line), "len=%u sum=%08x\n",
+				 (unsigned int)want,
+				 (unsigned int)sum_pat(want));
+
+	return blen == n + want && !memcmp(body, line, n) &&
+	       sum_add(0, body + n, want) == sum_pat(want);
+}
+
+/*
+ * The whole body of the server's answer to a GET it took as want pattern
+ * bytes: the summary line, then the pattern.  Its length, and in sum the
+ * running sum of all of it, as raw5_rx() accumulates one
+ */
+static size_t
+raw5_body(size_t want, uint32_t *sum)
+{
+	char line[40];
+	size_t n, i;
+
+	n = (size_t)lws_snprintf(line, sizeof(line), "len=%u sum=%08x\n",
+				 (unsigned int)want,
+				 (unsigned int)sum_pat(want));
+	*sum = sum_add(0, (const uint8_t *)line, n);
+	for (i = 0; i < want; i++) {
+		uint8_t b = pat(i);
+
+		*sum = sum_add(*sum, &b, 1);
+	}
+
+	return n + want;
+}
+
+/*
+ * The one-shot case's rx, a byte at a time as the two answers stream in:
+ * each answer's head is collected until its blank line, and its
+ * Content-Length body summed as it passes rather than kept.  Returns 1 once
+ * both are whole, 0 for more, -1 if what came is not two 200s
+ */
+static int
+raw5_rx(struct conn *cn, const uint8_t *p, size_t len)
+{
+	while (len--) {
+		uint8_t b = *p++;
+
+		if (cn->r5_remain) {
+			cn->r5_sum = sum_add(cn->r5_sum, &b, 1);
+			if (--cn->r5_remain)
+				continue;
+		} else {
+			long cl;
+			int n;
+
+			/* a head byte */
+			if (cn->raw_len == RAW_BUF_MAX)
+				return -1;
+			cn->raw_buf[cn->raw_len++] = b;
+			if (cn->raw_len < 4 ||
+			    memcmp(cn->raw_buf + cn->raw_len - 4, "\r\n\r\n", 4))
+				continue;
+
+			n = raw_head(cn->raw_buf, cn->raw_buf + cn->raw_len,
+				     &cl, ONESHOT_MAX);
+			if (n <= 0)
+				return -1;
+			cn->raw_len = 0;
+			cn->r5_sum = 0;
+			cn->r5_lens[cn->r5_done] = (size_t)cl;
+			cn->r5_remain = (size_t)cl;
+			if (cl)
+				continue;
+		}
+
+		/* an answer's body is all here */
+		cn->r5_sums[cn->r5_done++] = cn->r5_sum;
+		if (cn->r5_done == 2)
+			/* and nothing may follow the second */
+			return len ? -1 : 1;
+	}
+
+	return 0;
+}
+
+static int
+callback_raw_h1(struct lws *wsi, enum lws_callback_reasons reason,
+		void *user, void *in, size_t len)
+{
+	struct conn *cn = (struct conn *)lws_get_opaque_user_data(wsi);
+	uint8_t buf[LWS_PRE + 256 + RAW3_BODY_MAX];
+	const uint8_t *body[2];
+	char path2[48], *q;
+	size_t o, blen[2];
+	uint32_t sum;
+	int n;
+
+	if (!cn)
+		return lws_callback_http_dummy(wsi, reason, user, in, len);
+
+	switch (reason) {
+	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+		lwsl_user("%s: raw h1 client: connection error: %s\n",
+			  __func__, in ? (const char *)in : "(null)");
+		cn->error = 1;
+		if (cn->case_idx == cur)
+			case_check();
+		break;
+
+	case LWS_CALLBACK_RAW_CONNECTED:
+		if (cn->c->raw >= 3) {
+			/* the first request, and the GET behind it */
+			if (cn->c->body_len > RAW3_BODY_MAX)
+				return -1;
+			lws_strncpy(path2, cn->c->path, sizeof(path2));
+			q = strstr(path2, "-later");
+			if (q)
+				*q = '\0';
+			n = lws_snprintf((char *)buf + LWS_PRE, 256,
+					 "%s %s HTTP/1.1\r\nHost: %s\r\n",
+					 cn->c->method, cn->c->path,
+					 server_addr);
+			if (cn->c->req == XR_CL)
+				n += lws_snprintf((char *)buf + LWS_PRE + n,
+						  (size_t)(256 - n),
+						  "Content-Length: %u\r\n",
+						  (unsigned int)
+							cn->c->body_len);
+			n += lws_snprintf((char *)buf + LWS_PRE + n,
+					  (size_t)(256 - n), "\r\n");
+			for (o = 0; o < cn->c->body_len; o++)
+				buf[LWS_PRE + (size_t)n++] = pat(o);
+
+			if (cn->c->raw == 5) {
+				/*
+				 * Only the first request for now, and we do
+				 * not read its answer until our timer says:
+				 * the second goes while the answer waits
+				 */
+				if (lws_rx_flow_control(wsi, 0))
+					return -1;
+				lws_set_timer_usecs(wsi, 100 * LWS_US_PER_MS);
+			} else if (cn->c->raw == 6)
+				/* the second goes in its own write, later */
+				lws_set_timer_usecs(wsi, 100 * LWS_US_PER_MS);
+			else
+				n += lws_snprintf((char *)buf + LWS_PRE + n,
+					  sizeof(buf) - LWS_PRE - (size_t)n,
+					  "GET %s HTTP/1.1\r\nHost: %s\r\n\r\n",
+					  path2, server_addr);
+		} else
+			n = lws_snprintf((char *)buf + LWS_PRE,
+					 sizeof(buf) - LWS_PRE,
+					 "GET %s HTTP/1.1\r\nHost: %s\r\n\r\n"
+					 "GET %s HTTP/1.1\r\nHost: %s\r\n\r\n",
+					 cn->c->path, server_addr,
+					 cn->c->path, server_addr);
+		if (lws_write(wsi, buf + LWS_PRE, (size_t)n, LWS_WRITE_RAW) != n)
+			return -1;
+		break;
+
+	case LWS_CALLBACK_TIMER:
+		if (cn->c->raw == 6) {
+			/* the GET behind the first request, in its own segment */
+			lws_strncpy(path2, cn->c->path, sizeof(path2));
+			q = strstr(path2, "-later");
+			if (q)
+				*q = '\0';
+			n = lws_snprintf((char *)buf + LWS_PRE, 256,
+					 "GET %s HTTP/1.1\r\nHost: %s\r\n\r\n",
+					 path2, server_addr);
+			if (lws_write(wsi, buf + LWS_PRE, (size_t)n,
+				      LWS_WRITE_RAW) != n)
+				return -1;
+			break;
+		}
+		if (cn->c->raw != 5)
+			break;
+		switch (cn->raw_phase++) {
+		case 0:
+			/*
+			 * The first answer has been sent as far as the socket
+			 * buffers allow and waits to drain: our next request
+			 * goes now, and we count the loop's turns until we
+			 * read, which a server spinning on its readable socket
+			 * would run up by the tens of thousands
+			 */
+			n = lws_snprintf((char *)buf + LWS_PRE, 256,
+					 "GET /echo-cl HTTP/1.1\r\nHost: %s\r\n\r\n",
+					 server_addr);
+			if (lws_write(wsi, buf + LWS_PRE, (size_t)n,
+				      LWS_WRITE_RAW) != n)
+				return -1;
+			cn->turns_start = turns;
+			lws_set_timer_usecs(wsi, RAW3_LATER_MS * LWS_US_PER_MS);
+			break;
+		case 1:
+			cn->turns_waited = turns - cn->turns_start;
+			lwsl_user("%s: raw h1 client: %u turns while the answer "
+				  "waited unread\n", __func__, cn->turns_waited);
+			/* now read both answers */
+			if (lws_rx_flow_control(wsi, 1))
+				return -1;
+			break;
+		default:
+			break;
+		}
+		break;
+
+	case LWS_CALLBACK_RAW_RX:
+		if (!cn->raw_buf) {
+			cn->raw_buf = malloc(RAW_BUF_MAX);
+			if (!cn->raw_buf)
+				return -1;
+		}
+
+		if (cn->c->raw == 5) {
+			n = raw5_rx(cn, (const uint8_t *)in, len);
+			if (n < 0) {
+				lwsl_err("%s: raw h1 client: unexpected answer "
+					 "(%d whole)\n", __func__, cn->r5_done);
+				return -1;
+			}
+			if (!n)
+				break;
+
+			/* the big answer, then the one to the GET behind it */
+			if (cn->r5_lens[0] != raw5_body(BIG_ONESHOT, &sum) ||
+			    cn->r5_sums[0] != sum ||
+			    cn->r5_lens[1] != raw5_body(0, &sum) ||
+			    cn->r5_sums[1] != sum) {
+				lwsl_err("%s: raw h1 client: answers %u/%08x, "
+					 "%u/%08x\n", __func__,
+					 (unsigned int)cn->r5_lens[0],
+					 cn->r5_sums[0],
+					 (unsigned int)cn->r5_lens[1],
+					 cn->r5_sums[1]);
+				return -1;
+			}
+
+			cn->status = 200;
+			cn->completed = 1;
+			if (cn->case_idx == cur)
+				case_check();
+
+			return -1; /* done: close */
+		}
+
+		if (cn->raw_len + len > RAW_BUF_MAX)
+			return -1;
+		memcpy(cn->raw_buf + cn->raw_len, in, len);
+		cn->raw_len += len;
+
+		if (cn->c->raw >= 3) {
+			n = raw3_responses(cn->raw_buf, cn->raw_len, body,
+					   blen);
+			if (n < 0) {
+				lwsl_err("%s: raw h1 client: unexpected "
+					 "response\n", __func__);
+				return -1;
+			}
+			cn->rx_len = (size_t)n;
+			if (n < 2)
+				break;
+
+			/* the first request's body if any, then nothing */
+			if (!raw3_summary_ok(body[0], blen[0],
+					     cn->c->body_len) ||
+			    !raw3_summary_ok(body[1], blen[1], 0)) {
+				lwsl_err("%s: raw h1 client: responses say "
+					 "'%.*s', '%.*s'\n", __func__,
+					 (int)(blen[0] > 24 ? 24 : blen[0]),
+					 (const char *)body[0],
+					 (int)(blen[1] > 24 ? 24 : blen[1]),
+					 (const char *)body[1]);
+				return -1;
+			}
+
+			cn->status = 200;
+			cn->completed = 1;
+			if (cn->case_idx == cur)
+				case_check();
+
+			return -1; /* done: close */
+		}
+
+		/*
+		 * The body is only the summary line, so a last-chunk is the
+		 * only place "\r\n0\r\n\r\n" appears: count the responses
+		 * that ended
+		 */
+		n = 0;
+		for (o = 0; o + 7 <= cn->raw_len; o++)
+			if (!memcmp(cn->raw_buf + o, "\r\n0\r\n\r\n", 7))
+				n++;
+		cn->rx_len = (size_t)n;
+		if (n < 2)
+			break;
+
+		if (cn->raw_len < 12 || memcmp(cn->raw_buf, "HTTP/1.1 200", 12))
+			return -1;
+		cn->status = 200;
+		cn->completed = 1;
+		if (cn->case_idx == cur)
+			case_check();
+
+		return -1; /* done: close */
+
+	case LWS_CALLBACK_RAW_CLOSE:
+		lwsl_user("%s: raw h1 client: closed after %d responses ended\n",
+			  __func__, cn->c->raw == 5 ? cn->r5_done :
+						     (int)cn->rx_len);
+		cn->closed = 1;
+		if (cn->case_idx == cur)
+			case_check();
+		break;
+
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+static const struct lws_protocols protocols_cli[] = {
+	{ "http-xfer", callback_cli, 0, 0, 0, NULL, 0 },
+#if defined(LWS_WITH_HTTP2) && defined(LWS_WITH_FILE_OPS)
+	{ "http-xfer-h2c", callback_raw_h2c, 0, 0, 0, NULL, 0 },
+#endif
+	{ "http-xfer-raw-h1", callback_raw_h1, 0, 0, 0, NULL, 0 },
+	LWS_PROTOCOL_LIST_TERM
+};
+
+/*
+ * /small is served by the same protocol, but with a 64-byte body limit, to
+ * check what happens to bodies over the limit
+ */
+
+static const struct lws_http_mount mount_small = {
+	.mountpoint		= "/small",
+	.protocol		= "http-xfer",
+	.origin_protocol	= LWSMPRO_CALLBACK,
+	.mountpoint_len		= 6,
+	.max_http_body_size	= 64,
+};
+
+#if defined(LWS_WITH_JOSE)
+
+/*
+ * /gated is an ordinary callback mount served by the same protocol, except
+ * that every request to it must get past the interceptor protocol on
+ * /bouncer first
+ */
+
+static const struct lws_http_mount mount_bouncer = {
+	.mount_next		= &mount_small,
+	.mountpoint		= "/bouncer",
+	.protocol		= "xfer-gate",
+	.origin_protocol	= LWSMPRO_CALLBACK,
+	.mountpoint_len		= 8,
+};
+
+static const struct lws_http_mount mount_gated = {
+	.mount_next		= &mount_bouncer,
+	.mountpoint		= "/gated",
+	.protocol		= "http-xfer",
+	.origin_protocol	= LWSMPRO_CALLBACK,
+	.mountpoint_len		= 6,
+	.interceptor_path	= "/bouncer",
+};
+
+#define MOUNT_LIST (&mount_gated)
+#else
+#define MOUNT_LIST (&mount_small)
+#endif
+
+#if defined(LWS_WITH_FILE_OPS)
+/*
+ * /file serves this directory, for the h2c upgrade case and to show a file
+ * with no mimetype is refused.  .md is not in the server's own table, the
+ * mount has to say what it is.
+ */
+
+static const struct lws_protocol_vhost_options mime_md = {
+	NULL, NULL, ".md", "text/markdown"
+};
+
+static const struct lws_http_mount mount_file = {
+	.mount_next		= MOUNT_LIST,
+	.mountpoint		= "/file",
+	.origin			= ".",
+	.extra_mimetypes	= &mime_md,
+	.origin_protocol	= LWSMPRO_FILE,
+	.mountpoint_len		= 5,
+};
+#undef MOUNT_LIST
+#define MOUNT_LIST (&mount_file)
+#endif
+
+/*
+ * /cb is a callback mount written the other way, naming its protocol as its
+ * origin, which reaches the protocol by another path in lws
+ */
+
+static const struct lws_http_mount mount_cb = {
+	.mount_next		= MOUNT_LIST,
+	.mountpoint		= "/cb",
+	.origin			= "http-xfer",
+	.origin_protocol	= LWSMPRO_CALLBACK,
+	.mountpoint_len		= 3,
+};
+#undef MOUNT_LIST
+#define MOUNT_LIST (&mount_cb)
+
+#if defined(LWS_WITH_HTTP_PROXY)
+/* the proxy vhost forwards everything to the h1 server vhost */
+
+static char proxy_origin[48];
+
+static const struct lws_http_mount mount_proxy = {
+	.mountpoint		= "/",
+	.origin			= proxy_origin,
+	.origin_protocol	= LWSMPRO_HTTP,
+	.mountpoint_len		= 1,
+};
+#endif
+
+void sigint_handler(int sig)
+{
+	lws_default_loop_exit(context);
+}
+
+int main(int argc, const char **argv)
+{
+	struct lws_context_creation_info info;
+	struct lws_vhost *vh;
+	const char *p;
+	int n = 0;
+
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	/*
+	 * The defaults budget 8 fds per thread, sized for a lone client.
+	 * We have four listen sockets (h1 + h2, v4 + v6) plus the system
+	 * fds, and a case can have both ends of an h2 connection, two
+	 * pipelined clients and a keepalive connection left over from the
+	 * previous case all open at once.  Past the budget lws stops
+	 * servicing the listeners until something closes, which here is
+	 * the previous case's idle keepalive timing out 5s later.
+	 */
+	info.fd_limit_per_thread = 0;
+
+	if ((p = lws_cmdline_option(argc, argv, "-p")))
+		port_h1 = atoi(p);
+	if ((p = lws_cmdline_option(argc, argv, "--h2-port")))
+		port_h2 = atoi(p);
+	if ((p = lws_cmdline_option(argc, argv, "--proxy-port")))
+		port_proxy = atoi(p);
+#if defined(LWS_ROLE_H3)
+	if ((p = lws_cmdline_option(argc, argv, "--h3-port")))
+		port_h3 = atoi(p);
+#if defined(LWS_WITH_HTTP_PROXY)
+	if ((p = lws_cmdline_option(argc, argv, "--proxy-tls-port")))
+		port_proxy_tls = atoi(p);
+#endif
+#endif
+	if ((p = lws_cmdline_option(argc, argv, "--server")))
+		server_addr = p;
+	if ((p = lws_cmdline_option(argc, argv, "--case")))
+		only_case = atoi(p);
+	/* --serve-only: just run the server vhosts, for poking at by hand */
+
+	signal(SIGINT, sigint_handler);
+
+	lwsl_user("LWS API selftest: http body transfer framings\n");
+
+	info.options = LWS_SERVER_OPTION_EXPLICIT_VHOSTS;
+#if defined(LWS_WITH_TLS)
+	info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+#endif
+
+	context = lws_create_context(&info);
+	if (!context) {
+		lwsl_err("lws init failed\n");
+		return 1;
+	}
+
+	/* h1 server vhost */
+
+	info.port = port_h1;
+	info.vhost_name = "srv-h1";
+	info.protocols = protocols_srv;
+	info.mounts = MOUNT_LIST;
+
+	vh = lws_create_vhost(context, &info);
+	if (!vh) {
+		lwsl_err("Failed to create h1 server vhost\n");
+		goto bail;
+	}
+
+#if defined(LWS_WITH_UNIX_SOCK) && !defined(WIN32)
+	/*
+	 * The same server on a unix socket, only ever named by the redirect
+	 * the client must refuse.  It's named after our h1 port so parallel
+	 * runs do not collide; on linux it's abstract, leaving no file
+	 */
+#if defined(__linux__)
+	lws_snprintf(uds_path, sizeof(uds_path), "@lws-api-test-http-xfer-%d",
+		     port_h1);
+#else
+	lws_snprintf(uds_path, sizeof(uds_path), "lws-api-test-http-xfer-%d.sock",
+		     port_h1);
+	unlink(uds_path);
+#endif
+	lws_snprintf(uds_location, sizeof(uds_location), "http://+%s:80/echo-cl",
+		     uds_path);
+
+	info.port = 0;
+	info.iface = uds_path;
+	info.vhost_name = "srv-uds";
+	info.options |= LWS_SERVER_OPTION_UNIX_SOCK;
+
+	if (!lws_create_vhost(context, &info)) {
+		lwsl_err("Failed to create unix socket server vhost\n");
+		goto bail;
+	}
+
+	info.options &= ~(uint64_t)LWS_SERVER_OPTION_UNIX_SOCK;
+	info.iface = NULL;
+#endif
+
+#if defined(LWS_WITH_HTTP2)
+	/* h2 server vhost, cleartext with prior knowledge */
+
+	info.port = port_h2;
+	info.vhost_name = "srv-h2";
+	info.options |= LWS_SERVER_OPTION_H2_PRIOR_KNOWLEDGE;
+
+	vh = lws_create_vhost(context, &info);
+	if (!vh) {
+		lwsl_err("Failed to create h2 server vhost\n");
+		goto bail;
+	}
+	info.options &= ~(uint64_t)LWS_SERVER_OPTION_H2_PRIOR_KNOWLEDGE;
+#endif
+
+#if defined(LWS_ROLE_H3)
+	/* h3 server vhost: a quic listener on udp, tls with the test cert */
+
+	info.port = CONTEXT_PORT_NO_LISTEN_SERVER;
+	info.vhost_name = "srv-h3";
+	info.listen_accept_role = "quic";
+	info.listen_accept_protocol = "http-xfer";
+	info.alpn = "h3";
+	info.server_ssl_cert_mem = test_cert;
+	info.server_ssl_cert_mem_len = (unsigned int)strlen(test_cert);
+	info.server_ssl_private_key_mem = test_key;
+	info.server_ssl_private_key_mem_len = (unsigned int)strlen(test_key);
+
+	vh_h3 = lws_create_vhost(context, &info);
+	if (!vh_h3) {
+		lwsl_err("Failed to create h3 server vhost\n");
+		goto bail;
+	}
+
+	if (!lws_create_adopt_udp(vh_h3, server_addr, port_h3, LWS_CAUDP_BIND,
+				  "http-xfer", NULL, NULL, NULL, NULL,
+				  "quic_listen")) {
+		lwsl_err("Failed to bind the quic listener\n");
+		goto bail;
+	}
+
+	info.listen_accept_role = NULL;
+	info.listen_accept_protocol = NULL;
+	info.alpn = NULL;
+	info.server_ssl_cert_mem = NULL;
+	info.server_ssl_cert_mem_len = 0;
+	info.server_ssl_private_key_mem = NULL;
+	info.server_ssl_private_key_mem_len = 0;
+#endif
+
+#if defined(LWS_WITH_HTTP_PROXY)
+	/* proxy vhost, an http proxy mount on to the h1 server */
+
+	lws_snprintf(proxy_origin, sizeof(proxy_origin), "%s:%d/",
+		     server_addr, port_h1);
+	info.port = port_proxy;
+	info.vhost_name = "srv-proxy";
+	info.mounts = &mount_proxy;
+	/*
+	 * The relay of the onward response lives in the default http
+	 * callback, so this vhost must not have our server protocol, whose
+	 * callback answers HTTP_WRITEABLE for its own echo
+	 */
+	info.protocols = NULL;
+
+	vh = lws_create_vhost(context, &info);
+	if (!vh) {
+		lwsl_err("Failed to create proxy vhost\n");
+		goto bail;
+	}
+
+#if defined(LWS_ROLE_H3)
+	/*
+	 * The same proxy mount on a tls vhost, the way lwsws sets one up: an
+	 * alpn naming h3 has the vhost bring up its own quic listener on the
+	 * same port, so h2 comes in over tcp and h3 over udp
+	 */
+
+	info.port = port_proxy_tls;
+	info.vhost_name = "srv-proxy-tls";
+	info.alpn = "h2,http/1.1,h3";
+	info.server_ssl_cert_mem = test_cert;
+	info.server_ssl_cert_mem_len = (unsigned int)strlen(test_cert);
+	info.server_ssl_private_key_mem = test_key;
+	info.server_ssl_private_key_mem_len = (unsigned int)strlen(test_key);
+
+	vh = lws_create_vhost(context, &info);
+	if (!vh) {
+		lwsl_err("Failed to create tls proxy vhost\n");
+		goto bail;
+	}
+
+	info.alpn = NULL;
+	info.server_ssl_cert_mem = NULL;
+	info.server_ssl_cert_mem_len = 0;
+	info.server_ssl_private_key_mem = NULL;
+	info.server_ssl_private_key_mem_len = 0;
+#endif
+#endif
+
+	/* client vhost, no listener */
+
+	info.port = CONTEXT_PORT_NO_LISTEN;
+	info.vhost_name = "cli";
+	info.protocols = protocols_cli;
+	info.mounts = NULL;
+
+	vh_cli = lws_create_vhost(context, &info);
+	if (!vh_cli) {
+		lwsl_err("Failed to create client vhost\n");
+		goto bail;
+	}
+
+	result = 1;
+	if (!lws_cmdline_option(argc, argv, "--serve-only"))
+		lws_sul_schedule(context, 0, &sul_next, next_case, 1);
+
+	while (n >= 0) {
+		n = lws_service(context, 0);
+		turns++;
+	}
+
+bail:
+	lws_context_destroy(context);
+	conn_reap(1);
+
+	lwsl_user("Completed: %s (%d of %d cases failed)\n",
+		  result ? "FAIL" : "PASS", failures,
+		  (int)LWS_ARRAY_SIZE(cases));
+
+	return result;
+}

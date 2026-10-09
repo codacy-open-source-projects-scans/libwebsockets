@@ -50,7 +50,7 @@ static struct lws_protocols protocols[] = {
 };
 
 static struct lws_context *context;
-static int interrupted, port = 7681, options = 0;
+static int result, port = 7681, options = 0;
 static const char *url = "/", *ads = "localhost", *iface = NULL;
 
 /* pass pointers to shared vars to the protocol */
@@ -90,16 +90,16 @@ static const struct lws_protocol_vhost_options pvo_port = {
 	(void *)&port	/* pvo value */
 };
 
-static const struct lws_protocol_vhost_options pvo_interrupted = {
+static const struct lws_protocol_vhost_options pvo_result = {
 	&pvo_port,
 	NULL,
-	"interrupted",		/* pvo name */
-	(void *)&interrupted	/* pvo value */
+	"result",		/* pvo name */
+	(void *)&result		/* pvo value */
 };
 
 static const struct lws_protocol_vhost_options pvo = {
 	NULL,		/* "next" pvo linked-list */
-	&pvo_interrupted,	/* "child" pvo linked-list */
+	&pvo_result,		/* "child" pvo linked-list */
 	"lws-minimal-client-echo",	/* protocol name we belong to on this vhost */
 	""		/* ignored */
 };
@@ -116,20 +116,14 @@ static const struct lws_extension extensions[] = {
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
 	const char *p;
-	int n, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE
-			/* for LLL_ verbosity above NOTICE to be built into lws,
-			 * lws must have been configured and built with
-			 * -DCMAKE_BUILD_TYPE=DEBUG instead of =RELEASE */
-			/* | LLL_INFO */ /* | LLL_PARSER */ /* | LLL_HEADER */
-			/* | LLL_EXT */ /* | LLL_CLIENT */ /* | LLL_LATENCY */
-			/* | LLL_DEBUG */;
+	int n;
 	(void)switches;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
@@ -138,10 +132,7 @@ int main(int argc, const char **argv)
 	}
 
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal ws client echo + permessage-deflate + multifragment bulk message\n");
 	lwsl_user("   lws-minimal-ws-client-echo [-n (no exts)] [-u url] [-p port] [-o (once)]\n");
 
@@ -149,7 +140,14 @@ int main(int argc, const char **argv)
 		url = p;
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_P].sw)))
-		port = atoi(p);
+		{
+			int __pt = atoi(p);
+			if (__pt < 0 || __pt > 65535) {
+				lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+				return 1;
+			}
+			port = __pt;
+		}
 
 	if (lws_cmdline_option(argc, argv, switches[LWS_SW_O].sw))
 		options |= 1;
@@ -165,7 +163,8 @@ int main(int argc, const char **argv)
 
 	lwsl_user("options %d, ads %s\n", options, ads);
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.port = CONTEXT_PORT_NO_LISTEN;
 	info.protocols = protocols;
 	info.pvo = &pvo;
@@ -178,10 +177,10 @@ int main(int argc, const char **argv)
 	 * since we know this lws context is only ever going to be used with
 	 * one client wsis / fds / sockets at a time, let lws know it doesn't
 	 * have to use the default allocations for fd tables up to ulimit -n.
-	 * It will just allocate for 1 internal and 1 (+ 1 http2 nwsi) that we
-	 * will use.
+	 * It will just allocate for its own fds and overhead
+	 * (LWS_FD_LIMIT_PER_THREAD_MIN) plus the one connection we will use.
 	 */
-	info.fd_limit_per_thread = 1 + 1 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 1;
 
 	if (lws_cmdline_option(argc, argv, switches[LWS_SW_LIBUV].sw))
 		info.options |= LWS_SERVER_OPTION_LIBUV;
@@ -194,13 +193,13 @@ int main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (!lws_service(context, 0) && !interrupted)
+	while (lws_service(context, 0) >= 0)
 		;
 
 	lws_context_destroy(context);
 
-	n = (options & 1) ? interrupted != 2 : interrupted == 3;
-	lwsl_user("Completed %d %s\n", interrupted, !n ? "OK" : "failed");
+	n = (options & 1) ? result != 2 : result == 3;
+	lwsl_user("Completed %d %s\n", result, !n ? "OK" : "failed");
 
 	return n;
 }

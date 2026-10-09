@@ -103,3 +103,117 @@ lws_plugins_destroy(struct lws_plugin **pplugin, each_plugin_cb_t each,
 plugins and a pointer to its exported header object, so you can walk this
 after loading.
 
+## Protocol Plugin Best Practices
+
+When writing a protocol plugin that utilizes `LWS_CALLBACK_PROTOCOL_INIT`, you must follow these requirements:
+
+### 1. Ignore NULL `in` Parameters
+
+During context creation or system initialization, `LWS_CALLBACK_PROTOCOL_INIT` may be called with a `NULL` `in` parameter (which normally carries the `lws_protocol_vhost_options`). Your plugin must safely ignore this and exit without error:
+
+```c
+	case LWS_CALLBACK_PROTOCOL_INIT:
+		if (!in)
+			return 0;
+```
+
+### 2. Contextual Warning for PVO Errors
+
+When parsing `lws_protocol_vhost_options` (PVOs) during `PROTOCOL_INIT`, if an error occurs (such as a missing or invalid value), you should use `lws_vhost_warn(lws_get_vhost(wsi), ...)` or `lws_vhost_err(...)` instead of generic logging. This ensures the user can understand *which* vhost is misconfigured, especially in multi-vhost setups.
+
+### 3. Stub Process Isolation
+
+Generic stub processes (such as `--lws-stub=dnssec-priv`) inherit the user's config and will attempt to initialize all plugins. To prevent resource contention (like conflicting UDP port bindings or duplicated threads), plugins must explicitly opt-in or opt-out of running inside stubs.
+
+If your plugin **should never run** inside a stub process (which is the case for most application and UI plugins), you must inject this snippet at the top of your `PROTOCOL_INIT` block:
+
+```c
+	case LWS_CALLBACK_PROTOCOL_INIT:
+		if (!in)
+			return 0;
+
+		/* Do not initialize in generic stub processes */
+		if (lws_cmdline_option_cx(lws_get_context(wsi), "--lws-stub"))
+			return 0;
+```
+
+If your plugin **is explicitly designed to run** inside a specific stub (e.g. `dnssec-monitor` running inside `dnssec-priv`), you must modify the snippet to ensure it only initializes for *that specific* stub, and ignores any others:
+
+```c
+	case LWS_CALLBACK_PROTOCOL_INIT:
+		if (!in)
+			return 0;
+
+		/* Only initialize if we are running as the dnssec-priv stub */
+		const char *stub = lws_cmdline_option_cx(lws_get_context(wsi), "--lws-stub");
+		if (stub && strcmp(stub, "dnssec-priv"))
+			return 0;
+```
+
+### 4. One-time setup goes in the export's `.init`, not `PROTOCOL_INIT`
+
+`LWS_CALLBACK_PROTOCOL_INIT` comes once per vhost that instantiates your
+protocol, and with `in` NULL on vhosts that merely offer it.  Anything that must
+happen once per process -- above all the server side of your own stub, which
+reads its secret from stdin exactly once -- does not belong there: how many
+times it arrives depends on the deployment.
+
+A protocol plugin export built with `LWS_PLUGIN_API_MAGIC` 193 or later can
+give `.init` and `.deinit`.  lws calls `.init` once per context, after the
+system vhost exists and before `lws_create_context()` returns, and `.deinit`
+once at context destruction after every vhost is gone, however the plugin
+arrived: dlopened, built into lws, or composed into the application (below).
+
+```c
+static int
+my_plugin_init(struct lws_context *cx)
+{
+	const char *stub = lws_cmdline_option_cx(cx, "--lws-stub");
+
+	/* only our own stub child has anything to set up */
+	if (!stub || strcmp(stub, "my-stub"))
+		return 0;
+
+	/* lws_stub_server_init(), keep what it read in plugin state... */
+
+	return 0;
+}
+
+const lws_plugin_protocol_t my_plugin = {
+	.hdr = { ..., .api_magic = LWS_PLUGIN_API_MAGIC },
+	...
+	.init		= my_plugin_init,
+	.deinit		= my_plugin_deinit,
+};
+```
+
+Then `PROTOCOL_INIT` stays the plain "no pvo, return 0" of section 1, even in
+the stub child, where no vhost needs to instantiate the plugin at all.
+
+The stub child cannot see the pvos, so where its UDS socket goes is best left
+to the parent alone: `lws_stub_spawn()` passes the child the `uds_path` it was
+given as `--lws-uds=<path>`, and a `lws_stub_server_init()` given a NULL
+`uds_path` listens there.  The parent can then take the path from its config,
+as the cert-dist plugins do with their `stub-dir` pvo.
+
+### 5. Applications composing a plugin into themselves
+
+An application may build a protocol plugin's source into itself instead of
+having lws load it (`#define LWS_PLUGIN_STATIC` before including the source, eg
+via the plugin's `include/lws-plugin-*-static-build-includes.h`).  It should
+then list the plugin's export in `info->plugins` when creating the context:
+
+```c
+static const lws_plugin_protocol_t * const composed_plugins[] = {
+	&my_plugin, NULL
+};
+	...
+	info.plugins = composed_plugins;
+```
+
+lws then calls its `.init` and `.deinit` just as for a plugin it loaded itself,
+and a builtin or dlopened plugin with the same `hdr.name` is not used at all:
+the application's copy wins.  The protocols still go on vhosts through the
+vhost's `pprotocols` as usual.  A plugin supporting this defines its export
+`static` under `LWS_PLUGIN_STATIC`, so it cannot collide with the same export
+in a libwebsockets built with `LWS_WITH_PLUGINS_BUILTIN`.

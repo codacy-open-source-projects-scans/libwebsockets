@@ -16,11 +16,13 @@
 
 enum {
 	LWS_SW_D,
+	LWS_SW_PORT,
 	LWS_SW_HELP,
 };
 
 static const struct lws_switches switches[] = {
 	[LWS_SW_D]	= { "-d",              "Debug logs (e.g. -d 15)" },
+	[LWS_SW_PORT]	= { "--port",          "Port to listen on (default 7681)" },
 	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
 };
 
@@ -40,12 +42,12 @@ static const struct lws_switches switches[] = {
  */
 struct pss {
 	struct lws_spa *spa;		/* lws helper decodes multipart form */
-	char filename[128];		/* the filename of the uploaded file */
+	char filename[128];		/* the file being saved, while it is */
 	unsigned long long file_length; /* the amount of bytes uploaded */
-	int fd;				/* fd on file being saved */
+	int fd;				/* fd on file being saved, or -1 */
 };
 
-static int interrupted;
+static struct lws_context *context;
 
 static const char * const param_names[] = {
 	"text1",
@@ -57,6 +59,26 @@ enum enum_param_names {
 	EPN_SEND,
 };
 
+/*
+ * An upload that did not complete: close its file and remove what it wrote,
+ * so it leaves neither an fd nor a partial file behind
+ */
+
+static void
+file_upload_abandon(struct pss *pss)
+{
+	if (pss->fd != -1) {
+		close(pss->fd);
+		pss->fd = -1;
+	}
+	if (pss->filename[0]) {
+		if (unlink(pss->filename) < 0)
+			lwsl_notice("%s: unlink %s failed: %d\n", __func__,
+				    pss->filename, errno);
+		pss->filename[0] = '\0';
+	}
+}
+
 static int
 file_upload_cb(void *data, const char *name, const char *filename,
 	       char *buf, int len, enum lws_spa_fileupload_states state)
@@ -65,6 +87,12 @@ file_upload_cb(void *data, const char *name, const char *filename,
 
 	switch (state) {
 	case LWS_UFS_OPEN:
+		/*
+		 * One file at a time: one still open here did not complete,
+		 * and the open below would otherwise leak it
+		 */
+		file_upload_abandon(pss);
+
 		/* take a copy of the provided filename */
 		lws_strncpy(pss->filename, filename, sizeof(pss->filename) - 1);
 		/* remove any scary things like .. */
@@ -74,11 +102,14 @@ file_upload_cb(void *data, const char *name, const char *filename,
 		if (pss->fd == -1) {
 			lwsl_notice("Failed to open output file %s\n",
 				    pss->filename);
-			return 1;
+			pss->filename[0] = '\0';
+			return -1;
 		}
 		break;
 	case LWS_UFS_FINAL_CONTENT:
 	case LWS_UFS_CONTENT:
+		if (pss->fd == -1)
+			break;
 		if (len) {
 			int n;
 
@@ -98,10 +129,14 @@ file_upload_cb(void *data, const char *name, const char *filename,
 		lwsl_user("%s: upload done, written %lld to %s\n", __func__,
 			  pss->file_length, pss->filename);
 
+		/* it's complete: keep it */
 		close(pss->fd);
 		pss->fd = -1;
+		pss->filename[0] = '\0';
 		break;
 	case LWS_UFS_CLOSE:
+		/* the form ended, or the client went, mid-file */
+		file_upload_abandon(pss);
 		break;
 	}
 
@@ -140,6 +175,8 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 		/* create the POST argument parser if not already existing */
 
 		if (!pss->spa) {
+			pss->fd = -1;
+			pss->filename[0] = '\0';
 			pss->spa = lws_spa_create(wsi, param_names,
 					LWS_ARRAY_SIZE(param_names), 1024,
 					file_upload_cb, pss);
@@ -184,7 +221,11 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 		break;
 
 	case LWS_CALLBACK_HTTP_DROP_PROTOCOL:
-		/* called when our wsi user_space is going to be destroyed */
+		/*
+		 * called when our wsi user_space is going to be destroyed...
+		 * a spa not finalized yet gives the upload callback its
+		 * LWS_UFS_CLOSE here, which cleans up an incomplete file
+		 */
 		if (pss->spa) {
 			lws_spa_destroy(pss->spa);
 			pss->spa = NULL;
@@ -215,21 +256,14 @@ static const struct lws_http_mount mount = {
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	struct lws_context *context;
 	const char *p;
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE
-			/* for LLL_ verbosity above NOTICE to be built into lws,
-			 * lws must have been configured and built with
-			 * -DCMAKE_BUILD_TYPE=DEBUG instead of =RELEASE */
-			/* | LLL_INFO */ /* | LLL_PARSER */ /* | LLL_HEADER */
-			/* | LLL_EXT */ /* | LLL_CLIENT */ /* | LLL_LATENCY */
-			/* | LLL_DEBUG */;
+	int n = 0;
 	(void)switches;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
@@ -240,14 +274,23 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal http server POST file | visit http://localhost:7681\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	/* a server: size the fds tables to the process limit */
+	info.fd_limit_per_thread = 0;
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.port = 7681;
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_PORT].sw))) {
+		int pt = atoi(p);
+
+		if (pt <= 0 || pt > 65535) {
+			lwsl_err("Port %d is outside valid 16-bit range\n", pt);
+			return 1;
+		}
+		info.port = pt;
+	}
 	info.protocols = protocols;
 	info.mounts = &mount;
 	info.options =
@@ -259,7 +302,7 @@ int main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

@@ -13,7 +13,7 @@
 #include <libwebsockets.h>
 
 enum {
-	LWS_SW_H1,
+	LWS_SW_POLICY_FILE,
 	LWS_SW_A,
 	LWS_SW_H,
 	LWS_SW_I,
@@ -22,7 +22,7 @@ enum {
 };
 
 static const struct lws_switches switches[] = {
-	[LWS_SW_H1]	= { "--h1",            "Enable --h1 feature" },
+	[LWS_SW_POLICY_FILE]	= { "-c",              "Policy JSON file path, overrides the compiled-in policy" },
 	[LWS_SW_A]	= { "-a",              "Enable -a feature" },
 	[LWS_SW_H]	= { "-h",              "Strict Host Check / Help" },
 	[LWS_SW_I]	= { "-i",              "Interface to bind to" },
@@ -34,7 +34,8 @@ static const struct lws_switches switches[] = {
 #include <signal.h>
 
 static unsigned int timeout_ms = 6000;
-static int interrupted, bad = 1, h1;
+static int bad = 1;
+static struct lws_context *context;
 static lws_state_notify_link_t nl;
 static size_t hugeurl_size = 4000;
 
@@ -69,7 +70,7 @@ static const char * const default_ss_policy =
 		 * We fetch the real policy from there using SS and switch to
 		 * using that.
 		 */
-		"{\"isrg_root_x1\": \""
+				"{\"isrg_root_x1\": \""
 	"MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw"
 	"TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh"
 	"cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4"
@@ -97,15 +98,30 @@ static const char * const default_ss_policy =
 	"jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc"
 	"oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq"
 	"4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA"
-	"mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d"
-	"emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc="
+	"mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57de"
+	"myPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc="
+	  "\"},\n"
+		"{\"isrg_root_x2\": \""
+	"MIICGzCCAaGgAwIBAgIQQdKd0XLq7qeAwSxs6S+HUjAKBggqhkjOPQQDAzBPMQsw"
+	"CQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJuZXQgU2VjdXJpdHkgUmVzZWFyY2gg"
+	"R3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBYMjAeFw0yMDA5MDQwMDAwMDBaFw00"
+	"MDA5MTcxNjAwMDBaME8xCzAJBgNVBAYTAlVTMSkwJwYDVQQKEyBJbnRlcm5ldCBT"
+	"ZWN1cml0eSBSZXNlYXJjaCBHcm91cDEVMBMGA1UEAxMMSVNSRyBSb290IFgyMHYw"
+	"EAYHKoZIzj0CAQYFK4EEACIDYgAEzZvVn4CDCuwJSvMWSj5cz3es3mcFDR0HttwW"
+	"+1qLFNvicWDEukWVEYmO6gbf9yoWHKS5xcUy4APgHoIYOIvXRdgKam7mAHf7AlF9"
+	"ItgKbppbd9/w+kHsOdx1ymgHDB/qo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0T"
+	"AQH/BAUwAwEB/zAdBgNVHQ4EFgQUfEKWrt5LSDv6kviejM9ti6lyN5UwCgYIKoZI"
+	"zj0EAwMDaAAwZQIwe3lORlCEwkSHRhtFcP9Ymd70/aTSVaYgLXTWNLxBo1BfASdW"
+	"tL4ndQavEi51mI38AjEAi/V3bNTIZargCyzuFJ0nN6T5U6VR5CmD1/iQMVtCnwr1"
+	"/q4AaOeMSQ+2b1tbFfLn"
 	  "\"}"
 	  "],"
 	  "\"trust_stores\": [" /* named cert chains */
 		"{"
 			"\"name\": \"le_via_isrg\","
 			"\"stack\": ["
-				"\"isrg_root_x1\""
+				"\"isrg_root_x1\","
+				"\"isrg_root_x2\""
 			"]"
 		"}"
 	  "],"
@@ -196,7 +212,7 @@ myss_rx(void *userobj, const uint8_t *buf, size_t len, int flags)
 
 	if (flags & LWSSS_FLAG_EOM) {
 
-		interrupted = 1;
+		lws_default_loop_exit(context);
 
 		/* confirm that what we collected is the expected size */
 
@@ -268,7 +284,7 @@ myss_state(void *userobj, void *sh, lws_ss_constate_t state,
 
 	case LWSSSCS_ALL_RETRIES_FAILED:
 		/* if we're out of retries, we want to close the app and FAIL */
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		lws_cancel_service(lws_ss_get_context(m->ss));
 		break;
 
@@ -282,7 +298,7 @@ myss_state(void *userobj, void *sh, lws_ss_constate_t state,
 
 	case LWSSSCS_TIMEOUT:
 		lwsl_notice("%s: LWSSSCS_TIMEOUT\n", __func__);
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		lws_cancel_service(lws_ss_get_context(m->ss));
 		break;
 
@@ -317,7 +333,7 @@ static int
 app_system_state_nf(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 		    int current, int target)
 {
-	struct lws_context *context = lws_system_context_from_system_mgr(mgr);
+	struct lws_context *cx = lws_system_context_from_system_mgr(mgr);
 
 
 	/*
@@ -331,10 +347,7 @@ app_system_state_nf(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 	if (current != LWS_SYSTATE_OPERATIONAL)
 		return 0;
 
-	if (h1)
-		ssi.streamtype = "lws_anything_h1";
-
-	if (!lws_ss_create(context, 0, &ssi, NULL, NULL, NULL, NULL))
+	if (!lws_ss_create(cx, 0, &ssi, NULL, NULL, NULL, NULL))
 		return 0;
 
 	lwsl_err("%s: failed to create secure stream\n", __func__);
@@ -349,13 +362,12 @@ static lws_state_notify_link_t * const app_notifier_list[] = {
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	struct lws_context *context;
 	const char *p;
 	int n = 0;
 	(void)switches;
@@ -368,12 +380,11 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	memset(&info, 0, sizeof info);
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	lws_context_info_defaults(&info, NULL);lws_cmdline_option_handle_builtin(argc, argv, &info);
 
 	lwsl_user("LWS secure streams hugeurl test client [-d<verb>][-h <urlarg len>]\n");
 
-	info.fd_limit_per_thread = 1 + 6 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 6;
 	info.port = CONTEXT_PORT_NO_LISTEN;
 #if defined(LWS_SS_USE_SSPC)
 	info.protocols = lws_sspc_protocols;
@@ -381,7 +392,14 @@ int main(int argc, const char **argv)
 	/* connect to ssproxy via UDS by default, else via
 	 * tcp connection to this port */
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_P].sw)))
-		info.ss_proxy_port = (uint16_t)atoi(p);
+		{
+			int __pt = atoi(p);
+			if (__pt < 0 || __pt > 65535) {
+				lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+				return 1;
+			}
+			info.ss_proxy_port = (uint16_t)__pt;
+		}
 
 	/* UDS "proxy.ss.lws" in abstract namespace, else this socket
 	 * path; when -p given this can specify the network interface
@@ -394,15 +412,18 @@ int main(int argc, const char **argv)
 		info.ss_proxy_address = p;
 #else
 	info.pss_policies_json = default_ss_policy;
+
+	/* if given, -c overrides the compiled-in policy with a policy from
+	 * a file, so the same binary can be pointed at a locally-generated
+	 * policy targeting a local test server */
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_POLICY_FILE].sw)))
+		info.pss_policies_json = p;
 	info.options = LWS_SERVER_OPTION_EXPLICIT_VHOSTS |
 		       LWS_SERVER_OPTION_H2_JUST_FIX_WINDOW_UPDATE_OVERFLOW |
 		       LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 #endif
 	info.connect_timeout_secs = 15;
 	info.timeout_secs = 10;
-
-	if (lws_cmdline_option(argc, argv, switches[LWS_SW_H1].sw))
-		h1 = 1;
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_H].sw)))
 		hugeurl_size = (size_t)atol(p);
@@ -434,7 +455,7 @@ int main(int argc, const char **argv)
 
 	/* the event loop */
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

@@ -38,6 +38,10 @@ const STORAGE_VIDEO_ID = 'lws_mixer_video_id';
 const STORAGE_AUDIO_ID = 'lws_mixer_audio_id';
 const STORAGE_OUTPUT_ID = 'lws_mixer_output_id';
 const STORAGE_CTRL_PREFIX = 'lws_mixer_ctrl_';
+
+/* most recent chat messages kept in the DOM */
+const CHAT_HISTORY_MAX = 200;
+
 let loggedInEmail = "";
 let labelTimeout;
 
@@ -83,7 +87,7 @@ function updateView() {
         videoLabel.innerText = "Conference Stream";
         startButton.innerText = "Connected";
 
-        if (overlayContainer) overlayContainer.style.display = 'block';
+        if (overlayContainer) overlayContainer.classList.remove('hidden');
 
         displayVideo.volume = 1.0;
         displayVideo.play().catch(e => console.log("Auto-play failed:", e));
@@ -102,7 +106,7 @@ function updateView() {
         }
 
         // Hide decorations when in local preview
-        if (overlayContainer) overlayContainer.style.display = 'none';
+        if (overlayContainer) overlayContainer.classList.add('hidden');
 
         // Ensure label stays visible during preview (cancel any fade timeout)
         videoLabel.classList.remove('hidden');
@@ -110,14 +114,28 @@ function updateView() {
     }
     updateButtonState();
 
-    // Initial size check and event listeners
+    /*
+     * Initial size check.  The listeners themselves are registered exactly
+     * once, at startup: updateView() is called from the 1s signalling
+     * reconnect loop, so registering here would leak one listener per
+     * second against a server that is down.
+     */
     adjustOverlaySize();
-    window.addEventListener('resize', adjustOverlaySize);
-    displayVideo.addEventListener('resize', adjustOverlaySize);
-    displayVideo.addEventListener('loadedmetadata', adjustOverlaySize);
 
     startFPSMonitor();
 }
+
+function onDisplayVideoClick() {
+    if (displayVideo.paused) {
+        console.log("Video clicked, attempting manual play...");
+        displayVideo.play().catch(e => console.error("Manual play failed:", e));
+    }
+}
+
+window.addEventListener('resize', adjustOverlaySize);
+displayVideo.addEventListener('resize', adjustOverlaySize);
+displayVideo.addEventListener('loadedmetadata', adjustOverlaySize);
+displayVideo.addEventListener('click', onDisplayVideoClick);
 
 let fpsInterval;
 function startFPSMonitor() {
@@ -220,10 +238,9 @@ function adjustOverlaySize() {
         left = 0;
     }
 
-    overlayContainer.style.width = `${width}px`;
-    overlayContainer.style.height = `${height}px`;
-    overlayContainer.style.left = `${left}px`;
-    overlayContainer.style.top = `${top}px`;
+    overlayContainer.animate([
+        { width: `${width}px`, height: `${height}px`, left: `${left}px`, top: `${top}px` }
+    ], { duration: 0, fill: 'forwards' });
 }
 
 function updateButtonState() {
@@ -291,6 +308,69 @@ document.addEventListener('DOMContentLoaded', () => {
     remoteModalTitle = document.getElementById('remoteModalTitle');
     remoteModalBody = document.getElementById('remoteModalBody');
 });
+
+/*
+ * Normalize a control descriptor array that came from another participant
+ * over the wire.  Returns a fresh array of descriptors that renderNodeControls()
+ * and applyControl() can consume without any further type checks, or null if
+ * anything at all about the blob was unexpected: a peer's capabilities are
+ * untrusted input and must never half-apply.
+ */
+function sanitiseRemoteControls(controls) {
+    if (!Array.isArray(controls) || controls.length > 128)
+        return null;
+
+    const out = [];
+
+    for (const c of controls) {
+        if (!c || typeof c !== 'object' || Array.isArray(c))
+            return null;
+
+        if (typeof c.id !== 'string' && typeof c.id !== 'number')
+            return null;
+
+        const id = String(c.id);
+        if (!id.length || id.length > 64)
+            return null;
+
+        const min = Number(c.min), max = Number(c.max);
+        let step = Number(c.step), val = Number(c.val);
+
+        /*
+         * A control with no usable range (a v4l2 BUTTON, say) just has
+         * nothing to render; skip it rather than reject the whole device.
+         */
+        if (!Number.isFinite(min) || !Number.isFinite(max) || min >= max)
+            continue;
+        if (!Number.isFinite(step) || step <= 0)
+            step = 1;
+        if (!Number.isFinite(val))
+            val = min;
+        val = Math.min(Math.max(val, min), max);
+
+        /*
+         * Map V4L2 types to frontend types
+         * 1=INTEGER, 2=BOOLEAN, 3=MENU, 4=BUTTON, 5=INT64, 6=CLASS,
+         * 7=STRING, 8=BITMASK, 9=INT_MENU
+         *
+         * Everything that is not BOOLEAN becomes a slider: we do not have
+         * the menu labels for MENU / INT_MENU, and 'select' would require
+         * an options array we would then have to trust.
+         */
+        out.push({
+            id: id,
+            type: c.type === 2 ? 'boolean' : 'slider',
+            name: typeof c.name === 'string' && c.name.length &&
+                  c.name.length <= 64 ? c.name : id,
+            min: min,
+            max: max,
+            step: step,
+            val: val
+        });
+    }
+
+    return out;
+}
 
 function renderNodeControls(node, container) {
     if (!container) return;
@@ -375,7 +455,7 @@ function renderNodeControls(node, container) {
             input.value = ctrl.val;
 
             input.oninput = (e) => {
-                const newVal = parseFloat(e.target.value);
+                const newVal = Number.parseFloat(e.target.value);
                 valSpan.innerText = newVal;
                 applyControl(node, ctrl, newVal);
             };
@@ -502,7 +582,7 @@ async function discoverLocalCapabilities() {
                     min = finalRange.min;
                     max = finalRange.max;
                     step = finalRange.step || 1;
-                    val = saved !== null ? parseFloat(saved) : settings[name] || min;
+                    val = saved !== null ? Number.parseFloat(saved) : settings[name] || min;
                 }
 
                 console.log(`Adding video control ${name} as ${type}`, cap);
@@ -560,11 +640,11 @@ async function discoverLocalCapabilities() {
                      max = caps[name]?.max || 1.0;
                      step = caps[name]?.step || 0.01;
                      const def = settings[name] !== undefined ? settings[name] : max;
-                     val = saved !== null ? parseFloat(saved) : def;
+                     val = saved !== null ? Number.parseFloat(saved) : def;
                 } else if (type === 'boolean') {
                     // For boolean, val 1.0 = true, 0.0 = false
                     const def = settings[name] !== undefined ? (settings[name] ? 1.0 : 0.0) : 1.0;
-                    val = saved !== null ? parseFloat(saved) : def;
+                    val = saved !== null ? Number.parseFloat(saved) : def;
                 }
 
                 console.log(`Adding control ${name} as ${type}`);
@@ -591,7 +671,7 @@ async function discoverLocalCapabilities() {
             min: 0,
             max: 2.0,
             step: 0.05,
-            val: savedSoft !== null ? parseFloat(savedSoft) : 1.0
+            val: savedSoft !== null ? Number.parseFloat(savedSoft) : 1.0
         });
 
         if (!audioCtx) {
@@ -600,7 +680,7 @@ async function discoverLocalCapabilities() {
                 const source = audioCtx.createMediaStreamSource(localStream);
                 gainNode = audioCtx.createGain();
                 const savedSoft = localStorage.getItem(`${STORAGE_CTRL_PREFIX}${aNode.id}_software-gain`);
-                gainNode.gain.value = savedSoft !== null ? parseFloat(savedSoft) : 1.0;
+                gainNode.gain.value = savedSoft !== null ? Number.parseFloat(savedSoft) : 1.0;
                 source.connect(gainNode);
             } catch (e) {
                 console.error("AudioContext failed:", e);
@@ -619,7 +699,7 @@ async function discoverLocalCapabilities() {
             min: 0,
             max: 1.0,
             step: 0.05,
-            val: savedVol !== null ? parseFloat(savedVol) : 1.0
+            val: savedVol !== null ? Number.parseFloat(savedVol) : 1.0
         });
         // Sinks don't support constraints in the same way, so we purely use soft controls/setSinkId
     }
@@ -673,6 +753,10 @@ function toggleVideoMute() {
             btn.innerHTML = '<svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M1 1l22 22"></path><path d="M21 21l-3.5-3.5"></path><path d="M9 9l-7 5 7 5V9z"></path><path d="M17 17v-3.5"></path><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>';
         } else {
              btn.innerHTML = '<svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"></path><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>';
+        }
+
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "video_mute", muted: !track.enabled }));
         }
     }
 }
@@ -754,59 +838,74 @@ async function connectSignalling() {
                 await pc.setRemoteDescription(new RTCSessionDescription(msg));
             } else if (msg.type === 'candidate') {
                 await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-            } else if (msg.type === 'device_controls') {
-                log("Remote device controls received");
-                // Create a virtual node for remote controls
-                const rVideoNode = new MediaNode("remote_video", "Remote Camera", "videoinput", true);
-                rVideoNode.controls = msg.video;
-                const rAudioNode = new MediaNode("remote_audio", "Remote Audio", "audioinput", true);
-                rAudioNode.controls = msg.audio;
-
-                remoteNodes = [rVideoNode, rAudioNode];
-                refreshDeviceUI();
             } else if (msg.type === 'request_res') {
                 const track = localStream.getVideoTracks()[0];
                 if (track) {
                     await track.applyConstraints({ width: { ideal: msg.width }, height: { ideal: msg.height } });
                 }
             } else if (msg.type === 'remote_capabilities') {
-                /* {"type":"remote_capabilities","target":"<name>","payload":{"type":"capabilities","kind":"video","controls":[...]}} */
-                log("Remote caps received for " + msg.target);
-                const payload = msg.payload;
+                /*
+                 * {"type":"remote_capabilities","target":"<opaque id>",
+                 *  "name":"<display name>",
+                 *  "payload":"<the owner's capabilities message, as a JSON
+                 *              *string* we parse ourselves>"}
+                 *
+                 * The server does not parse the payload, so it can not splice
+                 * it into this message as JSON: it hands it to us escaped as
+                 * a string and we parse it here.  "target" is the server's
+                 * opaque handle for the participant, not a name the
+                 * participant chose, and it is what we must quote back when
+                 * addressing it.
+                 */
+                let payload, controls;
+                try {
+                    payload = typeof msg.payload === 'string' ?
+                              JSON.parse(msg.payload) : msg.payload;
+                    controls = payload && Array.isArray(payload.controls) ?
+                               sanitiseRemoteControls(payload.controls) : null;
+                } catch (e) {
+                    controls = null;
+                }
+                /*
+                 * The payload is composed by another participant.  If any of
+                 * it is not what we expect, drop the whole blob quietly: it
+                 * must not be able to half-apply, and it must not be able to
+                 * reach the catch-all below, which is a UI-visible path.
+                 */
+                if (!controls || (payload.kind !== 'video' &&
+                                  payload.kind !== 'audio')) {
+                    console.warn("remote_capabilities: ignoring malformed payload");
+                    return;
+                }
+                if (typeof msg.target !== 'string' || !msg.target) {
+                    console.warn("remote_capabilities: no target");
+                    return;
+                }
 
-                // Find or create remote node
-                // We use ID = "remote_" + target_name + "_" + kind
+                const displayName = typeof msg.name === 'string' && msg.name ?
+                                    msg.name : msg.target;
+
+                log("Remote caps received for " + displayName);
+
+                // Find or create remote node, keyed by the opaque target id
                 const id = `remote_${msg.target}_${payload.kind}`;
-                const label = `${msg.target} (${payload.kind})`;
+                const label = `${displayName} (${payload.kind})`;
                 const kind = payload.kind === 'video' ? 'videoinput' : 'audioinput';
 
                 let node = remoteNodes.find(n => n.id === id);
                 if (!node) {
                     node = new MediaNode(id, label, kind, true);
                     node.targetName = msg.target;
+                    node.displayName = displayName;
                     remoteNodes.push(node);
                 }
 
-                node.controls = payload.controls.map(c => {
-                    // Map V4L2 types to frontend types
-                    // 1=INTEGER, 2=BOOLEAN, 3=MENU, 4=BUTTON, 5=INT64, 6=CLASS, 7=STRING, 8=BITMASK, 9=INT_MENU
-                    if (c.type === 2) {
-                        c.type = 'boolean';
-                    } else if (c.type === 3 || c.type === 9) {
-                        c.type = 'select';
-                         // We lack menu labels for now, so maybe treat as slider or numeric select?
-                         // actually, let's keep it slider for now unless we iterate the menu items backend side
-                         c.type = 'slider';
-                    } else {
-                        c.type = 'slider';
-                    }
-                    console.log(`[DEBUG] Mapped control ${c.name} (v4l2_type=${c.type_orig || 'unknown'}) to ${c.type}`);
-                    return c;
-                });
+                node.controls = controls;
 
                 // If remote modal is open for this participant, refresh it
-                if (!remoteSettingsModal.classList.contains('hidden') &&
-                    remoteModalTitle.innerText.includes(msg.target)) {
+                if (remoteSettingsModal && remoteModalTitle && remoteModalBody &&
+                    !remoteSettingsModal.classList.contains('hidden') &&
+                    remoteModalTitle.innerText.includes(displayName)) {
                      // Re-render
                      // Find all nodes for this target
                      const nodes = remoteNodes.filter(n => n.targetName === msg.target);
@@ -847,7 +946,7 @@ async function connectSignalling() {
                 if (dot) {
                      // level is 0-100. Opacity 0.2 to 1.0.
                      const op = 0.2 + (msg.level / 100) * 0.8;
-                     dot.style.opacity = op;
+                     dot.animate([{ opacity: op }], { duration: 100, fill: 'forwards' });
                 }
             } else if (msg.type === 'chat') {
                 if (inConference) {
@@ -858,7 +957,7 @@ async function connectSignalling() {
                 const ta = document.getElementById('debugLogArea');
                 const modal = document.getElementById('debugModal');
 
-                if (ta && modal && modal.style.display !== 'none') {
+                if (ta && modal && !modal.classList.contains('hidden')) {
                     ta.value = header + msg.log + "\n\n" + ta.value;
                 } else {
                     showDebugModal(header + msg.log);
@@ -866,13 +965,17 @@ async function connectSignalling() {
                 debugContextReason = ""; // clear after showing
             }
         } catch (e) {
+            /*
+             * Record the reason, but do not pull the server's connection log
+             * and pop the failure modal from here: a signalling message is
+             * peer-influenced, so a peer that can make this throw would
+             * otherwise be able to drive both at will.  The log is requested
+             * only from the two explicit connection-failure paths.
+             */
             console.error("Signaling exception:", e);
             log("Signaling error: " + e.message, true);
             debugContextReason = "Frontend Exception handling signaling message: " + e.message;
             if (e.stack) debugContextReason += "\nStack: " + e.stack;
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'request_debug_log' }));
-            }
         }
     };
 
@@ -901,13 +1004,47 @@ async function connectSignalling() {
     };
 }
 
+/*
+ * The ICE server list is deployment policy, not something we should decide
+ * for the user: contacting a STUN server discloses the visitor's public IP
+ * and NAT mapping to whoever runs it.  So there is no default, and no third
+ * party is contacted unless the deployment asks for one.
+ *
+ * To use STUN/TURN, set data-ice-servers on the <script> tag that loads this
+ * file to a JSON array of RTCIceServer dictionaries, eg
+ *
+ *   <script src="main.js" data-ice-servers='[{"urls":"stun:stun.example.com:19302"}]'></script>
+ *
+ * With an empty list the mixer works over host candidates, which is what a
+ * server reachable from the browser's own network needs.
+ */
+function getIceServers() {
+    const el = document.getElementById('mixerScript');
+    const raw = el ? el.getAttribute('data-ice-servers') : null;
+
+    if (!raw || !raw.trim())
+        return [];
+
+    try {
+        const list = JSON.parse(raw);
+        if (!Array.isArray(list))
+            throw new Error("not an array");
+
+        return list;
+    } catch (e) {
+        console.warn("Ignoring unparseable data-ice-servers", e);
+
+        return [];
+    }
+}
+
 function createPeerConnection() {
     if (pc) {
         pc.close();
     }
 
     pc = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        iceServers: getIceServers()
     });
 
     pc.oniceconnectionstatechange = () => {
@@ -966,14 +1103,12 @@ function startAdaptationLoop() {
         try {
             const stats = await pc.getStats();
             let packetsLost = 0;
-            let totalPackets = 0;
             let rtt = 0;
             let currentFramesEncoded = 0;
 
             stats.forEach(report => {
                 if (report.type === 'remote-inbound-rtp' && report.kind === 'video') {
                     packetsLost = report.packetsLost;
-                    totalPackets = report.packetsReceived + report.packetsLost; // Approximation
                     rtt = report.roundTripTime;
                 }
                 if (report.type === 'outbound-rtp' && report.kind === 'video') {
@@ -1174,9 +1309,6 @@ async function setupPreview() {
     }
 
     if (localStream) {
-        const vTrack = localStream.getVideoTracks()[0];
-        const aTrack = localStream.getAudioTracks()[0];
-
         updateView();
 
         // Populate labels and discover capabilities
@@ -1296,21 +1428,25 @@ document.getElementById('partDeviceBtn').onclick = () => {
     if (!activeParticipant) return;
 
     // Check if we are actually joined
-    const local = participantList.querySelector('.participant-item:not(.unjoined) .name');
-    // ^ crude check. Better:
     if (!inConference) {
         log("You must join the conference to access remote devices.", true);
         partMenu.classList.remove('show');
         return;
     }
 
-    const pName = activeParticipant;
-    const vNode = remoteNodes.find(n => n.targetName === pName && n.kind === 'videoinput');
+    /*
+     * activeParticipant is {id, name}: `id` is the server's opaque handle and
+     * is what everything on the wire is addressed by; `name` is only for
+     * display.
+     */
+    const pId = activeParticipant.id;
+    const pName = activeParticipant.name || activeParticipant.id;
+    const vNode = remoteNodes.find(n => n.targetName === pId && n.kind === 'videoinput');
 
     if (!vNode) {
         // Request it
         if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'request_caps', target: pName }));
+            ws.send(JSON.stringify({ type: 'request_caps', target: pId }));
             log(`Requesting controls for ${pName}...`);
         }
     }
@@ -1359,7 +1495,7 @@ document.getElementById('partDeviceBtn').onclick = () => {
     document.getElementById('localSettingsGroup').classList.remove('hidden');
 
     // Find all nodes for this target
-    const nodes = remoteNodes.filter(n => n.targetName === pName);
+    const nodes = remoteNodes.filter(n => n.targetName === pId);
     console.log(`[DEBUG] Opening sidebar settings for ${pName}. Found ${nodes.length} nodes.`);
 
     if (nodes.length === 0) {
@@ -1384,14 +1520,15 @@ document.getElementById('partDeviceBtn').onclick = () => {
     }
 };
 
-function showParticipantMenu(e, name) {
+function showParticipantMenu(e, client) {
     e.preventDefault();
     e.stopPropagation();
-    activeParticipant = name;
+    activeParticipant = client;
 
     // Position menu
-    partMenu.style.top = `${e.clientY}px`;
-    partMenu.style.left = `${e.clientX}px`;
+    partMenu.animate([
+        { top: `${e.clientY}px`, left: `${e.clientX}px` }
+    ], { duration: 0, fill: 'forwards' });
     partMenu.classList.add('show');
 
     // Close other menus
@@ -1412,9 +1549,9 @@ function updateParticipants(clients) {
         if (participantList) {
             const item = document.createElement('div');
             item.className = 'participant-item' + (c.joined ? '' : ' unjoined');
-            item.style.cursor = 'pointer';
+            item.classList.add('cursor-pointer');
 
-            item.onclick = (e) => showParticipantMenu(e, c.name);
+            item.onclick = (e) => showParticipantMenu(e, { id: c.id, name: c.name });
 
             // Icon for everyone
             const icon = document.createElement('span');
@@ -1425,8 +1562,7 @@ function updateParticipants(clients) {
                 // Determine a pseudo-color from name hash (requires stringToColor to exist, but using simple style or keeping it default if not)
                 // Assuming CSS handles default color or we just don't touch it.
             } else {
-                icon.style.color = '#888';
-                icon.style.opacity = '0.5';
+                icon.classList.add('icon-grey');
                 item.title = "Connecting...";
             }
 
@@ -1443,28 +1579,43 @@ function updateParticipants(clients) {
 }
 
 function updateLayout(regions) {
-    if (!overlayContainer) return;
+    if (!overlayContainer || !Array.isArray(regions)) return;
     overlayContainer.innerHTML = ''; // clear existing overlays
 
+    /*
+     * Work out which region is ours before rendering anything.
+     *
+     * The layout broadcast is one shared string and does not carry the
+     * server's opaque participant id, so all we have to go on is the first
+     * line of "text", the display name.  That name is cosmetic and
+     * peer-chosen, so another peer is free to claim ours: accept a name
+     * match only when exactly one region carries it.  A peer that copies
+     * our name then just makes the match ambiguous, and we leave the
+     * encoder unconstrained rather than take a tile size (and hence a
+     * scaleResolutionDownBy of up to 8x) that a peer chose for us.
+     */
+    const myName = loggedInEmail || 'Anonymous';
+    const named = regions.filter(r => r && typeof r.text === 'string' &&
+                                 r.text.split('\n')[0] === myName);
+    const mine = named.length === 1 ? named[0] : null;
+
+    window.assignedLayoutPx = (mine && mine.px_w) ?
+                { w: mine.px_w, h: mine.px_h } : { w: null, h: null };
+
     regions.forEach(r => {
+        if (!r) return;
+
         const overlay = document.createElement('div');
         overlay.className = 'name-overlay';
 
         // Apply explicit positions rather than CSS classes
-        overlay.style.left = r.x + '%';
-        overlay.style.top = r.y + '%';
-        // Note: we don't strictly set width/height as it's an overlay div,
-        // but it's guaranteed to be within the sub-region.
-        overlay.style.maxWidth = r.w + '%';
+        overlay.animate([
+            { left: r.x + '%', top: r.y + '%', maxWidth: r.w + '%' }
+        ], { duration: 0, fill: 'forwards' });
 
         // The text comes in as "Alice\nStats..."
-        const parts = r.text.split('\n');
+        const parts = typeof r.text === 'string' ? r.text.split('\n') : [];
         const name = parts[0] || '';
-
-        const myName = loggedInEmail || 'Anonymous';
-        if (name === myName && r.px_w) {
-            window.assignedLayoutPx = { w: r.px_w, h: r.px_h };
-        }
 
         const nameSpan = document.createElement('div');
         nameSpan.innerText = name;
@@ -1687,22 +1838,36 @@ function linkify(text) {
 function appendChatMessage(msg) {
     if (!chatHistory) return;
 
+    // msg object: { sender: "Name", text: "..." }
+    const sender = typeof msg.sender === 'string' ? msg.sender : '';
+    const text = typeof msg.text === 'string' ? msg.text : '';
+
+    if (!text) return;
+
     const div = document.createElement('div');
     div.className = 'chat-msg';
 
-    // msg object: { sender: "Name", text: "..." }
     const senderSpan = document.createElement('span');
     senderSpan.className = 'chat-sender';
-    senderSpan.innerText = msg.sender + ':';
+    senderSpan.innerText = sender + ':';
 
     const textSpan = document.createElement('span');
     textSpan.className = 'chat-text';
-    textSpan.innerHTML = linkify(escapeHtml(msg.text));
+    textSpan.innerHTML = linkify(escapeHtml(text));
 
     div.appendChild(senderSpan);
     div.appendChild(textSpan);
 
     chatHistory.appendChild(div);
+
+    /*
+     * Chat arrives from other participants and is only bounded per-message
+     * by the server: keep the history a fixed-size ring in the DOM, dropping
+     * the oldest, so a peer that streams chat cannot grow this document
+     * without limit.
+     */
+    while (chatHistory.childElementCount > CHAT_HISTORY_MAX)
+        chatHistory.removeChild(chatHistory.firstElementChild);
 
     // Auto-scroll if near bottom
     if (chatVisible) {

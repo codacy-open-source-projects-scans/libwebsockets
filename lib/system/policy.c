@@ -25,6 +25,15 @@
 #include <private-lib-core.h>
 
 #if defined(LWS_WITH_NETWORK)
+#if defined(LWS_WITH_FILE_OPS)
+/*
+ * lws_system_parse_policy() parses a JSON policy file and so depends on the
+ * LEJP JSON parser.  Only build the real implementation when LEJP is enabled;
+ * otherwise provide a stub (in the #else below) that reports "no policy", so
+ * callers that reference it without gating on LWS_WITH_LEJP (eg, the ACME /
+ * versioned-cert path in tls.c) still link without pulling in lejp.
+ */
+#if defined(LWS_WITH_LEJP)
 
 static const char * const policy_paths[] = {
 	"dns_base_dir",
@@ -70,6 +79,7 @@ policy_cb(struct lejp_ctx *ctx, char reason)
 	return 0;
 }
 
+
 static const char *default_policy =
 	"{\n"
 	"    \"dns_base_dir\": \"/var/dnssec\",\n"
@@ -93,10 +103,20 @@ lws_system_parse_policy(struct lws_context *cx, const char *filepath, lws_system
 		const char *pt = strrchr(filepath, '/');
 		if (pt) {
 			char dir[256];
-			lws_strncpy(dir, filepath, sizeof(dir));
-			dir[pt - filepath] = '\0';
-			if (mkdir(dir, 0755) < 0)
-				lwsl_debug("%s: mkdir %s failed (may exist)\n", __func__, dir);
+			size_t dl = lws_ptr_diff_size_t(pt, filepath);
+
+			/*
+			 * The last / can be at any offset in the caller's
+			 * path... only make the dir if the whole of it fits
+			 */
+
+			if (dl < sizeof(dir)) {
+				lws_strnncpy(dir, filepath, dl, sizeof(dir));
+				if (mkdir(dir, 0750) < 0)
+					lwsl_debug("%s: mkdir %s failed "
+						   "(may exist)\n", __func__,
+						   dir);
+			}
 		}
 #endif
 		fd = lws_open(filepath, O_CREAT | O_WRONLY | O_TRUNC, 0644);
@@ -155,6 +175,19 @@ bail:
 	lws_system_policy_free(p);
 	return 1;
 }
+
+#else /* !LWS_WITH_LEJP */
+
+int
+lws_system_parse_policy(struct lws_context *cx, const char *filepath,
+			lws_system_policy_t **_policy)
+{
+	*_policy = NULL;
+	return 1; /* no JSON parser available without LEJP */
+}
+
+#endif /* LWS_WITH_LEJP */
+#endif /* LWS_WITH_FILE_OPS */
 
 void
 lws_system_policy_free(lws_system_policy_t *policy)

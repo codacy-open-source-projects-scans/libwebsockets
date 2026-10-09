@@ -41,12 +41,12 @@ static const struct test_vector vectors[] = {
 	{
 		{ 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f,
 		  0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f },
-		"legal liberty liberal lipid liberty liberal lipid liberty liberal lipid liberty list"
+		"legal winner thank year wave sausage worth useful legal winner thank yellow"
 	},
 	{
 		{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
 		  0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80 },
-		"letter letter letter letter letter letter letter letter letter letter letter lactic"
+		"letter advice cage absurd amount doctor acoustic avoid letter advice cage above"
 	},
 	{
 		{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -63,7 +63,8 @@ int main(int argc, const char **argv)
 	char buf[256];
 	uint8_t entropy[16];
 
-	memset(&info, 0, sizeof(info));
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 	info.port = CONTEXT_PORT_NO_LISTEN;
 

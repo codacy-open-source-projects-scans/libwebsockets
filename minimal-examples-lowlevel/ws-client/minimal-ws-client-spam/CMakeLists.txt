@@ -27,10 +27,7 @@ if (requirements)
        # instantiate the server per sai builder instance, they are running in the same
        # machine context in parallel so they can tread on each other otherwise
        #
-	set(PORT_WCS_SRV "7620")
-	if ("$ENV{SAI_INSTANCE_IDX}")
-		math(EXPR PORT_WCS_SRV "7621 + $ENV{SAI_INSTANCE_IDX}")
-	endif()
+	lws_get_free_port(PORT_WCS_SRV)
 
 # hack
 if (WIN32)
@@ -41,7 +38,7 @@ if (WIN32)
 	add_test(NAME st_wcs_srv COMMAND cmd.exe /c start /b $<TARGET_FILE:test-server> -s --port ${PORT_WCS_SRV})
 	add_test(NAME ki_wcs_srv COMMAND taskkill /F /IM $<TARGET_FILE_NAME:test-server> /T)
 else()
-	if (VALGRIND)
+	if (VALGRIND AND NOT LWS_WITH_ASAN)
 		add_test(NAME st_wcs_srv COMMAND
 			${CMAKE_SOURCE_DIR}/scripts/ctest-background.sh
 			wcs_srv ${VALGRIND} --tool=memcheck $<TARGET_FILE:test-server>
@@ -65,7 +62,7 @@ endif()
 	set_tests_properties(st_wcs_srv PROPERTIES WORKING_DIRECTORY . FIXTURES_SETUP wcs_srv TIMEOUT 800)
 	set_tests_properties(ki_wcs_srv PROPERTIES FIXTURES_CLEANUP wcs_srv)
 
-	add_test(NAME ws-client-spam COMMAND lws-minimal-ws-client-spam --server localhost --port ${PORT_WCS_SRV} -l 32 -c 3)
+	add_test(NAME ws-client-spam COMMAND lws-minimal-ws-client-spam --server ${LWS_CTEST_SERVER_RESOLVE} --port ${PORT_WCS_SRV} -l 32 -c 3)
 	set_tests_properties(ws-client-spam PROPERTIES
 			     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/minimal-examples-lowlevel/ws-client/minimal-ws-client-spam
 			     FIXTURES_REQUIRED "wcs_srv"

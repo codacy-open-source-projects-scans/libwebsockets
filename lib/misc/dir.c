@@ -32,7 +32,6 @@
 #include "private-lib-core.h"
 #include <string.h>
 #include <stdio.h>
-
 #include <sys/stat.h>
 #if defined(WIN32)
 #include <direct.h>
@@ -83,7 +82,20 @@ lws_dir_via_stat(char *combo, size_t l, const char *path, struct lws_dir_entry *
 
         lde->type = LDOT_UNKNOWN;
 
+	/*
+	 * This is the fallback for filesystems that don't fill in d_type (XFS
+	 * with ftype=0, ZFS) and for platforms that never do.  It must agree
+	 * with what the d_type path reports, ie, a symlink must come out as
+	 * LDOT_LINK and not as whatever it points at... stat() follows the
+	 * link and would report a symlink-to-dir as LDOT_DIR, letting rm -rf
+	 * style callbacks recurse out of the tree they are walking.
+	 */
+
+#if defined(WIN32) || defined(_WIN32)
         if (!stat(combo, &s)) {
+#else
+        if (!lstat(combo, &s)) {
+#endif
 		switch (s.st_mode & S_IFMT) {
 		case S_IFBLK:
 			lde->type = LDOT_BLOCK;
@@ -176,7 +188,7 @@ lws_dir_via_info(struct lws_dir_info *info)
 #if !defined(__sun) && !defined(__QNX__)
 		type = namelist[i]->d_type;
 #endif
-		if (strchr(namelist[i]->d_name, '~'))
+		if ((char *)strchr(namelist[i]->d_name, '~'))
 			goto skip;
 
 		_fill_lde(combo, l, namelist[i]->d_name, type, &lde);
@@ -346,6 +358,102 @@ lws_dir_rm_rf_cb(const char *dirpath, void *user, struct lws_dir_entry *lde)
 	return 0;
 }
 
+#if !defined(WIN32) && !defined(_WIN32)
+/*
+ * Make the new link under a temp name and rename() it over \p path, so
+ * anything opening \p path meanwhile finds either the old or the new target,
+ * never nothing
+ */
+
+static int
+lws_dir_symlink_replace(const char *path, const char *target)
+{
+	char tmp[512];
+	int e;
+
+	if (strlen(path) + 5 > sizeof(tmp)) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+
+	lws_snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+	unlink(tmp); /* left over from an interrupted rotation */
+	if (symlink(target, tmp))
+		return -1;
+
+	if (rename(tmp, path)) {
+		e = errno; /* the rename's reason, not the cleanup's */
+		unlink(tmp);
+		errno = e;
+		return -1;
+	}
+
+	return 0;
+}
+#endif
+
+int
+lws_dir_symlink_rotate(const char *cur, const char *target,
+		       const char *cur_tag, const char *prev_tag)
+{
+#if !defined(WIN32) && !defined(_WIN32)
+	size_t ct = strlen(cur_tag), pt = strlen(prev_tag);
+	char prev[512], old[512];
+	const char *p, *q;
+	ssize_t n;
+	int e;
+
+	/* the tag names the link, so it's the last one in the path */
+	p = NULL;
+	for (q = strstr(cur, cur_tag); q && ct; q = strstr(q + 1, cur_tag))
+		p = q;
+	if (!p) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	/*
+	 * We only learn what's outgoing here, nothing is decided on it that
+	 * a change under us could exploit, and the replacement is atomic
+	 */
+	/* coverity[toctou] */
+	n = readlink(cur, old, sizeof(old) - 1);
+	if (n > 0) {
+		old[n] = '\0';
+
+		if (!strcmp(old, target))
+			return 0; /* already current, nothing is outgoing */
+
+		if (lws_ptr_diff_size_t(p, cur) + pt + strlen(p + ct) >=
+								sizeof(prev)) {
+			errno = ENAMETOOLONG;
+			return -1;
+		}
+
+		lws_snprintf(prev, sizeof(prev), "%.*s%s%s",
+			     (int)lws_ptr_diff_size_t(p, cur), cur, prev_tag,
+			     p + ct);
+
+		if (lws_dir_symlink_replace(prev, old))
+			lwsl_warn("%s: unable to link %s: errno %d\n", __func__,
+				  prev, errno);
+	}
+
+	if (lws_dir_symlink_replace(cur, target)) {
+		e = errno; /* logging may disturb it */
+		lwsl_err("%s: unable to link %s: errno %d\n", __func__, cur, e);
+		errno = e;
+		return -1;
+	}
+
+	return 0;
+#else
+	errno = ENOSYS;
+	return -1;
+#endif
+}
+
 
 #endif
 
@@ -358,6 +466,7 @@ lws_plugin_alloc(struct lws_plugin **pplugin)
 		return NULL;
 
 	pin->list = *pplugin;
+	pin->basename[0] = '\0';
 	*pplugin = pin;
 
 	return pin;
@@ -480,6 +589,40 @@ lws_plugins_dir_cb(const char *dirpath, void *user, struct lws_dir_entry *lde)
 	if (pa->filter && strcmp(base, pa->filter))
 		return 0; /* keep going */
 
+	/*
+	 * The class is visible in the filename too: don't dlopen() files
+	 * that cannot be the class we are scanning for.  Loading a protocol
+	 * plugin just to find it is not an event lib brings in its whole
+	 * dependency chain (codecs, OpenMP...), some of which cannot be
+	 * cleanly unloaded again.
+	 */
+
+	if (!strcmp(pa->_class, "lws_evlib_plugin")) {
+		if (strncmp(base, "evlib_", 6))
+			return 0;
+	} else if (!strcmp(pa->_class, "lws_protocol_plugin")) {
+		p = lde->name;
+		if (!strncmp(p, "lib", 3))
+			p += 3;
+		if (strncmp(p, "protocol_", 9))
+			return 0;
+	}
+
+	/*
+	 * Directory precedence: a plugin already loaded from an earlier
+	 * directory is not opened again just to be found duplicate
+	 */
+
+	{
+		struct lws_plugin *pin = *pa->pplugin;
+
+		while (pin) {
+			if (!strcmp(pin->basename, base))
+				return 0; /* keep going */
+			pin = pin->list;
+		}
+	}
+
 	lws_snprintf(path, sizeof(path) - 1, "%s/%s", dirpath, lde->name);
 
 	pl = lws_plat_dlopen(pa->pplugin, path, base, pa->_class,
@@ -515,6 +658,15 @@ lws_plugins_init(struct lws_plugin **pplugin, const char * const *d,
 	 */
 
 	ld_env = getenv("LD_LIBRARY_PATH");
+	/*
+	 * The dynamic loader ignores LD_LIBRARY_PATH for set-uid / set-gid
+	 * (AT_SECURE) processes precisely so an unprivileged caller cannot
+	 * pick the code a privileged process loads; scanning it ourselves
+	 * for plugins to dlopen() would reintroduce that.  Honour the same
+	 * rule.
+	 */
+	if (ld_env && lws_environment_untrusted())
+		ld_env = NULL;
 	if (ld_env) {
 		char temp[128];
 		struct lws_tokenize ts;

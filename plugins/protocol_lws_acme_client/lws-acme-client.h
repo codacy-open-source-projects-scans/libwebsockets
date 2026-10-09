@@ -56,7 +56,12 @@ struct lws_acme_cert_config {
 	const char *common_name;
 	const char *email;
 	const char *challenge_type_str;
+	const char *profile;
 	struct lws_acme_cert_config_acme *acme;
+
+	/* reissue on the next evaluation however much validity is left: set
+	 * by an LWSSMDCL_CERTS force-reissue, cleared as acquisition starts */
+	char force_reissue;
 };
 
 struct lws_acme_challenge_ops {
@@ -81,6 +86,20 @@ struct lws_acme_core_ops {
 
 	void
 	(*notify_challenge_ready)(struct per_vhost_data__lws_acme_client *vhd);
+
+	void
+	(*trigger_resign)(struct per_vhost_data__lws_acme_client *vhd);
+
+	int
+	(*acme_ipc_save_payload)(struct per_vhost_data__lws_acme_client *vhd,
+				 const char *req, const char *domain,
+				 const char *filename, const char *payload,
+				 size_t payload_len);
+
+	/* the challenge could not be set up: end the attempt as a failure */
+	void
+	(*challenge_failed)(struct per_vhost_data__lws_acme_client *vhd,
+			    const char *reason);
 };
 
 #endif

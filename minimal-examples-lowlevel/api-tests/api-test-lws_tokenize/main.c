@@ -192,8 +192,52 @@ struct expected expected1[] = {
 	expected18[] = {
 		{ LWS_TOKZE_TOKEN, "x=y", 3 },
 		{ LWS_TOKZE_ENDED, "", 0 },
+	},
+	expected19[] = {
+		{ LWS_TOKZE_TOKEN, "a+b", 3 },
+		{ LWS_TOKZE_ENDED, "", 0 },
+	},
+	/*
+	 * This is the exact flag set lws_process_ws_upgrade() uses to parse
+	 * Sec-WebSocket-Protocol... subprotocol names are RFC 2616 tokens, so
+	 * '+' is a legal character, eg, OPC UA's "opcua+uacp" and "opcua+json"
+	 */
+	expected20[] = {
+		{ LWS_TOKZE_TOKEN, "opcua+uacp", 10 },
+		{ LWS_TOKZE_DELIMITER, ",", 1 },
+		{ LWS_TOKZE_TOKEN, "opcua+json", 10 },
+		{ LWS_TOKZE_ENDED, "", 0 },
+	},
+	/*
+	 * ...without LWS_TOKENIZE_F_PLUS_NONTERM, the same list is rejected,
+	 * since the '+' inside the token is treated as an unexpected delimiter
+	 */
+	expected21[] = {
+		{ LWS_TOKZE_TOKEN, "opcua", 5 },
+		{ LWS_TOKZE_ERR_COMMA_LIST, "", 0 },
+	},
+	/*
+	 * A quoted string overrunning the tokenizer's 255-byte collect[]
+	 * limit must be reported as LWS_TOKZE_TOO_LONG, never silently
+	 * delivered as a "valid" quoted string holding only the token's
+	 * tail (which is how a >255-byte JWT once got planted as a session
+	 * cookie: see the lws-login BFF extraction)
+	 */
+	expected22[] = {
+		{ LWS_TOKZE_TOO_LONG, "", 0 },
+	},
+	/* same for an unquoted token */
+	expected23[] = {
+		{ LWS_TOKZE_TOO_LONG, "", 0 },
 	}
 ;
+
+/*
+ * >255-char token material for expected22 / expected23, filled in main()
+ * (too big to spell out literarily)
+ */
+static char	overlong_quoted[512],
+		overlong_token[512];
 
 struct tests tests[] = {
 	{
@@ -276,6 +320,33 @@ struct tests tests[] = {
 	{
 		"x=y", expected18,
 		LWS_ARRAY_SIZE(expected18), LWS_TOKENIZE_F_EQUALS_NONTERM
+	},
+	{
+		"a+b", expected19,
+		LWS_ARRAY_SIZE(expected19), LWS_TOKENIZE_F_PLUS_NONTERM
+	},
+	{
+		"opcua+uacp, opcua+json", expected20,
+		LWS_ARRAY_SIZE(expected20),
+		LWS_TOKENIZE_F_COMMA_SEP_LIST | LWS_TOKENIZE_F_MINUS_NONTERM |
+		LWS_TOKENIZE_F_DOT_NONTERM | LWS_TOKENIZE_F_PLUS_NONTERM |
+		LWS_TOKENIZE_F_RFC7230_DELIMS
+	},
+	{
+		"opcua+uacp", expected21,
+		LWS_ARRAY_SIZE(expected21),
+		LWS_TOKENIZE_F_COMMA_SEP_LIST | LWS_TOKENIZE_F_MINUS_NONTERM |
+		LWS_TOKENIZE_F_DOT_NONTERM | LWS_TOKENIZE_F_RFC7230_DELIMS
+	},
+	{
+		overlong_quoted, expected22,
+		LWS_ARRAY_SIZE(expected22),
+		LWS_TOKENIZE_F_MINUS_NONTERM | LWS_TOKENIZE_F_DOT_NONTERM
+	},
+	{
+		overlong_token, expected23,
+		LWS_ARRAY_SIZE(expected23),
+		LWS_TOKENIZE_F_MINUS_NONTERM | LWS_TOKENIZE_F_DOT_NONTERM
 	}
 };
 
@@ -345,34 +416,34 @@ int main(int argc, const char **argv)
 	lws_tokenize_elem e;
 	const char *p;
 	char b1[22];
-	int n, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE
-			/* for LLL_ verbosity above NOTICE to be built into lws,
-			 * lws must have been configured and built with
-			 * -DCMAKE_BUILD_TYPE=DEBUG instead of =RELEASE */
-			/* | LLL_INFO */ /* | LLL_PARSER */ /* | LLL_HEADER */
-			/* | LLL_EXT */ /* | LLL_CLIENT */ /* | LLL_LATENCY */
-			/* | LLL_DEBUG */;
+	int n;
 	int fail = 0, ok = 0, flags = 0;
 	char dotstar[512];
 	(void)switches;
 
-	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
+	if (lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
 		lws_switches_print_help(argv[0], switches, LWS_ARRAY_SIZE(switches));
 		return 0;
 	}
 
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS API selftest: lws_tokenize\n");
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_F].sw)))
 		flags = atoi(p);
 
+	/* 300 'a's inside quotes / bare: both overrun collect[256] */
+	memset(overlong_quoted, 'a', sizeof(overlong_quoted));
+	overlong_quoted[0] = '"';
+	overlong_quoted[301] = '"';
+	overlong_quoted[302] = '\0';
+	memset(overlong_token, 'a', sizeof(overlong_token));
+	overlong_token[300] = '\0';
 
-	memset(&info, 0, sizeof info);
+
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT |
 		       LWS_SERVER_OPTION_H2_JUST_FIX_WINDOW_UPDATE_OVERFLOW;
 
@@ -380,10 +451,10 @@ int main(int argc, const char **argv)
 	 * since we know this lws context is only ever going to be used with
 	 * one client wsis / fds / sockets at a time, let lws know it doesn't
 	 * have to use the default allocations for fd tables up to ulimit -n.
-	 * It will just allocate for 1 internal and 1 (+ 1 http2 nwsi) that we
-	 * will use.
+	 * It will just allocate for its own fds and overhead
+	 * (LWS_FD_LIMIT_PER_THREAD_MIN) plus the one connection we will use.
 	 */
-	info.fd_limit_per_thread = 1 + 1 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 1;
 
 #if 0
 #if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL)
@@ -464,7 +535,8 @@ int main(int argc, const char **argv)
 
 		lws_fx_add(&r, &a, &b);
 
-		if (r.whole != -2 || r.frac != 50000000) {
+		/* -1 + -1.5 = -2.5, canonical sign-magnitude: both fields negative */
+		if (r.whole != -2 || r.frac != -50000000) {
 			lwsl_err("%s: fixed3232: test4 fail\n", __func__);
 			return 1;
 		}
@@ -721,7 +793,7 @@ int main(int argc, const char **argv)
 
 		lws_fx_sub(&r, &a, &b);
 
-		if (r.whole != -15 || r.frac != 20000000) {
+		if (r.whole != -15 || r.frac != -20000000) {
 			lwsl_err("%s: fixed3232: test22 fail: %d.%08u\n", __func__, r.whole, r.frac);
 			return 1;
 		}
@@ -1057,6 +1129,155 @@ int main(int argc, const char **argv)
 			ok++;
 	}
 
+	/*
+	 * Non-chunked overlong-token recovery: after LWS_TOKZE_TOO_LONG the
+	 * tokenizer must discard the REST of the same overlong token and then
+	 * keep delivering the following tokens normally.  It used to restart
+	 * collection mid-token, fabricating a "valid" token out of the
+	 * overlong token's tail.
+	 */
+	{
+		char big[600];
+		int in_fail = fail, seen_too_long = 0;
+		struct expected follow[] = {
+			{ LWS_TOKZE_TOKEN,	"subsequent", 10 },
+			{ LWS_TOKZE_TOKEN,	"tokens", 6 },
+			{ LWS_TOKZE_DELIMITER,	",", 1 },
+			{ LWS_TOKZE_TOKEN,	"after", 5 },
+			{ LWS_TOKZE_ENDED,	NULL, 0 },
+		};
+		size_t fl = 0;
+
+		/* <300-char dotted token> subsequent tokens, after */
+		memset(big, 'a', sizeof(big));
+		memcpy(big + 100, ".bbbb", 5); /* ensure dots survive nonterm */
+		memcpy(big + 300, " subsequent tokens, after", 25);
+		big[325] = '\0';
+
+		memset(&ts, 0, sizeof(ts));
+		ts.start = big;
+		ts.len = strlen(big);
+		ts.flags = LWS_TOKENIZE_F_MINUS_NONTERM |
+			   LWS_TOKENIZE_F_DOT_NONTERM;
+
+		do {
+			e = lws_tokenize(&ts);
+
+			/*
+			 * One TOO_LONG when collect[] fills, another when the
+			 * overlong token finally terminates: both must be
+			 * TOO_LONG, never a fabricated tail token
+			 */
+			if (e == LWS_TOKZE_TOO_LONG) {
+				seen_too_long++;
+				continue;
+			}
+			if (!seen_too_long) {
+				lws_strnncpy(dotstar, ts.token,
+					     ts.token_len, sizeof(dotstar));
+				lwsl_notice("fail: expected TOO_LONG, got %s "
+					    "'%s'\n",
+					    element_names[e + LWS_TOKZE_ERRS],
+					    dotstar);
+				fail++;
+				break;
+			}
+
+			if (e != follow[fl].e) {
+				lwsl_notice("fail: post-TOO_LONG elem %s, "
+					    "expected %s\n",
+					    element_names[e + LWS_TOKZE_ERRS],
+					    element_names[follow[fl].e +
+							LWS_TOKZE_ERRS]);
+				fail++;
+				break;
+			}
+			if (e > 0 && (ts.token_len != follow[fl].len ||
+				      memcmp(follow[fl].value, ts.token,
+					     follow[fl].len))) {
+				lws_strnncpy(dotstar, ts.token,
+					     ts.token_len, sizeof(dotstar));
+				lwsl_notice("fail: post-TOO_LONG token "
+					    "mismatch at %d: got %s '%s' "
+					    "(%d) want '%s' (%d)\n", (int)fl,
+					    element_names[e + LWS_TOKZE_ERRS],
+					    dotstar, (int)ts.token_len,
+					    follow[fl].value,
+					    (int)follow[fl].len);
+				fail++;
+				break;
+			}
+			fl++;
+		} while (e != LWS_TOKZE_ENDED);
+
+		if (fail == in_fail)
+			ok++;
+	}
+
+	/*
+	 * UTF-8 without LWS_TOKENIZE_F_RFC7230_DELIMS: the last byte of a
+	 * multibyte char must not be taken for a delimiter.
+	 *
+	 * And with LWS_TOKENIZE_F_EXPECT_MORE, input arriving in pieces may
+	 * split a multibyte char between two calls.  The decode state has to
+	 * survive to the next call, or the continuation bytes look like
+	 * broken UTF-8.  Feed it one byte at a time to hit every split.
+	 */
+	{
+		/* "Miloša Žunjića x" */
+		static const char split_in[] = "Milo\xc5\xa1" "a \xc5\xbdunji\xc4\x87" "a x";
+		static const struct expected split_exp[] = {
+			{ LWS_TOKZE_TOKEN, "Milo\xc5\xa1" "a", 7 },
+			{ LWS_TOKZE_TOKEN, "\xc5\xbdunji\xc4\x87" "a", 9 },
+			{ LWS_TOKZE_TOKEN, "x", 1 },
+			{ LWS_TOKZE_ENDED, NULL, 0 },
+		};
+		int in_fail = fail;
+		size_t pos = 0, sx = 0;
+
+		memset(&ts, 0, sizeof(ts));
+		ts.flags = LWS_TOKENIZE_F_EXPECT_MORE;
+
+		while (sx < LWS_ARRAY_SIZE(split_exp) && fail == in_fail) {
+			if (pos == sizeof(split_in) - 1) {
+				/* all delivered, now we can say it's the end */
+				ts.flags &= (uint16_t)~LWS_TOKENIZE_F_EXPECT_MORE;
+				ts.len = 0;
+			} else {
+				ts.start = split_in + pos++;
+				ts.len = 1;
+			}
+
+			do {
+				e = lws_tokenize(&ts);
+				if (e == LWS_TOKZE_WANT_READ)
+					break;
+
+				if (e != split_exp[sx].e ||
+				    (e > 0 && (ts.token_len != split_exp[sx].len ||
+					       memcmp(ts.token, split_exp[sx].value,
+						      split_exp[sx].len)))) {
+					lws_strnncpy(dotstar, e > 0 ? ts.token : "",
+						     e > 0 ? ts.token_len : 0,
+						     sizeof(dotstar));
+					lwsl_notice("fail: split utf8 elem %d: "
+						    "got %s '%s', expected %s\n",
+						    (int)sx,
+						    element_names[e + LWS_TOKZE_ERRS],
+						    dotstar,
+						    element_names[split_exp[sx].e +
+								LWS_TOKZE_ERRS]);
+					fail++;
+					break;
+				}
+				sx++;
+			} while (e > 0 && sx < LWS_ARRAY_SIZE(split_exp));
+		}
+
+		if (fail == in_fail)
+			ok++;
+	}
+
 	if (p) {
 		ts.start = p;
 		ts.len = strlen(p);
@@ -1136,7 +1357,7 @@ int main(int argc, const char **argv)
 					lwsl_err("%s: failed date render\n", __func__);
 					fail++;
 				} else {
-					if (!strcmp(s, "Tue, 15 Nov 1994 08:12:31 GMT")) {
+					if (strcmp(s, "Tue, 15 Nov 1994 08:12:31 GMT")) {
 						lwsl_err("%s: date render wrong\n", __func__);
 						fail++;
 					}
@@ -1241,6 +1462,170 @@ int main(int argc, const char **argv)
 				"ssproxy.n.cn.failures", 21)) {
 		lwsl_user("%s: wc 16 fail\n", __func__);
 		fail++;
+	}
+
+	/*
+	 * A name part that overran collect[] must also be reported as
+	 * LWS_TOKZE_TOO_LONG when the '=' arrives, never as a
+	 * LWS_TOKZE_TOKEN_NAME_EQUALS still carrying the internal
+	 * "discarding the rest of the token" token_len sentinel
+	 */
+
+	{
+		char big[512];
+		int in_fail = fail;
+		struct expected follow[] = {
+			{ LWS_TOKZE_TOO_LONG,	NULL, 0 },
+			{ LWS_TOKZE_TOO_LONG,	NULL, 0 },
+			{ LWS_TOKZE_TOKEN,	"value", 5 },
+			{ LWS_TOKZE_ENDED,	NULL, 0 },
+		};
+		size_t fl = 0;
+
+		memset(big, 'a', sizeof(big));
+		memcpy(big + 300, "=value", 6);
+		big[306] = '\0';
+
+		memset(&ts, 0, sizeof(ts));
+		ts.start = big;
+		ts.len = strlen(big);
+
+		do {
+			e = lws_tokenize(&ts);
+
+			if (fl >= LWS_ARRAY_SIZE(follow) || e != follow[fl].e ||
+			    ts.token_len > sizeof(ts.collect)) {
+				lwsl_notice("fail: name= overlong at %d: %s "
+					    "len %d\n", (int)fl,
+					    element_names[e + LWS_TOKZE_ERRS],
+					    (int)ts.token_len);
+				fail++;
+				break;
+			}
+
+			if (follow[fl].value &&
+			    (ts.token_len != follow[fl].len ||
+			     memcmp(follow[fl].value, ts.token,
+				    follow[fl].len))) {
+				lws_strnncpy(dotstar, ts.token, ts.token_len,
+					     sizeof(dotstar));
+				lwsl_notice("fail: name= overlong token at %d: "
+					    "'%s'\n", (int)fl, dotstar);
+				fail++;
+				break;
+			}
+
+			fl++;
+		} while (e != LWS_TOKZE_ENDED);
+
+		if (fail == in_fail)
+			ok++;
+	}
+
+	/*
+	 * lws_strcmp_wildcard() must not dereference check[0] when clen is 0
+	 */
+
+	if (lws_strcmp_wildcard("*", 1, "", 0)) {
+		lwsl_user("%s: wc 17 fail\n", __func__);
+		fail++;
+	}
+	if (lws_strcmp_wildcard("", 0, "", 0)) {
+		lwsl_user("%s: wc 18 fail\n", __func__);
+		fail++;
+	}
+	if (!lws_strcmp_wildcard("a", 1, "", 0)) {
+		lwsl_user("%s: wc 19 fail\n", __func__);
+		fail++;
+	}
+
+	/*
+	 * lws_hex_len_to_byte_array() must reject input needing more than
+	 * \p max bytes, rather than silently truncating a length-checked field
+	 */
+
+	{
+		uint8_t hb[4];
+
+		if (lws_hex_to_byte_array("01020304", hb, (int)sizeof(hb)) != 4) {
+			lwsl_user("%s: hex 1 fail\n", __func__);
+			fail++;
+		}
+		if (lws_hex_to_byte_array("0102030405", hb, 2) != -1) {
+			lwsl_user("%s: hex 2 fail\n", __func__);
+			fail++;
+		}
+	}
+
+	/*
+	 * lws_urldecode() must write at most \p len bytes, including the NUL
+	 */
+
+	{
+		char ud[16];
+
+		memset(ud, 'x', sizeof(ud));
+		if (lws_urldecode(ud, "abcdefghij", 8) || strcmp(ud, "abcdefg") ||
+		    ud[8] != 'x') {
+			lwsl_user("%s: urldecode 1 fail '%s' (%d)\n", __func__,
+				  ud, (int)ud[8]);
+			fail++;
+		}
+	}
+
+	/*
+	 * lws_vbi_decode() must consume what lws_vbi_encode() produced, and
+	 * report the number of bytes it consumed
+	 */
+
+	{
+		static const uint64_t vbi_t[] = { 0, 1, 127, 128, 16383, 16384,
+						  0xfffffff };
+		uint8_t vb[8];
+		uint64_t vv;
+		size_t vn;
+
+		for (vn = 0; vn < LWS_ARRAY_SIZE(vbi_t); vn++) {
+			int el = lws_vbi_encode(vbi_t[vn], vb), dl;
+
+			vv = 0xdeadbeef;
+			dl = lws_vbi_decode(vb, &vv, sizeof(vb));
+
+			if (el < 1 || dl != el || vv != vbi_t[vn]) {
+				lwsl_user("%s: vbi %d fail (%d, %d, %llu)\n",
+					  __func__, (int)vn, el, dl,
+					  (unsigned long long)vv);
+				fail++;
+			}
+		}
+	}
+
+	/*
+	 * lws_humanize_pad() must not underflow its pad width when the
+	 * rendering is already wider than the pad
+	 */
+
+	{
+		struct { char buf[24]; char guard[8]; } hp;
+		int hn;
+
+		memset(&hp, 0xa5, sizeof(hp));
+		hn = lws_humanize_pad(hp.buf, sizeof(hp.buf), 1024001,
+				      humanize_schema_si_bytes);
+		if (hn != 11 || strcmp(hp.buf, "1000.001KiB")) {
+			lwsl_user("%s: humanize_pad 1 fail '%s' (%d)\n",
+				  __func__, hp.buf, hn);
+			fail++;
+		}
+
+		memset(&hp, 0xa5, sizeof(hp));
+		hn = lws_humanize_pad(hp.buf, sizeof(hp.buf), 1024,
+				      humanize_schema_si_bytes);
+		if (hn != 10 || strcmp(hp.buf, "      1KiB")) {
+			lwsl_user("%s: humanize_pad 2 fail '%s' (%d)\n",
+				  __func__, hp.buf, hn);
+			fail++;
+		}
 	}
 
 	lwsl_user("Completed: PASS: %d, FAIL: %d\n", ok, fail);

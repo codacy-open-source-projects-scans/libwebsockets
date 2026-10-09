@@ -36,6 +36,10 @@ lws_genrsa_create(struct lws_genrsa_ctx *ctx,
 {
 	gnutls_datum_t m, e, d, p, q, u, e1, e2;
 
+	/* the caller must hand us a zeroed ctx; a still-live ctx is a misuse */
+	if (ctx->created_mark == LWS_GENRSA_CTX_CREATED_MARK)
+		return -1;
+
 	memset(ctx, 0, sizeof(*ctx));
 	ctx->context = context;
 	ctx->mode = mode;
@@ -68,19 +72,32 @@ lws_genrsa_create(struct lws_genrsa_ctx *ctx,
 
 		if (gnutls_privkey_import_rsa_raw(ctx->priv, &m, &e, &d, &p, &q, &u, &e1, &e2) < 0) {
 			gnutls_privkey_deinit(ctx->priv);
+			ctx->priv = NULL;
 			return 1;
 		}
 	}
 
 	if (m.data && e.data) {
-		if (gnutls_pubkey_init(&ctx->pub) < 0)
+		if (gnutls_pubkey_init(&ctx->pub) < 0) {
+			if (ctx->priv) {
+				gnutls_privkey_deinit(ctx->priv);
+				ctx->priv = NULL;
+			}
 			return 1;
+		}
 
 		if (gnutls_pubkey_import_rsa_raw(ctx->pub, &m, &e) < 0) {
 			gnutls_pubkey_deinit(ctx->pub);
+			ctx->pub = NULL;
+			if (ctx->priv) {
+				gnutls_privkey_deinit(ctx->priv);
+				ctx->priv = NULL;
+			}
 			return 1;
 		}
 	}
+
+	ctx->created_mark = LWS_GENRSA_CTX_CREATED_MARK;
 
 	return 0;
 }
@@ -103,6 +120,10 @@ lws_genrsa_new_keypair(struct lws_context *context, struct lws_genrsa_ctx *ctx,
 {
 	gnutls_datum_t m, e, d, p, q, u, e1, e2;
 	int ret = -1;
+
+	/* the caller must hand us a zeroed ctx; a still-live ctx is a misuse */
+	if (ctx->created_mark == LWS_GENRSA_CTX_CREATED_MARK)
+		return -1;
 
 	memset(ctx, 0, sizeof(*ctx));
 	ctx->context = context;
@@ -153,8 +174,16 @@ lws_genrsa_new_keypair(struct lws_context *context, struct lws_genrsa_ctx *ctx,
 	ret = 0;
 
 bail:
-	if (ret)
+	if (!ret) {
+		ctx->created_mark = LWS_GENRSA_CTX_CREATED_MARK;
+		return 0;
+	}
+
+	if (ctx->priv) {
 		gnutls_privkey_deinit(ctx->priv);
+		ctx->priv = NULL;
+	}
+
 	return ret;
 }
 
@@ -175,6 +204,7 @@ lws_genrsa_public_encrypt(struct lws_genrsa_ctx *ctx, const uint8_t *in,
 			  size_t in_len, uint8_t *out)
 {
 	gnutls_datum_t v_in, v_out;
+	unsigned int bits = 0;
 	int n;
 
 	v_in.data = (uint8_t *)in;
@@ -184,6 +214,16 @@ lws_genrsa_public_encrypt(struct lws_genrsa_ctx *ctx, const uint8_t *in,
 		lwsl_err("%s: GnuTLS does not support RSA OAEP\n", __func__);
 		return -2;
 	}
+
+	if (!ctx->pub) {
+		lwsl_err("%s: no public key\n", __func__);
+		return -1;
+	}
+
+	/* the room the api has the caller provide at out: the modulus size */
+	if (gnutls_pubkey_get_pk_algorithm(ctx->pub, &bits) != GNUTLS_PK_RSA ||
+	    !bits)
+		return -1;
 
 	n = gnutls_pubkey_encrypt_data(ctx->pub, 0, &v_in, &v_out);
 
@@ -195,6 +235,16 @@ lws_genrsa_public_encrypt(struct lws_genrsa_ctx *ctx, const uint8_t *in,
 		    0)
 			return -2;
 		lwsl_err("%s: gnutls_pubkey_encrypt_data failed: %s\n", __func__, gnutls_strerror(n));
+		return -1;
+	}
+
+	/*
+	 * An RSA ciphertext is exactly the modulus size, as the other
+	 * backends write it... gnutls has no reason to give us more, but
+	 * nothing but the api contract bounds out, so don't take its word
+	 */
+	if (v_out.size > (bits + 7) / 8) {
+		gnutls_free(v_out.data);
 		return -1;
 	}
 
@@ -218,6 +268,12 @@ lws_genrsa_private_decrypt(struct lws_genrsa_ctx *ctx, const uint8_t *in,
 	if (ctx->mode == LGRSAM_PKCS1_OAEP_PSS) {
 		lwsl_err("%s: GnuTLS does not support RSA OAEP\n", __func__);
 		return -2;
+	}
+
+	if (!ctx->priv) {
+		/* the key had only public elements */
+		lwsl_err("%s: no private key\n", __func__);
+		return -1;
 	}
 
 	n = gnutls_privkey_decrypt_data(ctx->priv, 0, &v_in, &v_out);
@@ -253,6 +309,51 @@ lws_genrsa_private_encrypt(struct lws_genrsa_ctx *ctx, const uint8_t *in,
 	return -1;
 }
 
+/*
+ * The JWS "PS256/384/512" algs and the "RS256/384/512" ones use the same hash
+ * but different paddings, and the whole point of the JOSE header binding the
+ * alg is that they must not be interchangeable... ctx->mode carries which one
+ * the caller asked for and is authoritative here
+ */
+
+static int
+lws_genrsa_sign_alg(struct lws_genrsa_ctx *ctx,
+		    enum lws_genhash_types hash_type,
+		    gnutls_sign_algorithm_t *alg)
+{
+	if (ctx->mode == LGRSAM_PKCS1_OAEP_PSS) {
+#if GNUTLS_VERSION_NUMBER >= 0x030600
+		switch (hash_type) {
+		case LWS_GENHASH_TYPE_SHA256:
+			*alg = GNUTLS_SIGN_RSA_PSS_RSAE_SHA256;
+			return 0;
+		case LWS_GENHASH_TYPE_SHA384:
+			*alg = GNUTLS_SIGN_RSA_PSS_RSAE_SHA384;
+			return 0;
+		case LWS_GENHASH_TYPE_SHA512:
+			*alg = GNUTLS_SIGN_RSA_PSS_RSAE_SHA512;
+			return 0;
+		default:
+			break;
+		}
+#endif
+		lwsl_err("%s: no RSA-PSS for hash %d in this gnutls\n",
+			 __func__, (int)hash_type);
+
+		return -1;
+	}
+
+	switch (hash_type) {
+	case LWS_GENHASH_TYPE_SHA1: *alg = GNUTLS_SIGN_RSA_SHA1; break;
+	case LWS_GENHASH_TYPE_SHA256: *alg = GNUTLS_SIGN_RSA_SHA256; break;
+	case LWS_GENHASH_TYPE_SHA384: *alg = GNUTLS_SIGN_RSA_SHA384; break;
+	case LWS_GENHASH_TYPE_SHA512: *alg = GNUTLS_SIGN_RSA_SHA512; break;
+	default: return -1;
+	}
+
+	return 0;
+}
+
 int
 lws_genrsa_hash_sig_verify(struct lws_genrsa_ctx *ctx, const uint8_t *in,
 			   enum lws_genhash_types hash_type,
@@ -261,13 +362,8 @@ lws_genrsa_hash_sig_verify(struct lws_genrsa_ctx *ctx, const uint8_t *in,
 	gnutls_datum_t v_hash, v_sig;
 	gnutls_sign_algorithm_t alg;
 
-	switch (hash_type) {
-	case LWS_GENHASH_TYPE_SHA1: alg = GNUTLS_SIGN_RSA_SHA1; break;
-	case LWS_GENHASH_TYPE_SHA256: alg = GNUTLS_SIGN_RSA_SHA256; break;
-	case LWS_GENHASH_TYPE_SHA384: alg = GNUTLS_SIGN_RSA_SHA384; break;
-	case LWS_GENHASH_TYPE_SHA512: alg = GNUTLS_SIGN_RSA_SHA512; break;
-	default: return -1;
-	}
+	if (!ctx->pub || lws_genrsa_sign_alg(ctx, hash_type, &alg))
+		return -1;
 
 	v_hash.data = (uint8_t *)in;
 	v_hash.size = (unsigned int)lws_genhash_size(hash_type);
@@ -288,13 +384,14 @@ lws_genrsa_hash_sign(struct lws_genrsa_ctx *ctx, const uint8_t *in,
 	gnutls_datum_t v_hash, v_sig;
 	gnutls_sign_algorithm_t alg;
 
-	switch (hash_type) {
-	case LWS_GENHASH_TYPE_SHA1: alg = GNUTLS_SIGN_RSA_SHA1; break;
-	case LWS_GENHASH_TYPE_SHA256: alg = GNUTLS_SIGN_RSA_SHA256; break;
-	case LWS_GENHASH_TYPE_SHA384: alg = GNUTLS_SIGN_RSA_SHA384; break;
-	case LWS_GENHASH_TYPE_SHA512: alg = GNUTLS_SIGN_RSA_SHA512; break;
-	default: return -1;
+	if (!ctx->priv) {
+		/* the key had only public elements */
+		lwsl_err("%s: no private key\n", __func__);
+		return -1;
 	}
+
+	if (lws_genrsa_sign_alg(ctx, hash_type, &alg))
+		return -1;
 
 	v_hash.data = (uint8_t *)in;
 	v_hash.size = (unsigned int)lws_genhash_size(hash_type);
@@ -323,6 +420,7 @@ lws_genrsa_destroy(struct lws_genrsa_ctx *ctx)
 
 	ctx->priv = NULL;
 	ctx->pub = NULL;
+	ctx->created_mark = 0;
 }
 
 int

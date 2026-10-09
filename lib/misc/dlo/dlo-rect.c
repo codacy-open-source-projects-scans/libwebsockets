@@ -68,8 +68,9 @@ lws_display_render_rect(struct lws_display_render_state *rs)
 {
 	lws_dlo_t *dlo = rs->st[rs->sp].dlo;
 	lws_dlo_rect_t *r = lws_container_of(dlo, lws_dlo_rect_t, dlo);
-	lws_fx_t cf, y, w, trim, s, e, t2, sfy;
+	lws_fx_t cf, y, w, trim, s, e, t2, sfy, top, bot, cov;
 	lws_display_colour_t dc;
+	unsigned int row_alpha;
 	int n, le, os;
 
 	if (!LWSDC_ALPHA(dlo->dc))
@@ -95,8 +96,28 @@ lws_display_render_rect(struct lws_display_render_state *rs)
 	if (lws_fx_comp(&r->db.x, &rs->ic->wh_px[0]) >= 0)
 		return LWS_SRET_OK; /* off to the right */
 
-	if (rs->curr < r->db.y.whole - 1 || rs->curr > lws_fx_roundup(&r->btm))
+	/*
+	 * How much of this row the rect covers vertically: a fractional top
+	 * or bottom row is drawn with its alpha scaled by the overlap, so a
+	 * 1px underline at y = 32.9 is one row over two, not four solid
+	 * rows, and a zero-height rect draws nothing
+	 */
+	top.whole = rs->curr;
+	top.frac = 0;
+	if (lws_fx_comp(&top, &r->db.y) < 0)
+		top = r->db.y;
+	bot.whole = rs->curr + 1;
+	bot.frac = 0;
+	if (lws_fx_comp(&bot, &r->btm) > 0)
+		bot = r->btm;
+	lws_fx_sub(&cov, &bot, &top);
+	if (cov.whole < 0 || (!cov.whole && cov.frac <= 0))
 		return LWS_SRET_OK;
+
+	row_alpha = dlo->dc >> 24;
+	if (!cov.whole)
+		row_alpha = (unsigned int)(((uint64_t)cov.frac * row_alpha) /
+					   LWS_FX_FRACTION_MSD) & 0xff;
 
 	s = r->db.x;
 	lws_fx_add(&e, &s, &dlo->box.w);
@@ -141,6 +162,39 @@ lws_display_render_rect(struct lws_display_render_state *rs)
 		lws_fx_sub(&e, &e, &trim);
 	}
 
+	/*
+	 * The css border-triangle idiom: fill only the triangle at one corner,
+	 * bounded by the diagonal to the opposite corner.  On scanline y the
+	 * diagonal is at x = w.y / h from the left (or mirrored)
+	 */
+
+	if (r->tri && dlo->box.w.whole > 0 && dlo->box.h.whole > 0) {
+		lws_fx_t t, k;
+
+		lws_fx_set(k, (int32_t)rs->curr, 0);
+		lws_fx_sub(&k, &k, &r->db.y);        /* row in the box */
+		lws_fx_mul(&t, &k, &dlo->box.w);
+		lws_fx_div(&t, &t, &dlo->box.h);     /* diagonal x at this row */
+
+		switch (r->tri) {
+		case 1: /* top-left: full width at the top, shrinking */
+			lws_fx_add(&e, &r->db.x, &dlo->box.w);
+			lws_fx_sub(&e, &e, &t);
+			break;
+		case 2: /* top-right */
+			lws_fx_add(&s, &r->db.x, &t);
+			lws_fx_add(&e, &r->db.x, &dlo->box.w);
+			break;
+		case 3: /* bottom-left */
+			lws_fx_add(&e, &r->db.x, &t);
+			break;
+		default: /* bottom-right */
+			lws_fx_add(&s, &r->db.x, &dlo->box.w);
+			lws_fx_sub(&s, &s, &t);
+			break;
+		}
+	}
+
 	/* clips */
 
 	if (s.whole < 0)
@@ -162,7 +216,7 @@ lws_display_render_rect(struct lws_display_render_state *rs)
 	le = e.whole + 1;
 
 	while (s.whole <= le) {
-		unsigned int alpha = dlo->dc >> 24;
+		unsigned int alpha = row_alpha;
 
 		if (rs->curr <= r->c[0].ory.whole - 1 && s.whole >= r->db.x.whole &&
 		    lws_fx_comp(&s, &r->c[0].orx) <= 0) {

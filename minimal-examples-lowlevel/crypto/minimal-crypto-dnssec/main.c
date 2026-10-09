@@ -55,7 +55,7 @@ smd_cb(void *opaque, lws_smd_class_t c, lws_usec_t ts, void *buf, size_t len)
 		return 0;
 
 	const char *p = (const char *)buf;
-	if (!strstr(p, "\"ext-ips\""))
+	if (!(char *)strstr(p, "\"ext-ips\""))
 		return 0;
 
 	const char *start = strchr(p, '[');
@@ -73,10 +73,10 @@ smd_cb(void *opaque, lws_smd_class_t c, lws_usec_t ts, void *buf, size_t len)
 		if (*q == '"') {
 			if (in_quotes) {
 				temp[tlen] = '\0';
-				if (strchr(temp, '.')) {
+				if ((char *)strchr(temp, '.')) {
 					lws_strncpy(glb_ipv4, temp, sizeof(glb_ipv4));
 					ip_consensus_reached |= 1;
-				} else if (strchr(temp, ':')) {
+				} else if ((char *)strchr(temp, ':')) {
 					lws_strncpy(glb_ipv6, temp, sizeof(glb_ipv6));
 					ip_consensus_reached |= 2;
 				}
@@ -94,7 +94,7 @@ smd_cb(void *opaque, lws_smd_class_t c, lws_usec_t ts, void *buf, size_t len)
 
 int main(int argc, const char **argv)
 {
-	int result = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	int result = 0;
 	struct lws_context_creation_info info;
 	struct lws_context *context;
 	const char *p;
@@ -102,10 +102,7 @@ int main(int argc, const char **argv)
 	const struct lws_dht_dnssec_ops *ops;
 	struct lws_vhost *vh;
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, "-h") || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
 		lwsl_user("Usage: %s <keygen|importnsd|dsfromkey|signzone> [args...]\n\n", argv[0]);
@@ -132,7 +129,8 @@ int main(int argc, const char **argv)
 
 	static const char * dynamic_pdirs[3];
 
-	memset(&info, 0, sizeof info);
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 #if defined(LWS_WITH_NETWORK)
 	info.port = CONTEXT_PORT_NO_LISTEN;
 #endif

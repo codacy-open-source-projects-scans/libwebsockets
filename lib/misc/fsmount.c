@@ -48,12 +48,57 @@ rm_rf_cb(const char *dirpath, void *user, struct lws_dir_entry *lde)
 	lws_snprintf(path, sizeof(path), "%s/%s", dirpath, lde->name);
 
 	if (lde->type == LDOT_DIR) {
-		lws_dir(path, NULL, rm_rf_cb);
+#if !defined(__COVERITY__)
+		char dummy[8];
+
+		/*
+		 * A symlink to a directory can be reported as LDOT_DIR (eg,
+		 * when the fs gave no d_type and we had to fall back to a
+		 * stat()).  Recursing into it would take the deletion outside
+		 * the session dir, so like lws_dir_rm_rf_cb() only recurse if
+		 * readlink() says it is not a symlink.
+		 *
+		 * dummy[] is immediately discarded without being looked in, so
+		 * its lack of NUL termination cannot bite us.  Hidden from
+		 * Coverity, which flags any use of readlink() even if safe.
+		 */
+		if (readlink(path, dummy, sizeof(dummy)) < 0)
+#endif
+			lws_dir(path, NULL, rm_rf_cb);
+
 		rmdir(path);
 	} else
 		unlink(path);
 
 	return 0;
+}
+
+/*
+ * ovname, distro and the layer names are pasted both into the overlayfs mount
+ * option string (where ':' separates lowerdirs and ',' separates options) and
+ * into a path we then recursively delete.  Confine them to a conservative
+ * alphabet, so that neither the option string can be extended with attacker-
+ * chosen lowerdir / upperdir / workdir options, nor the deletion walked out of
+ * the overlay base by a '/' or a ".." component.
+ */
+
+static int
+fsmount_name_ok(const char *name)
+{
+	const char *p = name;
+
+	if (!name || !*name || !strcmp(name, "..") || !strcmp(name, "."))
+		return 0;
+
+	while (*p) {
+		if (!(*p >= 'a' && *p <= 'z') && !(*p >= 'A' && *p <= 'Z') &&
+		    !(*p >= '0' && *p <= '9') &&
+		    *p != '.' && *p != '_' && *p != '-')
+			return 0;
+		p++;
+	}
+
+	return 1;
 }
 
 int
@@ -62,6 +107,28 @@ lws_fsmount_mount(struct lws_fsmount *fsm)
 	struct libmnt_context *ctx;
 	char opts[512], c;
 	int n, m;
+
+	/*
+	 * These come from the caller's config or, typically, from a job
+	 * description that arrived over the network... validate them before
+	 * they are pasted into a mount option string or into a path we rm -rf.
+	 * They are fixed-size arrays, so also confirm they are terminated.
+	 */
+
+	if (!memchr(fsm->ovname, '\0', sizeof(fsm->ovname)) ||
+	    !memchr(fsm->distro, '\0', sizeof(fsm->distro)) ||
+	    !fsmount_name_ok(fsm->ovname) || !fsmount_name_ok(fsm->distro)) {
+		lwsl_err("%s: bad ovname or distro\n", __func__);
+
+		return 1;
+	}
+
+	for (m = 0; m < (int)LWS_ARRAY_SIZE(fsm->layers); m++)
+		if (fsm->layers[m] && !fsmount_name_ok(fsm->layers[m])) {
+			lwsl_err("%s: bad layer name\n", __func__);
+
+			return 1;
+		}
 
 	/*
 	 * For robustness, there are a couple of sticky situations caused by
@@ -84,8 +151,16 @@ lws_fsmount_mount(struct lws_fsmount *fsm)
 	 * even if the overlay path is empty or /
 	 */
 
-	lws_snprintf(opts, sizeof(opts), "%s/overlays/%s/session",
-		     fsm->overlay_path, fsm->ovname);
+	n = lws_snprintf(opts, sizeof(opts), "%s/overlays/%s/session",
+			 fsm->overlay_path, fsm->ovname);
+	if (n >= (int)sizeof(opts))
+		/*
+		 * lws_snprintf() returns the buffer size on truncation... a
+		 * truncated path here names a *parent* dir, so we must not
+		 * hand it to the recursive delete
+		 */
+		goto too_long;
+
 	lwsl_info("%s: emptying session dir %s\n", __func__, opts);
 	lws_dir(opts, NULL, rm_rf_cb);
 
@@ -93,24 +168,41 @@ lws_fsmount_mount(struct lws_fsmount *fsm)
 	 * Piece together the options for the overlay mount...
 	 */
 
+	/*
+	 * lws_snprintf() returns the given size on truncation, so after any
+	 * append n may be exactly sizeof(opts)... check after each one, since
+	 * continuing would write opts[sizeof(opts)] with the ':' below and then
+	 * underflow the remaining-length arg to (size_t)-1.  A truncated mount
+	 * option string is unusable anyway, since it would name the wrong dirs.
+	 */
+
 	n = lws_snprintf(opts, sizeof(opts), "lowerdir=");
 	for (m = LWS_ARRAY_SIZE(fsm->layers) - 1; m >= 0; m--)
 		if (fsm->layers[m]) {
+			if (n >= (int)sizeof(opts) - 1)
+				goto too_long;
+
 			if (n != 9)
 				opts[n++] = ':';
 
-			n += lws_snprintf(&opts[n], (size_t)(sizeof(opts) - (unsigned int)n),
+			n += lws_snprintf(&opts[n], sizeof(opts) - (size_t)n,
 					  "%s/%s/%s", fsm->layers_path,
 					  fsm->distro, fsm->layers[m]);
+			if (n >= (int)sizeof(opts))
+				goto too_long;
 		}
 
-	n += lws_snprintf(&opts[n], (size_t)(sizeof(opts) - (unsigned int)n),
+	n += lws_snprintf(&opts[n], sizeof(opts) - (size_t)n,
 			  ",upperdir=%s/overlays/%s/session",
 			  fsm->overlay_path, fsm->ovname);
+	if (n >= (int)sizeof(opts))
+		goto too_long;
 
-	n += lws_snprintf(&opts[n], (size_t)(sizeof(opts) - (unsigned int)n),
+	n += lws_snprintf(&opts[n], sizeof(opts) - (size_t)n,
 			  ",workdir=%s/overlays/%s/work",
 			  fsm->overlay_path, fsm->ovname);
+	if (n >= (int)sizeof(opts))
+		goto too_long;
 
 	ctx = mnt_new_context();
 	if (!ctx)
@@ -131,6 +223,11 @@ lws_fsmount_mount(struct lws_fsmount *fsm)
 	mnt_free_context(ctx);
 
 	return m;
+
+too_long:
+	lwsl_err("%s: overlay paths too long\n", __func__);
+
+	return 1;
 }
 
 int

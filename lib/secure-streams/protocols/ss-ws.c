@@ -59,7 +59,11 @@ secstream_ws(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 		if (r == LWSSSSRET_DESTROY_ME)
 			return _lws_ss_handle_state_ret_CAN_DESTROY_HANDLE(r, wsi, &h);
 
-		h->wsi = NULL;
+		if (h->wsi == wsi) /* not a newer wsi the app just started */
+			h->wsi = NULL;
+		if (h->wsi)
+			/* the app connected again from inside the callback */
+			break;
 		r = lws_ss_backoff(h);
 		if (r != LWSSSSRET_OK)
 			return _lws_ss_handle_state_ret_CAN_DESTROY_HANDLE(r, wsi, &h);
@@ -79,9 +83,17 @@ secstream_ws(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 		if (r == LWSSSSRET_DESTROY_ME)
 			return _lws_ss_handle_state_ret_CAN_DESTROY_HANDLE(r, wsi, &h);
 
-		if (h->wsi)
-			lws_set_opaque_user_data(h->wsi, NULL);
-		h->wsi = NULL;
+		/*
+		 * The DISCONNECTED helper above already cleared h->wsi before
+		 * calling the app's state callback... if it's set now, the app
+		 * started a new connection from inside that callback and we
+		 * must detach only the wsi that is actually closing, not the
+		 * live one that has taken its place
+		 */
+		if (h->wsi == wsi) {
+			lws_set_opaque_user_data(wsi, NULL);
+			h->wsi = NULL;
+		}
 
 #if defined(LWS_WITH_SERVER)
 		lws_pt_lock(pt, __func__);
@@ -90,7 +102,8 @@ secstream_ws(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 #endif
 
 		if (reason == LWS_CALLBACK_CLIENT_CLOSED) {
-			if (h->policy &&
+			if (!h->wsi && /* not if one is already live */
+			    h->policy &&
 			    !(h->policy->flags & LWSSSPOLF_OPPORTUNISTIC) &&
 #if defined(LWS_WITH_SERVER)
 			    !(h->info.flags & LWSSSINFLAGS_ACCEPTED) && /* not server */
@@ -192,14 +205,20 @@ secstream_ws(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 
 		if ((f & LWSSS_FLAG_SOM) && wsi->ws->last_valid && !wsi->ws->last_fin) {
 			lwsl_ss_err(h, "%s TX: Illegal LWSSS_FLAG_SOM after previous frame without LWSSS_FLAG_EOM", h->policy ? h->policy->streamtype : "unknown");
+			lwsl_err("Dumping cutting-in payload: %.*s\n", (int)buflen, buf + LWS_PRE);
+			lwsl_hexdump_err(buf + LWS_PRE, buflen);
 			assert(0);
 		}
 		if (!(f & LWSSS_FLAG_SOM) && wsi->ws->last_valid && wsi->ws->last_fin) {
 			lwsl_ss_err(h, "%s TX: Missing LWSSS_FLAG_SOM after previous frame with LWSSS_FLAG_EOM", h->policy ? h->policy->streamtype : "unknown");
+			lwsl_err("Dumping payload: %.*s\n", (int)buflen, buf + LWS_PRE);
+			lwsl_hexdump_err(buf + LWS_PRE, buflen);
 			assert(0);
 		}
 		if (!(f & LWSSS_FLAG_SOM) && !wsi->ws->last_valid) {
 			lwsl_ss_err(h, "%s TX: Missing LWSSS_FLAG_SOM on first frame", h->policy ? h->policy->streamtype : "unknown");
+			lwsl_err("Dumping payload: %.*s\n", (int)buflen, buf + LWS_PRE);
+			lwsl_hexdump_err(buf + LWS_PRE, buflen);
 			assert(0);
 		}
 
@@ -292,5 +311,6 @@ secstream_connect_munge_ws(lws_ss_handle_t *h, char *buf, size_t len,
 }
 
 const struct ss_pcols ss_pcol_ws = {
-	"ws",  "http/1.1",  &protocol_secstream_ws, secstream_connect_munge_ws, 0, 0
+	"ws",  "http/1.1",  &protocol_secstream_ws, secstream_connect_munge_ws, 0, 0,
+	NULL
 };

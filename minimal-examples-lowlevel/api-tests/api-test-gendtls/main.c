@@ -96,7 +96,7 @@ int main(int argc, const char **argv)
     int use_udp = 0;
 	(void)switches;
 
-	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
+	if (lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
 		lws_switches_print_help(argv[0], switches, LWS_ARRAY_SIZE(switches));
 		return 0;
 	}
@@ -185,7 +185,14 @@ int main(int argc, const char **argv)
     const char *p;
 
     if ((p = lws_cmdline_option(argc, (const char **)argv, switches[LWS_SW_PORT].sw))) {
-        port = atoi(p);
+        {
+        	int __pt = atoi(p);
+        	if (__pt < 0 || __pt > 65535) {
+        		lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+        		return 1;
+        	}
+        	port = __pt;
+        }
     }
 
     if (use_udp) {

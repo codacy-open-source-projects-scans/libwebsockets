@@ -71,6 +71,14 @@ enum pending_timeout {
 	PENDING_TIMEOUT_THREADPOOL_TASK				= 30,
 	PENDING_TIMEOUT_KILLED_BY_PROXY_CLIENT_CLOSE		= 31,
 	PENDING_TIMEOUT_USER_OK					= 32,
+	PENDING_TIMEOUT_HTTP_RESPONSE				= 33,
+	/**< Server: we started writing the response (sent response headers) but
+	 * the transaction never completed in time -- no END_STREAM was sent under
+	 * h2 / h3, or the response body was never finished.  User code likely
+	 * wrote a headers-only response via lws_finalize_write_http_header()
+	 * instead of lws_finalize_write_http_header_flags() with
+	 * LWS_WRITE_H2_STREAM_END, or never drained a chunked body.  Stream is
+	 * closed as unusable. */
 
 	/****** add new things just above ---^ ******/
 
@@ -305,6 +313,11 @@ __lws_sul_insert(lws_dll2_owner_t *own, lws_sorted_usec_list_t *sul);
 
 LWS_VISIBLE LWS_EXTERN lws_usec_t
 __lws_sul_service_ripe(lws_dll2_owner_t *own, int own_len, lws_usec_t usnow);
+/*
+ * An event loop calls this holding the context lock and then the pt lock, in
+ * that order, so the callbacks it runs may close connections or destroy
+ * vhosts, which take the same locks in the same order.
+ */
 
 #if defined(STANDALONE)
 #undef lws_context

@@ -44,6 +44,17 @@
 #include <string.h>
 #include <limits.h>
 
+/*
+ * PNG itself allows dimensions up to 2^31 - 1, which as a line buffer is
+ * meaningless for us: we're a streaming decoder for embedded display lists and
+ * the line pair buffer is allocated up-front from the IHDR alone.  Cap what we
+ * accept at the same limits the jpeg decoder uses, so a 25-byte hostile header
+ * can't ask for a multi-GB allocation.
+ */
+
+#define LWS_UPNG_MAX_WIDTH	16384
+#define LWS_UPNG_MAX_HEIGHT	16384
+
 typedef enum upng_color {
 	LWS_UPNG_LUM		= 0,
 	LWS_UPNG_RGB		= 2,
@@ -112,6 +123,15 @@ struct lws_upng_t {
 	uint32_t		ctype;
 
 	upng_outer_framing_t	of;
+
+	/*
+	 * Nonzero once any FATAL has been returned, and it is that FATAL:
+	 * every later call returns it again without touching anything.  The
+	 * framing and inflate states are not left anywhere a later call can
+	 * safely carry on from, eg, a bad signature byte leaves the magic
+	 * index past the one it failed at.
+	 */
+	lws_stateful_ret_t	failed;
 
 	uint8_t			no_more_input;
 	char			hold_at_metadata;
@@ -224,15 +244,13 @@ unfilter_scanline(lws_upng_t *u)
 	return LWS_SRET_OK;
 }
 
-lws_stateful_ret_t
-lws_upng_emit_next_line(lws_upng_t *u, const uint8_t **ppix,
-		    const uint8_t **pos, size_t *size, char hold_at_metadata)
+static lws_stateful_ret_t
+upng_emit_line(lws_upng_t *u, const uint8_t **ppix, const uint8_t **pos,
+	       size_t *size, char hold_at_metadata)
 {
 	struct upng_unfline	*uf = &u->u;
 	unsigned long		obp;
 	lws_stateful_ret_t	ret = LWS_SRET_OK;
-
-	*ppix = NULL;
 
 	u->hold_at_metadata = hold_at_metadata;
 
@@ -300,6 +318,30 @@ out:
 	return ret;
 }
 
+lws_stateful_ret_t
+lws_upng_emit_next_line(lws_upng_t *u, const uint8_t **ppix,
+		    const uint8_t **pos, size_t *size, char hold_at_metadata)
+{
+	lws_stateful_ret_t r;
+
+	if (ppix)
+		*ppix = NULL;
+	if (!u || !ppix || !pos || !size)
+		return LWS_SRET_FATAL + 100;
+
+	if (u->failed)
+		return u->failed;
+
+	r = upng_emit_line(u, ppix, pos, size, hold_at_metadata);
+	if (r & LWS_SRET_FATAL) {
+		/* see ->failed: there is no coming back from it */
+		u->failed = r;
+		*ppix = NULL; /* eg, a line whose unfilter failed */
+	}
+
+	return r;
+}
+
 static lws_upng_format_t
 determine_format(lws_upng_t* upng) {
 	switch (upng->color_type) {
@@ -357,22 +399,18 @@ static const uint8_t magic[] = { 137, 80, 78, 71, 13, 10, 26, 10 };
 static lws_stateful_ret_t
 lws_upng_decode(lws_upng_t* u, const uint8_t **_pos, size_t *_size)
 {
-	const uint8_t *pos = _pos ? *_pos : NULL, *end = pos + *_size;
+	const uint8_t *pos = _pos ? *_pos : NULL, *end = pos + (_size ? *_size : 0);
 	lws_stateful_ret_t r = LWS_SRET_FATAL + 60;
 	size_t m;
 
-	if (u->of == UOF_INSIDE && !u->inf.in) {
-		u->inf.inpos = 0;
-		u->inf.in = pos;
-		u->inf.bp = 0;
-		m = lws_ptr_diff_size_t(end, pos);
-		if (m > u->chunklen)
-			m = u->chunklen;
-		u->inf.inlen = m;
-	}
+	/*
+	 * Once we are into the deflate data, the inflater may still have
+	 * output to give (eg, the rest of a back-reference) even when there
+	 * is no new input, so we let it run then as well
+	 */
 
 	while (!u->no_more_input &&
-	       ((u->of == UOF_INSIDE && _pos == NULL) || pos < end)) {
+	       (pos < end || (u->of == UOF_INSIDE && u->inf.subsequent))) {
 		switch (u->of) {
 		case UOF_MAGIC:
 			if (*pos++ != magic[u->sctr++])
@@ -405,7 +443,7 @@ lws_upng_decode(lws_upng_t* u, const uint8_t **_pos, size_t *_size)
 			u->acc = (u->acc << 8) | *pos++;
 			if (++u->sctr == 4) {
 				u->width = u->acc;
-				if (!u->acc)
+				if (!u->acc || u->acc > LWS_UPNG_MAX_WIDTH)
 					return LWS_SRET_FATAL + 18;
 				u->of++;
 				u->sctr = 0;
@@ -416,6 +454,8 @@ lws_upng_decode(lws_upng_t* u, const uint8_t **_pos, size_t *_size)
 			u->acc = (u->acc << 8) | *pos++;
 			if (++u->sctr == 4) {
 				u->height = u->acc;
+				if (!u->acc || u->acc > LWS_UPNG_MAX_HEIGHT)
+					return LWS_SRET_FATAL + 21;
 				u->of++;
 				u->sctr = 0;
 			}
@@ -484,23 +524,52 @@ lws_upng_decode(lws_upng_t* u, const uint8_t **_pos, size_t *_size)
 
 		case UOF_CHUNK_LEN:
 			if (!u->inf.out) {
-				size_t ims = (u->u.bypl * 2) + u->inf.info_size;
+				size_t ims;
 
-				if (u->u.bypl > UINT_MAX / 2 || u->inf.info_size > UINT_MAX - (u->u.bypl * 2)) {
-					lwsl_err("%s: integer overflow occur in ims %llu",
-						 __func__, (unsigned long long)ims);
+				/*
+				 * Confirm the line-pair + window arithmetic
+				 * can't wrap *before* we evaluate it.  width
+				 * and bpp are already capped at IHDR, this is
+				 * belt-and-braces on the allocation size.
+				 */
+
+				if (u->u.bypl > UINT_MAX / 2 ||
+				    u->inf.info_size >
+					      UINT_MAX - (u->u.bypl * 2)) {
+					lwsl_err("%s: ims overflow\n",
+						 __func__);
+
 					return LWS_SRET_FATAL + 27;
 				}
 
-				if (u->hold_at_metadata)
-					return LWS_SRET_AWAIT_RETRY;
+				ims = (size_t)(u->u.bypl * 2) +
+						u->inf.info_size;
+
+				/*
+				 * We must publish how much of the caller's
+				 * buffer we consumed, even on this early exit,
+				 * or he will replay bytes we already ate into
+				 * a different parser state
+				 */
+
+				if (u->hold_at_metadata) {
+					r = LWS_SRET_AWAIT_RETRY;
+					goto bail;
+				}
 
 				u->inf.out = (uint8_t *)lws_malloc(ims, __func__);
 				if (!u->inf.out) {
 					lwsl_notice("%s: inf malloc %u OOM\n",
 						__func__, (unsigned int)ims);
 
-					return LWS_SRET_YIELD;
+					/*
+					 * As above, publish what we consumed.
+					 * The caller may call again later,
+					 * when we retry the allocation before
+					 * eating any more
+					 */
+					r = LWS_SRET_YIELD;
+					goto bail;
 				}
 				u->u.lines = u->inf.out + u->inf.info_size;
 				u->u.in		= u->inf.out;
@@ -538,80 +607,86 @@ lws_upng_decode(lws_upng_t* u, const uint8_t **_pos, size_t *_size)
 
 			/* it's a usable IDAT */
 
-			if (!u->inf.subsequent)
-				u->inf.inpos = 2;
-			else
-				u->inf.inpos = 0;
-
-			m = lws_ptr_diff_size_t(end, pos);
-			if (m > u->chunklen)
-				m = u->chunklen;
-
-			u->inf.in = pos;
-			u->inf.inlen = m;
-			u->inf.bp = 0;
 			u->of++;
 			break;
 
 		case UOF_INSIDE:
 			if (!u->inf.subsequent) {
+				/*
+				 * The first IDAT starts with the 2-byte zlib
+				 * header, which may come split over any number
+				 * of calls.  Collect and check it before the
+				 * inflater sees any of the chunk.  The IDAT is
+				 * at least 2 bytes, checked above.
+				 */
 
-				switch (u->sctr) {
-				case 0:
-					u->acc = (uint32_t)((*pos++) << 8);
-					u->sctr++;
-					continue;
-
-				case 1:
-					u->acc |= *pos++;
-
-					if (u->acc % 31)
-						return LWS_SRET_FATAL + 31;
-
-					if (((u->acc >> 8) & 15) != 8 ||
-					    ((u->acc >> 12) & 15) > 7)
-						return LWS_SRET_FATAL + 31;
-
-					if ((u->acc >> 5) & 1)
-						return LWS_SRET_FATAL + 31;
-
-					u->inf.subsequent = 1;
+				u->acc = (u->acc << 8) | *pos++;
+				u->chunklen--;
+				if (++u->sctr != 2)
 					break;
-				}
+
+				u->sctr = 0;
+				u->acc &= 0xffff;
+
+				if (u->acc % 31)
+					return LWS_SRET_FATAL + 31;
+
+				if (((u->acc >> 8) & 15) != 8 ||
+				    ((u->acc >> 12) & 15) > 7)
+					return LWS_SRET_FATAL + 31;
+
+				if ((u->acc >> 5) & 1)
+					return LWS_SRET_FATAL + 31;
+
+				u->inf.subsequent = 1;
+				break;
 			}
+
+			/*
+			 * Lend the inflater what the caller gave us of this
+			 * IDAT's data.  It must not keep a pointer into the
+			 * caller's buffer after we return, so afterwards we
+			 * take back the whole bytes it is finished with, and
+			 * keep only its bit offset into the next byte, which
+			 * the caller will present again at *_pos
+			 */
+
+			m = lws_ptr_diff_size_t(end, pos);
+			if (m > u->chunklen)
+				m = u->chunklen;
+
+			u->inf.in	= pos;
+			u->inf.inpos	= 0;
+			u->inf.inlen	= m;
 
 			r = _lws_upng_inflate_data(&u->inf);
-			switch (r) {
 
-			case LWS_SRET_WANT_INPUT:
+			m = u->inf.bp >> 3;
+			if (m > u->inf.inlen)
+				m = u->inf.inlen;
+			if (m)
+				pos += m;
+			u->chunklen	= u->chunklen - (uint32_t)m;
+			u->inf.bp	-= m << 3;
+			u->inf.in	= NULL;
+			u->inf.inlen	= 0;
 
-				/* indicate no existing to drain */
-				u->inf.in = NULL;
-
-				pos += u->inf.inlen - u->inf.inpos;
-				u->chunklen = u->chunklen -
-						(unsigned int)(u->inf.inlen);
-
-				if (!u->chunklen) {
-					u->chunklen = 4; /* skip the 32-bit CRC */
-
-					u->of = UOF_SKIP_CHUNK_LEN;
-					break;
-				}
-				if (pos != end) {
-					u->inf.inpos = 0;
-					u->inf.in = pos;
-					m = lws_ptr_diff_size_t(end, pos);
-					if (m > u->chunklen)
-						m = u->chunklen;
-					u->inf.inlen = m;
-					continue;
-				}
+			if (r != LWS_SRET_WANT_INPUT)
+				/* eg, WANT_OUTPUT, or FATAL */
 				goto bail;
-			default:
-				goto bail;
+
+			/*
+			 * It used all we lent it: either the IDAT or the
+			 * caller's buffer is finished (or both)
+			 */
+
+			if (!u->chunklen) {
+				u->chunklen = 4; /* skip the 32-bit CRC */
+				u->of = UOF_SKIP_CHUNK_LEN;
+				break;
 			}
-			break;
+
+			goto bail;
 
 		case UOF_SKIP_CHUNK_LEN:
 			pos++;
@@ -631,8 +706,10 @@ lws_upng_decode(lws_upng_t* u, const uint8_t **_pos, size_t *_size)
 	}
 
 bail:
-	*_pos = pos;
-	*_size = lws_ptr_diff_size_t(end, pos);
+	if (_pos)
+		*_pos = pos;
+	if (_size)
+		*_size = lws_ptr_diff_size_t(end, pos);
 
 	return r;
 }
@@ -661,6 +738,9 @@ lws_upng_new(void)
 void
 lws_upng_free(lws_upng_t** upng)
 {
+	if (!*upng)
+		return;
+
 	if ((*upng)->inf.out)
 		lws_free_set_NULL((*upng)->inf.out);
 
@@ -716,9 +796,13 @@ lws_upng_get_pixelsize(const lws_upng_t* upng)
 	unsigned bits = lws_upng_get_bitdepth(upng) *
 				lws_upng_get_components(upng);
 
-	bits += bits % 8;
+	/*
+	 * Round up to whole bytes... "bits += bits % 8" gave 2 for a 1bpp
+	 * image, ie, a zero-byte pixel stride at the consumer, and did not
+	 * match the (bpp + 7) / 8 bytes-per-pixel the decoder actually emits
+	 */
 
-	return bits;
+	return ((bits + 7) / 8) * 8;
 }
 
 lws_upng_format_t

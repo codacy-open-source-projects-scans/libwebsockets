@@ -24,6 +24,7 @@
 
 #include "protocol_lws_rtc_camera.h"
 #include "webcam-media.h"
+#include <libwebsockets/lws-alsa.h>
 
 #include "../protocol_lws_webrtc/protocol_lws_webrtc.h"
 
@@ -35,13 +36,25 @@ struct per_vhost_data {
 
 struct attach_args {
 	char *device_path;
+	char *audio_device_path;
 	char *name;
+	char *auth_token;
 	uint32_t width;
 	uint32_t height;
 };
 
 const struct lws_webrtc_ops *we_ops = NULL;
 static struct lws_rtc_camera_ops my_ops;
+
+#if defined(LWS_WITH_OPUS)
+static void alsa_audio_cb(void *user_data, const uint8_t *payload, size_t len)
+{
+	struct pss_camshow *app_state = (struct pss_camshow *)user_data;
+	if (we_ops && we_ops->send_audio && we_ops->get_media && app_state->pss) {
+		we_ops->send_audio(we_ops->get_media(app_state->pss), payload, len, 0);
+	}
+}
+#endif
 
 static void
 emit_state(struct lws_vhost *vh, const char *dev, enum lws_rtc_camera_states state)
@@ -53,7 +66,7 @@ emit_state(struct lws_vhost *vh, const char *dev, enum lws_rtc_camera_states sta
 }
 
 static int
-api_attach(struct lws_vhost *vh, const char *url, const char *device_path, const char *name, uint32_t width, uint32_t height)
+api_attach(struct lws_vhost *vh, const char *url, const char *device_path, const char *audio_device_path, const char *name, uint32_t width, uint32_t height, const char *auth_token)
 {
 	struct per_vhost_data *vhd = (struct per_vhost_data *)lws_protocol_vh_priv_get(vh, lws_vhost_name_to_protocol(vh, "lws-rtc-camera"));
 	if (!vhd || !url) return -1;
@@ -83,7 +96,9 @@ api_attach(struct lws_vhost *vh, const char *url, const char *device_path, const
 	struct attach_args *args = malloc(sizeof(*args));
 	if (!args) return -1;
 	args->device_path = strdup(device_path);
+	args->audio_device_path = audio_device_path ? strdup(audio_device_path) : strdup("default");
 	args->name = name ? strdup(name) : NULL;
+	args->auth_token = auth_token ? strdup(auth_token) : NULL;
 	args->width = width;
 	args->height = height;
 
@@ -106,6 +121,7 @@ api_attach(struct lws_vhost *vh, const char *url, const char *device_path, const
 		emit_state(vh, device_path, LWS_RTC_CAMERA_STATE_ERROR);
 		free(args->device_path);
 		if (args->name) free((void *)args->name);
+		if (args->auth_token) free((void *)args->auth_token);
 		free(args);
 		lws_parse_uri_destroy(&puri);
 		return -1;
@@ -143,6 +159,19 @@ callback_rtc_camera(struct lws *wsi, enum lws_callback_reasons reason,
 	}
 
 	switch (reason) {
+		case LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER: {
+			struct attach_args *args = (struct attach_args *)lws_get_opaque_user_data(wsi);
+			unsigned char **p = (unsigned char **)in;
+			unsigned char *end = (*p) + len;
+
+			if (args && args->auth_token) {
+				char cookie[512];
+				int n = lws_snprintf(cookie, sizeof(cookie), "auth_session=%s", args->auth_token);
+				if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_COOKIE, (unsigned char *)cookie, n, p, end))
+					return -1;
+			}
+			break;
+		}
 		case LWS_CALLBACK_CLIENT_WRITEABLE:
 			{
 				struct pss_camshow *app_state = NULL;
@@ -178,24 +207,32 @@ callback_rtc_camera(struct lws *wsi, enum lws_callback_reasons reason,
 					}
 
 					if (lws_json_simple_find((const char *)in, len, "\"type\":\"peer_ip\"", &al)) {
-						const char *p = lws_json_simple_find((const char *)in, len, "\"ip\":", &al);
-						if (p) {
-							char ip_buf[64];
-							size_t nl = al;
-							if (*p == '\"') { p++; nl -= 2; }
-							if (nl >= sizeof(ip_buf)) nl = sizeof(ip_buf) - 1;
-							memcpy(ip_buf, p, nl);
-							ip_buf[nl] = '\0';
-							if (we_ops && we_ops->create_offer) {
-								we_ops->create_offer(app_state->pss);
-							}
-						}
+						/*
+						 * lws_json_simple_find() already returns the
+						 * value with its quotes stripped, so the old
+						 * "skip the quote and take off 2" fixup only
+						 * ever fired on an empty value "", where it
+						 * underflowed the size_t length into a 63-byte
+						 * read past the rx buffer.  We do not use the
+						 * address anyway, so just check it is present.
+						 */
+						if (lws_json_simple_find((const char *)in, len, "\"ip\":", &al) &&
+						    we_ops && we_ops->create_offer)
+							we_ops->create_offer(app_state->pss);
 					}
 
 					if (lws_json_simple_find((const char *)in, len, "\"type\":\"request_caps\"", &al) ||
 							lws_json_simple_find((const char *)in, len, "\"request_caps\"", &al)) {
 						if (app_state->ops && app_state->ops->send_capabilities)
 							app_state->ops->send_capabilities(app_state);
+#if defined(LWS_WITH_OPUS)
+						if (app_state->alsa_cap) {
+							char abuf[1024];
+							int n = lws_alsa_opus_send_capabilities(app_state->alsa_cap, abuf, sizeof(abuf));
+							if (n > 0 && we_ops && we_ops->send_text)
+								we_ops->send_text(app_state->pss, abuf, (size_t)n);
+						}
+#endif
 					}
 
 					if (lws_json_simple_find((const char *)in, len, "\"type\":\"set_control\"", &al)) {
@@ -217,8 +254,17 @@ callback_rtc_camera(struct lws *wsi, enum lws_callback_reasons reason,
 						}
 
 						if (id != -1) {
-							if (app_state->ops && app_state->ops->set_control) {
-								app_state->ops->set_control(app_state, (uint32_t)id, (int32_t)val);
+							size_t kl;
+							const char *k = lws_json_simple_find((const char *)in, len, "\"kind\":", &kl);
+							if (k && !strncmp(k, "\"audio\"", 7)) {
+#if defined(LWS_WITH_OPUS)
+								if (app_state->alsa_cap)
+									lws_alsa_opus_set_control(app_state->alsa_cap, (uint32_t)id, (long)val);
+#endif
+							} else {
+								if (app_state->ops && app_state->ops->set_control) {
+									app_state->ops->set_control(app_state, (uint32_t)id, (int32_t)val);
+								}
 							}
 						}
 					}
@@ -242,6 +288,7 @@ callback_rtc_camera(struct lws *wsi, enum lws_callback_reasons reason,
 					we_ops->set_user_data(we_pss, app_state);
 
 				app_state->video_device = args && args->device_path ? strdup(args->device_path) : strdup("/dev/video0");
+				app_state->audio_device = args && args->audio_device_path ? strdup(args->audio_device_path) : strdup("default");
 
 				app_state->pss = we_pss;
 				app_state->context = lws_get_context(wsi);
@@ -259,7 +306,28 @@ callback_rtc_camera(struct lws *wsi, enum lws_callback_reasons reason,
 #endif
 
 				if (app_state->ops && app_state->ops->init(app_state) < 0) {
+					/*
+					 * We are already installed as the webrtc
+					 * session's user data, and returning nonzero
+					 * closes the wsi, so CLIENT_CLOSED will come
+					 * and use it: uninstall before freeing, or
+					 * that is a UAF read, an indirect call
+					 * through app_state->ops and a double free.
+					 */
+					if (we_ops && we_ops->set_user_data)
+						we_ops->set_user_data(we_pss, NULL);
+					free((void *)app_state->video_device);
+					free((void *)app_state->audio_device);
 					free(app_state);
+					/* args is only freed at the end of this block */
+					if (args) {
+						lws_set_opaque_user_data(wsi, NULL);
+						free(args->name);
+						free(args->device_path);
+						free(args->audio_device_path);
+						free(args->auth_token);
+						free(args);
+					}
 					return -1;
 				}
 
@@ -279,10 +347,36 @@ callback_rtc_camera(struct lws *wsi, enum lws_callback_reasons reason,
 					}
 				}
 
+#if defined(LWS_WITH_OPUS)
+				struct lws_alsa_info ainfo;
+				memset(&ainfo, 0, sizeof(ainfo));
+				ainfo.device_name = app_state->audio_device;
+				ainfo.rate = AUDIO_RATE;
+				ainfo.channels = AUDIO_CHANNELS;
+				ainfo.samples_per_frame = AUDIO_SAMPLES_PER_FRAME;
+
+				app_state->alsa_cap = lws_alsa_opus_capture_create(&ainfo, alsa_audio_cb, app_state);
+				if (app_state->alsa_cap) {
+					int fd = lws_alsa_opus_get_fd(app_state->alsa_cap);
+					if (fd >= 0) {
+						struct lws_adopt_desc ad;
+						memset(&ad, 0, sizeof(ad));
+						ad.vh = lws_get_vhost(wsi);
+						ad.type = LWS_ADOPT_RAW_FILE_DESC;
+						ad.fd.filefd = (lws_filefd_type)(long)fd;
+						ad.vh_prot_name = "lws-rtc-camera-v4l2";
+						app_state->wsi_alsa = lws_adopt_descriptor_vhost_via_info(&ad);
+						if (app_state->wsi_alsa) {
+							lws_set_wsi_user(app_state->wsi_alsa, app_state);
+						}
+					}
+				}
+#endif
+
 				lws_callback_on_writable(wsi);
 
 				char json[256];
-				const char *name = args && args->name ? args->name : strrchr(app_state->video_device, '/');
+				const char *name = args && args->name ? args->name : (char *)strrchr(app_state->video_device, '/');
 				if (name && name[0] == '/') name++; else if (!name) name = app_state->video_device;
 
 				char esc_name[384];
@@ -296,6 +390,19 @@ callback_rtc_camera(struct lws *wsi, enum lws_callback_reasons reason,
 				if (app_state->ops && app_state->ops->send_capabilities) {
 					app_state->ops->send_capabilities(app_state);
 				}
+#if defined(LWS_WITH_OPUS)
+				if (app_state->alsa_cap) {
+					char abuf[1024];
+					int n = lws_alsa_opus_send_capabilities(app_state->alsa_cap, abuf, sizeof(abuf));
+					if (n > 0) {
+						lwsl_notice("%s: Sending audio capabilities (%d bytes): %s\n", __func__, n, abuf);
+						if (we_ops && we_ops->send_text)
+							we_ops->send_text(app_state->pss, abuf, (size_t)n);
+					} else {
+						lwsl_warn("%s: No audio capabilities found\n", __func__);
+					}
+				}
+#endif
 				app_state->caps_sent = 1;
 
 				char stats_json[128];
@@ -313,17 +420,22 @@ callback_rtc_camera(struct lws *wsi, enum lws_callback_reasons reason,
 				if (args) {
 					if (args->name) free(args->name);
 					if (args->device_path) free(args->device_path);
+					if (args->audio_device_path) free(args->audio_device_path);
+					if (args->auth_token) free(args->auth_token);
 					free(args);
 				}
 				break;
 			}
 
 		case LWS_CALLBACK_PROTOCOL_INIT: {
+				if (lws_cmdline_option_cx(lws_get_context(wsi), "--lws-stub"))
+					return 0;
+				if (!in)
+					return 0;
+
 				const struct lws_protocol_vhost_options *pvo;
 
 				vhd = lws_protocol_vh_priv_zalloc(lws_get_vhost(wsi), lws_get_protocol(wsi), sizeof(struct per_vhost_data));
-
-				lwsl_err("LWS_CALLBACK_PROTOCOL_INIT for lws-rtc-camera\n");
 				if (!vhd)
 					return -1;
 				vhd->vhd = (struct vhd_webrtc *)lws_protocol_vh_priv_get(lws_get_vhost(wsi), lws_vhost_name_to_protocol(lws_get_vhost(wsi), "lws-webrtc"));
@@ -408,6 +520,12 @@ callback_rtc_camera(struct lws *wsi, enum lws_callback_reasons reason,
 					emit_state(lws_get_vhost(wsi), app_state->video_device ? app_state->video_device : "?", LWS_RTC_CAMERA_STATE_CLOSED);
 					if (app_state->ops && app_state->ops->deinit)
 						app_state->ops->deinit(app_state);
+#if defined(LWS_WITH_OPUS)
+					if (app_state->alsa_cap)
+						lws_alsa_opus_capture_destroy(&app_state->alsa_cap);
+#endif
+					if (app_state->video_device) free((void *)app_state->video_device);
+					if (app_state->audio_device) free((void *)app_state->audio_device);
 					free(app_state);
 					we_ops->set_user_data((struct pss_webrtc *)user, NULL);
 				}
@@ -424,6 +542,12 @@ callback_rtc_camera(struct lws *wsi, enum lws_callback_reasons reason,
 					if (app_state->ops && app_state->ops->process_rx)
 						app_state->ops->process_rx(app_state);
 				}
+#if defined(LWS_WITH_OPUS)
+				else if (app_state && wsi == app_state->wsi_alsa) {
+					if (app_state->alsa_cap)
+						lws_alsa_opus_read(app_state->alsa_cap);
+				}
+#endif
 			}
 			break;
 
@@ -452,10 +576,11 @@ static const struct lws_protocols protocols[] = {
 
 LWS_VISIBLE const lws_plugin_protocol_t lws_rtc_camera = {
 	.hdr = {
-		"lws rtc camera plugin",
-		"lws_protocol_plugin",
-		LWS_BUILD_HASH,
-		LWS_PLUGIN_API_MAGIC
+		.name = "lws rtc camera plugin",
+		._class = "lws_protocol_plugin",
+		.lws_build_hash = LWS_BUILD_HASH,
+		.api_magic = LWS_PLUGIN_API_MAGIC,
+		.priority = 0
 	},
 	.protocols = protocols,
 	.count_protocols = LWS_ARRAY_SIZE(protocols)

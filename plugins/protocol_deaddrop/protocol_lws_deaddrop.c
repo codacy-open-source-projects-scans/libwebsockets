@@ -67,7 +67,7 @@ struct vhd_deaddrop {
 	struct lws_vhost		*vh;
 	const struct lws_protocols	*protocol;
 
-	struct pss_deaddrop		*pss_head;
+	lws_dll2_owner_t		pss_head; /* list of live pss */
 
 	const char			*upload_dir;
 	const char			*cookie_name;
@@ -75,6 +75,7 @@ struct vhd_deaddrop {
 	struct lwsac			*lwsac_head;
 	struct dir_entry		*dire_head;
 	int				filelist_version;
+	int				userlist_version;
 
 	unsigned long long		max_size;
 
@@ -83,6 +84,23 @@ struct vhd_deaddrop {
 #endif
 	struct lws_jwk			jwk;
 	uint8_t				has_jwk:1;
+	/*
+	 * set if this vhost gave the protocol a "basic-auth" pvo, ie, lws
+	 * itself checks the Authorization header at ws upgrade and rewrites
+	 * it to the validated username.  Without it, the header is just
+	 * something the peer typed and must not be believed.
+	 */
+	uint8_t				basic_auth:1;
+	/* set by the "allow-anonymous" pvo: serve unauthenticated ws peers */
+	uint8_t				allow_anon:1;
+	/*
+	 * set by the "require-origin" pvo: also refuse requests that carry no
+	 * Origin header at all, ie, non-browser clients
+	 */
+	uint8_t				require_origin:1;
+
+	/* the "origin-allow" pvo: extra origins accepted, comma-separated */
+	const char			*origin_allow;
 };
 
 struct pss_deaddrop {
@@ -95,20 +113,25 @@ struct pss_deaddrop {
 	char				browser[32];
 	char				user[64];
 	char				tab_id[32];
+	char				ip[46];
 	unsigned long long		file_length;
 	lws_filefd_type			fd;
 	int				response_code;
 
-	struct pss_deaddrop		*pss_list;
+	lws_dll2_t			pss_list; /* vhd->pss_head membership */
 
 	struct lwsac			*lwsac_head;
 	struct dir_entry		*dire;
 	int				filelist_version;
+	int				userlist_version;
+	int				sending_filelist_version;
+	int				sending_userlist_version;
 
 	uint8_t				completed:1;
 	uint8_t				sent_headers:1;
 	uint8_t				sent_body:1;
 	uint8_t				first:1;
+	uint8_t				sent_initial:1;
 	uint8_t				ws_ongoing_send:1;
 	uint8_t				has_star_grant:1;
 };
@@ -128,7 +151,7 @@ enum enum_param_names {
 };
 
 static void
-parse_user_agent(const char *ua, char *platform, size_t plat_len,
+deaddrop_parse_user_agent(const char *ua, char *platform, size_t plat_len,
 		 char *browser, size_t browser_len)
 {
 	lws_strncpy(platform, "Unknown", plat_len);
@@ -136,29 +159,216 @@ parse_user_agent(const char *ua, char *platform, size_t plat_len,
 
 	/* Guess platform from UA */
 
-	if (strstr(ua, "Windows"))
+	if ((char *)strstr(ua, "Windows"))
 		lws_strncpy(platform, "Windows", plat_len);
-	else if (strstr(ua, "Linux"))
+	else if ((char *)strstr(ua, "Linux"))
 		lws_strncpy(platform, "Linux", plat_len);
-	else if (strstr(ua, "Macintosh") || strstr(ua, "Mac OS"))
+	else if ((char *)strstr(ua, "Macintosh") || (char *)strstr(ua, "Mac OS"))
 		lws_strncpy(platform, "macOS", plat_len);
 
 	/* Guess browser / client from UA */
 
-	if (strstr(ua, "curl"))
+	if ((char *)strstr(ua, "curl"))
 		lws_strncpy(browser, "curl", browser_len);
-	else if (strstr(ua, "Wget"))
+	else if ((char *)strstr(ua, "Wget"))
 		lws_strncpy(browser, "Wget", browser_len);
-	else if (strstr(ua, "Edg/"))
+	else if ((char *)strstr(ua, "Edg/"))
 		lws_strncpy(browser, "Edge", browser_len);
-	else if (strstr(ua, "Firefox/"))
+	else if ((char *)strstr(ua, "Firefox/"))
 		lws_strncpy(browser, "Firefox", browser_len);
-	else if (strstr(ua, "Chrome/") && strstr(ua, "Safari/"))
+	else if ((char *)strstr(ua, "Chrome/") && (char *)strstr(ua, "Safari/"))
 		lws_strncpy(browser, "Chrome", browser_len);
 }
 
+/*
+ * Establish the authenticated identity for this connection into pss->user
+ * (left empty if there is none) and pss->has_star_grant.
+ *
+ * Two sources are accepted:
+ *
+ *  - the Authorization header, but ONLY if this vhost actually configured
+ *    basic auth on the protocol.  In that case lws has already validated it
+ *    and rewritten the header to the bare username
+ *    (lws_authorization_rewrite()).  Without that pvo, nothing validates or
+ *    rewrites it, and any peer could just send "Authorization: alice" and
+ *    be treated as alice.
+ *
+ *  - the JWT session cookie, which must both verify and still be live:
+ *    lws_jwt_auth_create() deliberately hands back a token that verified but
+ *    has expired, leaving the expiry policy to us.  For a session credential,
+ *    expired means no session.
+ */
+
+static void
+deaddrop_get_auth_identity(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss,
+			   struct lws *wsi)
+{
+	struct lws_jwt_auth *ja;
+	const char *sub;
+
+	pss->user[0]		= '\0';
+	pss->has_star_grant	= 0;
+
+	if (vhd->basic_auth &&
+	    lws_hdr_copy(wsi, pss->user, sizeof(pss->user),
+			 WSI_TOKEN_HTTP_AUTHORIZATION) > 0 &&
+	    strncmp(pss->user, "Basic ", 6) &&
+	    strncmp(pss->user, "Bearer ", 7)) {
+		lwsl_wsi_info(wsi, "%s: basic auth user '%s'", __func__,
+			      pss->user);
+
+		return;
+	}
+
+	pss->user[0] = '\0'; /* discard any raw header we do not trust */
+
+	if (!vhd->has_jwk)
+		return;
+
+	ja = lws_jwt_auth_create(wsi, &vhd->jwk, vhd->cookie_name, NULL, wsi,
+				 NULL);
+	if (!ja)
+		return;
+
+	if (lws_jwt_auth_get_exp(ja) <= (uint64_t)lws_now_secs()) {
+		lwsl_wsi_notice(wsi, "%s: JWT session expired", __func__);
+		lws_jwt_auth_destroy(&ja);
+
+		return;
+	}
+
+	sub = lws_jwt_auth_get_sub(ja);
+	if (sub)
+		lws_strncpy(pss->user, sub, sizeof(pss->user));
+
+	if (pss->user[0] && lws_jwt_auth_query_grant(ja, "*") >= 1)
+		pss->has_star_grant = 1;
+
+	lwsl_wsi_info(wsi, "%s: JWT user '%s'", __func__, pss->user);
+
+	lws_jwt_auth_destroy(&ja);
+}
+
+/* portable, locale-independent ASCII case-insensitive compare */
+
 static int
-de_mtime_sort(lws_list_ptr a, lws_list_ptr b)
+deaddrop_ncasecmp(const char *a, const char *b, size_t n)
+{
+	while (n--) {
+		char ca = *a++, cb = *b++;
+
+		if (ca >= 'A' && ca <= 'Z')
+			ca = (char)(ca + 32);
+		if (cb >= 'A' && cb <= 'Z')
+			cb = (char)(cb + 32);
+
+		if (ca != cb)
+			return 1;
+		if (!ca)
+			return 0;
+	}
+
+	return 0;
+}
+
+/*
+ * The "origin-allow" pvo is a comma-separated list of complete origins, eg
+ * "https://a.example.com,https://b.example.com:8443"
+ */
+
+static int
+deaddrop_origin_listed(const char *list, const char *origin)
+{
+	size_t ol = strlen(origin);
+
+	while (*list) {
+		const char *e;
+		size_t n;
+
+		while (*list == ' ' || *list == '\t' || *list == ',')
+			list++;
+		if (!*list)
+			break;
+
+		e = strchr(list, ',');
+		n = e ? (size_t)(e - list) : strlen(list);
+
+		while (n && (list[n - 1] == ' ' || list[n - 1] == '\t'))
+			n--;
+
+		if (n == ol && !deaddrop_ncasecmp(list, origin, n))
+			return 1;
+
+		if (!e)
+			break;
+
+		list = e + 1;
+	}
+
+	return 0;
+}
+
+/*
+ * Both the ws upgrade and the upload POST are authenticated by an ambient
+ * credential (the JWT session cookie, or basic auth), and neither is subject
+ * to the same-origin policy by itself: a ws upgrade is exempt, and a
+ * multipart POST is a CORS "simple request".  So without this, any page the
+ * victim visits while logged in can open our ws (and receive the whole file
+ * listing plus every connected user's IP), delete the victim's files, and
+ * upload files in the victim's name.
+ *
+ * Returns 0 if the request may proceed, nonzero to refuse it.
+ *
+ * Policy when the request carries no Origin at all: allow, unless the vhost
+ * gave us the "require-origin" pvo.  Browsers always send Origin on a ws
+ * upgrade and on any POST, so no Origin means a non-browser client (curl, a
+ * script, another service), and it is precisely the browser that a hostile
+ * page can aim at us with the victim's cookie attached.  Refusing those
+ * would break scripted use of the drop without closing anything, so it is
+ * the deployment's choice; "require-origin" is right for a vhost that only
+ * ever serves browsers.  Note that a sandboxed or otherwise opaque document
+ * sends the literal "null", which is not absent, and never matches.
+ */
+
+static int
+deaddrop_origin_ok(struct vhd_deaddrop *vhd, struct lws *wsi)
+{
+	char origin[256], host[256];
+	const char *p;
+
+	if (lws_hdr_copy(wsi, origin, sizeof(origin),
+			 WSI_TOKEN_ORIGIN) <= 0 || !origin[0])
+		return vhd->require_origin;
+
+	if (vhd->origin_allow && deaddrop_origin_listed(vhd->origin_allow,
+							origin))
+		return 0;
+
+	/* h2 and h3 carry the authority in :authority, h1 in Host */
+
+	if (lws_hdr_copy(wsi, host, sizeof(host),
+			 WSI_TOKEN_HTTP_COLON_AUTHORITY) <= 0 &&
+	    lws_hdr_copy(wsi, host, sizeof(host), WSI_TOKEN_HOST) <= 0)
+		return 1;
+
+	if (!strncmp(origin, "https://", 8))
+		p = origin + 8;
+	else if (!lws_is_ssl(wsi) && !strncmp(origin, "http://", 7))
+		/*
+		 * We are not the TLS terminator, so we cannot tell an http
+		 * deployment from an https one in front of a proxy; accept
+		 * our own host over either scheme in that case.  A vhost
+		 * doing its own TLS only ever accepts https.
+		 */
+		p = origin + 7;
+	else
+		return 1;
+
+	return !!deaddrop_ncasecmp(p, host, strlen(p) + 1);
+}
+
+static int
+deaddrop_de_mtime_sort(lws_list_ptr a, lws_list_ptr b)
 {
 	struct dir_entry *p1 = lp_to_dir_entry(a, next),
 			 *p2 = lp_to_dir_entry(b, next);
@@ -167,7 +377,7 @@ de_mtime_sort(lws_list_ptr a, lws_list_ptr b)
 }
 
 static void
-start_sending_dir(struct pss_deaddrop *pss)
+deaddrop_start_sending_dir(struct pss_deaddrop *pss)
 {
 	if (pss->lwsac_head)
 		lwsac_unreference(&pss->lwsac_head);
@@ -176,26 +386,45 @@ start_sending_dir(struct pss_deaddrop *pss)
 		lwsac_reference(pss->vhd->lwsac_head);
 	pss->lwsac_head = pss->vhd->lwsac_head;
 	pss->dire = pss->vhd->dire_head;
-	pss->filelist_version = pss->vhd->filelist_version;
+	pss->sending_filelist_version = pss->vhd->filelist_version;
+	pss->sending_userlist_version = pss->vhd->userlist_version;
 	pss->first = 1;
 	pss->ws_ongoing_send = 1;
 }
 
 static void
-broadcast_state_update(struct vhd_deaddrop *vhd)
+deaddrop_broadcast_userlist_update(struct vhd_deaddrop *vhd)
 {
-	vhd->filelist_version++; /* Invalidate client cache */
+	vhd->userlist_version++;
 
-	lws_start_foreach_llp(struct pss_deaddrop **, ppss, vhd->pss_head) {
-		if (!(*ppss)->ws_ongoing_send)
-			start_sending_dir(*ppss);
-		lws_callback_on_writable((*ppss)->wsi);
-	} lws_end_foreach_llp(ppss, pss_list);
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&vhd->pss_head)) {
+		struct pss_deaddrop *pss = lws_container_of(d, struct pss_deaddrop,
+						    pss_list);
+
+		if (!pss->ws_ongoing_send)
+			deaddrop_start_sending_dir(pss);
+		lws_callback_on_writable(pss->wsi);
+	} lws_end_foreach_dll(d);
+}
+
+static void
+deaddrop_broadcast_filelist_update(struct vhd_deaddrop *vhd)
+{
+	vhd->filelist_version++;
+
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&vhd->pss_head)) {
+		struct pss_deaddrop *pss = lws_container_of(d, struct pss_deaddrop,
+						    pss_list);
+
+		if (!pss->ws_ongoing_send)
+			deaddrop_start_sending_dir(pss);
+		lws_callback_on_writable(pss->wsi);
+	} lws_end_foreach_dll(d);
 }
 
 
 static int
-scan_upload_dir(struct vhd_deaddrop *vhd)
+deaddrop_scan_upload_dir(struct vhd_deaddrop *vhd)
 {
 	char filepath[512], *p_owner_end;
 	struct lwsac *lwsac_head = NULL;
@@ -241,7 +470,7 @@ scan_upload_dir(struct vhd_deaddrop *vhd)
 		dire->mtime = s.st_mtime;
 		dire->user[0] = '\0';
 
-		p_owner_end = strchr(de->d_name, '_');
+		p_owner_end = (char *)strchr(de->d_name, '_');
 		if (p_owner_end) {
 			size_t owner_len = (size_t)(p_owner_end - de->d_name);
 			if (owner_len < sizeof(dire->user)) {
@@ -252,10 +481,28 @@ scan_upload_dir(struct vhd_deaddrop *vhd)
 
 		memcpy(&dire[1], de->d_name, m);
 
-		lws_list_ptr_insert(&sorted_head, &dire->next, de_mtime_sort);
+		lws_list_ptr_insert(&sorted_head, &dire->next, deaddrop_de_mtime_sort);
 	}
 
 	closedir(dir);
+
+	int changed = 0;
+	struct dir_entry *old_dire = vhd->dire_head;
+	struct dir_entry *new_dire = sorted_head ? lp_to_dir_entry(sorted_head, next) : NULL;
+
+	while (old_dire && new_dire) {
+		if (old_dire->size != new_dire->size ||
+		    old_dire->mtime != new_dire->mtime ||
+		    strcmp(old_dire->user, new_dire->user) ||
+		    strcmp((const char *)&old_dire[1], (const char *)&new_dire[1])) {
+			changed = 1;
+			break;
+		}
+		old_dire = lp_to_dir_entry(old_dire->next, next);
+		new_dire = lp_to_dir_entry(new_dire->next, next);
+	}
+	if (old_dire || new_dire)
+		changed = 1;
 
 	/* the old lwsac continues to live while someone else is consuming it */
 	if (vhd->lwsac_head)
@@ -268,13 +515,31 @@ scan_upload_dir(struct vhd_deaddrop *vhd)
 	else
 		vhd->dire_head = NULL;
 
-	broadcast_state_update(vhd);
+	if (changed)
+		deaddrop_broadcast_filelist_update(vhd);
 
 	return 0;
 }
 
+/*
+ * An upload that did not complete: close its file and remove the partial
+ * temp file, so it leaves neither an fd nor a file behind
+ */
+
+static void
+deaddrop_upload_abandon(struct pss_deaddrop *pss)
+{
+	if (pss->fd == LWS_INVALID_FILE)
+		return;
+
+	close((int)(lws_intptr_t)pss->fd);
+	pss->fd = LWS_INVALID_FILE;
+	if (pss->filename[0])
+		unlink(pss->filename);
+}
+
 static int
-file_upload_cb(void *data, const char *name, const char *filename,
+deaddrop_file_upload_cb(void *data, const char *name, const char *filename,
 	       char *buf, int _len, enum lws_spa_fileupload_states state)
 {
 	lwsl_warn("%s: entered, state %d, pss->user: '%s'\n", __func__,
@@ -289,6 +554,23 @@ file_upload_cb(void *data, const char *name, const char *filename,
 
 	switch (state) {
 	case LWS_UFS_OPEN:
+		/*
+		 * One file at a time: a file still open here did not
+		 * complete, and would otherwise be leaked by the open below
+		 */
+		deaddrop_upload_abandon(pss);
+
+		/*
+		 * We can be bound to the protocol by a POST that never
+		 * matched our "/upload/" path (eg, straight to the
+		 * mountpoint itself), in which case we have no vhd
+		 */
+		if (!pss->vhd) {
+			pss->response_code = HTTP_STATUS_NOT_FOUND;
+
+			return -1;
+		}
+
 		/* REQUIRE an authenticated user on the upload POST itself */
 		if (!pss->user[0]) {
 			pss->response_code = HTTP_STATUS_FORBIDDEN;
@@ -297,7 +579,20 @@ file_upload_cb(void *data, const char *name, const char *filename,
 			return -1;
 		}
 
-		lws_urldecode(filename2, filename, sizeof(filename2) - 1);
+		/*
+		 * lws_urldecode() only terminates its output after a clean
+		 * run: on a malformed % escape it returns -1 having written
+		 * no NUL.  Consuming filename2 then walks off the end of an
+		 * uninitialized stack buffer, so refuse the upload instead.
+		 */
+		filename2[0] = '\0';
+		if (lws_urldecode(filename2, filename, sizeof(filename2) - 1)) {
+			pss->response_code = HTTP_STATUS_BAD_REQUEST;
+			lwsl_wsi_warn(pss->wsi, "%s: bad urlencoded filename",
+				      __func__);
+
+			return -1;
+		}
 		lws_filename_purify_inplace(filename2);
 		lws_filename_purify_inplace(pss->user);
 
@@ -330,9 +625,7 @@ file_upload_cb(void *data, const char *name, const char *filename,
 			if (pss->file_length > pss->vhd->max_size) {
 				pss->response_code =
 					HTTP_STATUS_REQ_ENTITY_TOO_LARGE;
-				close((int)(lws_intptr_t)pss->fd);
-				pss->fd = LWS_INVALID_FILE;
-				unlink(pss->filename);
+				deaddrop_upload_abandon(pss);
 
 				return -1;
 			}
@@ -360,10 +653,18 @@ file_upload_cb(void *data, const char *name, const char *filename,
 
 		pss->fd = LWS_INVALID_FILE;
 		pss->response_code = HTTP_STATUS_OK;
-		scan_upload_dir(pss->vhd);
+		deaddrop_scan_upload_dir(pss->vhd);
 
 		break;
 	case LWS_UFS_CLOSE:
+		/*
+		 * The spa delivers this even when the client vanished
+		 * mid-body: in that case LWS_UFS_FINAL_CONTENT never came, so
+		 * the fd is still open and the partial temp file is still on
+		 * disk.  Without cleaning both up here, every aborted upload
+		 * leaks an fd and a file for the life of the process.
+		 */
+		deaddrop_upload_abandon(pss);
 		break;
 	}
 
@@ -375,7 +676,7 @@ file_upload_cb(void *data, const char *name, const char *filename,
  */
 
 static int
-format_result(struct pss_deaddrop *pss)
+deaddrop_format_result(struct pss_deaddrop *pss)
 {
 	/*
 	 * We don't want to send any entity body back for the upload
@@ -388,7 +689,7 @@ format_result(struct pss_deaddrop *pss)
 
 
 static int
-handler_server_protocol_init(struct lws *wsi, void *in)
+deaddrop_handler_server_protocol_init(struct lws *wsi, void *in)
 {
 	struct vhd_deaddrop *vhd;
 	const char *cp;
@@ -420,6 +721,21 @@ handler_server_protocol_init(struct lws *wsi, void *in)
 		vhd->max_size = (unsigned long long)atoll(cp);
 	if (lws_pvo_get_str(in, "cookie-name", &vhd->cookie_name))
 		lwsl_info("%s: using default cookie-name\n", __func__);
+	/*
+	 * This is the same pvo lws itself consults to apply basic auth to the
+	 * ws upgrade; we only note whether it exists, so we know if the
+	 * Authorization header we see was validated and rewritten by lws
+	 */
+	if (!lws_pvo_get_str(in, "basic-auth", &cp))
+		vhd->basic_auth = 1;
+	if (!lws_pvo_get_str(in, "allow-anonymous", &cp) &&
+	    strcmp(cp, "off") && strcmp(cp, "0"))
+		vhd->allow_anon = 1;
+	if (!lws_pvo_get_str(in, "require-origin", &cp) &&
+	    strcmp(cp, "off") && strcmp(cp, "0"))
+		vhd->require_origin = 1;
+	if (lws_pvo_get_str(in, "origin-allow", &vhd->origin_allow))
+		vhd->origin_allow = NULL;
 	if (!lws_pvo_get_str(in, "jwt-jwk", &cp)) {
 		if (cp[0] == '{' || lws_jwk_load(&vhd->jwk, cp, NULL, NULL)) {
 			if (lws_jwk_import(&vhd->jwk, NULL, NULL, cp, strlen(cp))) {
@@ -455,7 +771,7 @@ handler_server_protocol_init(struct lws *wsi, void *in)
 	}
 #endif
 
-	scan_upload_dir(vhd);
+	deaddrop_scan_upload_dir(vhd);
 
 	lwsl_notice("  deaddrop: vh %s, upload dir %s, max size %llu\n",
 		    lws_get_vhost_name(vhd->vh), vhd->upload_dir,
@@ -465,7 +781,7 @@ handler_server_protocol_init(struct lws *wsi, void *in)
 }
 
 static void
-handler_server_protocol_destroy(struct vhd_deaddrop *vhd)
+deaddrop_handler_server_protocol_destroy(struct vhd_deaddrop *vhd)
 {
 	if (!vhd)
 		return;
@@ -481,7 +797,7 @@ handler_server_protocol_destroy(struct vhd_deaddrop *vhd)
 }
 
 static int
-handler_server_http(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss,
+deaddrop_handler_server_http(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss,
 		    struct lws *wsi)
 {
 	char *uri_ptr;
@@ -489,61 +805,52 @@ handler_server_http(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss,
 	int meth;
 
 	memset(pss, 0, sizeof(*pss));
-	pss->user[0] = '\0';
+	/* 0 is a perfectly good fd number, so this cannot be left memset */
+	pss->fd = LWS_INVALID_FILE;
+	pss->wsi = wsi;
 
-	pss->user[0] = '\0';
-	/* Correctly get username after lws basic auth processing */
-	if (lws_hdr_copy(wsi, pss->user, sizeof(pss->user),
-			 WSI_TOKEN_HTTP_AUTHORIZATION) > 0 &&
-	    strncmp(pss->user, "Basic ", 6) && strncmp(pss->user, "Bearer ", 7)) {
-		lwsl_wsi_info(wsi, "%s: POST auth user (pss %p): '%s'\n",
-			      __func__, (void *)pss, pss->user);
-	} else {
-		pss->user[0] = '\0'; /* flush raw headers if basic auth skipped */
-		if (vhd->has_jwk) {
-			struct lws_jwt_auth *ja = lws_jwt_auth_create(wsi, &vhd->jwk, vhd->cookie_name, NULL, wsi);
-			if (ja) {
-				const char *sub = lws_jwt_auth_get_sub(ja);
-				if (sub) {
-					lws_strncpy(pss->user, sub, sizeof(pss->user));
-					lwsl_wsi_info(wsi, "%s: POST JWT user (pss %p): '%s'\n",
-						__func__, (void *)pss, pss->user);
-				}
-				lws_jwt_auth_destroy(&ja);
-			}
-		}
-		if (!pss->user[0])
-			lwsl_wsi_warn(wsi, "%s: HTTP POST: no auth\n", __func__);
-	}
+	deaddrop_get_auth_identity(vhd, pss, wsi);
+	if (!pss->user[0])
+		lwsl_wsi_warn(wsi, "%s: HTTP POST: no auth\n", __func__);
 
 	meth = lws_http_get_uri_and_method(wsi, &uri_ptr, &uri_len);
 	if (meth != LWSHUMETH_POST || !uri_ptr)
 		return 1;
-	if (!strstr(uri_ptr, "/upload/"))
+	if (!(char *)strstr(uri_ptr, "/upload/"))
 		return 1;
 
+	/*
+	 * A cross-origin multipart POST is a CORS "simple request", ie, it is
+	 * sent with the victim's cookie and no preflight.  Refuse it here,
+	 * before any of the body is parsed or any file is created.
+	 */
+	if (deaddrop_origin_ok(vhd, wsi)) {
+		lwsl_wsi_notice(wsi, "%s: refusing upload, bad Origin",
+				__func__);
+		lws_return_http_status(wsi, HTTP_STATUS_FORBIDDEN, NULL);
+
+		return -1;
+	}
+
 	pss->vhd = vhd;
-	pss->wsi = wsi;
 
-	if (lws_hdr_copy(wsi, pss->filename, sizeof(pss->filename), WSI_TOKEN_HTTP_URI_ARGS) > 0)
-		return 0;
-
-	return 1;
+	return 0;
 }
 
 static int
-handler_server_http_body(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss,
+deaddrop_handler_server_http_body(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss,
 			 struct lws *wsi, void *in, size_t len)
 {
 	/* create the POST argument parser if not already existing */
 	if (!pss->spa) {
 		pss->spa = lws_spa_create(wsi, param_names,
 					  LWS_ARRAY_SIZE(param_names),
-					  1024, file_upload_cb, pss);
+					  1024, deaddrop_file_upload_cb, pss);
 		if (!pss->spa)
 			return -1;
 
 		pss->filename[0] = '\0';
+		pss->fd = LWS_INVALID_FILE;
 		pss->file_length = 0;
 		pss->response_code = HTTP_STATUS_SERVICE_UNAVAILABLE;
 	}
@@ -562,7 +869,7 @@ handler_server_http_body(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss,
 }
 
 static void
-handler_server_http_body_completion(struct pss_deaddrop *pss, struct lws *wsi)
+deaddrop_handler_server_http_body_completion(struct pss_deaddrop *pss, struct lws *wsi)
 {
 	/* call to inform no more payload data coming */
 	lws_spa_finalize(pss->spa);
@@ -572,7 +879,7 @@ handler_server_http_body_completion(struct pss_deaddrop *pss, struct lws *wsi)
 }
 
 static int
-handler_server_http_writeable(struct vhd_deaddrop *vhd,
+deaddrop_handler_server_http_writeable(struct vhd_deaddrop *vhd,
 			      struct pss_deaddrop *pss, struct lws *wsi)
 {
 	uint8_t buf[LWS_PRE + 2048], *start = &buf[LWS_PRE], *p = start,
@@ -586,7 +893,7 @@ handler_server_http_writeable(struct vhd_deaddrop *vhd,
 	end = p + sizeof(pss->result) - LWS_PRE - 1;
 
 	if (!pss->sent_headers) {
-		int n = format_result(pss);
+		int n = deaddrop_format_result(pss);
 
 		if (lws_add_http_header_status(wsi,
 				(unsigned int)pss->response_code,
@@ -616,7 +923,7 @@ handler_server_http_writeable(struct vhd_deaddrop *vhd,
 	}
 
 	if (!pss->sent_body) {
-		int n = format_result(pss);
+		int n = deaddrop_format_result(pss);
 		n = lws_write(wsi, (unsigned char *)start, (unsigned int)n,
 			      LWS_WRITE_HTTP_FINAL);
 
@@ -632,7 +939,7 @@ handler_server_http_writeable(struct vhd_deaddrop *vhd,
 }
 
 static int
-handler_server_raw_file_rx(struct vhd_deaddrop *vhd, struct lws *wsi)
+deaddrop_handler_server_raw_file_rx(struct vhd_deaddrop *vhd, struct lws *wsi)
 {
 #if defined(__linux__)
 	char ev_buf[1024];
@@ -645,7 +952,7 @@ handler_server_raw_file_rx(struct vhd_deaddrop *vhd, struct lws *wsi)
 
 	n = (int)read(fd, ev_buf, sizeof(ev_buf));
 	lwsl_info("%s: inotify event (%d), rescanning upload dir\n", __func__, n);
-	scan_upload_dir(vhd);
+	deaddrop_scan_upload_dir(vhd);
 
 	return n;
 #else
@@ -654,89 +961,44 @@ handler_server_raw_file_rx(struct vhd_deaddrop *vhd, struct lws *wsi)
 }
 
 static int
-handler_server_ws_filter_protocol_connection(struct vhd_deaddrop *vhd,
+deaddrop_handler_server_ws_filter_protocol_connection(struct vhd_deaddrop *vhd,
 					     struct pss_deaddrop *pss, struct lws *wsi)
 {
 	char ua_buf[256];
 
-	pss->user[0]		= '\0';
 	pss->platform[0]	= '\0';
 	pss->browser[0]		= '\0';
 
-	/* Correctly get username after lws basic auth processing */
-	if (lws_hdr_copy(wsi, pss->user, sizeof(pss->user),
-			 WSI_TOKEN_HTTP_AUTHORIZATION) > 0 &&
-	    strncmp(pss->user, "Basic ", 6) && strncmp(pss->user, "Bearer ", 7)) {
-		lwsl_wsi_info(wsi, "%s: WS filter auth user (pss %p): '%s'\n",
-			  __func__, (void *)pss, pss->user);
-	} else {
-		pss->user[0] = '\0'; /* flush raw headers if basic auth skipped */
-		if (vhd->has_jwk) {
-			int cookie_len = lws_hdr_total_length(wsi, WSI_TOKEN_HTTP_COOKIE);
+	deaddrop_get_auth_identity(vhd, pss, wsi);
 
-			if (cookie_len > 0) {
-				char *cookie_buf = NULL;
+	/*
+	 * The ws upgrade never passes through mounts or the lws-login
+	 * bouncer: this callback is the only place the upgrade can be
+	 * refused.  Anonymous sessions otherwise receive the whole file
+	 * listing and every logged-in user's IP, so unless the vhost
+	 * explicitly asked for that, they end here.
+	 */
+	if (!pss->user[0] && !vhd->allow_anon) {
+		lwsl_wsi_notice(wsi, "%s: refusing unauthenticated ws",
+				__func__);
 
-				/* lws_jwt_auth_create uses 1024 stack buf, bypass if too large */
-				if (cookie_len > 1000) {
-					cookie_buf = malloc((size_t)cookie_len + 1);
-					if (cookie_buf && lws_hdr_copy(wsi, cookie_buf, cookie_len + 1, WSI_TOKEN_HTTP_COOKIE) > 0) {
-						char *p = strstr(cookie_buf, vhd->cookie_name);
-						if (p) {
-							p += strlen(vhd->cookie_name);
-							if (*p == '=') {
-								p++;
-								char *jwt = p, *end = p;
-								while (*end && *end != ';')
-									end++;
-								*end = '\0';
+		return 1;
+	}
 
-								/* Manual parsing for large cookie bypass using public APIs */
-								char temp[2048], out[2048];
-								size_t out_len = sizeof(out);
-								int ret = lws_jwt_signed_validate(lws_get_context(wsi), &vhd->jwk,
-									"ES256,ES384,ES512,RS256,RS384,RS512,HS256",
-									jwt, strlen(jwt), temp, sizeof(temp), out, &out_len);
+	/*
+	 * The upgrade is authenticated by the ambient session cookie and the
+	 * ws handshake is exempt from the same-origin policy, so without this
+	 * any page the victim visits can open this socket as the victim.
+	 */
+	if (deaddrop_origin_ok(vhd, wsi)) {
+		lwsl_wsi_notice(wsi, "%s: refusing ws, bad Origin", __func__);
 
-								if (ret == 0) {
-									size_t alen = 0;
-									const char *sub = lws_json_simple_find(out, out_len, "\"sub\":", &alen);
-									if (sub && alen < sizeof(pss->user)) {
-										lws_strncpy(pss->user, sub, alen + 1);
-									}
-									const char *grant = lws_json_simple_find(out, out_len, "\"grant\":", &alen);
-									if (grant && ((alen == 1 && grant[0] == '*') || (alen > 1 && !strncmp(grant, "*", 1)))) {
-										pss->has_star_grant = 1;
-									}
-								}
-							}
-						}
-					}
-					if (cookie_buf)
-						free(cookie_buf);
-				} else {
-					struct lws_jwt_auth *ja = lws_jwt_auth_create(wsi, &vhd->jwk, vhd->cookie_name, NULL, wsi);
-					if (ja) {
-						const char *sub = lws_jwt_auth_get_sub(ja);
-						if (sub) {
-							lws_strncpy(pss->user, sub, sizeof(pss->user));
-						}
-
-						if (lws_jwt_auth_query_grant(ja, "*") >= 1) {
-							pss->has_star_grant = 1;
-						}
-						lws_jwt_auth_destroy(&ja);
-					}
-				}
-			}
-		}
-		if (!pss->user[0])
-			lwsl_wsi_warn(wsi, "WS filter: no auth\n");
+		return 1;
 	}
 
 	if (lws_hdr_copy(wsi, ua_buf, sizeof(ua_buf),
 			 WSI_TOKEN_HTTP_USER_AGENT) > 0)
-		parse_user_agent(ua_buf, pss->platform,  sizeof(pss->platform),
+		deaddrop_parse_user_agent(ua_buf, pss->platform,  sizeof(pss->platform),
 				 pss->browser, sizeof(pss->browser));
 
 	if (lws_get_urlarg_by_name_safe(wsi, "tabId=", pss->tab_id, sizeof(pss->tab_id)) < 0)
@@ -746,68 +1008,44 @@ handler_server_ws_filter_protocol_connection(struct vhd_deaddrop *vhd,
 }
 
 static void
-handler_server_ws_established(struct vhd_deaddrop *vhd,
+deaddrop_handler_server_ws_established(struct vhd_deaddrop *vhd,
 			      struct pss_deaddrop *pss, struct lws *wsi)
 {
 	pss->vhd		= vhd;
 	pss->wsi		= wsi;
 
-	/*
-	 * Browsers like Chrome sometimes hold zombie WS connections on refresh.
-	 * If we detect a new connection presenting the same tab ID from the same IP
-	 * and user, unilaterally kill the zombie old connection.
-	 */
-	if (pss->tab_id[0]) {
-		char ip[46];
-		lws_get_peer_simple(wsi, ip, sizeof(ip));
-		lws_start_foreach_llp(struct pss_deaddrop **, ppss, vhd->pss_head) {
-			if ((*ppss)->wsi && (*ppss)->wsi != wsi &&
-			    !strcmp((*ppss)->tab_id, pss->tab_id) &&
-			    !strcmp((*ppss)->user, pss->user)) {
-			    char oip[46];
-			    lws_get_peer_simple((*ppss)->wsi, oip, sizeof(oip));
-			    if (!strcmp(ip, oip)) {
-					lwsl_notice("%s: killing zombie WS for tab %s\n", __func__, pss->tab_id);
-					lws_set_timeout((*ppss)->wsi, 1, LWS_TO_KILL_ASYNC);
-				}
-			}
-		} lws_end_foreach_llp(ppss, pss_list);
-	}
+	lws_get_peer_simple(wsi, pss->ip, sizeof(pss->ip));
 
 	/* add ourselves to the list of live pss held in the vhd */
-	pss->pss_list		= vhd->pss_head;
-	vhd->pss_head		= pss;
+	lws_dll2_add_head(&pss->pss_list, &vhd->pss_head);
 
-	broadcast_state_update(vhd);
+	deaddrop_broadcast_userlist_update(vhd);
 }
 
 static void
-handler_server_ws_closed(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss)
+deaddrop_handler_server_ws_closed(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss)
 {
+	lwsl_notice("%s: WS connection closed (user: '%s', ip: %s)\n",
+		    __func__, pss->user, pss->ip);
+
 	if (pss->lwsac_head)
 		lwsac_unreference(&pss->lwsac_head);
 	/* remove our closing pss from the list of live pss */
-	lws_start_foreach_llp(struct pss_deaddrop **,
-			      ppss, vhd->pss_head) {
-		if (*ppss == pss) {
-			*ppss = pss->pss_list;
-			break;
-		}
-	} lws_end_foreach_llp(ppss, pss_list);
+	lws_dll2_remove(&pss->pss_list);
 
-	broadcast_state_update(vhd);
+	deaddrop_broadcast_userlist_update(vhd);
 }
 
 static void
-handler_server_ws_rx(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss,
+deaddrop_handler_server_ws_rx(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss,
 		     struct lws *wsi, void *in, size_t len)
 {
-#if defined(__linux__)
+#if !defined(WIN32) && !defined(_WIN32) && !defined(LWS_WITH_ESP32)
 	char path[512], resolved_path[PATH_MAX];
 #else
 	char path[512];
 #endif
-	char fname[256], *wp;
+	char fname[256], user[sizeof(pss->user)], *wp;
 	const char *cp;
 	int n;
 
@@ -818,35 +1056,56 @@ handler_server_ws_rx(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss,
 	if (strncmp((const char *)in, "{\"del\":\"", 8))
 		return;
 
-	cp = strchr((const char *)in + 8, '_');
-	if (!cp) {
-		lwsl_warn("%s: del: no owner in filename\n", __func__);
-		return;
-	}
-
-	/* Check if the authenticated user matches the file owner prefix */
-	n = (int)(cp - (((const char *)in) + 8));
-
-	if (!pss->has_star_grant && ((int)strlen(pss->user) != n ||
-	    strncmp(pss->user, ((const char *)in) + 8, (unsigned int)n))) {
-		lwsl_wsi_notice(wsi, "del: auth mismatch "
-			    " user '%s' tried to delete file with "
-			    "owner '%.*s'", pss->user, n,
-			    ((const char *)in) + 8);
-		return;
-	}
+	/*
+	 * Purify the requested name FIRST: the name we are going to unlink is
+	 * the purified one, so that is what the ownership check has to be
+	 * made on.  Checking the raw request instead lets, eg, user 'bob$1'
+	 * pass the check with 'bob$1_x' and then unlink 'bob_1's file.
+	 */
 
 	lws_strncpy(fname, ((const char *)in) + 8, sizeof(fname));
-	wp = strchr((const char *)fname, '\"');
+	wp = (char *)strchr((const char *)fname, '\"');
 	if (wp)
 		*wp = '\0';
 
 	lws_filename_purify_inplace(fname);
 
+	cp = (char *)strchr(fname, '_');
+	if (!cp) {
+		lwsl_warn("%s: del: no owner in filename\n", __func__);
+		return;
+	}
+
+	n = (int)(cp - fname);
+
+	/*
+	 * An anonymous session owns nothing, and neither does the empty owner
+	 * prefix of, eg, "_x": without these, pss->user "" == "" and the
+	 * comparison below passes for an unauthenticated peer.
+	 */
+	if (!pss->user[0] || !n) {
+		lwsl_wsi_notice(wsi, "del: refusing '%s' for unowned request",
+				fname);
+		return;
+	}
+
+	/* the owner prefix on disk was formed from the purified username */
+
+	lws_strncpy(user, pss->user, sizeof(user));
+	lws_filename_purify_inplace(user);
+
+	if (!pss->has_star_grant && ((int)strlen(user) != n ||
+	    strncmp(user, fname, (unsigned int)n))) {
+		lwsl_wsi_notice(wsi, "del: auth mismatch "
+			    " user '%s' tried to delete file with "
+			    "owner '%.*s'", pss->user, n, fname);
+		return;
+	}
+
 	lws_snprintf(path, sizeof(path), "%s/%s", vhd->upload_dir,
 		     fname);
 
-#if defined(__linux__)
+#if !defined(WIN32) && !defined(_WIN32) && !defined(LWS_WITH_ESP32)
 	if (!realpath(path, resolved_path)) {
 		lwsl_wsi_warn(wsi, "delete: realpath failed %s", path);
 		return;
@@ -867,64 +1126,123 @@ handler_server_ws_rx(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss,
 		lwsl_err("%s: unlink %s failed: %s\n", __func__,
 				path, strerror(errno));
 
-	scan_upload_dir(vhd);
+	deaddrop_scan_upload_dir(vhd);
 }
 
+/*
+ * JSON-escape src into dst (which is clamped and always terminated).
+ * Usernames and uploader names are attacker-influenced and must not be able
+ * to close the string and forge members, nor emit invalid JSON that kills
+ * JSON.parse() in every connected client's UI.
+ */
+
+static const char *
+deaddrop_json_esc(char *dst, size_t dst_len, const char *src)
+{
+	int in_used = 0;
+
+	return lws_json_purify(dst, src, (int)dst_len, &in_used);
+}
+
+/*
+ * Worst-case emitted length of one connected-user / one file object below,
+ * used to stop before the fixed send buffer truncates mid-token
+ */
+#define DEADDROP_USER_ENTRY_MAX 384
+#define DEADDROP_FILE_ENTRY_MAX 512
+
 static int
-handler_server_ws_writeable(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss,
+deaddrop_handler_server_ws_writeable(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss,
 			    struct lws *wsi)
 {
 	uint8_t buf[LWS_PRE + LWS_RECOMMENDED_MIN_HEADER_SPACE],
 		*start = &buf[LWS_PRE], *p = start,
 		*end = &buf[sizeof(buf) - 1];
+	char esc_user[128], esc_up[64];
 	int n, was = 0;
 
 	/* if nothing to write, write nothing */
 	if (!pss->ws_ongoing_send)
 		return 0;
 
+	int send_users = (pss->userlist_version != pss->sending_userlist_version) || !pss->sent_initial;
+	int send_files = (pss->filelist_version != pss->sending_filelist_version) || !pss->sent_initial;
+
 	if (pss->first) {
 		p += lws_snprintf((char *)p, lws_ptr_diff_size_t(end, p),
-				  "{\"max_size\":%llu, \"user\":\"%s\", \"cookie\":\"%s\", ",
+				  "{\"max_size\":%llu, \"user\":\"%s\", \"cookie\":\"%s\"",
 				  vhd->max_size,
-				  pss->user[0] ? pss->user : "",
+				  deaddrop_json_esc(esc_user,
+						    sizeof(esc_user),
+						    pss->user),
 				  vhd->cookie_name);
 
-		p += lws_snprintf((char *)p, lws_ptr_diff_size_t(end, p),
-				  "\"connected_users\":[");
+		if (send_users) {
+			p += lws_snprintf((char *)p, lws_ptr_diff_size_t(end, p),
+					  ", \"connected_users\":[");
 
-		int first_user = 1;
-		lws_start_foreach_llp(struct pss_deaddrop **, ppss,
-				      vhd->pss_head) {
-			char ip[46];
+			int first_user = 1;
+			lws_start_foreach_dll(struct lws_dll2 *, d,
+					      lws_dll2_get_head(&vhd->pss_head)) {
+				struct pss_deaddrop *pss1 =
+					lws_container_of(d, struct pss_deaddrop,
+							 pss_list);
 
-			/* Only list authenticated connections */
-			if ((*ppss)->wsi && (*ppss)->user[0]) {
-				lws_get_peer_simple((*ppss)->wsi, ip, sizeof(ip));
+				/* Only list authenticated connections */
+				if (pss1->wsi && pss1->user[0]) {
+					/* stop before we truncate mid-token */
+					if (lws_ptr_diff_size_t(end, p) <
+							DEADDROP_USER_ENTRY_MAX)
+						break;
 
-				p += lws_snprintf((char *)p,
-						  lws_ptr_diff_size_t(end, p),
-					"%c{\"user\":\"%s\", \"ip\":\"%s\", "
-					"\"platform\":\"%s\", \"browser\":\"%s\"%s%s}",
-					first_user ? ' ' : ',',
-					(*ppss)->user, ip, (*ppss)->platform,
-					(*ppss)->browser,
-					(*ppss)->has_star_grant ? ", \"is_admin\":1" : "",
-					((*ppss) == pss) ? ", \"is_self\":1" : "");
+					p += lws_snprintf((char *)p,
+							  lws_ptr_diff_size_t(end, p),
+						"%c{\"user\":\"%s\", \"ip\":\"%s\", "
+						"\"platform\":\"%s\", \"browser\":\"%s\"%s%s}",
+						first_user ? ' ' : ',',
+						deaddrop_json_esc(esc_user,
+								  sizeof(esc_user),
+								  pss1->user),
+						pss1->ip, pss1->platform,
+						pss1->browser,
+						pss1->has_star_grant ? ", \"is_admin\":1" : "",
+						(pss1 == pss) ? ", \"is_self\":1" : "");
 
-				first_user = 0;
-			}
-		} lws_end_foreach_llp(ppss, pss_list);
+					first_user = 0;
+				}
+			} lws_end_foreach_dll(d);
 
-		p += lws_snprintf((char *)p, lws_ptr_diff_size_t(end, p),
-				  "], \"files\": [");
-		was = 1;
+			p += lws_snprintf((char *)p, lws_ptr_diff_size_t(end, p), "]");
+		}
+
+		if (send_files) {
+			p += lws_snprintf((char *)p, lws_ptr_diff_size_t(end, p),
+					  ", \"files\": [");
+			was = 1;
+		} else {
+			p += lws_snprintf((char *)p, lws_ptr_diff_size_t(end, p), "}");
+			pss->dire = NULL;
+			was = 1;
+		}
 	}
 
 	n = 5;
 	while (n-- && pss->dire) {
-		int is_yours = (pss->has_star_grant || !strcmp(pss->user, pss->dire->user)) &&
-			       pss->user[0];
+		int is_yours;
+
+		/*
+		 * Stop before the entry would be truncated: pss->dire is our
+		 * resume cursor, so the rest simply goes out in the next
+		 * writeable.  Otherwise a long filename or a busy user list
+		 * cuts the JSON mid-token and every client's JSON.parse()
+		 * throws, permanently.
+		 */
+		if (lws_ptr_diff_size_t(end, p) < DEADDROP_FILE_ENTRY_MAX)
+			break;
+
+		is_yours = (pss->has_star_grant ||
+			    !strcmp(pss->user, pss->dire->user)) &&
+			   pss->user[0];
 		const char *fname = (const char *)&pss->dire[1];
 		const char *p_fn = fname;
 		int is_text = 0;
@@ -938,15 +1256,21 @@ handler_server_ws_writeable(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss,
 		    p_fn[10] == '_' && p_fn[13] == '-' &&
 		    p_fn[16] == '-' && !strcmp(p_fn + 19, ".txt"))
 			is_text = 1;
+		char escaped_fname[256];
+		int in_used = 0;
+		lws_json_purify(escaped_fname, fname, sizeof(escaped_fname), &in_used);
 
 		p += lws_snprintf((char *)p, lws_ptr_diff_size_t(end, p),
 				  "%c{\"name\":\"%s\", "
+				  "\"uploader\":\"%s\","
 				  "\"size\":%llu,"
 				  "\"mtime\":%llu,"
 				  "\"yours\":%d,"
 				  "\"is_text\":%d}",
 				  pss->first ? ' ' : ',',
-				  fname,
+				  escaped_fname,
+				  deaddrop_json_esc(esc_up, sizeof(esc_up),
+						    pss->dire->user),
 				  pss->dire->size,
 				  (unsigned long long)pss->dire->mtime,
 				  is_yours, is_text);
@@ -955,13 +1279,19 @@ handler_server_ws_writeable(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss,
 	}
 
 	if (!pss->dire) {
-		p += lws_snprintf((char *)p, lws_ptr_diff_size_t(end, p),
-				  "]}");
+		int send_files = (pss->filelist_version != pss->sending_filelist_version) || !pss->sent_initial;
+		if (send_files) {
+			p += lws_snprintf((char *)p, lws_ptr_diff_size_t(end, p),
+					  "]}");
+		}
 		if (pss->lwsac_head) {
 			lwsac_unreference(&pss->lwsac_head);
 			pss->lwsac_head = NULL;
 		}
 		pss->ws_ongoing_send = 0;
+		pss->sent_initial = 1;
+		pss->userlist_version = pss->sending_userlist_version;
+		pss->filelist_version = pss->sending_filelist_version;
 	}
 
 	n = lws_write(wsi, start, lws_ptr_diff_size_t(p, start),
@@ -978,10 +1308,11 @@ handler_server_ws_writeable(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss,
 
 	/* ie, we finished */
 
-	if (pss->filelist_version != pss->vhd->filelist_version) {
+	if (pss->filelist_version != pss->vhd->filelist_version ||
+	    pss->userlist_version != pss->vhd->userlist_version) {
 		lwsl_info("%s: restart send\n", __func__);
 		/* what we just sent is already out of date */
-		start_sending_dir(pss);
+		deaddrop_start_sending_dir(pss);
 		lws_callback_on_writable(wsi);
 	}
 
@@ -989,7 +1320,7 @@ handler_server_ws_writeable(struct vhd_deaddrop *vhd, struct pss_deaddrop *pss,
 }
 
 static int
-callback_deaddrop(struct lws *wsi, enum lws_callback_reasons reason,
+_deaddrop_callback_deaddrop(struct lws *wsi, enum lws_callback_reasons reason,
 		  void *user, void *in, size_t len)
 {
 	struct vhd_deaddrop *vhd = (struct vhd_deaddrop *)
@@ -997,63 +1328,95 @@ callback_deaddrop(struct lws *wsi, enum lws_callback_reasons reason,
 							 lws_get_protocol(wsi));
 	struct pss_deaddrop *pss = (struct pss_deaddrop *)user;
 
+	/*
+	 * lws offers every loaded plugin protocol on every vhost, but only
+	 * calls PROTOCOL_INIT for a vhost that has a pvo for it.  On any other
+	 * vhost of the same process, vhd stays NULL forever, and a peer can
+	 * still bind us with "Sec-WebSocket-Protocol: lws-deaddrop" or by a
+	 * callback mount.  Refuse those cleanly rather than deref NULL.
+	 */
+
+	switch (reason) {
+	case LWS_CALLBACK_HTTP:
+	case LWS_CALLBACK_HTTP_BODY:
+	case LWS_CALLBACK_RAW_RX_FILE:
+	case LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION:
+	case LWS_CALLBACK_ESTABLISHED:
+	case LWS_CALLBACK_CLOSED:
+	case LWS_CALLBACK_RECEIVE:
+	case LWS_CALLBACK_SERVER_WRITEABLE:
+		if (!vhd)
+			return -1;
+		break;
+	default:
+		break;
+	}
+
 	switch (reason) {
 
 	case LWS_CALLBACK_PROTOCOL_INIT: /* per vhost */
+		if (lws_cmdline_option_cx(lws_get_context(wsi), "--lws-stub"))
+			return 0;
 
 		if (!in)
 			return 0;
 
-		handler_server_protocol_init(wsi, in);
+		deaddrop_handler_server_protocol_init(wsi, in);
 		break;
 
 	case LWS_CALLBACK_HTTP:
-		if (!handler_server_http(vhd, pss, wsi))
+		switch (deaddrop_handler_server_http(vhd, pss, wsi)) {
+		case 0:
 			return 0;
+		case -1:	 /* refused, status already sent */
+			return -1;
+		default:	 /* not a POST for us, let the dummy handle it */
+			break;
+		}
 		break;
 
 	case LWS_CALLBACK_PROTOCOL_DESTROY:
-		handler_server_protocol_destroy(vhd);
+		deaddrop_handler_server_protocol_destroy(vhd);
 		break;
 
 	case LWS_CALLBACK_RAW_RX_FILE:
-		handler_server_raw_file_rx(vhd, wsi);
+		deaddrop_handler_server_raw_file_rx(vhd, wsi);
 		break;
 
 	/* WS-related */
 
 	case LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION:
-		if (handler_server_ws_filter_protocol_connection(vhd, pss, wsi))
+		if (deaddrop_handler_server_ws_filter_protocol_connection(vhd, pss, wsi))
 			return 1;
 		return 0;
 
 	case LWS_CALLBACK_ESTABLISHED:
-		handler_server_ws_established(vhd, pss, wsi);
+		deaddrop_handler_server_ws_established(vhd, pss, wsi);
 		return 0;
 
 	case LWS_CALLBACK_CLOSED:
-		handler_server_ws_closed(vhd, pss);
+		deaddrop_handler_server_ws_closed(vhd, pss);
 		return 0;
 
 	case LWS_CALLBACK_RECEIVE:
-		handler_server_ws_rx(vhd, pss, wsi, in, len);
+		deaddrop_handler_server_ws_rx(vhd, pss, wsi, in, len);
 		break;
 
 	case LWS_CALLBACK_SERVER_WRITEABLE:
-		handler_server_ws_writeable(vhd, pss, wsi);
+		deaddrop_handler_server_ws_writeable(vhd, pss, wsi);
 		return 0;
 
 	/* POST-related */
 
 	case LWS_CALLBACK_HTTP_BODY:
-		return handler_server_http_body(vhd, pss, wsi, in, len);
+		return deaddrop_handler_server_http_body(vhd, pss, wsi, in, len);
 
 	case LWS_CALLBACK_HTTP_BODY_COMPLETION:
-		handler_server_http_body_completion(pss, wsi);
+		deaddrop_handler_server_http_body_completion(pss, wsi);
 		return 0;
 
 	case LWS_CALLBACK_HTTP_WRITEABLE:
-		switch (handler_server_http_writeable(vhd, pss, wsi)) {
+		switch (deaddrop_handler_server_http_writeable(vhd, pss, wsi)) {
 		case 0:
 			return 0;
 		case 1:
@@ -1088,10 +1451,25 @@ try_to_reuse:
 	return 0;
 }
 
+static int
+deaddrop_callback_deaddrop(struct lws *wsi, enum lws_callback_reasons reason,
+		  void *user, void *in, size_t len)
+{
+	int r = _deaddrop_callback_deaddrop(wsi, reason, user, in, len);
+
+	if (r && reason != LWS_CALLBACK_HTTP_WRITEABLE &&
+	    reason != LWS_CALLBACK_SERVER_WRITEABLE &&
+	    reason != LWS_CALLBACK_HTTP_BODY) {
+		lwsl_notice("%s: returning %d for reason %d on wsi %p\n", __func__, r, reason, wsi);
+	}
+
+	return r;
+}
+
 #define LWS_PLUGIN_PROTOCOL_DEADDROP \
 	{ \
 		"lws-deaddrop", \
-		callback_deaddrop, \
+		deaddrop_callback_deaddrop, \
 		sizeof(struct pss_deaddrop), \
 		1024, \
 		0, NULL, 0 \

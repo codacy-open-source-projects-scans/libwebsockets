@@ -20,12 +20,14 @@
 
 enum {
 	LWS_SW_PORT,
+	LWS_SW_PORT_LONG,
 	LWS_SW_H,
 	LWS_SW_HELP,
 };
 
 static const struct lws_switches switches[] = {
-	[LWS_SW_PORT]	= { "--port",          "Port to connect or listen on" },
+	[LWS_SW_PORT]	= { "-p",          "Port to listen on (default 7681)" },
+	[LWS_SW_PORT_LONG] = { "--port",     "Same as -p" },
 	[LWS_SW_H]	= { "-h",              "Strict Host Check / Help" },
 	[LWS_SW_HELP]	= { "--help",		"Show this help information" },
 };
@@ -34,7 +36,7 @@ static const struct lws_switches switches[] = {
 #include <signal.h>
 #include <errno.h>
 
-static int interrupted;
+static struct lws_context *context;
 
 #if defined(LWS_WITH_PLUGINS)
 static const char * const plugin_dirs[] = {
@@ -67,23 +69,23 @@ static const struct lws_http_mount
 };
 
 #if !defined(WIN32)
-void sigint_handler(int sig, siginfo_t *siginfo, void *context)
+void sigint_handler(int sig, siginfo_t *siginfo, void *uc)
 {
 	pid_t sender_pid = siginfo->si_pid;
 	lwsl_err("%s: sig %d from pid %lu\n", __func__, sig, (unsigned long)sender_pid);
-	interrupted = 1;
+	/* uc is the interrupted ucontext_t, not ours: stop our lws_context */
+	lws_default_loop_exit(context);
 }
 #else
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 #endif
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	struct lws_context *context;
 #if !defined(WIN32)
 	struct sigaction siga;
 #endif
@@ -110,13 +112,27 @@ int main(int argc, const char **argv)
 #else
 	signal(SIGINT, sigint_handler);
 #endif
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
 	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	info.fd_limit_per_thread = 0;
 	lwsl_user("LWS minimal http server TLS | visit https://localhost:7681\n");
 
-	info.port = 7681;
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_PORT].sw)))
-		info.port = atoi(p);
+	/*
+	 * lws_context_info_defaults() sets CONTEXT_PORT_NO_LISTEN (-1), so
+	 * the default port check has to cover that as well as 0
+	 */
+	if (info.port <= 0)
+		info.port = 7681;
+	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_PORT].sw)) ||
+	    (p = lws_cmdline_option(argc, argv, switches[LWS_SW_PORT_LONG].sw)))
+		{
+			int __pt = atoi(p);
+			if (__pt < 0 || __pt > 65535) {
+				lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+				return 1;
+			}
+			info.port = __pt;
+		}
 	info.mounts = &mount;
 	info.error_document_404 = "/404.html";
 	info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT |
@@ -138,7 +154,7 @@ int main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

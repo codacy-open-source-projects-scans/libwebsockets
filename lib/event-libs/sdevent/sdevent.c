@@ -4,7 +4,7 @@
 #include "private-lib-event-libs-sdevent.h"
 
 #define pt_to_priv_sd(_pt) ((struct lws_pt_eventlibs_sdevent *)(_pt)->evlib_pt)
-#define wsi_to_priv_sd(_w) ((struct lws_wsi_watcher_sdevent *)(_w)->evlib_wsi)
+#define wsi_to_priv_sd(_w) ((struct lws_wsi_watcher_sdevent *)(_w)->io->evlib_wsi)
 
 struct lws_pt_eventlibs_sdevent {
 	struct lws_context_per_thread *pt;
@@ -16,6 +16,12 @@ struct lws_pt_eventlibs_sdevent {
 struct lws_wsi_watcher_sdevent {
 	struct sd_event_source *source;
 	uint32_t events;
+#if defined(LWS_WITH_CLIENT)
+	struct {
+		struct sd_event_source *source;
+		uint32_t events;
+	} racing[LWS_MAX_PARALLEL_CONNS];
+#endif
 };
 
 static int
@@ -117,6 +123,18 @@ sock_accept_handler(sd_event_source *s, int fd, uint32_t revents, void *userdata
 		eventfd.revents |= LWS_POLLOUT;
 	}
 
+	/*
+	 * epoll reports these whether or not they were asked for... if we do
+	 * not translate them, we dispatch with nothing set, lws does nothing,
+	 * and we re-arm... ie, a busy loop for as long as the peer stays hung
+	 * up.  The other evlibs map them to LWS_POLLHUP.
+	 */
+
+	if (revents & (EPOLLERR | EPOLLHUP)) {
+		eventfd.events |= LWS_POLLHUP;
+		eventfd.revents |= LWS_POLLHUP;
+	}
+
 	lws_pt_unlock(pt);
 	lws_context_unlock(pt->context);
 
@@ -138,8 +156,14 @@ sock_accept_handler(sd_event_source *s, int fd, uint32_t revents, void *userdata
 	 * allow further events
 	 *
 	 * Note:
-	 * do not move the assignment up, lws_service_fd_tsi may invalidate it!
+	 * lws_service_fd_tsi may have synchronously closed and freed the
+	 * wsi itself (not just invalidated the source): re-lookup the wsi
+	 * from the fd table rather than touching the wsi we came in with.
 	 */
+	wsi = wsi_from_fd(context, fd);
+	if (!wsi)
+		return 0;
+
 	watcher = wsi_to_priv_sd(wsi)->source;
 	if (watcher)
 		sd_event_source_set_enabled(watcher, SD_EVENT_ONESHOT);
@@ -200,12 +224,18 @@ io_sd(struct lws *wsi, unsigned int flags)
 		sd_event_source_set_io_events(wsi_to_priv_sd(wsi)->source,
 					      wsi_to_priv_sd(wsi)->events);
 
+		/*
+		 * Nothing left wanted -> stop the source; otherwise re-arm it
+		 * with what remains (the same shape as uv_poll_stop() vs
+		 * uv_poll_start() in libuv.c)
+		 */
+
 		if (!(wsi_to_priv_sd(wsi)->events & (EPOLLIN | EPOLLOUT)))
 			sd_event_source_set_enabled(wsi_to_priv_sd(wsi)->source,
-						    SD_EVENT_ONESHOT);
+						    SD_EVENT_OFF);
 		else
 			sd_event_source_set_enabled(wsi_to_priv_sd(wsi)->source,
-						    SD_EVENT_OFF);
+						    SD_EVENT_ONESHOT);
 	}
 }
 
@@ -221,7 +251,7 @@ init_vhost_listen_wsi_sd(struct lws *wsi)
 
 	sd_event_add_io(pt_to_priv_sd(pt)->io_loop,
 			&wsi_to_priv_sd(wsi)->source,
-			wsi->desc.sockfd,
+			wsi->io->desc.sockfd,
 			wsi_to_priv_sd(wsi)->events,
 			sock_accept_handler,
 			wsi);
@@ -342,14 +372,14 @@ sock_accept_sd(struct lws *wsi)
 	if (wsi->role_ops->file_handle)
 		sd_event_add_io(pt_to_priv_sd(pt)->io_loop,
 				&wsi_to_priv_sd(wsi)->source,
-				wsi->desc.filefd,
+				wsi->io->desc.filefd,
 				wsi_to_priv_sd(wsi)->events,
 				sock_accept_handler,
 				wsi);
 	else
 		sd_event_add_io(pt_to_priv_sd(pt)->io_loop,
 				&wsi_to_priv_sd(wsi)->source,
-				wsi->desc.sockfd,
+				wsi->io->desc.sockfd,
 				wsi_to_priv_sd(wsi)->events,
 				sock_accept_handler,
 				wsi);
@@ -407,6 +437,116 @@ destroy_pt_sd(struct lws_context *context, int tsi)
 	}
 }
 
+#if defined(LWS_WITH_CLIENT)
+static int
+sock_accept_parallel_sd(struct lws *wsi, lws_sockfd_type fd, int pidx)
+{
+	struct lws_context_per_thread *pt = &wsi->a.context->pt[(int)wsi->tsi];
+
+	sd_event_add_io(pt_to_priv_sd(pt)->io_loop,
+			&wsi_to_priv_sd(wsi)->racing[pidx].source,
+			fd,
+			wsi_to_priv_sd(wsi)->racing[pidx].events,
+			sock_accept_handler,
+			wsi);
+
+	return 0;
+}
+
+static void
+io_parallel_sd(struct lws *wsi, int pidx, unsigned int flags)
+{
+	struct lws_context_per_thread *pt = &wsi->a.context->pt[(int)wsi->tsi];
+
+	if (!pt_to_priv_sd(pt)->io_loop ||
+	    !wsi_to_priv_sd(wsi)->racing[pidx].source ||
+	    pt->is_destroyed)
+		return;
+
+	if (flags & LWS_EV_START) {
+		if (flags & LWS_EV_WRITE)
+			wsi_to_priv_sd(wsi)->racing[pidx].events |= EPOLLOUT;
+
+		if (flags & LWS_EV_READ)
+			wsi_to_priv_sd(wsi)->racing[pidx].events |= EPOLLIN;
+
+		sd_event_source_set_io_events(wsi_to_priv_sd(wsi)->racing[pidx].source,
+					      wsi_to_priv_sd(wsi)->racing[pidx].events);
+		sd_event_source_set_enabled(wsi_to_priv_sd(wsi)->racing[pidx].source,
+					    SD_EVENT_ONESHOT);
+	} else {
+		if (flags & LWS_EV_WRITE)
+			wsi_to_priv_sd(wsi)->racing[pidx].events &= (uint32_t)(~EPOLLOUT);
+
+		if (flags & LWS_EV_READ)
+			wsi_to_priv_sd(wsi)->racing[pidx].events &= (uint32_t)(~EPOLLIN);
+
+		sd_event_source_set_io_events(wsi_to_priv_sd(wsi)->racing[pidx].source,
+					      wsi_to_priv_sd(wsi)->racing[pidx].events);
+
+		if (!(wsi_to_priv_sd(wsi)->racing[pidx].events & (EPOLLIN | EPOLLOUT)))
+			sd_event_source_set_enabled(wsi_to_priv_sd(wsi)->racing[pidx].source,
+						    SD_EVENT_OFF);
+		else
+			sd_event_source_set_enabled(wsi_to_priv_sd(wsi)->racing[pidx].source,
+						    SD_EVENT_ONESHOT);
+	}
+}
+
+static void
+close_handle_manually_parallel_sd(struct lws *wsi, int pidx)
+{
+	if (wsi_to_priv_sd(wsi)->racing[pidx].source) {
+		sd_event_source_set_enabled(wsi_to_priv_sd(wsi)->racing[pidx].source, SD_EVENT_OFF);
+		sd_event_source_unref(wsi_to_priv_sd(wsi)->racing[pidx].source);
+		wsi_to_priv_sd(wsi)->racing[pidx].source = NULL;
+	}
+
+	compatible_close(wsi->io->parallel_conns[pidx].desc.sockfd);
+}
+
+static int
+promote_parallel_sd(struct lws *wsi, int pidx)
+{
+	if (wsi_to_priv_sd(wsi)->source) {
+		sd_event_source_set_enabled(wsi_to_priv_sd(wsi)->source, SD_EVENT_OFF);
+		sd_event_source_unref(wsi_to_priv_sd(wsi)->source);
+	}
+
+	wsi_to_priv_sd(wsi)->source = wsi_to_priv_sd(wsi)->racing[pidx].source;
+	wsi_to_priv_sd(wsi)->events = wsi_to_priv_sd(wsi)->racing[pidx].events;
+
+	memset(&wsi_to_priv_sd(wsi)->racing[pidx], 0, sizeof(wsi_to_priv_sd(wsi)->racing[pidx]));
+	return 0;
+}
+#endif
+
+/*
+ * QUIC ALPN migration: the sources carry the wsi as their userdata, so the
+ * block copies and the sources are pointed at the new wsi.
+ */
+static int
+migrate_wsi_sd(struct lws *from, struct lws *to)
+{
+	struct lws_wsi_watcher_sdevent *f = wsi_to_priv_sd(from),
+				       *t = wsi_to_priv_sd(to);
+	size_t n;
+
+	memcpy(t, f, sizeof(*t));
+	memset(f, 0, sizeof(*f));
+
+	if (t->source)
+		sd_event_source_set_userdata(t->source, to);
+#if defined(LWS_WITH_CLIENT)
+	for (n = 0; n < LWS_ARRAY_SIZE(t->racing); n++)
+		if (t->racing[n].source)
+			sd_event_source_set_userdata(t->racing[n].source, to);
+#endif
+	(void)n;
+
+	return 0;
+}
+
 const struct lws_event_loop_ops event_loop_ops_sdevent = {
 		.name				= "sdevent",
 		.init_context			= NULL,
@@ -422,6 +562,12 @@ const struct lws_event_loop_ops event_loop_ops_sdevent = {
 		.run_pt				= run_pt_sd,
 		.destroy_pt			= destroy_pt_sd,
 		.destroy_wsi			= wsi_destroy_sd,
+#if defined(LWS_WITH_CLIENT)
+		.sock_accept_parallel		= sock_accept_parallel_sd,
+		.io_parallel			= io_parallel_sd,
+		.close_handle_manually_parallel = close_handle_manually_parallel_sd,
+		.promote_parallel		= promote_parallel_sd,
+#endif
 
 		.flags				= 0,
 
@@ -429,6 +575,7 @@ const struct lws_event_loop_ops event_loop_ops_sdevent = {
 		.evlib_size_pt			= sizeof(struct lws_pt_eventlibs_sdevent),
 		.evlib_size_vh			= 0,
 		.evlib_size_wsi			= sizeof(struct lws_wsi_watcher_sdevent),
+		.migrate_wsi			= migrate_wsi_sd,
 };
 
 #if defined(LWS_WITH_EVLIB_PLUGINS)

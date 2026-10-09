@@ -57,11 +57,11 @@ static const struct lws_http_mount mount = {
 	.mountpoint_len		= 1,			/* char count */
 };
 
-static int interrupted;
+static struct lws_context *context;
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 static struct lws_protocol_vhost_options pvo1 = {
@@ -81,9 +81,8 @@ static const struct lws_protocol_vhost_options pvo = {
 
 int main(int argc, const char **argv)
 {
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	int n = 0;
 	struct lws_context_creation_info info;
-	struct lws_context *context;
 	char outward[256];
 	const char *p;
 	(void)switches;
@@ -96,10 +95,7 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal raw proxy fallback | visit http://localhost:7681\n");
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_R].sw))) {
@@ -107,7 +103,10 @@ int main(int argc, const char **argv)
 		pvo1.value = outward;
 	}
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	/* a server: size the fds tables to the process limit */
+	info.fd_limit_per_thread = 0;
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.port = 7681;
 	info.pvo = &pvo;
 	info.mounts = &mount;
@@ -147,7 +146,7 @@ int main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

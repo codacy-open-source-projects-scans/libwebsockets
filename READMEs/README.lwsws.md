@@ -33,6 +33,10 @@ replaced with the LWS install data directory path, eg, "/usr/share" or whatever 
 set when LWS was built + installed.  That lets you refer to installed paths without
 having to change the config if your install path was different.
 
+ - Scoped substitution defines: a pair whose name starts with '=' is not part of the
+config schema, it defines a substitution symbol instead.  See
+"Scoped substitution defines" below.
+
 There is a single file intended for global settings
 
 /etc/lwsws/conf
@@ -81,6 +85,57 @@ on port 7681, non-SSL is provided.  To set it up
 	# sudo lwsws
 ```
 
+## Scoped substitution defines
+
+A pair whose name starts with `=` is not passed through to the config schema.
+It defines a substitution symbol, and its value is used to expand `${NAME}`
+sequences in string values of the config that are produced while it is in
+scope:
+
+```
+	{
+	  "global": {
+	   "=PKI_ROOT": "/var/dnssec",     # define PKI_ROOT for this object
+	   "server-string": "lwsws",
+	   "reject-service-keywords": [{
+	      "=BADBOT": "scumbot/1.0",     # define scoped to this array item
+	      "name": "${BADBOT}"           # -> "scumbot/1.0"
+	   }]
+	  }
+	}
+```
+
+The rules are:
+
+ - A define is visible from where it is defined, until the close of the JSON
+object it was defined in.  The value string may itself use `${NAME}`
+sequences referencing defines already defined in the same or an enclosing
+object.
+
+ - Defines in an inner object may shadow ones with the same name from
+enclosing objects.  Within the same object, the redefinition replaces the
+earlier define from that point on.
+
+ - Defines in the "global" section of the globals config files (conf and
+conf.d/) are install-wide: they accumulate across the globals config
+fragments, and stay visible in all the vhost config files, until all config
+files have been walked.  Defines in the vhost config files themselves stay
+isolated to the file they were created in.
+
+ - Each file is otherwise parsed with a fresh set of defines, so defines do
+not leak between unrelated files.
+
+ - Define names are 1...31 characters from `a-z`, `A-Z`, `0-9` and `_`.
+
+ - Strings are substituted as they are parsed, so any string value in the
+config can use `${NAME}`, including values used to build other define
+values.  Substitution applies to string values only, pair names are not
+substituted.
+
+ - Problems fail the config load loudly at the file and line concerned:
+using an undefined symbol, an invalid define name, or giving a define a
+non-string value.  Pair names starting with `=` are reserved for this.
+
 ## Using Letsencrypt or other ACME providers
 
 Lws supports automatic provisioning and renewal of TLS certificates.
@@ -100,6 +155,12 @@ if a keyword is found in the user agent
 
  - `timeout-secs` lets you set the global timeout for various network-related
  operations in lws, in seconds.  It defaults to 5.
+
+ - `http-header-data` sets the maximum bytes of http header lws will buffer
+per connection, for server and client connections.  It defaults to 4096;
+sites that deal with very fat response headers (for example, release
+redirects from github with many cookies) should raise it, eg `"8192"`.
+The maximum is 32768.
  
 ## Lwsws Vhosts
 
@@ -174,6 +235,27 @@ true vhosts on one listening socket and the active vhost decided at SSL
 negotiation time (via SNI) or if no SSL, then after the Host: header from
 the client has been parsed.
 
+ - A tls connection whose SNI name matches no vhost on the port it arrived on is
+refused, with a fatal `unrecognized_name` alert.  Otherwise the certificate the
+peer is shown, and the client certificate policy he meets, would be decided by
+vhost creation order just because he named something that does not exist.  A
+vhost may be nominated to take those connections instead with
+`"sni-fallback": "1"`, see below.
+
+ - A connection that sends no SNI at all is not affected by that, it stays on the
+vhost that accepted it; neither is selection by `Host:` header, since a server
+with a single vhost is reached by IP address all the time.
+
+ - All the tls backends do this the same way.  OpenSSL, mbedtls, gnutls and
+openHiTLS act on it in their servername callback; BearSSL and Schannel have no
+callback that can still change the certificate at that point (Schannel has none
+at all, and BearSSL's chain-selection hook runs after ALPN and the cipher suites
+are already settled), so on those two lws reads the name out of the ClientHello
+itself, before handing the first record to the tls library.  The only case those
+two treat differently is a ClientHello split across several tls records, which
+no client does: lws does not reassemble it, and such a peer is served as if he
+had sent no SNI.
+
 
 ## Lwsws Protocols
 
@@ -217,11 +299,34 @@ to be selected using "raw": "1"
 
 See also "apply-listen-accept" below.
 
+## Care about redirecting the trailing /
+
+In lws the mount applies at the URL folder, so a mount at /myapp actually works starting from /myapp/.
+
+This means you often need to add an additional redirect mount to do the last step for the user who
+may have typed .../myapp, to get them to .../myapp/ where the app actually takes over.
+
+        "mountpoint": "/git",
+        "origin": ">https://warmcat.com/git/",
+
 ## Lwsws Other vhost options
 
  - If the three options `host-ssl-cert`, `host-ssl-ca` and `host-ssl-key` are given, then the vhost supports SSL.
 
  Each vhost may have its own certs, SNI is used during the initial connection negotiation to figure out which certs to use by the server name it's asking for from the request DNS name.
+
+ When the cert and key files are renewed on disk, eg, by moving a `-latest` symlink onto new files the way the acme plugin, the cert distribution client or certbot do, the vhost notices and moves onto them without a restart and without disturbing its connections.  Connections made before the renewal carry on with the old cert until they close.  The files must still be readable by lwsws after it has dropped its privileges, or the renewal can't be seen; a warning is logged once if they aren't.
+
+ - "`host-ssl-cert-grace-secs`": "900" holds a renewed cert back for that many seconds after it was issued or written, whichever is later, before the vhost serves it.  Use it when the cert is published in DNS for DANE, so the new TLSA record has replaced cached copies of the old one first.  Default 0, the renewed cert is served as soon as it is seen.
+
+ - "`sni-fallback`": "1" makes this vhost the one that serves tls connections
+arriving on its listen port with an SNI name that matches no vhost there.  At
+most one vhost per port needs it; if none has it, such connections are refused
+with a fatal `unrecognized_name` alert and one rate-limited notice-level log
+line.  Give it to the vhost whose certificate and client-certificate policy you
+are happy for an unknown name to meet, typically the "main" vhost on the port.
+Connections that send no SNI at all never come here, they stay on the vhost that
+accepted them.
 
  - `keeplive-timeout` (in secs) defaults to 60 for lwsws, it may be set as a vhost option
 
@@ -237,17 +342,21 @@ See also "apply-listen-accept" below.
 
  - `"enable-client-ssl"`: `"1"` enables the vhost's client SSL context, you will need this if you plan to create client conections on the vhost that will use SSL.  You don't need it if you only want http / ws client connections.
 
- - "`ciphers`": "<cipher list>"  OPENSSL only: sets the allowed list of TLS <= 1.2 ciphers and key exchange protocols for the serving SSL_CTX on the vhost.  The default list is restricted to only those providing PFS (Perfect Forward Secrecy) on the author's Fedora system.
+ - "`ciphers`": "<cipher list>"  sets the allowed list of TLS <= 1.2 ciphers and key exchange protocols for the serving SSL_CTX on the vhost.  With OPENSSL, the default list is restricted to only those providing PFS (Perfect Forward Secrecy) on the author's Fedora system.
+
+ With GNUTLS, this string is used verbatim as the gnutls priority string for the vhost's server side, and controls the protocol versions as well as the ciphers.  The default is "`NORMAL:-VERS-TLS1.0:-VERS-TLS1.1`", ie, the gnutls NORMAL set with TLS1.0 and TLS1.1 disabled, since offering those caps the server at a "B" on ssllabs.com.  If you need TLS1.2 only, use eg "`NORMAL:-VERS-ALL:+VERS-TLS1.2:+VERS-TLS1.3`".
  
  If you need to allow weaker ciphers, you can provide an alternative list here per-vhost.
 
- - "`client-ssl-ciphers`": "<cipher list>"  OPENSSL only: sets the allowed list of <= TLS1.2 ciphers and key exchange protocols for the client SSL_CTX on the vhost
+ - "`client-ssl-ciphers`": "<cipher list>"  sets the allowed list of <= TLS1.2 ciphers and key exchange protocols for the client SSL_CTX on the vhost.  With GNUTLS, this is the gnutls priority string for the vhost's client side, defaulting to "`NORMAL:-VERS-TLS1.0:-VERS-TLS1.1`".
 
  - "`tls13-ciphers`": "<cipher list>"  OPENSSL 1.1.1+ only: sets allowed list of TLS1.3+ ciphers and key exchange protocols for the client SSL_CTX on the vhost.  The default is to allow all.
 
  - "`client-tls13-ciphers`": "<cipher list>"  OPENSSL 1.1.1+ only: sets the allowed list of TLS1.3+ ciphers and key exchange protocols for the client SSL_CTX on the vhost.  The default is to allow all.
  
- - "`ecdh-curve`": "<curve name>"   The default ecdh curve is "prime256v1", but you can override it here, per-vhost
+ - "`ecdh-curve`": "<group list>"   OPENSSL only: colon-separated list of TLS group names (eg, "X25519:P-384", or a single group name like "prime256v1") restricting the groups used for key exchange on the vhost's serving SSL_CTX.  On old OpenSSL (<1.1.0), only a single curve name is understood and the default is "prime256v1".
+
+ - "`client-ecdh-curve`": "<group list>"   OPENSSL only: colon-separated list of TLS group names restricting the groups offered in the ClientHello by the vhost's client SSL_CTX.  If not given, `ecdh-curve` is used for the client SSL_CTX too.  This is useful to stop clients offering groups some servers cannot cope with, for example the post-quantum and ffdhe groups that OpenSSL 3.4+ includes in its defaults.
 
  - "`noipv6`": "on"  Disable ipv6 completely for this vhost
 
@@ -466,7 +575,7 @@ authenticated username.
 ```
 
 - `"exact-match": "1"` forces the mount to only match if the request URL is exactly the `mountpoint` (no directory prefix matching).
-- `"append-path": "1"` can be used with HTTP/HTTPS redirects (`>http://` or `>https://`). By default, redirects strictly redirect to the `origin` without appending the trailing path of the URL. Setting this flag will append the remainder of the request URL to the redirect destination.
+- `"append-path": "1"` can be used with HTTP/HTTPS redirects (`>http://` or `>https://`). By default, redirects strictly redirect to the `origin` without appending the trailing path of the URL. Setting this flag will append the remainder of the request URL to the redirect destination, always as a path after the origin: a `/` is put between them if neither has one.
 - `"no-ws-upgrades": "1"` instructs the router to ignore this mount if the incoming HTTP request is a WebSocket upgrade request (contains an `Upgrade:` header). This is useful to prevent WSS connections from being accidentally swallowed by a broad alias or redirect mount (e.g. `/`) when they were intended for a different, overlapping protocol.
 
 In the case you want to also protect being able to connect to a ws protocol on
@@ -479,7 +588,7 @@ Auth before the ws upgrade, this is also possible.  In this case, the
 
 The mounts in lws allow you to stack up other plugins that run "before" the main mountpoint.
 There are two "interceptor plugins" provided which can be useful for this,
-`lws_login` and `lws_captcha_ratelimit`
+`lws_login` and `lws_captcha_ratelimit`, you can create your own based on these.
 
 To indicate you want to use an interceptor plugin for a mount, you add an
 "interceptor-path" entry to the original mount definition, pointing to the

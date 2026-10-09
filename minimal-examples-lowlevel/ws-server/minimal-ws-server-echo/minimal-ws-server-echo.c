@@ -39,7 +39,8 @@ static struct lws_protocols protocols[] = {
 	LWS_PROTOCOL_LIST_TERM
 };
 
-static int interrupted, port = 7681, options;
+static struct lws_context *context;
+static int result, port = 7681, options;
 
 /* pass pointers to shared vars to the protocol */
 
@@ -50,16 +51,16 @@ static const struct lws_protocol_vhost_options pvo_options = {
 	(void *)&options	/* pvo value */
 };
 
-static const struct lws_protocol_vhost_options pvo_interrupted = {
+static const struct lws_protocol_vhost_options pvo_result = {
 	&pvo_options,
 	NULL,
-	"interrupted",		/* pvo name */
-	(void *)&interrupted	/* pvo value */
+	"result",		/* pvo name */
+	(void *)&result		/* pvo value */
 };
 
 static const struct lws_protocol_vhost_options pvo = {
 	NULL,				/* "next" pvo linked-list */
-	&pvo_interrupted,		/* "child" pvo linked-list */
+	&pvo_result,			/* "child" pvo linked-list */
 	"lws-minimal-server-echo",	/* protocol name we belong to on this vhost */
 	""				/* ignored */
 };
@@ -76,21 +77,14 @@ static const struct lws_extension extensions[] = {
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
-	struct lws_context *context;
 	const char *p;
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE
-			/* for LLL_ verbosity above NOTICE to be built into lws,
-			 * lws must have been configured and built with
-			 * -DCMAKE_BUILD_TYPE=DEBUG instead of =RELEASE */
-			/* | LLL_INFO */ /* | LLL_PARSER */ /* | LLL_HEADER */
-			/* | LLL_EXT */ /* | LLL_CLIENT */ /* | LLL_LATENCY */
-			/* | LLL_DEBUG */;
+	int n = 0;
 	(void)switches;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
@@ -101,21 +95,28 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal ws client echo + permessage-deflate + multifragment bulk message\n");
 	lwsl_user("   lws-minimal-ws-client-echo [-n (no exts)] [-p port] [-o (once)]\n");
 
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_P].sw)))
-		port = atoi(p);
+		{
+			int __pt = atoi(p);
+			if (__pt < 0 || __pt > 65535) {
+				lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+				return 1;
+			}
+			port = __pt;
+		}
 
 	if (lws_cmdline_option(argc, argv, switches[LWS_SW_O].sw))
 		options |= 1;
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	/* a server: size the fds tables to the process limit */
+	info.fd_limit_per_thread = 0;
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.port = port;
 	info.protocols = protocols;
 	info.pvo = &pvo;
@@ -131,12 +132,12 @@ int main(int argc, const char **argv)
 		return 1;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);
 
-	lwsl_user("Completed %s\n", interrupted == 2 ? "OK" : "failed");
+	lwsl_user("Completed %s\n", result == 2 ? "OK" : "failed");
 
-	return interrupted != 2;
+	return result != 2;
 }

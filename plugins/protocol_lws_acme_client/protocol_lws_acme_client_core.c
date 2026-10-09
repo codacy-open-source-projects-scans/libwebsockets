@@ -39,6 +39,7 @@
 #include "../../lib/tls/private-lib-tls.h"
 
 #include <string.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <ctype.h>
 
@@ -50,138 +51,52 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
-static int
-acme_ipc_save_payload(struct lws_context *cx, const char *uds_path, const char *req, const char *domain, const char *filename, const char *payload, size_t payload_len)
+#include "private-acme-client.h"
+
+static const char *
+acme_state_name(lws_acme_state s)
 {
-	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (fd < 0) return 1;
-	struct sockaddr_un addr;
-	memset(&addr, 0, sizeof(addr));
-	addr.sun_family = AF_UNIX;
-	strncpy(addr.sun_path, uds_path, sizeof(addr.sun_path) - 1);
-	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		close(fd);
-		return 1;
-	}
+	static const char *const n[] = {
+		"DIRECTORY", "NEW-NONCE", "NEW-ACCOUNT", "NEW-ORDER",
+		"AUTHZ", "START-CHALL", "POLLING", "POLLING-CSR",
+		"DOWNLOAD-CERT", "FINISHED",
+	};
 
-	char header[3072];
-	char jwt[2048] = {0};
-
-	/* Sign the payload with the proxy 64-byte secret preamble */
-#if defined(LWS_WITH_SECURE_STREAMS_AUTH_SIGV4)
-	lws_system_blob_t *b = lws_system_get_blob(cx, LWS_SYSBLOB_TYPE_EXT_AUTH1, 0);
-	if (b) {
-		size_t hex_len = lws_system_blob_get_size(b);
-		if (hex_len > 0) {
-			char hex[129];
-			char temp[2048];
-			size_t jwt_len = sizeof(jwt);
-			struct lws_jwk jwk;
-			if (hex_len >= sizeof(hex)) hex_len = sizeof(hex) - 1;
-			lws_system_blob_get(b, (uint8_t *)hex, &hex_len, 0);
-			hex[hex_len] = '\0';
-			memset(&jwk, 0, sizeof(jwk));
-			jwk.kty = LWS_GENCRYPTO_KTY_OCT;
-			jwk.e[LWS_GENCRYPTO_OCT_KEYEL_K].len = 64;
-			jwk.e[LWS_GENCRYPTO_OCT_KEYEL_K].buf = malloc(64);
-			lws_hex_to_byte_array(hex, jwk.e[LWS_GENCRYPTO_OCT_KEYEL_K].buf, 64);
-
-			uint64_t now = (uint64_t)lws_now_usecs() / LWS_US_PER_SEC;
-			lws_jwt_sign_compact(cx, &jwk, "HS256", jwt, &jwt_len, temp, sizeof(temp),
-			    "{\"iss\":\"acme-ipc\",\"aud\":\"dnssec-monitor\",\"iat\":%llu,\"exp\":%llu}",
-			    (unsigned long long)now, (unsigned long long)now + 300);
-
-			lws_jwk_destroy(&jwk);
-		}
-	}
-#endif
-
-	int hlen = lws_snprintf(header, sizeof(header), "{\"req\":\"%s\",\"jwt\":\"%s\",\"domain\":\"%s\",\"subdomain\":\"%s\",\"zone\":\"", req, jwt, domain, filename);
-	write(fd, header, (size_t)hlen);
-
-	for (size_t i = 0; i < payload_len; i++) {
-        char c = payload[i];
-        if (c == '\n') { write(fd, "\\n", 2); }
-        else if (c == '\r') { write(fd, "\\r", 2); }
-        else if (c == '"') { write(fd, "\\\"", 2); }
-        else if (c == '\\') { write(fd, "\\\\", 2); }
-        else { write(fd, &c, 1); }
-    }
-	write(fd, "\"}\n", 3);
-
-	char resp[256];
-	read(fd, resp, sizeof(resp));
-	close(fd);
-	return 0;
+	return s <= ACME_STATE_FINISHED ? n[s] : "unknown";
 }
+
+
+static void
+acme_aging_next_cert(struct per_vhost_data__lws_acme_client *vhd);
+static void
+acme_ipc_arm(struct per_vhost_data__lws_acme_client *vhd);
+
+/*
+ * Point a -latest[-fullchain].crt / -latest.key symlink at the newly
+ * written timestamped file (linked by its basename, it is in the same
+ * dir).  Whatever it pointed at before stays linked as -previous, which
+ * the zone signer's ${DANE1/...} publishes the TLSA for.
+ */
+
+static void
+acme_link_rotate(const char *latest, const char *written)
+{
+	const char *target = strrchr(written, '/') ? strrchr(written, '/') + 1 :
+						     written;
+
+#if defined(LWS_WITH_DIR)
+	if (lws_dir_symlink_rotate(latest, target, "-latest", "-previous"))
+		lwsl_err("%s: unable to link %s -> %s: %s\n", __func__, latest,
+			 target, strerror(errno));
 #else
-static int
-acme_ipc_save_payload(struct lws_context *cx, const char *uds_path, const char *req, const char *domain, const char *filename, const char *payload, size_t payload_len)
-{
-	return 1;
-}
+	unlink(latest);
+#if !defined(WIN32)
+	if (symlink(target, latest))
+		lwsl_err("%s: unable to link %s -> %s: %s\n", __func__, latest,
+			 target, strerror(errno));
 #endif
-
-typedef enum {
-	ACME_STATE_DIRECTORY,	/* get the directory JSON using GET + parse */
-	ACME_STATE_NEW_NONCE,	/* get the replay nonce */
-	ACME_STATE_NEW_ACCOUNT,	/* register a new RSA key + email combo */
-	ACME_STATE_NEW_ORDER,	/* start the process to request a cert */
-	ACME_STATE_AUTHZ,	/* */
-	ACME_STATE_START_CHALL, /* notify server ready for one challenge */
-	ACME_STATE_POLLING,	/* he should be trying our challenge */
-	ACME_STATE_POLLING_CSR,	/* sent CSR, checking result */
-	ACME_STATE_DOWNLOAD_CERT,
-
-	ACME_STATE_FINISHED
-} lws_acme_state;
-
-struct acme_connection {
-	char buf[4096];
-	char replay_nonce[64];
-	char chall_token[64];
-	char challenge_uri[256];
-	char detail[64];
-	char status[16];
-	char key_auth[256];
-	char http01_mountpoint[256];
-	struct lws_http_mount mount;
-	char urls[6][256]; /* directory contents */
-	char active_url[256];
-	char authz_url[256];
-	char order_url[256];
-	char finalize_url[256];
-	char cert_url[256];
-	char acct_id[256];
-	char *kid;
-	lws_acme_state state;
-	struct lws_client_connect_info i;
-	struct lejp_ctx jctx;
-	struct lws_context_creation_info ci;
-	struct lws_vhost *vhost;
-
-	struct lws *cwsi;
-
-	const char *real_vh_name;
-	const char *real_vh_iface;
-
-	char *alloc_privkey_pem;
-
-	char *dest;
-	int pos;
-	int len;
-	int resp;
-	int cpos;
-
-	int real_vh_port;
-	int goes_around;
-
-	size_t len_privkey_pem;
-
-	unsigned int yes;
-	unsigned int use:1;
-	unsigned int is_sni_02:1;
-};
+#endif
+}
 
 /*
  * Maps for nested JSON parsing
@@ -198,6 +113,7 @@ static const lws_struct_map_t map_acme_cert_config[] = {
 	LSM_STRING_PTR(struct lws_acme_cert_config, common_name, "common-name"),
 	LSM_STRING_PTR(struct lws_acme_cert_config, challenge_type_str, "challenge-type"),
 	LSM_STRING_PTR(struct lws_acme_cert_config, email, "email"),
+	LSM_STRING_PTR(struct lws_acme_cert_config, profile, "profile"),
 	LSM_CHILD_PTR(struct lws_acme_cert_config, acme, struct lws_acme_cert_config_acme, NULL, map_acme_acme_obj, "acme"),
 };
 
@@ -205,51 +121,166 @@ static const lws_struct_map_t map_acme_cert_config_root[] = {
 	LSM_SCHEMA(struct lws_acme_cert_config, NULL, map_acme_cert_config, "lws-acme-client-config"),
 };
 
-struct per_vhost_data__lws_acme_client {
-	struct lws_context *context;
-	struct lws_vhost *vhost;
-	const struct lws_protocols *protocol;
-	const struct lws_acme_challenge_ops *ops;
-	void *challenge_priv;
+static void
+acme_ipc_sign_jwt(struct per_vhost_data__lws_acme_client *vhd, char *jwt, size_t jwt_len)
+{
+	jwt[0] = '\0';
+#if defined(LWS_WITH_JOSE)
+	lws_system_blob_t *b = lws_system_get_blob(vhd->context, LWS_SYSBLOB_TYPE_EXT_AUTH1, 0);
+	if (b) {
+		size_t hex_len = lws_system_blob_get_size(b);
+		if (hex_len > 0) {
+			char hex[129];
+			char temp[2048];
+			struct lws_jwk jwk;
+			uint8_t key[sizeof(hex) / 2];
+			size_t klen;
+
+			if (hex_len >= sizeof(hex)) hex_len = sizeof(hex) - 1;
+			if (lws_system_blob_get(b, (uint8_t *)hex, &hex_len, 0))
+				return;
+			hex[hex_len] = '\0';
+
+			/*
+			 * The blob is the key as hex; a short or malformed one
+			 * must not be padded out with whatever was already in
+			 * the key buffer, or we sign with uninitialised bytes
+			 */
+			if (hex_len < 2 || (hex_len & 1))
+				return;
+
+			klen = hex_len / 2;
+			if (lws_hex_to_byte_array(hex, key, (int)klen) !=
+								(int)klen) {
+				lwsl_vhost_err(vhd->vhost,
+					       "acme: bad IPC auth key blob");
+
+				return;
+			}
+
+			/*
+			 * The key is on the stack: lws_malloc() is not exported
+			 * to plugins, so a heap one could not be released by
+			 * lws_jwk_destroy()'s lws_free_set_NULL() safely.  Take
+			 * the element back off the jwk before destroying it.
+			 */
+			memset(&jwk, 0, sizeof(jwk));
+			jwk.kty = LWS_GENCRYPTO_KTY_OCT;
+			jwk.e[LWS_GENCRYPTO_OCT_KEYEL_K].len = (uint32_t)klen;
+			jwk.e[LWS_GENCRYPTO_OCT_KEYEL_K].buf = key;
+
+			uint64_t now = (uint64_t)time(NULL);
+			lws_jwt_sign_compact(vhd->context, &jwk, "HS256", jwt, &jwt_len, temp, sizeof(temp),
+			    "{\"iss\":\"acme-ipc\",\"aud\":\"dnssec-monitor\",\"iat\":%llu,\"nbf\":%llu,\"exp\":%llu}",
+			    (unsigned long long)now, (unsigned long long)now, (unsigned long long)now + 300);
+
+			jwk.e[LWS_GENCRYPTO_OCT_KEYEL_K].buf = NULL;
+			jwk.e[LWS_GENCRYPTO_OCT_KEYEL_K].len = 0;
+			lws_jwk_destroy(&jwk);
+			lws_explicit_bzero(key, sizeof(key));
+		}
+	}
+#endif
+}
+
+static int
+acme_ipc_save_payload(struct per_vhost_data__lws_acme_client *vhd, const char *req, const char *domain, const char *filename, const char *payload, size_t payload_len)
+{
+	char header[3072];
+	char jwt[2048] = {0};
+	char esc_domain[512], esc_filename[512];
+	int n;
+
+	acme_ipc_sign_jwt(vhd, jwt, sizeof(jwt));
 
 	/*
-	 * the vhd is allocated for every vhost using the plugin.
-	 * But ac is only allocated when we are doing the server auth.
+	 * The payload below is escaped as it is copied, but these header fields
+	 * come from the on-disk config (a domain directory name, a common name)
+	 * and would otherwise be able to close the JSON string and inject
+	 * another "req" key into a request to the root-privileged daemon.  req
+	 * is a literal at every call site and jwt is our own base64url compact
+	 * JWS, so those two need no escaping
 	 */
-	struct acme_connection *ac;
+	lws_json_purify(esc_domain, domain, (int)sizeof(esc_domain), NULL);
+	lws_json_purify(esc_filename, filename, (int)sizeof(esc_filename), NULL);
 
-	struct lws_jwk jwk;
-	struct lws_genrsa_ctx rsactx;
-	char *dns_base_dir;
+	int hlen = lws_snprintf(header, sizeof(header), "{\"req\":\"%s\",\"jwt\":\"%s\",\"domain\":\"%s\",\"subdomain\":\"%s\",\"zone\":\"", req, jwt, esc_domain, esc_filename);
 
-	lws_dll2_owner_t cert_configs;
-    struct lws_acme_cert_config *active_cert;
-    lws_sorted_usec_list_t sul_aging;
+	size_t est_len = (size_t)hlen + (payload_len * 2) + 4;
+	char *dyn_buf = malloc(est_len);
+	if (!dyn_buf)
+		return 1;
 
-	int count_live_pss;
-	char *dest;
-	int pos;
-	int len;
-	#if !defined(LWS_WITH_ESP32)
-	/* removed persistent fd_updated_cert/key handles since they are opened dynamically per cert */
-	/* we allocate memory here because we drop root too early */
+	memcpy(dyn_buf, header, (size_t)hlen);
+	size_t pos = (size_t)hlen;
+	for (size_t i = 0; i < payload_len; i++) {
+		char c = payload[i];
+		if (c == '\n') { dyn_buf[pos++] = '\\'; dyn_buf[pos++] = 'n'; }
+		else if (c == '\r') { dyn_buf[pos++] = '\\'; dyn_buf[pos++] = 'r'; }
+		else if (c == '\t') { dyn_buf[pos++] = '\\'; dyn_buf[pos++] = 't'; }
+		else if (c == '"') { dyn_buf[pos++] = '\\'; dyn_buf[pos++] = '"'; }
+		else if (c == '\\') { dyn_buf[pos++] = '\\'; dyn_buf[pos++] = '\\'; }
+		else { dyn_buf[pos++] = c; }
+	}
+	dyn_buf[pos++] = '"'; dyn_buf[pos++] = '}'; dyn_buf[pos++] = '\n';
+
+	n = !vhd->ipc || lws_async_ipc_queue_payload(vhd->ipc, dyn_buf, pos);
+
+	/* the payload may be a private key (save_key, save_auth_key) */
+	lws_explicit_bzero(dyn_buf, pos);
+	free(dyn_buf);
+
+	if (n)
+		return 1;
+
+	/* each request is answered by exactly one line, see acme_ipc_line() */
+	vhd->ipc_pending_saves++;
+	acme_ipc_arm(vhd);
+
+	return 0;
+}
+
+static void
+lws_acme_core_trigger_resign(struct per_vhost_data__lws_acme_client *vhd)
+{
+	acme_ipc_save_payload(vhd, "trigger_resign", "none", "none", "", 0);
+}
+
+#else
+static int
+acme_ipc_save_payload(struct per_vhost_data__lws_acme_client *vhd, const char *req, const char *domain, const char *filename, const char *payload, size_t payload_len)
+{
+	return 1;
+}
+
+static void
+lws_acme_core_trigger_resign(struct per_vhost_data__lws_acme_client *vhd)
+{
+}
 #endif
-};
 
 static int
 callback_chall_http01(struct lws *wsi, enum lws_callback_reasons reason,
         void *user, void *in, size_t len)
 {
 	struct lws_vhost *vhost = lws_get_vhost(wsi);
-	struct acme_connection *ac = lws_vhost_user(vhost);
+	/*
+	 * The temp vhost's user is the vhd, not the acquisition: the vhost
+	 * destroy is asynchronous and can leave wsi bound to it after the ac
+	 * has been freed
+	 */
+	struct per_vhost_data__lws_acme_client *vhd = lws_vhost_user(vhost);
 	uint8_t buf[LWS_PRE + 2048], *start = &buf[LWS_PRE], *p = start,
 		*end = &buf[sizeof(buf) - 1];
 	int n;
 
+	if (!vhd)
+		return lws_callback_http_dummy(wsi, reason, user, in, len);
+
 	switch (reason) {
 	case LWS_CALLBACK_HTTP:
 		lwsl_wsi_notice(wsi, "CA connection received, key_auth %s",
-			    ac->key_auth);
+			    vhd->chall_key_auth);
 
 		if (lws_add_http_header_status(wsi, HTTP_STATUS_OK, &p, end)) {
 			lwsl_wsi_warn(wsi, "add status failed");
@@ -264,7 +295,7 @@ callback_chall_http01(struct lws *wsi, enum lws_callback_reasons reason,
 			return -1;
 		}
 
-		n = (int)strlen(ac->key_auth);
+		n = (int)strlen(vhd->chall_key_auth);
 		if (lws_add_http_header_content_length(wsi, (lws_filepos_t)n, &p, end)) {
 			lwsl_wsi_warn(wsi, "add content_length failed");
 			return -1;
@@ -287,7 +318,8 @@ callback_chall_http01(struct lws *wsi, enum lws_callback_reasons reason,
 		return 0;
 
 	case LWS_CALLBACK_HTTP_WRITEABLE:
-		p += lws_snprintf((char *)p, lws_ptr_diff_size_t(end, p), "%s", ac->key_auth);
+		p += lws_snprintf((char *)p, lws_ptr_diff_size_t(end, p), "%s",
+				  vhd->chall_key_auth);
 		// lwsl_notice("%s: len %d\n", __func__, lws_ptr_diff(p, start));
 		if (lws_write(wsi, (uint8_t *)start, lws_ptr_diff_size_t(p, start),
 			      LWS_WRITE_HTTP_FINAL) != lws_ptr_diff(p, start)) {
@@ -311,6 +343,41 @@ static const struct lws_protocols chall_http01_protocols[] = {
 	{ "http", callback_chall_http01, 0, 0, 0, NULL, 0 },
 	{ NULL, NULL, 0, 0, 0, NULL, 0 }
 };
+
+/*
+ * The JWS alg to sign with, from the account key: RS256 for RSA, ES256 or
+ * ES384 for an EC key on the matching curve (RFC 8555 6.2 / RFC 7518 3.1).
+ * NULL if we have no alg the key can sign with.
+ */
+
+static int
+acme_crv_is(const lws_gc_elem_t *crv, const char *name)
+{
+	size_t n = strlen(name);
+
+	/* generated keys count the NUL in the element length, parsed ones don't */
+	return crv->buf && (crv->len == n || (crv->len == n + 1 && !crv->buf[n])) &&
+	       !memcmp(crv->buf, name, n);
+}
+
+static const char *
+acme_jws_alg(const struct lws_jwk *jwk)
+{
+	switch (jwk->kty) {
+	case LWS_GENCRYPTO_KTY_RSA:
+		return "RS256";
+	case LWS_GENCRYPTO_KTY_EC:
+		if (acme_crv_is(&jwk->e[LWS_GENCRYPTO_EC_KEYEL_CRV], "P-256"))
+			return "ES256";
+		if (acme_crv_is(&jwk->e[LWS_GENCRYPTO_EC_KEYEL_CRV], "P-384"))
+			return "ES384";
+		break;
+	default:
+		break;
+	}
+
+	return NULL;
+}
 
 static int
 jws_create_packet(struct lws_jwe *jwe, const char *payload, size_t len,
@@ -345,7 +412,9 @@ jws_create_packet(struct lws_jwe *jwe, const char *payload, size_t len,
 	if (!jwe->jose.alg || !jwe->jose.alg->alg)
 		goto bail;
 
-	p += lws_snprintf(p, lws_ptr_diff_size_t(end, p), "{\"alg\":\"RS256\"");
+	/* the header names the alg we will actually sign with */
+	p += lws_snprintf(p, lws_ptr_diff_size_t(end, p), "{\"alg\":\"%s\"",
+			  jwe->jose.alg->alg);
 	if (kid)
 		p += lws_snprintf(p, lws_ptr_diff_size_t(end, p), ",\"kid\":\"%s\"", kid);
 	else {
@@ -429,249 +498,6 @@ callback_acme_client(struct lws *wsi, enum lws_callback_reasons reason,
 	0, (void *)&acme_core_ops, 0 \
 }
 
-/* directory JSON parsing */
-
-static const char * const jdir_tok[] = {
-	"keyChange",
-	"meta.termsOfService",
-	"newAccount",
-	"newNonce",
-	"newOrder",
-	"revokeCert",
-};
-
-enum enum_jdir_tok {
-	JAD_KEY_CHANGE_URL,
-	JAD_TOS_URL,
-	JAD_NEW_ACCOUNT_URL,
-	JAD_NEW_NONCE_URL,
-	JAD_NEW_ORDER_URL,
-	JAD_REVOKE_CERT_URL,
-};
-
-static signed char
-cb_dir(struct lejp_ctx *ctx, char reason)
-{
-	struct per_vhost_data__lws_acme_client *s =
-		(struct per_vhost_data__lws_acme_client *)ctx->user;
-
-	if (reason == LEJPCB_VAL_STR_START && ctx->path_match) {
-		s->pos = 0;
-		s->len = sizeof(s->ac->urls[0]) - 1;
-		s->dest = s->ac->urls[ctx->path_match - 1];
-		return 0;
-	}
-
-	if (!(reason & LEJP_FLAG_CB_IS_VALUE) || !ctx->path_match)
-		return 0;
-
-	if (s->pos + ctx->npos > s->len) {
-		lwsl_notice("url too long\n");
-		return -1;
-	}
-
-	memcpy(s->dest + s->pos, ctx->buf, ctx->npos);
-	s->pos += ctx->npos;
-	s->dest[s->pos] = '\0';
-
-	return 0;
-}
-
-
-/* order JSON parsing */
-
-static const char * const jorder_tok[] = {
-	"status",
-	"expires",
-	"identifiers[].type",
-	"identifiers[].value",
-	"authorizations",
-	"finalize",
-	"certificate"
-};
-
-enum enum_jorder_tok {
-	JAO_STATUS,
-	JAO_EXPIRES,
-	JAO_IDENTIFIERS_TYPE,
-	JAO_IDENTIFIERS_VALUE,
-	JAO_AUTHORIZATIONS,
-	JAO_FINALIZE,
-	JAO_CERT
-};
-
-static signed char
-cb_order(struct lejp_ctx *ctx, char reason)
-{
-	struct acme_connection *s = (struct acme_connection *)ctx->user;
-
-	if (reason == LEJPCB_CONSTRUCTED)
-		s->authz_url[0] = '\0';
-
-	if (!(reason & LEJP_FLAG_CB_IS_VALUE) || !ctx->path_match)
-		return 0;
-
-	switch (ctx->path_match - 1) {
-	case JAO_STATUS:
-		lws_strncpy(s->status, ctx->buf, sizeof(s->status));
-		break;
-	case JAO_EXPIRES:
-		break;
-	case JAO_IDENTIFIERS_TYPE:
-		break;
-	case JAO_IDENTIFIERS_VALUE:
-		break;
-	case JAO_AUTHORIZATIONS:
-		lws_snprintf(s->authz_url, sizeof(s->authz_url), "%s",
-			     ctx->buf);
-		break;
-	case JAO_FINALIZE:
-		lws_snprintf(s->finalize_url, sizeof(s->finalize_url), "%s",
-				ctx->buf);
-		break;
-	case JAO_CERT:
-		lws_snprintf(s->cert_url, sizeof(s->cert_url), "%s", ctx->buf);
-		break;
-	}
-
-	return 0;
-}
-
-/* authz JSON parsing */
-
-static const char * const jauthz_tok[] = {
-	"identifier.type",
-	"identifier.value",
-	"status",
-	"expires",
-	"challenges[].type",
-	"challenges[].status",
-	"challenges[].url",
-	"challenges[].token",
-	"detail"
-};
-
-enum enum_jauthz_tok {
-	JAAZ_ID_TYPE,
-	JAAZ_ID_VALUE,
-	JAAZ_STATUS,
-	JAAZ_EXPIRES,
-	JAAZ_CHALLENGES_TYPE,
-	JAAZ_CHALLENGES_STATUS,
-	JAAZ_CHALLENGES_URL,
-	JAAZ_CHALLENGES_TOKEN,
-	JAAZ_DETAIL,
-};
-
-static signed char
-cb_authz(struct lejp_ctx *ctx, char reason)
-{
-	struct per_vhost_data__lws_acme_client *vhd = (struct per_vhost_data__lws_acme_client *)ctx->user;
-	struct acme_connection *s = vhd->ac;
-
-	if (reason == LEJPCB_CONSTRUCTED) {
-		s->yes = 0;
-		s->use = 0;
-		s->chall_token[0] = '\0';
-	}
-
-	if (!(reason & LEJP_FLAG_CB_IS_VALUE) || !ctx->path_match)
-		return 0;
-
-	switch (ctx->path_match - 1) {
-	case JAAZ_ID_TYPE:
-		break;
-	case JAAZ_ID_VALUE:
-		break;
-	case JAAZ_STATUS:
-		break;
-	case JAAZ_EXPIRES:
-		break;
-	case JAAZ_DETAIL:
-		lws_snprintf(s->detail, sizeof(s->detail), "%s", ctx->buf);
-		break;
-	case JAAZ_CHALLENGES_TYPE:
-		lwsl_notice("JAAZ_CHALLENGES_TYPE: %s\n", ctx->buf);
-		lws_acme_challenge_type expected_challenge = vhd->active_cert ? vhd->active_cert->challenge_type : LWS_ACME_CHALLENGE_TYPE_HTTP_01;
-		s->use = !strcmp(ctx->buf, expected_challenge == LWS_ACME_CHALLENGE_TYPE_DNS_01 ? "dns-01" : "http-01");
-		break;
-	case JAAZ_CHALLENGES_STATUS:
-		lws_strncpy(s->status, ctx->buf, sizeof(s->status));
-		break;
-	case JAAZ_CHALLENGES_URL:
-		lwsl_notice("JAAZ_CHALLENGES_URL: %s %d\n", ctx->buf, s->use);
-		if (s->use) {
-			lws_strncpy(s->challenge_uri, ctx->buf,
-				    sizeof(s->challenge_uri));
-			s->yes = s->yes | 2;
-		}
-		break;
-	case JAAZ_CHALLENGES_TOKEN:
-		lwsl_notice("JAAZ_CHALLENGES_TOKEN: %s %d\n", ctx->buf, s->use);
-		if (s->use) {
-			lws_strncpy(s->chall_token, ctx->buf,
-				    sizeof(s->chall_token));
-			s->yes = s->yes | 1;
-		}
-		break;
-	}
-
-	return 0;
-}
-
-/* challenge accepted JSON parsing */
-
-static const char * const jchac_tok[] = {
-	"type",
-	"status",
-	"uri",
-	"token",
-	"error.detail"
-};
-
-enum enum_jchac_tok {
-	JCAC_TYPE,
-	JCAC_STATUS,
-	JCAC_URI,
-	JCAC_TOKEN,
-	JCAC_DETAIL,
-};
-
-static signed char
-cb_chac(struct lejp_ctx *ctx, char reason)
-{
-	struct acme_connection *s = (struct acme_connection *)ctx->user;
-
-	if (reason == LEJPCB_CONSTRUCTED) {
-		s->yes = 0;
-		s->use = 0;
-	}
-
-	if (!(reason & LEJP_FLAG_CB_IS_VALUE) || !ctx->path_match)
-		return 0;
-
-	switch (ctx->path_match - 1) {
-	case JCAC_TYPE:
-		if (strcmp(ctx->buf, "http-01"))
-			return 1;
-		break;
-	case JCAC_STATUS:
-		lws_strncpy(s->status, ctx->buf, sizeof(s->status));
-		break;
-	case JCAC_URI:
-		s->yes = s->yes | 2;
-		break;
-	case JCAC_TOKEN:
-		lws_strncpy(s->chall_token, ctx->buf, sizeof(s->chall_token));
-		s->yes = s->yes | 1;
-		break;
-	case JCAC_DETAIL:
-		lws_snprintf(s->detail, sizeof(s->detail), "%s", ctx->buf);
-		break;
-	}
-
-	return 0;
-}
 
 static int
 lws_acme_report_status(struct lws_vhost *v, int state, const char *json)
@@ -700,8 +526,26 @@ lws_acme_client_connect(struct lws_context *context, struct lws_vhost *vh,
 	puri = lws_parse_uri_create(url);
 	if (!puri) {
 		lwsl_err("unable to parse uri %s\n", url);
-
 		return NULL;
+	}
+
+	{
+		const struct lws_protocols *prot = lws_vhost_name_to_protocol(vh, "lws-acme-client-core");
+		struct per_vhost_data__lws_acme_client *vhd = prot ? 
+			(struct per_vhost_data__lws_acme_client *)lws_protocol_vh_priv_get(vh, prot) : NULL;
+		
+		if (vhd && vhd->active_cert && vhd->active_cert->pvop[LWS_TLS_SET_DIR_URL]) {
+			lws_parse_uri_t *puri_dir = lws_parse_uri_create(vhd->active_cert->pvop[LWS_TLS_SET_DIR_URL]);
+			if (puri_dir) {
+				if (strcmp(puri_dir->host, puri->host)) {
+					lwsl_err("ACME SSRF attempt blocked! URL %s doesn't match dir host %s\n", url, puri_dir->host);
+					lws_parse_uri_destroy(&puri);
+					lws_parse_uri_destroy(&puri_dir);
+					return NULL;
+				}
+				lws_parse_uri_destroy(&puri_dir);
+			}
+		}
 	}
 
 	i->address = puri->host;
@@ -718,12 +562,25 @@ lws_acme_client_connect(struct lws_context *context, struct lws_vhost *vh,
 
 	i->context = context;
 	i->vhost = vh;
-	i->ssl_connection = LCCSCF_USE_SSL;
+	/*
+	 * The host check above is only applied to URLs we connect to
+	 * ourselves.  If lws followed a 3xx for us, it would go to whatever
+	 * host the Location names and the handshake would rebuild and send
+	 * our signed JWS (contact, order identifiers, CSR) there.  RFC 8555
+	 * has no step that redirects, so a 3xx is just a failed step
+	 */
+	i->ssl_connection = LCCSCF_USE_SSL | LCCSCF_HTTP_NO_FOLLOW_REDIRECT;
 	i->host = i->address;
 	i->origin = i->address;
 	i->method = method;
 	i->pwsi = pwsi;
 	i->protocol = "lws-acme-client-core";
+	/*
+	 * Pin http/1.1: if we let the context default ALPN be offered, CAs
+	 * like LE negotiate h2, and the h1 transaction wedges trying to adopt
+	 * the h2 mux instead of issuing the request, with no error
+	 */
+	i->alpn = "http/1.1";
 
 	wsi = lws_client_connect_via_info(i);
 	if (!wsi) {
@@ -741,32 +598,253 @@ lws_acme_client_connect(struct lws_context *context, struct lws_vhost *vh,
 	return wsi;
 }
 
+/*
+ * The private key for the cert we are asking for: scrub it before letting it
+ * go, whether the attempt is over or we are about to make another
+ */
+
+static void
+acme_privkey_discard(struct acme_connection *ac)
+{
+	if (!ac->alloc_privkey_pem)
+		return;
+
+	lws_explicit_bzero(ac->alloc_privkey_pem, ac->len_privkey_pem);
+	free(ac->alloc_privkey_pem);
+	ac->alloc_privkey_pem = NULL;
+	ac->len_privkey_pem = 0;
+}
+
+/* the acquisition and everything it collected */
+
+static void
+acme_connection_free(struct acme_connection *ac)
+{
+	acme_privkey_discard(ac);
+	acme_cert_rx_free(&ac->crx);
+	free(ac);
+}
+
 static void
 lws_acme_finished(struct per_vhost_data__lws_acme_client *vhd)
 {
 	lwsl_notice("%s\n", __func__);
-    lws_sul_cancel(&vhd->sul_aging);
+
+	lws_sul_cancel(&vhd->sul_watchdog);
 
 	if (vhd->ac) {
+		/*
+		 * We must not try to close ac->cwsi here: if the connection
+		 * was adopted into h2 by ALPN, it became an internal nwsi that
+		 * we get no close notification for, so the pointer can name an
+		 * already-freed wsi.  h1 transaction connections clean up via
+		 * their own lws timeouts, and CLIENT_CONNECTION_ERROR /
+		 * CLOSED_CLIENT_HTTP null ac->cwsi as they go.
+		 */
+		vhd->ac->cwsi = NULL;
+
 		if (vhd->ac->vhost)
 			lws_vhost_destroy(vhd->ac->vhost);
-		if (vhd->ac->alloc_privkey_pem)
-			free(vhd->ac->alloc_privkey_pem);
-		free(vhd->ac);
+		acme_connection_free(vhd->ac);
 	}
 
-	lws_genrsa_destroy(&vhd->rsactx);
+	/* acme_cb_dir's accumulator pointed into the ac we just freed */
+
+	vhd->dest = NULL;
+	vhd->pos = 0;
+	vhd->len = 0;
+
 	lws_jwk_destroy(&vhd->jwk);
 
-	if (vhd->dns_base_dir) {
-		free(vhd->dns_base_dir);
-		vhd->dns_base_dir = NULL;
-	}
+	/*
+	 * This runs at the end of each acquisition attempt, not on vhost
+	 * destroy: dns_base_dir, the cert_configs list and the periodic
+	 * aging timer are persistent state and must survive it
+	 */
 
 	vhd->ac = NULL;
+	vhd->last_acme_failure = 0;
 #if defined(LWS_WITH_ESP32)
 	lws_esp32.acme = 0; /* enable scanning */
 #endif
+}
+
+/* seconds to wait after the n'th consecutive failed acquisition:
+ * 1h, 2h, 4h, 8h, 16h, capped at 24h... still comfortably inside the
+ * renewal margin of a 6-day cert renewed at 25% life */
+static lws_usec_t
+acme_backoff_us(int fails)
+{
+	lws_usec_t u = 3600ll * LWS_USEC_PER_SEC << (fails > 5 ? 5 : fails);
+
+	return u > 24 * 3600ll * LWS_USEC_PER_SEC ?
+			24 * 3600ll * LWS_USEC_PER_SEC : u;
+}
+
+static void
+acme_note_failure(struct per_vhost_data__lws_acme_client *vhd)
+{
+	vhd->acme_fail_count++;
+	vhd->acme_retry_not_before = lws_now_usecs() +
+				     acme_backoff_us(vhd->acme_fail_count);
+	lwsl_vhost_warn(vhd->vhost, "acme: failed acquisition #%d, next "
+			"attempt in %llds", vhd->acme_fail_count,
+			(long long)(acme_backoff_us(vhd->acme_fail_count) /
+				    LWS_USEC_PER_SEC));
+}
+
+/* end the acquisition in progress as a failure, and back off */
+
+static void
+acme_fail_acquisition(struct per_vhost_data__lws_acme_client *vhd,
+		      const char *reason)
+{
+	if (vhd->ops && vhd->ops->challenge_cleanup)
+		vhd->ops->challenge_cleanup(vhd->vhost, vhd->challenge_priv);
+
+	lws_acme_report_status(vhd->vhost, LWS_CUS_FAILED, reason);
+	lws_acme_finished(vhd);
+	vhd->last_acme_failure = lws_now_usecs();
+	acme_note_failure(vhd);
+}
+
+/*
+ * IPC with the root daemon
+ *
+ * Every request we send is answered by one line (see acme_ipc_line()), and
+ * we must never take one request's answer for another's.  So when anything
+ * goes wrong with the connection, or an answer does not come in time, we
+ * drop the connection with everything outstanding on it, and treat each
+ * outstanding request as failed: late answers on the old connection can't
+ * reach us, and a fresh connection starts with nothing outstanding.
+ */
+
+#define ACME_IPC_REPLY_TIMEOUT_US (30 * LWS_US_PER_SEC)
+
+static int
+acme_ipc_cb(const struct lws_async_ipc_cb_args *args);
+static void
+acme_ipc_fail_cb(lws_sorted_usec_list_t *sul);
+
+static int
+acme_ipc_open(struct per_vhost_data__lws_acme_client *vhd)
+{
+	struct lws_async_ipc_info ipc_info;
+
+	memset(&ipc_info, 0, sizeof(ipc_info));
+	ipc_info.cx		= vhd->context;
+	ipc_info.uds_path	= vhd->ipc_uds_path;
+	ipc_info.cb		= acme_ipc_cb;
+	ipc_info.opaque		= vhd;
+
+	vhd->ipc = lws_async_ipc_create(&ipc_info);
+
+	return !vhd->ipc;
+}
+
+/* (re)start the reply timeout if anything is outstanding, else stop it */
+
+static void
+acme_ipc_arm(struct per_vhost_data__lws_acme_client *vhd)
+{
+	if (vhd->ipc_failing)
+		return; /* the failure handling is already scheduled */
+
+	if (vhd->ipc_pending_saves || vhd->aging_current_cert)
+		lws_sul_schedule(vhd->context, 0, &vhd->sul_ipc,
+				 acme_ipc_fail_cb, ACME_IPC_REPLY_TIMEOUT_US);
+	else
+		lws_sul_cancel(&vhd->sul_ipc);
+}
+
+/*
+ * Handled from the event loop rather than from inside the async ipc callback
+ * that reports it: the connection can fail synchronously inside
+ * lws_async_ipc_queue_payload(), ie, while a caller is still using the state
+ * the failure handling would free
+ */
+
+static void
+acme_ipc_fail(struct per_vhost_data__lws_acme_client *vhd)
+{
+	vhd->ipc_failing = 1;
+	lws_sul_schedule(vhd->context, 0, &vhd->sul_ipc, acme_ipc_fail_cb, 1);
+}
+
+/*
+ * Drop the connection and everything outstanding on it.  An aging validity
+ * check that was waiting counts as failed, and aging moves on to the next
+ * cert, on a new connection
+ */
+
+static void
+acme_ipc_abandon(struct per_vhost_data__lws_acme_client *vhd)
+{
+	lws_sul_cancel(&vhd->sul_ipc);
+	vhd->ipc_failing = 0;
+	vhd->ipc_pending_saves = 0;
+	vhd->ipc_rx.len = 0;
+
+	lws_async_ipc_destroy(&vhd->ipc);
+	if (acme_ipc_open(vhd))
+		lwsl_vhost_err(vhd->vhost, "acme: unable to recreate IPC");
+
+	if (vhd->aging_current_cert) {
+		lwsl_vhost_warn(vhd->vhost, "acme_aging: validity check abandoned");
+		vhd->aging_current_cert = lws_dll2_get_next(vhd->aging_current_cert);
+		acme_aging_next_cert(vhd);
+	}
+}
+
+static void
+acme_ipc_fail_cb(lws_sorted_usec_list_t *sul)
+{
+	struct per_vhost_data__lws_acme_client *vhd = lws_container_of(sul,
+			struct per_vhost_data__lws_acme_client, sul_ipc);
+	int had_saves = vhd->ipc_pending_saves;
+
+	lwsl_vhost_warn(vhd->vhost, "acme: IPC with the root daemon failed or "
+			"stalled with %d save(s)%s outstanding", had_saves,
+			vhd->aging_current_cert ? " and a validity check" : "");
+
+	acme_ipc_abandon(vhd);
+
+	/* what this acquisition asked the daemon to store may not be stored */
+	if (had_saves && vhd->ac)
+		acme_fail_acquisition(vhd, "IPC with the root daemon failed");
+}
+
+/*
+ * If any single acquisition attempt wedges (eg, the CA connection stops
+ * responding, or a connection error is not noticed), the busy marker vhd->ac
+ * would otherwise block all future renewal attempts until restart
+ */
+static void
+lws_acme_watchdog_cb(lws_sorted_usec_list_t *sul)
+{
+	struct per_vhost_data__lws_acme_client *vhd = lws_container_of(sul,
+			struct per_vhost_data__lws_acme_client, sul_watchdog);
+
+	if (!vhd->ac)
+		return;
+
+	{
+		const char *cn = vhd->active_cert ?
+				vhd->active_cert->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME] : NULL;
+		lwsl_vhost_warn(vhd->vhost, "ACME transaction watchdog timeout for %s "
+				"(state %s), abandoning this attempt",
+				cn ? cn : "unknown",
+				acme_state_name(vhd->ac->state));
+	}
+
+	/*
+	 * Answers still owed to this attempt must not be counted against
+	 * anything later, so they go with it
+	 */
+	if (vhd->ipc_pending_saves)
+		acme_ipc_abandon(vhd);
+
+	acme_fail_acquisition(vhd, "ACME transaction watchdog timeout");
 }
 
 
@@ -777,15 +855,37 @@ lws_acme_load_create_auth_keys(struct per_vhost_data__lws_acme_client *vhd,
 	int n;
 
 	if (!lws_jwk_load(&vhd->jwk, vhd->active_cert->pvop[LWS_TLS_SET_AUTH_PATH],
-				NULL, NULL))
-		return 0;
+				NULL, NULL)) {
+		if (acme_jws_alg(&vhd->jwk))
+			return 0;
 
-	vhd->jwk.kty = LWS_GENCRYPTO_KTY_RSA;
+		/* we make P-256 keys, but an older or imported one may differ */
+		lwsl_vhost_err(vhd->vhost, "acme: account key %s is not RSA, "
+			       "P-256 or P-384, unable to sign with it",
+			       vhd->active_cert->pvop[LWS_TLS_SET_AUTH_PATH]);
+		lws_jwk_destroy(&vhd->jwk);
+		vhd->last_acme_failure = lws_now_usecs();
 
-	lwsl_notice("Generating ACME %d-bit keypair... "
-			"will take a little while\n", bits);
-	n = lws_genrsa_new_keypair(vhd->context, &vhd->rsactx, LGRSAM_PKCS1_1_5,
-			vhd->jwk.e, bits);
+		return 1;
+	}
+
+	vhd->jwk.kty = LWS_GENCRYPTO_KTY_EC;
+
+	lwsl_notice("Generating ACME P-256 keypair... "
+			"will take a little while\n");
+
+	struct lws_genec_ctx ecdsa;
+
+	memset(&ecdsa, 0, sizeof(ecdsa));
+
+	if (lws_genecdsa_create(&ecdsa, vhd->context, NULL)) {
+		lwsl_vhost_warn(vhd->vhost, "failed to create ecdsa ctx");
+		return 1;
+	}
+
+	n = lws_genecdsa_new_keypair(&ecdsa, "P-256", vhd->jwk.e);
+	lws_genec_destroy(&ecdsa);
+
 	if (n) {
 		lwsl_vhost_warn(vhd->vhost, "failed to create keypair");
 		return 1;
@@ -794,45 +894,61 @@ lws_acme_load_create_auth_keys(struct per_vhost_data__lws_acme_client *vhd,
 	lwsl_notice("...keypair generated\n");
 
 	if (lws_jwk_save(&vhd->jwk, vhd->active_cert->pvop[LWS_TLS_SET_AUTH_PATH])) {
-        lwsl_vhost_notice(vhd->vhost, "falling back to ACME footprint IPC to save %s", vhd->active_cert->pvop[LWS_TLS_SET_AUTH_PATH]);
-        char tmp_path[256];
-        lws_snprintf(tmp_path, sizeof(tmp_path), "/tmp/lws-acme-auth-%d.jwk", getpid());
-        if (!lws_jwk_save(&vhd->jwk, tmp_path)) {
-            int fd = open(tmp_path, O_RDONLY);
-            int success = 0;
-            if (fd >= 0) {
-                struct stat st;
-                if (!fstat(fd, &st) && st.st_size > 0) {
-                    char *buf = malloc((size_t)st.st_size);
-                    if (buf && read(fd, buf, (size_t)st.st_size) == st.st_size) {
-                        const char *fp = vhd->active_cert->pvop[LWS_TLS_SET_AUTH_PATH];
-                        const char *fn = strrchr(fp, '/');
-                        if (fn) fn++; else fn = fp;
-                        int r = acme_ipc_save_payload(vhd->context, "/var/run/lws-dnssec-monitor.sock",
-                            "save_auth_key",
-                            vhd->active_cert->pvop[LWS_TLS_SET_ROOT_DOMAIN] ? vhd->active_cert->pvop[LWS_TLS_SET_ROOT_DOMAIN] : vhd->active_cert->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME],
-                            fn,
-                            buf, (size_t)st.st_size);
-                        if (!r) success = 1;
-                    }
-                    if (buf) free(buf);
-                }
-                close(fd);
-            }
-            unlink(tmp_path);
-            if (!success) {
-                lwsl_vhost_warn(vhd->vhost, "unable to save %s via footprint IPC",
-                        vhd->active_cert->pvop[LWS_TLS_SET_AUTH_PATH]);
-                return 1;
-            }
-        } else {
-            lwsl_vhost_warn(vhd->vhost, "unable to save %s",
-                    vhd->active_cert->pvop[LWS_TLS_SET_AUTH_PATH]);
-            return 1;
-        }
+		const char *fp = vhd->active_cert->pvop[LWS_TLS_SET_AUTH_PATH];
+		const char *fn = strrchr(fp, '/');
+		int buflen = 4096, r = -1;
+		char *buf;
+
+		lwsl_vhost_notice(vhd->vhost, "falling back to ACME footprint IPC to save %s", fp);
+
+		/*
+		 * Q-35/Q-31: the unprivileged ACME client cannot write the
+		 * real key path, so it exports the JWK into heap and relays
+		 * it to the privileged daemon via acme_ipc_save_payload(),
+		 * which stores it at the real path.  The private key never
+		 * touches the filesystem on this side.
+		 */
+
+		buf = malloc((size_t)buflen);
+		if (buf) {
+			int n = lws_jwk_export(&vhd->jwk, LWSJWKF_EXPORT_PRIVATE,
+					       buf, &buflen);
+
+			if (n > 0)
+				r = acme_ipc_save_payload(vhd, "save_auth_key",
+					vhd->active_cert->pvop[LWS_TLS_SET_ROOT_DOMAIN] ?
+					vhd->active_cert->pvop[LWS_TLS_SET_ROOT_DOMAIN] :
+					vhd->active_cert->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME],
+					fn ? fn + 1 : fp, buf, (size_t)n);
+
+			lws_explicit_bzero(buf, 4096);
+			free(buf);
+		}
+
+		if (r) {
+			lwsl_vhost_warn(vhd->vhost, "unable to save %s via footprint IPC", fp);
+			vhd->last_acme_failure = lws_now_usecs();
+			return 1;
+		}
 	}
 
 	return 0;
+}
+
+static int
+lws_acme_start_acquisition(struct per_vhost_data__lws_acme_client *vhd,
+		struct lws_vhost *v);
+
+LWS_VISIBLE void
+lws_acme_core_destroy_vhost(struct per_vhost_data__lws_acme_client *vhd);
+
+static void
+lws_acme_start_acquisition_cb(lws_sorted_usec_list_t *sul)
+{
+	struct per_vhost_data__lws_acme_client *vhd = lws_container_of(sul,
+			struct per_vhost_data__lws_acme_client, sul_acquisition);
+
+	lws_acme_start_acquisition(vhd, vhd->vhost);
 }
 
 static int
@@ -851,14 +967,31 @@ lws_acme_start_acquisition(struct per_vhost_data__lws_acme_client *vhd,
 		return 0;
 	}
 
+	if (vhd->last_acme_failure &&
+	    lws_now_usecs() - vhd->last_acme_failure < 60 * LWS_US_PER_SEC) {
+		lwsl_vhost_notice(vhd->vhost, "acme: recent failure, cooling down");
+		return 0;
+	}
+
 	/*
 	 * ...well... we should try to do something about it then...
 	 */
-	lwsl_vhost_notice(vhd->vhost, "ACME cert needs creating / updating:  "
-			"vhost %s", lws_get_vhost_name(vhd->vhost));
+	lwsl_vhost_notice(vhd->vhost, "ACME cert needs creating / updating: %s "
+			"(via vhost %s)", vhd->active_cert->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME], lws_get_vhost_name(vhd->vhost));
 
 	vhd->ac = malloc(sizeof(*vhd->ac));
+	if (!vhd->ac) {
+		lwsl_vhost_err(vhd->vhost, "acme: OOM allocating acquisition");
+
+		return 1;
+	}
 	memset(vhd->ac, 0, sizeof(*vhd->ac));
+
+	/* a healthy acquisition, including the 20s dns-01 propagation wait
+	 * and LE-side validation polling, completes in well under this; the
+	 * watchdog unwedges stuck ones */
+	lws_sul_schedule(vhd->context, 0, &vhd->sul_watchdog,
+			 lws_acme_watchdog_cb, 600 * LWS_US_PER_SEC);
 
 	/*
 	 * So if we don't have it, the first job is get the directory.
@@ -894,7 +1027,7 @@ lws_acme_start_acquisition(struct per_vhost_data__lws_acme_client *vhd,
 
 	lws_acme_report_status(vhd->vhost, LWS_CUS_CREATE_KEYS,
 			"Generating auth keys, please wait");
-	if (lws_acme_load_create_auth_keys(vhd, 4096))
+	if (lws_acme_load_create_auth_keys(vhd, 2048))
 		goto bail;
 	lws_acme_report_status(vhd->vhost, LWS_CUS_CREATE_KEYS,
 			"Auth keys created");
@@ -904,7 +1037,7 @@ lws_acme_start_acquisition(struct per_vhost_data__lws_acme_client *vhd,
 		return 0;
 
 bail:
-	free(vhd->ac);
+	acme_connection_free(vhd->ac);
 	vhd->ac = NULL;
 
 	return 1;
@@ -914,6 +1047,33 @@ struct acme_scan_ctx {
 	struct per_vhost_data__lws_acme_client *vhd;
 	char domain[256];
 };
+
+/*
+ * Domain directory names and config common-names end up in the JSON control
+ * messages we send to the root-privileged daemon, and (for dns-01) in the zone
+ * lines it signs.  Nothing that is not a plausible hostname has any business
+ * being there, so refuse it at the point we load it rather than relying on
+ * escaping downstream.  '*' is allowed for wildcard certs.
+ */
+static int
+acme_valid_hostname(const char *p)
+{
+	size_t n = 0;
+
+	if (!p || !*p)
+		return 0;
+
+	while (*p) {
+		if (!isalnum((unsigned char)*p) && *p != '.' && *p != '-' &&
+		    *p != '_' && *p != '*')
+			return 0;
+		p++;
+		if (++n > 255)
+			return 0;
+	}
+
+	return 1;
+}
 
 static int
 lws_acme_scan_dir_cb(const char *dirpath, void *user, struct lws_dir_entry *lde)
@@ -964,6 +1124,11 @@ lws_acme_scan_dir_cb(const char *dirpath, void *user, struct lws_dir_entry *lde)
     }
 
     cfg = (struct lws_acme_cert_config *)args.dest;
+    if (cfg && !acme_valid_hostname(cfg->common_name)) {
+        lwsl_vhost_err(vhd->vhost, "acme: %s: refusing invalid common-name", path);
+        goto done;
+    }
+
     if (cfg) {
 		char common_name_s[128];
 		char dir_path[256];
@@ -993,15 +1158,20 @@ lws_acme_scan_dir_cb(const char *dirpath, void *user, struct lws_dir_entry *lde)
 			*q = '\0';
 
 			char *certs_dir = dir_path;
+			const char *env_dir = (cfg->acme && cfg->acme->directory_url && (char *)strstr(cfg->acme->directory_url, "staging")) ? "staging" : "production";
 			lws_snprintf(certs_dir, sizeof(dir_path), "%s/domains/%s/certs", vhd->dns_base_dir, scan_ctx->domain);
 #if !defined(WIN32) && !defined(LWS_WITH_ESP32)
-			mkdir(certs_dir, 0700);
+			mkdir(certs_dir, 0750);
 #endif
-			lws_snprintf(certs_dir, sizeof(dir_path), "%s/domains/%s/certs/crt", vhd->dns_base_dir, scan_ctx->domain);
+			lws_snprintf(certs_dir, sizeof(dir_path), "%s/domains/%s/certs/%s", vhd->dns_base_dir, scan_ctx->domain, env_dir);
 #if !defined(WIN32) && !defined(LWS_WITH_ESP32)
-			mkdir(certs_dir, 0700);
+			mkdir(certs_dir, 0750);
 #endif
-			lws_snprintf(certs_dir, sizeof(dir_path), "%s/domains/%s/certs/key", vhd->dns_base_dir, scan_ctx->domain);
+			lws_snprintf(certs_dir, sizeof(dir_path), "%s/domains/%s/certs/%s/crt", vhd->dns_base_dir, scan_ctx->domain, env_dir);
+#if !defined(WIN32) && !defined(LWS_WITH_ESP32)
+			mkdir(certs_dir, 0750);
+#endif
+			lws_snprintf(certs_dir, sizeof(dir_path), "%s/domains/%s/certs/%s/key", vhd->dns_base_dir, scan_ctx->domain, env_dir);
 #if !defined(WIN32) && !defined(LWS_WITH_ESP32)
 			mkdir(certs_dir, 0700);
 #endif
@@ -1011,15 +1181,22 @@ lws_acme_scan_dir_cb(const char *dirpath, void *user, struct lws_dir_entry *lde)
 			char *cert_path = (char *)malloc(len);
 			char *key_path = (char *)malloc(len);
 			char *auth_path = (char *)malloc(len);
+			char *root_domain = strdup(scan_ctx->domain);
 
-			if (cert_path && key_path && auth_path) {
-				lws_snprintf(cert_path, len, "%s/domains/%s/certs/crt/%s-latest.crt", vhd->dns_base_dir, scan_ctx->domain, common_name_s);
-				lws_snprintf(key_path, len, "%s/domains/%s/certs/key/%s-latest.key", vhd->dns_base_dir, scan_ctx->domain, common_name_s);
+			if (cert_path && key_path && auth_path && root_domain) {
+				lws_snprintf(cert_path, len, "%s/domains/%s/certs/%s/crt/%s-latest.crt", vhd->dns_base_dir, scan_ctx->domain, env_dir, common_name_s);
+				lws_snprintf(key_path, len, "%s/domains/%s/certs/%s/key/%s-latest.key", vhd->dns_base_dir, scan_ctx->domain, env_dir, common_name_s);
 				lws_snprintf(auth_path, len, "%s/domains/%s/%s-auth.jwk", vhd->dns_base_dir, scan_ctx->domain, common_name_s);
 
 				cfg->pvop[LWS_TLS_SET_CERT_PATH] = cert_path;
 				cfg->pvop[LWS_TLS_SET_KEY_PATH] = key_path;
 				cfg->pvop[LWS_TLS_SET_AUTH_PATH] = auth_path;
+				cfg->pvop[LWS_TLS_SET_ROOT_DOMAIN] = root_domain;
+			} else {
+				if (cert_path) free(cert_path);
+				if (key_path) free(key_path);
+				if (auth_path) free(auth_path);
+				if (root_domain) free(root_domain);
 			}
 		}
 
@@ -1055,8 +1232,24 @@ lws_acme_scan_domains_cb(const char *dirpath, void *user, struct lws_dir_entry *
 	if (!strcmp(lde->name, ".") || !strcmp(lde->name, ".."))
 		return 0;
 
+	/* the directory name is used as the domain in the daemon IPC */
+	if (!acme_valid_hostname(lde->name)) {
+		lwsl_vhost_warn(vhd->vhost, "acme: ignoring domain dir '%s': "
+				"not a valid hostname", lde->name);
+		return 0;
+	}
+
 	scan_ctx.vhd = vhd;
 	lws_strncpy(scan_ctx.domain, lde->name, sizeof(scan_ctx.domain));
+
+	char disabled_path[512];
+	lws_snprintf(disabled_path, sizeof(disabled_path), "%s/domains/%s/acme_disabled", vhd->dns_base_dir, lde->name);
+	int fd = open(disabled_path, O_RDONLY);
+	if (fd >= 0) {
+		close(fd);
+		lwsl_notice("acme: Skipping domain %s (acme_disabled present)\n", lde->name);
+		return 0;
+	}
 
 	lws_snprintf(path, sizeof(path), "%s/domains/%s/conf.d", vhd->dns_base_dir, lde->name);
 
@@ -1085,6 +1278,266 @@ lws_acme_timer_cb(lws_sorted_usec_list_t *sul)
     lws_sul_schedule(vhd->context, 0, &vhd->sul_aging, lws_acme_timer_cb, 3600 * LWS_US_PER_SEC);
 }
 
+#if defined(LWS_WITH_SYS_SMD)
+
+/*
+ * {"acme":"force-reissue","domain":"example.com",
+ *  "common-name":"www.example.com"} on LWSSMDCL_CERTS marks the cert we
+ * manage for that common-name in that domain to be reissued however much
+ * validity it has left, and brings the next evaluation forward to now
+ */
+
+static const char * const acme_smd_paths[] = {
+	"acme",
+	"domain",
+	"common-name",
+};
+
+struct acme_smd_req {
+	char acme[32];
+	char domain[128];
+	char cn[128];
+};
+
+static signed char
+acme_smd_req_cb(struct lejp_ctx *ctx, char reason)
+{
+	struct acme_smd_req *r = (struct acme_smd_req *)ctx->user;
+
+	if (reason != LEJPCB_VAL_STR_END || !ctx->path_match)
+		return 0;
+
+	switch (ctx->path_match - 1) {
+	case 0:
+		lws_strncpy(r->acme, ctx->buf, sizeof(r->acme));
+		break;
+	case 1:
+		lws_strncpy(r->domain, ctx->buf, sizeof(r->domain));
+		break;
+	case 2:
+		lws_strncpy(r->cn, ctx->buf, sizeof(r->cn));
+		break;
+	}
+
+	return 0;
+}
+
+static int
+acme_smd_cb(void *opaque, lws_smd_class_t _class, lws_usec_t timestamp,
+	    void *buf, size_t len)
+{
+	struct per_vhost_data__lws_acme_client *vhd =
+			(struct per_vhost_data__lws_acme_client *)opaque;
+	struct acme_smd_req r;
+	struct lejp_ctx ctx;
+	int m, matched = 0;
+
+	memset(&r, 0, sizeof(r));
+	lejp_construct(&ctx, acme_smd_req_cb, &r, acme_smd_paths,
+		       LWS_ARRAY_SIZE(acme_smd_paths));
+	m = lejp_parse(&ctx, (const uint8_t *)buf, (int)len);
+	lejp_destruct(&ctx);
+
+	if (m < 0 || strcmp(r.acme, "force-reissue") || !r.domain[0] ||
+	    !r.cn[0])
+		return 0;
+
+	lws_start_foreach_dll(struct lws_dll2 *, d,
+			      lws_dll2_get_head(&vhd->cert_configs)) {
+		struct lws_acme_cert_config *cfg = lws_container_of(d,
+					struct lws_acme_cert_config, list);
+		/* the same notion of a cert's domain that aging uses */
+		const char *domain = cfg->pvop[LWS_TLS_SET_ROOT_DOMAIN] ?
+				cfg->pvop[LWS_TLS_SET_ROOT_DOMAIN] :
+				cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME];
+		const char *cn = cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME];
+
+		if (domain && cn && !strcmp(domain, r.domain) &&
+		    !strcmp(cn, r.cn)) {
+			cfg->force_reissue = 1;
+			matched = 1;
+		}
+	} lws_end_foreach_dll(d);
+
+	if (!matched)
+		return 0;
+
+	/* it matched one of our certs, so it's fine to log */
+	lwsl_vhost_notice(vhd->vhost, "acme: reissue of %s (%s) forced",
+			  r.cn, r.domain);
+
+	/*
+	 * Evaluate now, the timer puts itself back to hourly after.  If an
+	 * evaluation or acquisition is already running this one declines, and
+	 * the flags wait for the next
+	 */
+	lws_sul_schedule(vhd->context, 0, &vhd->sul_aging, lws_acme_timer_cb, 1);
+
+	return 0;
+}
+#endif
+
+/* the cert was fetched, and every save we asked the daemon for is answered */
+
+static void
+acme_ipc_saves_done(struct per_vhost_data__lws_acme_client *vhd)
+{
+	if (vhd->ac->save_refused) {
+		acme_fail_acquisition(vhd, "root daemon could not store the cert");
+		return;
+	}
+
+	lws_acme_finished(vhd);
+	lws_acme_report_status(vhd->vhost, LWS_CUS_SUCCESS, NULL);
+	/* cert fetched AND stored: clear the acquisition failure backoff */
+	vhd->acme_fail_count = 0;
+	vhd->acme_retry_not_before = 0;
+}
+
+/* the answer to the aging validity check for vhd->aging_current_cert */
+
+static void
+acme_ipc_validity(struct per_vhost_data__lws_acme_client *vhd,
+		  const struct acme_ipc_reply *r)
+{
+	struct lws_acme_cert_config *cfg = lws_container_of(
+			vhd->aging_current_cert, struct lws_acme_cert_config, list);
+	lws_usec_t now;
+
+	if (!cfg->force_reissue && r->ok &&
+	    !(r->total_days && r->days_left <= (r->total_days / 4))) {
+		lwsl_vhost_notice(vhd->vhost, "acme: cert %s: %d days left, total %d (skip renewal)", cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME], r->days_left, r->total_days);
+		vhd->aging_current_cert = lws_dll2_get_next(vhd->aging_current_cert);
+		acme_aging_next_cert(vhd);
+		return;
+	}
+
+	now = lws_now_usecs();
+	if (now < vhd->acme_retry_not_before) {
+		/* a recent acquisition for this failed:
+		 * don't hammer the CA with repeated
+		 * orders for the same cert (LE allows
+		 * 5 duplicates / 7 days) */
+		lwsl_vhost_notice(vhd->vhost, "acme_aging: %s still needs a cert "
+			"but backing off, next attempt in %llds",
+			cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME],
+			(long long)((vhd->acme_retry_not_before - now) /
+				    LWS_USEC_PER_SEC));
+		vhd->aging_current_cert = lws_dll2_get_next(vhd->aging_current_cert);
+		acme_aging_next_cert(vhd);
+		return;
+	}
+
+	if (cfg->force_reissue)
+		lwsl_vhost_notice(vhd->vhost, "acme_aging: cert %s has %d days left (total %d). Forced reissue!", cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME], r->days_left, r->total_days);
+	else if (!r->ok)
+		lwsl_notice("acme_aging: triggering acquisition for %s: root daemon could not read cert\n", cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME]);
+	else
+		lwsl_vhost_notice(vhd->vhost, "acme_aging: cert %s has %d days left (total %d). Triggering renewal!", cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME], r->days_left, r->total_days);
+
+	cfg->force_reissue = 0;
+	vhd->active_cert = cfg;
+	for (int n = 0; n < LWS_TLS_TOTAL_COUNT; n++) {
+		if (vhd->aging_caa.element_overrides[n])
+			vhd->active_cert->pvop[n] = vhd->aging_caa.element_overrides[n];
+	}
+	lws_sul_schedule(vhd->context, 0, &vhd->sul_acquisition,
+			 lws_acme_start_acquisition_cb, 100 * LWS_US_PER_MS);
+	vhd->aging_current_cert = NULL;
+}
+
+/*
+ * One complete line from the daemon.  Each of our requests gets exactly one
+ * answer line, but lines that answer nothing of ours come too, so match them
+ * by what they answer, not by arrival
+ */
+
+static int
+acme_ipc_line(void *opaque, const char *line, size_t len)
+{
+	struct per_vhost_data__lws_acme_client *vhd =
+			(struct per_vhost_data__lws_acme_client *)opaque;
+	struct acme_ipc_reply r;
+
+	acme_ipc_classify(line, len, &r);
+
+	switch (r.type) {
+	case ACME_IPC_LINE_SAVE:
+		if (!vhd->ipc_pending_saves)
+			break; /* not ours */
+		vhd->ipc_pending_saves--;
+
+		if (!r.ok) {
+			lwsl_vhost_warn(vhd->vhost, "acme: root daemon refused "
+					"a save: %.*s", (int)len, line);
+			if (r.stores_cert && vhd->ac)
+				vhd->ac->save_refused = 1;
+		}
+
+		acme_ipc_arm(vhd);
+
+		if (!vhd->ipc_pending_saves && vhd->ac && vhd->ac->saves_awaited)
+			acme_ipc_saves_done(vhd);
+		break;
+
+	case ACME_IPC_LINE_VALIDITY:
+		if (!vhd->aging_current_cert)
+			break; /* not ours */
+
+		acme_ipc_validity(vhd, &r);
+		acme_ipc_arm(vhd);
+		break;
+
+	case ACME_IPC_LINE_REFUSED:
+		if (!vhd->ipc_pending_saves && !vhd->aging_current_cert)
+			break;
+
+		/* it was one of ours, but which?  Everything outstanding fails */
+		lwsl_vhost_warn(vhd->vhost, "acme: root daemon refused a request: "
+				"%.*s", (int)len, line);
+		acme_ipc_fail(vhd);
+
+		return 1; /* nothing more on this connection is taken as an answer */
+
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+static int
+acme_ipc_cb(const struct lws_async_ipc_cb_args *args)
+{
+	struct per_vhost_data__lws_acme_client *vhd = args->opaque;
+
+	switch (args->state) {
+	case LWS_ASYNC_IPC_STATE_TIMEOUT:
+	case LWS_ASYNC_IPC_STATE_ERROR:
+		/* the connection and its queue are gone, and anything owed on it */
+		lwsl_vhost_err(vhd->vhost, "acme: IPC with the root daemon %s",
+			       args->state == LWS_ASYNC_IPC_STATE_TIMEOUT ?
+					"timed out" : "failed");
+		acme_ipc_fail(vhd);
+		break;
+
+	case LWS_ASYNC_IPC_STATE_CONNECTED:
+		vhd->ipc_rx.len = 0;
+		break;
+
+	case LWS_ASYNC_IPC_STATE_RX:
+		if (!vhd->ipc_failing)
+			acme_ipc_rx(&vhd->ipc_rx, (const char *)args->data,
+				    args->len, acme_ipc_line, vhd);
+		break;
+
+	default:
+		break;
+	}
+
+	return 0;
+}
+
 static int
 callback_acme_client(struct lws *wsi, enum lws_callback_reasons reason,
 		void *user, void *in, size_t len)
@@ -1101,6 +1554,7 @@ callback_acme_client(struct lws *wsi, enum lws_callback_reasons reason,
 	const char *content_type;
 	struct lws_jwe jwe;
 	struct lws *cwsi;
+	size_t leaf_len;
 	int n, m;
 
 	if (vhd)
@@ -1110,13 +1564,12 @@ callback_acme_client(struct lws *wsi, enum lws_callback_reasons reason,
 
 	switch ((int)reason) {
 	case LWS_CALLBACK_PROTOCOL_INIT:
+		if (lws_cmdline_option_cx(lws_get_context(wsi), "--lws-stub"))
+			return 0;
 		if (!in)
 			return 0;
 
-		/*
-		 * Don't run ACME certificate acquisition inside the root-monitor
-		 * spawned process to avoid duplicated challenges.
-		 */
+		/* ACME now runs globally in the root-monitor */
 		if (lws_cmdline_option_cx(lws_get_context(wsi), "--lws-dht-dnssec-monitor-root"))
 			return 0;
 
@@ -1145,31 +1598,63 @@ callback_acme_client(struct lws *wsi, enum lws_callback_reasons reason,
 			}
 			vhd->dns_base_dir = strdup(policy->dns_base_dir);
 			lws_system_policy_free(policy);
+
+			const struct lws_protocol_vhost_options *pvo = (const struct lws_protocol_vhost_options *)in;
+			while (pvo) {
+				if (!strcmp(pvo->name, "uds-path"))
+					vhd->uds_path = pvo->value;
+				pvo = pvo->next;
+			}
+
+			vhd->ipc_uds_path = vhd->uds_path;
+			if (!vhd->ipc_uds_path)
+				vhd->ipc_uds_path = lws_cmdline_option_cx(
+						vhd->context, "--uds-path");
+			if (!vhd->ipc_uds_path)
+				vhd->ipc_uds_path = "/var/run/lws-dnssec-monitor.sock";
+
+			acme_ipc_open(vhd);
 		}
 
         {
             struct lws_dir_info info;
             char path[512];
             int ret;
+
             memset(&info, 0, sizeof(info));
             lws_snprintf(path, sizeof(path), "%s/domains", vhd->dns_base_dir);
-            lwsl_notice("acme: Scanning base domains dir %s\n", path);
-            info.dirpath = path;
-            info.user = vhd;
-            info.cb = lws_acme_scan_domains_cb;
+            lwsl_notice("acme: ACME PLUGIN INIT! Scanning base domains dir %s\n", path);
+
+            info.dirpath        = path;
+            info.user           = vhd;
+            info.cb             = lws_acme_scan_domains_cb;
+
             ret = lws_dir_via_info(&info);
-            if (ret)
-                lwsl_err("acme: Failed to scan domains dir %s\n", path);
+            if (ret != 1)
+                lwsl_err("acme: Failed to scan domains dir %s (err %d)\n", path, ret);
+            else
+
+                lwsl_notice("acme: Found %d cert configs in base dir\n", (int)lws_dll2_count(
+                	&vhd->cert_configs));
         }
 
         /* Start polling domain cert lifetimes */
         lws_sul_schedule(vhd->context, 0, &vhd->sul_aging, lws_acme_timer_cb, 5 * LWS_US_PER_SEC);
 
+#if defined(LWS_WITH_SYS_SMD)
+		if (!vhd->smd_peer)
+			vhd->smd_peer = lws_smd_register(vhd->context, vhd, 0,
+							 LWSSMDCL_CERTS, acme_smd_cb);
+#endif
+
 		break;
 
 	case LWS_CALLBACK_PROTOCOL_DESTROY:
-		if (vhd)
-			lws_acme_finished(vhd);
+		if (vhd) {
+			lws_acme_core_destroy_vhost(vhd);
+			if (vhd->ipc)
+				lws_async_ipc_destroy(&vhd->ipc);
+		}
 		break;
 
 	case LWS_CALLBACK_VHOST_CERT_AGING:
@@ -1177,33 +1662,10 @@ callback_acme_client(struct lws *wsi, enum lws_callback_reasons reason,
 			break;
 
 		caa = (struct lws_acme_cert_aging_args *)in;
-		/*
-		 * Somebody is telling us about a cert some vhost is using.
-		 *
-		 * First see if the cert is getting close enough to expiry that
-		 * we *want* to do something about it.
-		 */
-		if ((int)(ssize_t)len > 14)
-			break;
-
-		/*
-		 * ...is this a vhost we were configured on?
-		 */
 		if (vhd->vhost != caa->vh)
 			return 1;
 
-		if (!vhd->active_cert)
-			return 1; /* For now, just operate on the single active certificate during aging */
-
-		for (n = 0; n < LWS_TLS_TOTAL_COUNT; n++)
-			if (caa->element_overrides[n])
-				vhd->active_cert->pvop[n] = caa->element_overrides[n];
-
-		lwsl_notice("starting acme acquisition on %s: %s\n",
-				lws_get_vhost_name(caa->vh),
-				vhd->active_cert->pvop[LWS_TLS_SET_DIR_URL]);
-
-		lws_acme_start_acquisition(vhd, caa->vh);
+		lws_acme_core_cert_aging(vhd, caa);
 		break;
 
 	/*
@@ -1217,6 +1679,14 @@ callback_acme_client(struct lws *wsi, enum lws_callback_reasons reason,
 		ac->resp = (int)lws_http_client_http_response(wsi);
         lwsl_vhost_notice(vhd->vhost, "ACME Received Response: [wsi=%p] HTTP %d (State %d)", wsi, ac->resp, ac->state);
 
+		/* we never follow a redirect, see lws_acme_client_connect() */
+		if (ac->resp >= 300 && ac->resp < 400) {
+			lwsl_vhost_warn(vhd->vhost, "acme: %s: HTTP %d redirect "
+					"refused", acme_state_name(ac->state),
+					ac->resp);
+			goto failed;
+		}
+
 		/* we get a new nonce each time */
 		if (lws_hdr_total_length(wsi, WSI_TOKEN_REPLAY_NONCE) &&
 				lws_hdr_copy(wsi, ac->replay_nonce,
@@ -1229,8 +1699,8 @@ callback_acme_client(struct lws *wsi, enum lws_callback_reasons reason,
 
 		switch (ac->state) {
 		case ACME_STATE_DIRECTORY:
-			lejp_construct(&ac->jctx, cb_dir, vhd, jdir_tok,
-					LWS_ARRAY_SIZE(jdir_tok));
+			lejp_construct(&ac->jctx, acme_cb_dir, vhd, acme_jdir_tok,
+					LWS_ARRAY_SIZE(acme_jdir_tok));
 			break;
 
 		case ACME_STATE_NEW_NONCE:
@@ -1243,7 +1713,7 @@ callback_acme_client(struct lws *wsi, enum lws_callback_reasons reason,
 			ac->state = ACME_STATE_NEW_ACCOUNT;
 			lws_acme_report_status(vhd->vhost, LWS_CUS_REG, NULL);
 
-			strcpy(buf, ac->urls[JAD_NEW_ACCOUNT_URL]);
+			lws_strncpy(buf, ac->urls[JAD_NEW_ACCOUNT_URL], sizeof(buf));
 			cwsi = lws_acme_client_connect(vhd->context, vhd->vhost,
 					&ac->cwsi, &ac->i, buf, "POST");
 			if (!cwsi) {
@@ -1283,28 +1753,29 @@ callback_acme_client(struct lws *wsi, enum lws_callback_reasons reason,
 				goto failed;
 			}
 
-			lejp_construct(&ac->jctx, cb_order, ac, jorder_tok,
-					LWS_ARRAY_SIZE(jorder_tok));
+			lejp_construct(&ac->jctx, acme_cb_order, ac, acme_jorder_tok,
+					LWS_ARRAY_SIZE(acme_jorder_tok));
 			break;
 
 		case ACME_STATE_AUTHZ:
-			lejp_construct(&ac->jctx, cb_authz, vhd, jauthz_tok,
-					LWS_ARRAY_SIZE(jauthz_tok));
+			lejp_construct(&ac->jctx, acme_cb_authz, vhd, acme_jauthz_tok,
+					LWS_ARRAY_SIZE(acme_jauthz_tok));
 			break;
 
 		case ACME_STATE_START_CHALL:
-			lejp_construct(&ac->jctx, cb_chac, ac, jchac_tok,
-					LWS_ARRAY_SIZE(jchac_tok));
+			lejp_construct(&ac->jctx, acme_cb_chac, ac, acme_jchac_tok,
+					LWS_ARRAY_SIZE(acme_jchac_tok));
 			break;
 
 		case ACME_STATE_POLLING:
 		case ACME_STATE_POLLING_CSR:
-			lejp_construct(&ac->jctx, cb_order, ac, jorder_tok,
-					LWS_ARRAY_SIZE(jorder_tok));
+			lejp_construct(&ac->jctx, acme_cb_order, ac, acme_jorder_tok,
+					LWS_ARRAY_SIZE(acme_jorder_tok));
 			break;
 
 		case ACME_STATE_DOWNLOAD_CERT:
-			ac->cpos = 0;
+			/* a retried download must not append to the last one */
+			acme_cert_rx_free(&ac->crx);
 			break;
 
 		default:
@@ -1329,13 +1800,23 @@ callback_acme_client(struct lws *wsi, enum lws_callback_reasons reason,
 
 			lws_strncpy(ac->active_url, ac->urls[JAD_NEW_ACCOUNT_URL], sizeof(ac->active_url));
 pkt_add_hdrs:
-			if (lws_gencrypto_jwe_alg_to_definition("RSA1_5",
-						&jwe.jose.alg)) {
-				ac->len = 0;
-				lwsl_notice("%s: no RSA1_5\n", __func__);
-				goto failed;
-			}
+			/*
+			 * The alg follows the account key, so the key must be
+			 * in the jwe before we choose it: lws_jwe_init() left
+			 * jwe.jwk zeroed
+			 */
 			jwe.jwk = vhd->jwk;
+			{
+				const char *alg = acme_jws_alg(&jwe.jwk);
+
+				if (!alg || lws_gencrypto_jws_alg_to_definition(
+							alg, &jwe.jose.alg)) {
+					ac->len = 0;
+					lwsl_vhost_warn(vhd->vhost, "acme: no JWS "
+							"alg for the account key");
+					goto failed;
+				}
+			}
 
 			ac->len = jws_create_packet(&jwe,
 					start, lws_ptr_diff_size_t(p, start),
@@ -1368,7 +1849,7 @@ pkt_add_hdrs:
 				goto failed;
 			}
 
-			n = sprintf(buf, "%d", ac->len);
+			n = lws_snprintf(buf, sizeof(buf), "%d", ac->len);
 			if (lws_add_http_header_by_token(wsi,
 						WSI_TOKEN_HTTP_CONTENT_LENGTH,
 						(uint8_t *)buf, n, pp, pend)) {
@@ -1387,8 +1868,12 @@ pkt_add_hdrs:
 					"\"type\":\"dns\","
 					"\"value\":\"%s\""
 					"}]"
+					"%s%s%s"
 					"}",
-			vhd->active_cert->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME]);
+			vhd->active_cert->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME],
+			(vhd->active_cert->profile && vhd->active_cert->profile[0]) ? ",\"profile\":\"" : "",
+			(vhd->active_cert->profile && vhd->active_cert->profile[0]) ? vhd->active_cert->profile : "",
+			(vhd->active_cert->profile && vhd->active_cert->profile[0]) ? "\"" : "");
 
 			lws_strncpy(ac->active_url, ac->urls[JAD_NEW_ORDER_URL], sizeof(ac->active_url));
 			goto pkt_add_hdrs;
@@ -1415,6 +1900,8 @@ pkt_add_hdrs:
 				goto pkt_add_hdrs;
 			}
 			lwsl_vhost_notice(vhd->vhost, "Generating ACME CSR... may take a little while");
+			/* the CSR creator allocates a new key unconditionally */
+			acme_privkey_discard(ac);
 			p += lws_snprintf(p, lws_ptr_diff_size_t(end, p), "{\"csr\":\"");
 			n = lws_tls_acme_sni_csr_create_ecdsa(vhd->context,
 					&vhd->active_cert->pvop[0],
@@ -1491,15 +1978,13 @@ pkt_add_hdrs:
 
 		case ACME_STATE_DOWNLOAD_CERT:
 			/*
-			 * It should be the DER cert...
-			 * ACME 2.0 can send certs chain with 3 certs, store only first bytes
+			 * The PEM leaf followed by its chain, in as many reads
+			 * as the CA likes: collected whole, see acme_cert_rx
 			 */
-			if ((unsigned int)ac->cpos + len > sizeof(ac->buf))
-				len = sizeof(ac->buf) - (unsigned int)ac->cpos;
-
-			if (len) {
-				memcpy(&ac->buf[ac->cpos], in, len);
-				ac->cpos += (int)len;
+			if (acme_cert_rx_append(&ac->crx, in, len)) {
+				lwsl_vhost_err(vhd->vhost, "ACME cert body over %u",
+					       (unsigned int)ACME_CERT_CHAIN_MAX);
+				goto failed;
 			}
 			break;
 		default:
@@ -1542,7 +2027,7 @@ pkt_add_hdrs:
 
 			ac->state = ACME_STATE_NEW_NONCE;
 
-			strcpy(buf, ac->urls[JAD_NEW_NONCE_URL]);
+			lws_strncpy(buf, ac->urls[JAD_NEW_NONCE_URL], sizeof(buf));
 			cwsi = lws_acme_client_connect(vhd->context, vhd->vhost,
 					&ac->cwsi, &ac->i, buf,
 					"GET");
@@ -1562,7 +2047,7 @@ pkt_add_hdrs:
 				 */
 				ac->state = ACME_STATE_NEW_ORDER;
 
-				strcpy(buf, ac->urls[JAD_NEW_ORDER_URL]);
+				lws_strncpy(buf, ac->urls[JAD_NEW_ORDER_URL], sizeof(buf));
 				cwsi = lws_acme_client_connect(vhd->context,
 						vhd->vhost, &ac->cwsi,
 						&ac->i, buf, "POST");
@@ -1593,7 +2078,7 @@ pkt_add_hdrs:
 			lws_acme_report_status(vhd->vhost, LWS_CUS_AUTH,
 					NULL);
 
-			strcpy(buf, ac->authz_url);
+			lws_strncpy(buf, ac->authz_url, sizeof(buf));
 			cwsi = lws_acme_client_connect(vhd->context,
 					vhd->vhost, &ac->cwsi,
 					&ac->i, buf, "POST");
@@ -1620,8 +2105,6 @@ pkt_add_hdrs:
 			ac->state = ACME_STATE_START_CHALL;
 			lws_acme_report_status(vhd->vhost, LWS_CUS_CHALLENGE,
 					NULL);
-
-			memset(&ac->ci, 0, sizeof(ac->ci));
 
 			/* compute the key authorization */
 
@@ -1654,34 +2137,44 @@ pkt_add_hdrs:
 				}
 				return -1; /* dns-01 is asynchronous, it will reconnect Let's Encrypt after the propagation delay! */
 			} else {
-				lws_snprintf(ac->http01_mountpoint,
-						sizeof(ac->http01_mountpoint),
+				/*
+				 * The temp vhost is destroyed asynchronously, so
+				 * the mount, the mountpoint string, the .user and
+				 * the key auth it serves all have to outlive the
+				 * ac: they live in the vhd
+				 */
+				lws_snprintf(vhd->chall_mountpoint,
+						sizeof(vhd->chall_mountpoint),
 						"/.well-known/acme-challenge/%s",
 						ac->chall_token);
+				lws_strncpy(vhd->chall_key_auth, ac->key_auth,
+					    sizeof(vhd->chall_key_auth));
 
-				memset(&ac->mount, 0, sizeof (struct lws_http_mount));
-				ac->mount.protocol = "http";
-				ac->mount.mountpoint = ac->http01_mountpoint;
-				ac->mount.mountpoint_len = (unsigned char)
-					strlen(ac->http01_mountpoint);
-				ac->mount.origin_protocol = LWSMPRO_CALLBACK;
+				memset(&vhd->chall_mount, 0,
+				       sizeof(vhd->chall_mount));
+				vhd->chall_mount.protocol = "http";
+				vhd->chall_mount.mountpoint = vhd->chall_mountpoint;
+				vhd->chall_mount.mountpoint_len = (unsigned char)
+					strlen(vhd->chall_mountpoint);
+				vhd->chall_mount.origin_protocol = LWSMPRO_CALLBACK;
 
-				ac->ci.mounts = &ac->mount;
+				memset(&vhd->chall_ci, 0, sizeof(vhd->chall_ci));
+				vhd->chall_ci.mounts = &vhd->chall_mount;
 
 				/* listen on the same port as the vhost that triggered us */
-				ac->ci.port = 80;
+				vhd->chall_ci.port = 80;
 
 				/* make ourselves protocols[0] for the new vhost */
-				ac->ci.protocols = chall_http01_protocols;
+				vhd->chall_ci.protocols = chall_http01_protocols;
 
 				/*
-				 * vhost .user points to the ac associated with the
+				 * vhost .user points to the vhd that owns the
 				 * temporary vhost
 				 */
-				ac->ci.user = ac;
+				vhd->chall_ci.user = vhd;
 
 				ac->vhost = lws_create_vhost(lws_get_context(wsi),
-						&ac->ci);
+						&vhd->chall_ci);
 				if (!ac->vhost)
 					goto failed;
 			}
@@ -1718,7 +2211,7 @@ poll_again:
 				goto failed;
 			}
 
-			strcpy(buf, ac->order_url);
+			lws_strncpy(buf, ac->order_url, sizeof(buf));
 			cwsi = lws_acme_client_connect(vhd->context, vhd->vhost,
 						       &ac->cwsi, &ac->i, buf,
 						       "POST");
@@ -1770,7 +2263,7 @@ poll_again:
 			lws_acme_report_status(vhd->vhost, LWS_CUS_REQ, NULL);
 			ac->goes_around = 0;
 
-			strcpy(buf, ac->finalize_url);
+			lws_strncpy(buf, ac->finalize_url, sizeof(buf));
 			cwsi = lws_acme_client_connect(vhd->context, vhd->vhost,
 						       &ac->cwsi, &ac->i, buf,
 						       "POST");
@@ -1794,7 +2287,7 @@ poll_again:
 
 					goto failed;
 				}
-				strcpy(buf, ac->order_url);
+				lws_strncpy(buf, ac->order_url, sizeof(buf));
 				cwsi = lws_acme_client_connect(vhd->context,
 						vhd->vhost,
 						&ac->cwsi, &ac->i, buf,
@@ -1811,7 +2304,7 @@ poll_again:
 
 			ac->state = ACME_STATE_DOWNLOAD_CERT;
 
-			strcpy(buf, ac->cert_url);
+			lws_strncpy(buf, ac->cert_url, sizeof(buf));
 			cwsi = lws_acme_client_connect(vhd->context, vhd->vhost,
 						       &ac->cwsi, &ac->i, buf,
 						       "POST");
@@ -1834,12 +2327,17 @@ poll_again:
 			lws_acme_report_status(vhd->vhost, LWS_CUS_ISSUE, NULL);
 
 			/*
-			 * That means we have the issued cert in
-			 * ac->buf, length in ac->cpos; and the key in
-			 * ac->alloc_privkey_pem, length in
-			 * ac->len_privkey_pem.
-			 * ACME 2.0 can send certs chain with 3 certs, we need save only first
+			 * That means we have the issued cert and its chain
+			 * in ac->crx, and the key in ac->alloc_privkey_pem,
+			 * length in ac->len_privkey_pem.  The .crt gets the
+			 * leaf alone, the -fullchain.crt the whole body
 			 */
+			leaf_len = acme_cert_leaf_len(&ac->crx);
+			if (!leaf_len) {
+				lwsl_vhost_err(vhd->vhost, "Unable to find ACME cert!");
+				goto failed;
+			}
+
 			{
 				char cert_ts[256], key_ts[256], full_ts[256];
 				const char *cert_latest = vhd->active_cert->pvop[LWS_TLS_SET_CERT_PATH];
@@ -1850,39 +2348,37 @@ poll_again:
 				struct tm *tm;
 				int fd_cert = -1, fd_key = -1, fd_full = -1;
 				char *p;
-				int cpos_fullchain = ac->cpos;
-
-				char *end_cert = strstr(ac->buf, "END CERTIFICATE-----");
-
-				if (end_cert) {
-					ac->cpos = (int)(lws_ptr_diff_size_t(end_cert, ac->buf) + sizeof("END CERTIFICATE-----") - 1);
-				} else {
-					ac->cpos = 0;
-					lwsl_vhost_err(vhd->vhost, "Unable to find ACME cert!");
-					goto failed;
-				}
 
 				time(&t);
-				tm = localtime(&t);
-				strftime(timebuf, sizeof(timebuf), "%Y%m%d-%H%M%S", tm);
+#if defined(WIN32) || defined(_WIN32)
+				struct tm tmp;
+				tm = localtime_s(&tmp, &t) == 0 ? &tmp : NULL;
+#else
+				struct tm tmp;
+				tm = localtime_r(&t, &tmp);
+#endif
+				if (tm)
+					strftime(timebuf, sizeof(timebuf), "%Y%m%d-%H%M%S", tm);
+				else
+					timebuf[0] = '\0';
 
 				lws_strncpy(cert_ts, cert_latest, sizeof(cert_ts));
-				p = strstr(cert_ts, "-latest.crt");
+				p = (char *)strstr(cert_ts, "-latest.crt");
 				if (p)
 					lws_snprintf(p, sizeof(cert_ts) - (size_t)(p - cert_ts), "-%s.crt", timebuf);
 
 				lws_strncpy(full_latest, cert_latest, sizeof(full_latest));
-				p = strstr(full_latest, "-latest.crt");
+				p = (char *)strstr(full_latest, "-latest.crt");
 				if (p)
 					lws_snprintf(p, sizeof(full_latest) - (size_t)(p - full_latest), "-latest-fullchain.crt");
 
 				lws_strncpy(full_ts, full_latest, sizeof(full_ts));
-				p = strstr(full_ts, "-latest-fullchain.crt");
+				p = (char *)strstr(full_ts, "-latest-fullchain.crt");
 				if (p)
 					lws_snprintf(p, sizeof(full_ts) - (size_t)(p - full_ts), "-%s-fullchain.crt", timebuf);
 
 				lws_strncpy(key_ts, key_latest, sizeof(key_ts));
-				p = strstr(key_ts, "-latest.key");
+				p = (char *)strstr(key_ts, "-latest.key");
 				if (p)
 					lws_snprintf(p, sizeof(key_ts) - (size_t)(p - key_ts), "-%s.key", timebuf);
 
@@ -1891,18 +2387,18 @@ poll_again:
 #ifdef WIN32
 					| O_BINARY
 #endif
-					, 0600);
+					, 0644);
 				if (fd_cert < 0) {
 					lwsl_vhost_notice(vhd->vhost, "falling back to IPC footprint to save %s", cert_ts);
-                    const char *fn = strrchr(cert_ts, '/');
-                    if (fn) fn++; else fn = cert_ts;
-					int r = acme_ipc_save_payload(vhd->context, "/var/run/lws-dnssec-monitor.sock", "save_cert", vhd->active_cert->pvop[LWS_TLS_SET_ROOT_DOMAIN] ? vhd->active_cert->pvop[LWS_TLS_SET_ROOT_DOMAIN] : vhd->active_cert->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME], fn, ac->buf, (size_t)ac->cpos);
+					const char *fn = strrchr(cert_ts, '/');
+					if (fn) fn++; else fn = cert_ts;
+					int r = acme_ipc_save_payload(vhd, "save_cert", vhd->active_cert->pvop[LWS_TLS_SET_ROOT_DOMAIN] ? vhd->active_cert->pvop[LWS_TLS_SET_ROOT_DOMAIN] : vhd->active_cert->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME], fn, ac->crx.pem, leaf_len);
 					if (r) {
 						lwsl_vhost_err(vhd->vhost, "unable to create cert file %s", cert_ts);
 						goto failed;
 					}
 				} else {
-					n = lws_plat_write_cert(vhd->vhost, 0, fd_cert, ac->buf, (size_t)ac->cpos);
+					n = lws_plat_write_cert(vhd->vhost, 0, fd_cert, ac->crx.pem, leaf_len);
 					close(fd_cert);
 					if (n) {
 						lwsl_vhost_err(vhd->vhost, "unable to write ACME cert!");
@@ -1917,9 +2413,9 @@ poll_again:
 					, 0600);
 				if (fd_key < 0) {
 					lwsl_vhost_notice(vhd->vhost, "falling back to IPC footprint to save %s", key_ts);
-                    const char *fn = strrchr(key_ts, '/');
-                    if (fn) fn++; else fn = key_ts;
-					int r = acme_ipc_save_payload(vhd->context, "/var/run/lws-dnssec-monitor.sock", "save_key", vhd->active_cert->pvop[LWS_TLS_SET_ROOT_DOMAIN] ? vhd->active_cert->pvop[LWS_TLS_SET_ROOT_DOMAIN] : vhd->active_cert->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME], fn, ac->alloc_privkey_pem, ac->len_privkey_pem);
+					const char *fn = strrchr(key_ts, '/');
+					if (fn) fn++; else fn = key_ts;
+					int r = acme_ipc_save_payload(vhd, "save_key", vhd->active_cert->pvop[LWS_TLS_SET_ROOT_DOMAIN] ? vhd->active_cert->pvop[LWS_TLS_SET_ROOT_DOMAIN] : vhd->active_cert->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME], fn, ac->alloc_privkey_pem, ac->len_privkey_pem);
 					if (r) {
 						lwsl_vhost_err(vhd->vhost, "unable to create key file %s", key_ts);
 						goto failed;
@@ -1937,35 +2433,27 @@ poll_again:
 #ifdef WIN32
 					| O_BINARY
 #endif
-					, 0600);
+					, 0644);
 				if (fd_full < 0) {
 					lwsl_vhost_notice(vhd->vhost, "falling back to IPC footprint to save %s", full_ts);
-                    const char *fn = strrchr(full_ts, '/');
-                    if (fn) fn++; else fn = full_ts;
-					int r = acme_ipc_save_payload(vhd->context, "/var/run/lws-dnssec-monitor.sock", "save_cert", vhd->active_cert->pvop[LWS_TLS_SET_ROOT_DOMAIN] ? vhd->active_cert->pvop[LWS_TLS_SET_ROOT_DOMAIN] : vhd->active_cert->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME], fn, ac->buf, (size_t)cpos_fullchain);
+					const char *fn = strrchr(full_ts, '/');
+					if (fn) fn++; else fn = full_ts;
+					int r = acme_ipc_save_payload(vhd, "save_cert", vhd->active_cert->pvop[LWS_TLS_SET_ROOT_DOMAIN] ? vhd->active_cert->pvop[LWS_TLS_SET_ROOT_DOMAIN] : vhd->active_cert->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME], fn, ac->crx.pem, ac->crx.len);
 					if (r) {
 						lwsl_vhost_err(vhd->vhost, "unable to create fullchain file %s", full_ts);
 					}
 				} else {
-					n = lws_plat_write_cert(vhd->vhost, 0, fd_full, ac->buf, (size_t)cpos_fullchain);
+					n = lws_plat_write_cert(vhd->vhost, 0, fd_full, ac->crx.pem, ac->crx.len);
 					close(fd_full);
 					if (n) {
 						lwsl_vhost_err(vhd->vhost, "unable to write ACME fullchain cert!");
 					}
 				}
 
-				/* Symlink update */
-				unlink(cert_latest);
-				unlink(full_latest);
-#if !defined(WIN32)
-				symlink(strrchr(cert_ts, '/') ? strrchr(cert_ts, '/') + 1 : cert_ts, cert_latest);
-				symlink(strrchr(full_ts, '/') ? strrchr(full_ts, '/') + 1 : full_ts, full_latest);
-#endif
-
-				unlink(key_latest);
-#if !defined(WIN32)
-				symlink(strrchr(key_ts, '/') ? strrchr(key_ts, '/') + 1 : key_ts, key_latest);
-#endif
+				/* Symlink update, keeping the outgoing ones as -previous */
+				acme_link_rotate(cert_latest, cert_ts);
+				acme_link_rotate(full_latest, full_ts);
+				acme_link_rotate(key_latest, key_ts);
 
 				lwsl_vhost_notice(vhd->vhost, "Updated certs written for %s "
 						"to %s and %s",
@@ -1973,7 +2461,7 @@ poll_again:
 					cert_ts,
 					key_ts);
 #else
-				n = lws_plat_write_cert(vhd->vhost, 0, 0, ac->buf, (size_t)ac->cpos);
+				n = lws_plat_write_cert(vhd->vhost, 0, 0, ac->crx.pem, leaf_len);
 				if (n) {
 					lwsl_vhost_err(vhd->vhost, "unable to write ACME cert!");
 					goto failed;
@@ -1993,21 +2481,56 @@ poll_again:
 			if (lws_tls_cert_updated(vhd->context,
 					vhd->active_cert->pvop[LWS_TLS_SET_CERT_PATH],
 					vhd->active_cert->pvop[LWS_TLS_SET_KEY_PATH],
-						ac->buf, (size_t)ac->cpos,
+						ac->crx.pem, leaf_len,
 						ac->alloc_privkey_pem,
 						ac->len_privkey_pem)) {
 				lwsl_vhost_warn(vhd->vhost, "problem setting certs");
 			}
 
-			lws_acme_finished(vhd);
-			lws_acme_report_status(vhd->vhost,
-					LWS_CUS_SUCCESS, NULL);
+			if (vhd->ipc_pending_saves > 0) {
+				lwsl_vhost_notice(vhd->vhost, "Waiting for %d IPC saves to complete...", vhd->ipc_pending_saves);
+				/* the last answer finishes it, acme_ipc_line() */
+				ac->saves_awaited = 1;
+			} else {
+				lws_acme_finished(vhd);
+				lws_acme_report_status(vhd->vhost,
+						LWS_CUS_SUCCESS, NULL);
+			}
 
 			return -1;
 
 		default:
 			break;
 		}
+		break;
+
+	/*
+	 * Without this, any CA connection failure (TLS trust, network, DNS)
+	 * leaves vhd->ac set forever, and every subsequent aging pass aborts
+	 * with "already busy" until restart
+	 */
+	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+		if (vhd && vhd->ac && wsi == vhd->ac->cwsi) {
+			/*
+			 * Only a failure of the current transaction connection
+			 * is fatal for the acquisition: older step connections
+			 * are deliberately closed with -1 after their successor
+			 * connected, and lws reports those closes this way too
+			 */
+			lwsl_vhost_warn(vhd->vhost, "ACME connection failed: %s",
+					in ? (const char *)in : "unknown");
+			/* the failed: return -1 below closes this wsi */
+			vhd->ac->cwsi = NULL;
+			failreason = in ? (char *)in : (char *)"connection failed";
+			goto failed;
+		}
+		break;
+
+	/* keep ac->cwsi nulled when its connection goes away by itself, so
+	 * lws_acme_finished() can rely on it only ever naming a live wsi */
+	case LWS_CALLBACK_CLOSED_CLIENT_HTTP:
+		if (vhd && vhd->ac && wsi == vhd->ac->cwsi)
+			vhd->ac->cwsi = NULL;
 		break;
 
 	case LWS_CALLBACK_USER + 0xac33:
@@ -2030,12 +2553,8 @@ poll_again:
 	return 0;
 
 failed:
-	if (vhd->ops && vhd->ops->challenge_cleanup)
-		vhd->ops->challenge_cleanup(vhd->vhost, vhd->challenge_priv);
-
 	lwsl_vhost_warn(vhd->vhost, "Failed out");
-	lws_acme_report_status(vhd->vhost, LWS_CUS_FAILED, failreason);
-	lws_acme_finished(vhd);
+	acme_fail_acquisition(vhd, failreason);
 
 	return -1;
 }
@@ -2074,59 +2593,232 @@ LWS_VISIBLE void
 lws_acme_core_destroy_vhost(struct per_vhost_data__lws_acme_client *vhd)
 {
 	/* lws_dll2 list cleanup happens in the overarching protocol destroy loop */
-	if (vhd)
+	if (vhd) {
+		lws_sul_cancel(&vhd->sul_aging);
+		lws_sul_cancel(&vhd->sul_acquisition);
+		lws_sul_cancel(&vhd->sul_ipc);
+#if defined(LWS_WITH_SYS_SMD)
+		if (vhd->smd_peer) {
+			lws_smd_unregister(vhd->smd_peer);
+			vhd->smd_peer = NULL;
+		}
+#endif
 		lws_acme_finished(vhd);
+
+		if (vhd->dns_base_dir) {
+			free(vhd->dns_base_dir);
+			vhd->dns_base_dir = NULL;
+		}
+	}
+}
+
+static void
+acme_aging_next_cert(struct per_vhost_data__lws_acme_client *vhd)
+{
+	while (vhd->aging_current_cert) {
+		struct lws_acme_cert_config *cfg = lws_container_of(vhd->aging_current_cert, struct lws_acme_cert_config, list);
+
+		lwsl_vhost_notice(vhd->vhost, "acme_aging: checking cert CN: %s\n", cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME] ? cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME] : "unknown");
+
+		const char *env_dir = vhd->aging_is_production ? "production" : "staging";
+		char cert_path[512], key_path[512];
+		const char *domain = cfg->pvop[LWS_TLS_SET_ROOT_DOMAIN] ?
+				cfg->pvop[LWS_TLS_SET_ROOT_DOMAIN] :
+				cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME];
+		const char *cn = cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME];
+
+		if (domain && cn) {
+			lws_snprintf(cert_path, sizeof(cert_path), "%s/domains/%s/certs/%s/crt/%s-latest.crt",
+				vhd->dns_base_dir, domain, env_dir, cn);
+			lws_snprintf(key_path, sizeof(key_path), "%s/domains/%s/certs/%s/key/%s-latest.key",
+				vhd->dns_base_dir, domain, env_dir, cn);
+
+			if (cfg->pvop[LWS_TLS_SET_CERT_PATH] && strcmp(cfg->pvop[LWS_TLS_SET_CERT_PATH], cert_path) != 0) {
+				free((void *)cfg->pvop[LWS_TLS_SET_CERT_PATH]);
+				cfg->pvop[LWS_TLS_SET_CERT_PATH] = strdup(cert_path);
+			}
+			if (cfg->pvop[LWS_TLS_SET_KEY_PATH] && strcmp(cfg->pvop[LWS_TLS_SET_KEY_PATH], key_path) != 0) {
+				free((void *)cfg->pvop[LWS_TLS_SET_KEY_PATH]);
+				cfg->pvop[LWS_TLS_SET_KEY_PATH] = strdup(key_path);
+			}
+
+			if (vhd->aging_is_production)
+				cfg->pvop[LWS_TLS_SET_DIR_URL] = "https://acme-v02.api.letsencrypt.org/directory";
+			else
+				cfg->pvop[LWS_TLS_SET_DIR_URL] = "https://acme-staging-v02.api.letsencrypt.org/directory";
+
+			if (vhd->aging_global_email[0]) {
+				static char safe_global_email[128];
+				lws_strncpy(safe_global_email, vhd->aging_global_email, sizeof(safe_global_email));
+				cfg->pvop[LWS_TLS_REQ_ELEMENT_EMAIL] = safe_global_email;
+			}
+
+			/*
+			 * The global profile (eg, "shortlived") from the dnssec
+			 * monitor's settings applies to all certs; without it in
+			 * the newOrder, the CA defaults to its classic 90-day
+			 * profile
+			 */
+			if (vhd->aging_global_profile[0]) {
+				static char safe_global_profile[128];
+				lws_strncpy(safe_global_profile, vhd->aging_global_profile, sizeof(safe_global_profile));
+				cfg->profile = safe_global_profile;
+			}
+		}
+
+		if (!cfg->pvop[LWS_TLS_SET_CERT_PATH] || !cfg->pvop[LWS_TLS_SET_KEY_PATH]) {
+			lwsl_vhost_notice(vhd->vhost, "acme_aging: skipping %s: missing cert/key paths in pvop\n", cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME]);
+			vhd->aging_current_cert = lws_dll2_get_next(vhd->aging_current_cert);
+			continue;
+		}
+
+		char disabled_path[512];
+		if (domain) {
+			lws_snprintf(disabled_path, sizeof(disabled_path), "%s/domains/%s/acme_disabled",
+				vhd->dns_base_dir, domain);
+			if (access(disabled_path, F_OK) == 0) {
+				lwsl_vhost_notice(vhd->vhost, "acme_aging: skipping %s: acme_disabled file present at %s\n", domain, disabled_path);
+				vhd->aging_current_cert = lws_dll2_get_next(vhd->aging_current_cert);
+				continue;
+			}
+		}
+
+		if (vhd->last_acme_failure && lws_now_usecs() - vhd->last_acme_failure < 60 * LWS_US_PER_SEC) {
+			lwsl_vhost_notice(vhd->vhost, "acme_aging: skipping %s: last_acme_failure cooldown\n", cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME]);
+			vhd->aging_current_cert = lws_dll2_get_next(vhd->aging_current_cert);
+			continue;
+		}
+
+		/* Asynchronous IPC validity check */
+		char req_buf[2048];
+		char jwt[2048] = {0};
+		char esc_domain[512], esc_cn[512];
+
+		acme_ipc_sign_jwt(vhd, jwt, sizeof(jwt));
+
+		/* config-derived, so escape it before it enters the IPC JSON */
+		lws_json_purify(esc_domain, domain, (int)sizeof(esc_domain), NULL);
+		lws_json_purify(esc_cn, cn, (int)sizeof(esc_cn), NULL);
+
+		int len = lws_snprintf(req_buf, sizeof(req_buf), "{\"req\":\"get_cert_validity\",\"jwt\":\"%s\",\"domain\":\"%s\",\"subdomain\":\"%s\"}\n",
+				jwt, esc_domain, esc_cn);
+
+		if (vhd->ipc && !lws_async_ipc_queue_payload(vhd->ipc, req_buf,
+							     (size_t)len)) {
+			/* we continue iterating when it is answered, or fails */
+			acme_ipc_arm(vhd);
+			return;
+		} else {
+			lwsl_vhost_err(vhd->vhost, "acme_aging: async IPC not available");
+			vhd->aging_current_cert = lws_dll2_get_next(vhd->aging_current_cert);
+			continue;
+		}
+	}
+
+	lwsl_vhost_notice(vhd->vhost, "acme_aging: completed evaluation of all certs\n");
 }
 
 LWS_VISIBLE int
 lws_acme_core_cert_aging(struct per_vhost_data__lws_acme_client *vhd,
 			 const struct lws_acme_cert_aging_args *caa)
 {
-	int n, days_left, total_days;
-    struct lws_acme_cert_config *cfg;
+	/* caa != NULL means we were called from lws vhost cert aging rather
+	 * than our own periodic scan: identify the caller in the logs so
+	 * concurrent entries can be told apart */
+	const char *src = caa ? "vhost-cert-aging" : "periodic-scan";
 
-	if (!vhd || !vhd->cert_configs.head)
+	if (!vhd || !lws_dll2_get_head(&vhd->cert_configs)) {
+		if (vhd)
+			lwsl_vhost_notice(vhd->vhost, "acme_aging: aborting (%s), cert_configs.head is empty\n", src);
+		else
+			lwsl_notice("acme_aging: aborting, no vhd\n");
 		return 0;
+	}
 
-    /* If we are already doing an ACME check, busy. Try again later */
-    if (vhd->ac)
-        return 0;
+	/* If we are already doing an ACME check, busy. Try again later */
+	if (vhd->ac) {
+		const char *cn = vhd->active_cert ?
+				vhd->active_cert->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME] : NULL;
+		lwsl_vhost_notice(vhd->vhost, "acme_aging: aborting (%s), "
+				"acquisition for %s already in progress (state %s)\n",
+				src, cn ? cn : "unknown",
+				acme_state_name(vhd->ac->state));
+		return 0;
+	}
 
-    lws_start_foreach_dll(struct lws_dll2 *, d, vhd->cert_configs.head) {
-        cfg = lws_container_of(d, struct lws_acme_cert_config, list);
+	/* Prevent re-entrancy if already iterating */
+	if (vhd->aging_current_cert) {
+		struct lws_acme_cert_config *cfg = lws_container_of(vhd->aging_current_cert,
+				struct lws_acme_cert_config, list);
+		const char *cn = cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME];
+		lwsl_vhost_notice(vhd->vhost, "acme_aging: aborting (%s), "
+				"already iterating cert configs (at %s)\n",
+				src, cn ? cn : "unknown");
+		return 0;
+	}
 
-        if (!cfg->pvop[LWS_TLS_SET_CERT_PATH] || !cfg->pvop[LWS_TLS_SET_KEY_PATH])
-            goto next_cert;
+	vhd->aging_is_production = 0;
+	int has_config = 0;
+	int global_enabled = 1;
+	vhd->aging_global_email[0] = '\0';
+	vhd->aging_global_profile[0] = '\0';
 
-        /* Check if cert needs renewing based on 25% remaining validity */
-        if (!lws_tls_cert_get_x509_remaining(vhd->context,
-                                         cfg->pvop[LWS_TLS_SET_CERT_PATH],
-                                         &days_left, &total_days)) {
-             lwsl_vhost_notice(vhd->vhost, "acme: cert %s: %d days left, total %d",
-                cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME], days_left, total_days);
+	if (caa)
+		vhd->aging_caa = *caa;
+	else
+		memset(&vhd->aging_caa, 0, sizeof(vhd->aging_caa));
 
-             if (total_days && days_left > (total_days / 4))
-                 goto next_cert; /* Still active! */
-        }
+	char d_path[1024];
+	lws_snprintf(d_path, sizeof(d_path), "%s/acme_config.json", vhd->dns_base_dir);
+	int fd_cfg = open(d_path, O_RDONLY);
+	if (fd_cfg >= 0) {
+		char buf[1024];
+		ssize_t nr = read(fd_cfg, buf, sizeof(buf) - 1);
+		if (nr > 0) {
+			buf[nr] = '\0';
+			if ((char *)strstr(buf, "\"production\": true") || (char *)strstr(buf, "\"production\":true"))
+				vhd->aging_is_production = 1;
+			if ((char *)strstr(buf, "\"enabled\": false") || (char *)strstr(buf, "\"enabled\":false"))
+				global_enabled = 0;
 
-        /* Activate this cert and configure it for acquisition! */
-        vhd->active_cert = cfg;
-        for (n = 0; n < LWS_TLS_TOTAL_COUNT; n++) {
-            if (caa && caa->element_overrides[n])
-                vhd->active_cert->pvop[n] = caa->element_overrides[n];
-        }
+			const char *email_start = strstr(buf, "\"email\": \"");
+			if (email_start) {
+				email_start += 10;
+				const char *email_end = strchr(email_start, '"');
+				if (email_end && (size_t)(email_end - email_start) < sizeof(vhd->aging_global_email)) {
+					memcpy(vhd->aging_global_email, email_start, (size_t)(email_end - email_start));
+					vhd->aging_global_email[(size_t)(email_end - email_start)] = '\0';
+				}
+			}
 
-        lwsl_notice("starting acme acquisition on %s (cert: %s): %s\n",
-                lws_get_vhost_name(vhd->vhost),
-                cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME],
-                vhd->active_cert->pvop[LWS_TLS_SET_DIR_URL]);
+			const char *profile_start = strstr(buf, "\"profile\": \"");
+			if (profile_start) {
+				profile_start += 12;
+				const char *profile_end = strchr(profile_start, '"');
+				if (profile_end && (size_t)(profile_end - profile_start) < sizeof(vhd->aging_global_profile)) {
+					memcpy(vhd->aging_global_profile, profile_start, (size_t)(profile_end - profile_start));
+					vhd->aging_global_profile[(size_t)(profile_end - profile_start)] = '\0';
+				}
+			}
+			has_config = 1;
+		}
+		close(fd_cfg);
+	} else {
+		lwsl_notice("acme_aging: failed to open acme_config.json at %s\n", d_path);
+	}
 
-        lws_acme_start_acquisition(vhd, vhd->vhost);
-        return 0; /* Wait for this cert to finish before kicking off the next! */
+	if (!global_enabled) {
+		lwsl_notice("acme_aging: global ACME is disabled in acme_config.json\n");
+		return 0;
+	}
 
-next_cert:
-		;
-    } lws_end_foreach_dll(d);
+	lwsl_notice("acme_aging: starting evaluation of cert_configs (has_config: %d, is_production: %d, profile: %s)\n",
+			has_config, vhd->aging_is_production,
+			vhd->aging_global_profile[0] ? vhd->aging_global_profile : "ca default");
+
+	/* Start evaluating from the head */
+	vhd->aging_current_cert = lws_dll2_get_head(&vhd->cert_configs);
+	acme_aging_next_cert(vhd);
 
 	return 0;
 }
@@ -2150,6 +2842,23 @@ lws_acme_core_notify_challenge_ready(struct per_vhost_data__lws_acme_client *vhd
 LWS_VISIBLE void
 lws_acme_core_destroy_vhost(struct per_vhost_data__lws_acme_client *vhd);
 
+/*
+ * The challenge plugin could not get its challenge in place, eg, the zone
+ * with the dns-01 TXT was never signed: the server was not told to validate
+ * it, so this attempt just ends, failed, without a failed validation
+ */
+
+static void
+lws_acme_core_challenge_failed(struct per_vhost_data__lws_acme_client *vhd,
+			       const char *reason)
+{
+	if (!vhd->ac)
+		return;
+
+	lwsl_vhost_warn(vhd->vhost, "acme: challenge failed: %s", reason);
+	acme_fail_acquisition(vhd, reason);
+}
+
 LWS_VISIBLE int
 lws_acme_core_cert_aging(struct per_vhost_data__lws_acme_client *vhd,
 			 const struct lws_acme_cert_aging_args *caa);
@@ -2161,7 +2870,10 @@ static const struct lws_acme_core_ops acme_core_ops = {
 	.init_vhost = lws_acme_core_init_vhost,
 	.destroy_vhost = lws_acme_core_destroy_vhost,
 	.cert_aging = lws_acme_core_cert_aging,
-	.notify_challenge_ready = lws_acme_core_notify_challenge_ready
+	.notify_challenge_ready = lws_acme_core_notify_challenge_ready,
+	.trigger_resign = lws_acme_core_trigger_resign,
+	.acme_ipc_save_payload = acme_ipc_save_payload,
+	.challenge_failed = lws_acme_core_challenge_failed,
 };
 
 LWS_VISIBLE const struct lws_protocols lws_acme_client_protocols[] = {

@@ -51,7 +51,7 @@ static struct my_conn {
 } mco;
 
 static struct lws_context *context;
-static int interrupted, port = 443, ssl_connection = LCCSCF_USE_SSL;
+static int port = 443, ssl_connection = LCCSCF_USE_SSL;
 static const char *server_address = "libwebsockets.org",
 		  *pro = "dumb-increment-protocol";
 
@@ -97,6 +97,12 @@ connect_client(lws_sorted_usec_list_t *sul)
 	i.retry_and_idle_policy = &retry;
 	i.userdata = m;
 
+#if defined(LWS_ROLE_H3)
+	if (lws_cmdline_option_cx(context, "--h3")) {
+		i.alpn = "h3";
+	}
+#endif
+
 	if (!lws_client_connect_via_info(&i))
 		/*
 		 * Failed... schedule a retry... we can't use the _retry_wsi()
@@ -106,7 +112,7 @@ connect_client(lws_sorted_usec_list_t *sul)
 		if (lws_retry_sul_schedule(context, 0, sul, &retry,
 					   connect_client, &m->retry_count)) {
 			lwsl_err("%s: connection attempts exhausted\n", __func__);
-			interrupted = 1;
+			lws_default_loop_exit(context);
 		}
 }
 
@@ -155,7 +161,7 @@ do_retry:
 	if (lws_retry_sul_schedule_retry_wsi(wsi, &m->sul, connect_client,
 					     &m->retry_count)) {
 		lwsl_err("%s: connection attempts exhausted\n", __func__);
-		interrupted = 1;
+		lws_default_loop_exit(context);
 	}
 
 	return 0;
@@ -169,7 +175,7 @@ static const struct lws_protocols protocols[] = {
 static void
 sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
@@ -186,8 +192,7 @@ int main(int argc, const char **argv)
 
 
 	signal(SIGINT, sigint_handler);
-	memset(&info, 0, sizeof info);
-	lws_cmdline_option_handle_builtin(argc, argv, &info);
+	lws_context_info_defaults(&info, NULL);lws_cmdline_option_handle_builtin(argc, argv, &info);
 
 	lwsl_user("LWS minimal ws client\n");
 
@@ -195,7 +200,7 @@ int main(int argc, const char **argv)
 	info.port = CONTEXT_PORT_NO_LISTEN; /* we do not run any server */
 	info.protocols = protocols;
 
-#if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL)
+#if defined(LWS_WITH_MBEDTLS) || defined(USE_WOLFSSL) || defined(LWS_WITH_OPENHITLS)
 	/*
 	 * OpenSSL uses the system trust store.  mbedTLS has to be told which
 	 * CA to trust explicitly.
@@ -210,7 +215,14 @@ int main(int argc, const char **argv)
 		server_address = p;
 
 	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_P].sw)))
-		port = atoi(p);
+		{
+			int __pt = atoi(p);
+			if (__pt < 0 || __pt > 65535) {
+				lwsl_err("Port %d is outside valid 16-bit range\n", __pt);
+				return 1;
+			}
+			port = __pt;
+		}
 
 	if (lws_cmdline_option(argc, argv, switches[LWS_SW_N].sw))
 		ssl_connection &= ~LCCSCF_USE_SSL;
@@ -227,7 +239,7 @@ int main(int argc, const char **argv)
 	if (lws_cmdline_option(argc, argv, switches[LWS_SW_E].sw))
 		ssl_connection |= LCCSCF_ALLOW_EXPIRED;
 
-	info.fd_limit_per_thread = 1 + 1 + 1;
+	info.fd_limit_per_thread = LWS_FD_LIMIT_PER_THREAD_MIN + 1;
 
 	context = lws_create_context(&info);
 	if (!context) {
@@ -238,7 +250,7 @@ int main(int argc, const char **argv)
 	/* schedule the first client connection attempt to happen immediately */
 	lws_sul_schedule(context, 0, &mco.sul, connect_client, 1);
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 	lws_context_destroy(context);

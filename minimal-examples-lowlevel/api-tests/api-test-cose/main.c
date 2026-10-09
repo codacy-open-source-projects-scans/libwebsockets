@@ -24,28 +24,26 @@ int
 test_cose_keys(struct lws_context *context);
 int
 test_cose_sign(struct lws_context *context);
+int
+test_cose_sign_eddsa(struct lws_context *context);
 
 int main(int argc, const char **argv)
 {
 	struct lws_context_creation_info info;
 	struct lws_context *context;
-	const char *p;
-	int result = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	int result = 0;
 	(void)switches;
 
-	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
+	if (lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
 		lws_switches_print_help(argv[0], switches, LWS_ARRAY_SIZE(switches));
 		return 0;
 	}
 
-
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
-
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS COSE api tests\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
+
 #if defined(LWS_WITH_NETWORK)
 	info.port = CONTEXT_PORT_NO_LISTEN;
 #endif
@@ -59,6 +57,7 @@ int main(int argc, const char **argv)
 
 	result |= test_cose_keys(context);
 	result |= test_cose_sign(context);
+	result |= test_cose_sign_eddsa(context);
 
 	lwsl_user("Completed: %s\n", result ? "FAIL" : "PASS");
 

@@ -50,7 +50,7 @@ static const struct lws_switches switches[] = {
 
 static struct lws *raw_wsi, *stdin_wsi;
 static uint8_t buf[LWS_PRE + 4096];
-static int waiting, interrupted;
+static int waiting;
 static struct lws_context *context;
 static int us_wait_after_input_close = LWS_USEC_PER_SEC / 10;
 
@@ -75,14 +75,14 @@ callback_raw_test(struct lws *wsi, enum lws_callback_reasons reason,
 		if (raw_wsi)
 			lws_set_timer_usecs(raw_wsi, us_wait_after_input_close);
 		else {
-			interrupted = 1;
+			lws_default_loop_exit(context);
 			lws_cancel_service(context);
 		}
 		break;
 
 	case LWS_CALLBACK_RAW_RX_FILE:
 		lwsl_user("LWS_CALLBACK_RAW_RX_FILE\n");
-		waiting = (int)read(0, buf, sizeof(buf));
+		waiting = (int)read(0, buf + LWS_PRE, sizeof(buf) - LWS_PRE);
 		lwsl_notice("raw file read %d\n", waiting);
 		if (waiting < 0)
 			return -1;
@@ -106,7 +106,7 @@ callback_raw_test(struct lws *wsi, enum lws_callback_reasons reason,
 		 * If the socket to the remote server closed, we must close
 		 * and drop any remaining stdin
 		 */
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		lws_cancel_service(context);
 		/* our pointer to this wsi is invalid now we close */
 		raw_wsi = NULL;
@@ -124,7 +124,7 @@ callback_raw_test(struct lws *wsi, enum lws_callback_reasons reason,
 		// lwsl_hexdump_info(buf, waiting);
 		if (stdin_wsi)
 			lws_rx_flow_control(stdin_wsi, 1);
-		if (lws_write(wsi, buf, (unsigned int)waiting, LWS_WRITE_RAW) != waiting) {
+		if (lws_write(wsi, buf + LWS_PRE, (unsigned int)waiting, LWS_WRITE_RAW) != waiting) {
 			lwsl_notice("%s: raw skt write failed\n", __func__);
 
 			return -1;
@@ -133,7 +133,7 @@ callback_raw_test(struct lws *wsi, enum lws_callback_reasons reason,
 
 	case LWS_CALLBACK_TIMER:
 		lwsl_user("LWS_CALLBACK_TIMER\n");
-		interrupted = 1;
+		lws_default_loop_exit(context);
 		lws_cancel_service(context);
 		return -1;
 
@@ -151,7 +151,7 @@ static struct lws_protocols protocols[] = {
 
 void sigint_handler(int sig)
 {
-	interrupted = 1;
+	lws_default_loop_exit(context);
 }
 
 int main(int argc, const char **argv)
@@ -162,7 +162,7 @@ int main(int argc, const char **argv)
 	struct addrinfo h, *r, *rp;
 	struct lws_vhost *vhost;
 	const char *p;
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
+	int n = 0;
 	(void)switches;
 
 	if ((argc == 1) || lws_cmdline_option(argc, argv, switches[LWS_SW_HELP].sw)) {
@@ -173,13 +173,11 @@ int main(int argc, const char **argv)
 
 	signal(SIGINT, sigint_handler);
 
-	if ((p = lws_cmdline_option(argc, argv, switches[LWS_SW_D].sw)))
-		logs = atoi(p);
 
-	lws_set_log_level(logs, NULL);
 	lwsl_user("LWS minimal raw netcat [--server ip] [--port port] [-w ms]\n");
 
-	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+	lws_context_info_defaults(&info, NULL);
+	lws_cmdline_option_handle_builtin(argc, argv, &info);
 	info.options = LWS_SERVER_OPTION_EXPLICIT_VHOSTS;
 
 	context = lws_create_context(&info);
@@ -268,7 +266,7 @@ int main(int argc, const char **argv)
 		goto bail;
 	}
 
-	while (n >= 0 && !interrupted)
+	while (n >= 0)
 		n = lws_service(context, 0);
 
 bail:

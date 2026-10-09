@@ -32,33 +32,52 @@ int lws_ssl_get_error(struct lws *wsi, int n)
 	return 0;
 }
 
+void
+lws_ssl_SSL_CTX_destroy(struct lws_vhost *vhost)
+{
+	if (vhost->tls.ssl_ctx) {
+		lws_tls_vhost_backend_free_ctx(vhost->tls.ssl_ctx);
+		vhost->tls.ssl_ctx = NULL;
+	}
+
+	if (!vhost->tls.user_supplied_ssl_ctx && vhost->tls.ssl_client_ctx) {
+		lws_tls_vhost_backend_free_ctx(vhost->tls.ssl_client_ctx);
+		vhost->tls.ssl_client_ctx = NULL;
+	}
+}
+
 void lws_ssl_destroy(struct lws_vhost *vhost)
 {
+	if (!lws_check_opt(vhost->context->options,
+			   LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT))
+		return;
+
+	lws_ssl_SSL_CTX_destroy(vhost);
 }
 
 int
 lws_bearssl_pump(struct lws *wsi)
 {
-	struct lws_tls_conn *conn = (struct lws_tls_conn *)wsi->tls.ssl;
-	unsigned st = 0;
+	struct lws_tls_conn *conn = (struct lws_tls_conn *)wsi->io->tls.ssl;
+	unsigned st;
 	int progressed = 0;
 
 	if (!conn)
 		return -1;
+
+	st = br_ssl_engine_current_state(&conn->u.engine);
 
 	while (1) {
 		unsigned old_st = 0;
 		do {
 			old_st = st;
 			st = br_ssl_engine_current_state(&conn->u.engine);
-			if (st != old_st)
-				lwsl_notice("%s: st changed %x -> %x\n", __func__, old_st, st);
 		} while (st != old_st && st != BR_SSL_CLOSED);
 
 		if (st == BR_SSL_CLOSED) {
 			int err = br_ssl_engine_last_error(&conn->u.engine);
 			if (err) {
-				lwsl_err("%s: BearSSL engine closed with err %d\n", __func__, err);
+				lwsl_info("%s: BearSSL engine closed with err %d\n", __func__, err);
 				return -1;
 			}
 			return 0;
@@ -67,8 +86,8 @@ lws_bearssl_pump(struct lws *wsi)
 		if (st & BR_SSL_SENDREC) {
 			size_t len;
 			unsigned char *buf = br_ssl_engine_sendrec_buf(&conn->u.engine, &len);
-			int n = (int)send(wsi->desc.sockfd, (const char *)buf, len, MSG_NOSIGNAL);
-			lwsl_notice("%s: sendrec_buf len %zu, send n=%d\n", __func__, len, n);
+			int n = (int)send(wsi->io->desc.sockfd, (const char *)buf, len, MSG_NOSIGNAL);
+			// lwsl_notice("%s: sendrec_buf len %zu, send n=%d\n", __func__, len, n);
 			if (n > 0) {
 				br_ssl_engine_sendrec_ack(&conn->u.engine, (size_t)n);
 				progressed = 1;
@@ -83,8 +102,8 @@ lws_bearssl_pump(struct lws *wsi)
 		if (st & BR_SSL_RECVREC) {
 			size_t len;
 			unsigned char *buf = br_ssl_engine_recvrec_buf(&conn->u.engine, &len);
-			int n = (int)recv(wsi->desc.sockfd, (char *)buf, len, 0);
-			lwsl_notice("%s: recvrec_buf len %d, recv n=%d\n", __func__, (int)len, n);
+			int n = (int)recv(wsi->io->desc.sockfd, (char *)buf, len, 0);
+			// lwsl_notice("%s: recvrec_buf len %d, recv n=%d\n", __func__, (int)len, n);
 			if (n > 0) {
 				br_ssl_engine_recvrec_ack(&conn->u.engine, (size_t)n);
 				progressed = 1;
@@ -103,11 +122,11 @@ lws_bearssl_pump(struct lws *wsi)
 		break;
 	}
 	int pending = lws_ssl_pending(wsi);
-	lwsl_notice("%s: pump exit progressed=%d, pending=%d, st=%x\n", __func__, progressed, pending, st);
+	// lwsl_notice("%s: pump exit progressed=%d, pending=%d, st=%x\n", __func__, progressed, pending, st);
 	if (pending) {
 		struct lws_context_per_thread *pt = &wsi->a.context->pt[(int)wsi->tsi];
-		if (lws_dll2_is_detached(&wsi->tls.dll_pending_tls))
-			lws_dll2_add_head(&wsi->tls.dll_pending_tls,
+		if (lws_dll2_is_detached(&wsi->io->tls.dll_pending_tls))
+			lws_dll2_add_head(&wsi->io->tls.dll_pending_tls,
 					  &pt->tls.dll_pending_tls_owner);
 	}
 
@@ -117,87 +136,109 @@ lws_bearssl_pump(struct lws *wsi)
 int
 lws_ssl_capable_read(struct lws *wsi, unsigned char *buf, size_t len)
 {
-	struct lws_tls_conn *conn = (struct lws_tls_conn *)wsi->tls.ssl;
+	struct lws_tls_conn *conn = (struct lws_tls_conn *)wsi->io->tls.ssl;
 	struct lws_context_per_thread *pt = &wsi->a.context->pt[(int)wsi->tsi];
 	size_t alen;
 	unsigned char *abuf;
 
 	unsigned st;
 
+	if (!wsi->io->tls.ssl)
+		return lws_ssl_capable_read_no_ssl(wsi, buf, len);
+
 	if (!conn)
 		return LWS_SSL_CAPABLE_ERROR;
 
-again:
-	/* 1. Drain whatever is already decrypted */
-	st = br_ssl_engine_current_state(&conn->u.engine);
-	if (st & BR_SSL_RECVAPP) {
-		abuf = br_ssl_engine_recvapp_buf(&conn->u.engine, &alen);
-		if (alen == 0) {
-			br_ssl_engine_recvapp_ack(&conn->u.engine, 0);
-			/* empty record consumed, pump again to get actual data */
-		} else {
-			if (alen > len)
-				alen = len;
-			memcpy(buf, abuf, alen);
-			br_ssl_engine_recvapp_ack(&conn->u.engine, alen);
+	do {
+		/* 1. Drain whatever is already decrypted */
+		st = br_ssl_engine_current_state(&conn->u.engine);
+		if (st == BR_SSL_CLOSED)
+			return LWS_SSL_CAPABLE_ERROR;
 
-			if (lws_ssl_pending(wsi)) {
-				if (lws_dll2_is_detached(&wsi->tls.dll_pending_tls))
-					lws_dll2_add_head(&wsi->tls.dll_pending_tls,
-							  &pt->tls.dll_pending_tls_owner);
-			} else
-				lws_ssl_remove_wsi_from_buffered_list(wsi);
+		if (st & BR_SSL_RECVAPP) {
+			abuf = br_ssl_engine_recvapp_buf(&conn->u.engine, &alen);
+			if (alen == 0) {
+				br_ssl_engine_recvapp_ack(&conn->u.engine, 0);
+				/* empty record consumed, pump again to get actual data */
+			} else {
+				if (alen > len)
+					alen = len;
+				memcpy(buf, abuf, alen);
+				br_ssl_engine_recvapp_ack(&conn->u.engine, alen);
 
-			return (int)alen;
+				if (lws_ssl_pending(wsi)) {
+					if (lws_dll2_is_detached(&wsi->io->tls.dll_pending_tls))
+						lws_dll2_add_head(&wsi->io->tls.dll_pending_tls,
+								  &pt->tls.dll_pending_tls_owner);
+				} else
+					lws_ssl_remove_wsi_from_buffered_list(wsi);
+
+				return (int)alen;
+			}
 		}
-	}
 
-	/* 2. Pump the engine to read from socket and decrypt */
-	int pump_ret = lws_bearssl_pump(wsi);
+		/* 2. Pump the engine to read from socket and decrypt */
+		int pump_ret = lws_bearssl_pump(wsi);
 
-	/* 3. Check again if anything was decrypted */
-	st = br_ssl_engine_current_state(&conn->u.engine);
-	if (st & BR_SSL_RECVAPP) {
-		abuf = br_ssl_engine_recvapp_buf(&conn->u.engine, &alen);
-		if (alen == 0) {
-			br_ssl_engine_recvapp_ack(&conn->u.engine, 0);
-			goto again;
-		} else {
-			if (alen > len)
-				alen = len;
-			memcpy(buf, abuf, alen);
-			br_ssl_engine_recvapp_ack(&conn->u.engine, alen);
+		/*
+		 * The pump can end up in lws callbacks (ALPN negotiation, jit
+		 * trust), and one of those closing the wsi freed conn with it:
+		 * everything below dereferences it again (C-417)
+		 */
 
-			if (lws_ssl_pending(wsi)) {
-				if (lws_dll2_is_detached(&wsi->tls.dll_pending_tls))
-					lws_dll2_add_head(&wsi->tls.dll_pending_tls,
-							  &pt->tls.dll_pending_tls_owner);
-			} else
-				lws_ssl_remove_wsi_from_buffered_list(wsi);
+		if (wsi->io->tls.ssl != (lws_tls_conn *)conn)
+			return LWS_SSL_CAPABLE_ERROR;
 
-			return (int)alen;
+		/* 3. Check again if anything was decrypted */
+		st = br_ssl_engine_current_state(&conn->u.engine);
+		if (st == BR_SSL_CLOSED)
+			return LWS_SSL_CAPABLE_ERROR;
+
+		if (st & BR_SSL_RECVAPP) {
+			abuf = br_ssl_engine_recvapp_buf(&conn->u.engine, &alen);
+			if (alen == 0) {
+				br_ssl_engine_recvapp_ack(&conn->u.engine, 0);
+				continue;
+			} else {
+				if (alen > len)
+					alen = len;
+				memcpy(buf, abuf, alen);
+				br_ssl_engine_recvapp_ack(&conn->u.engine, alen);
+
+				if (lws_ssl_pending(wsi)) {
+					if (lws_dll2_is_detached(&wsi->io->tls.dll_pending_tls))
+						lws_dll2_add_head(&wsi->io->tls.dll_pending_tls,
+								  &pt->tls.dll_pending_tls_owner);
+				} else
+					lws_ssl_remove_wsi_from_buffered_list(wsi);
+
+				return (int)alen;
+			}
 		}
-	}
 
-	lws_ssl_remove_wsi_from_buffered_list(wsi);
+		lws_ssl_remove_wsi_from_buffered_list(wsi);
 
-	if (pump_ret < 0)
-		return LWS_SSL_CAPABLE_ERROR;
+		if (pump_ret < 0)
+			return LWS_SSL_CAPABLE_ERROR;
 
-	st = br_ssl_engine_current_state(&conn->u.engine);
-	if (st & BR_SSL_SENDREC)
-		return LWS_SSL_CAPABLE_MORE_SERVICE_WRITE;
+		st = br_ssl_engine_current_state(&conn->u.engine);
+		if (st & BR_SSL_SENDREC)
+			return LWS_SSL_CAPABLE_MORE_SERVICE_WRITE;
 
-	return LWS_SSL_CAPABLE_MORE_SERVICE_READ;
+		return LWS_SSL_CAPABLE_MORE_SERVICE_READ;
+	} while (1);
 }
 
 int
 lws_ssl_capable_write(struct lws *wsi, unsigned char *buf, size_t len)
 {
-	struct lws_tls_conn *conn = (struct lws_tls_conn *)wsi->tls.ssl;
+	struct lws_tls_conn *conn = (struct lws_tls_conn *)wsi->io->tls.ssl;
 	size_t alen;
 	unsigned char *abuf;
 	unsigned st;
+
+	if (!wsi->io->tls.ssl)
+		return lws_ssl_capable_write_no_ssl(wsi, buf, len);
 
 	if (!conn)
 		return LWS_SSL_CAPABLE_ERROR;
@@ -207,8 +248,22 @@ lws_ssl_capable_write(struct lws *wsi, unsigned char *buf, size_t len)
 			return LWS_SSL_CAPABLE_ERROR;
 
 		st = br_ssl_engine_current_state(&conn->u.engine);
+		if (st == BR_SSL_CLOSED)
+			return LWS_SSL_CAPABLE_ERROR;
+
 		if (st & BR_SSL_SENDREC)
 			return LWS_SSL_CAPABLE_MORE_SERVICE_WRITE;
+
+		/*
+		 * the caller recomputes its own cap on every call, and
+		 * advances its buflist by what we return... so never claim
+		 * more than this call actually offered
+		 */
+		if (conn->pending_app_data_len > len) {
+			conn->pending_app_data_len -= len;
+
+			return (int)len;
+		}
 
 		int ret = (int)conn->pending_app_data_len;
 		conn->pending_app_data_len = 0;
@@ -227,6 +282,9 @@ lws_ssl_capable_write(struct lws *wsi, unsigned char *buf, size_t len)
 			return LWS_SSL_CAPABLE_ERROR;
 
 		st = br_ssl_engine_current_state(&conn->u.engine);
+		if (st == BR_SSL_CLOSED)
+			return LWS_SSL_CAPABLE_ERROR;
+
 		if (st & BR_SSL_SENDREC) {
 			conn->pending_app_data_len = alen;
 			return LWS_SSL_CAPABLE_MORE_SERVICE_WRITE;
@@ -244,8 +302,11 @@ lws_ssl_capable_write(struct lws *wsi, unsigned char *buf, size_t len)
 
 int lws_ssl_pending(struct lws *wsi)
 {
-	struct lws_tls_conn *conn = (struct lws_tls_conn *)wsi->tls.ssl;
+	struct lws_tls_conn *conn = (struct lws_tls_conn *)wsi->io->tls.ssl;
 	size_t alen;
+
+	if (!wsi->io->tls.ssl)
+		return lws_ssl_pending_no_ssl(wsi);
 
 	if (!conn)
 		return 0;
@@ -259,11 +320,26 @@ int lws_ssl_pending(struct lws *wsi)
 
 void lws_ssl_info_callback(const lws_tls_conn *ssl, int where, int ret)
 {
+	/* bearssl has no openssl-style info callback hook */
+}
+
+/*
+ * The conn now belongs to wsi (lws_tls_transfer_wsi()): jit trust collects
+ * the peer chain's key ids into the wsi the conn points at
+ */
+void
+lws_tls_conn_set_wsi(struct lws *wsi)
+{
+#if defined(LWS_WITH_TLS_JIT_TRUST)
+	wsi->io->tls.ssl->wsi = wsi;
+#else
+	(void)wsi;
+#endif
 }
 
 int lws_ssl_close(struct lws *wsi)
 {
-	struct lws_tls_conn *conn = (struct lws_tls_conn *)wsi->tls.ssl;
+	struct lws_tls_conn *conn = (struct lws_tls_conn *)wsi->io->tls.ssl;
 
 	if (!conn)
 		return 0;
@@ -278,14 +354,24 @@ int lws_ssl_close(struct lws *wsi)
 		lws_x509_destroy(&conn->temp_cert);
 #endif
 
+	if (conn->alpn_strings) {
+		size_t i;
+		for (i = 0; i < conn->alpn_strings_count; i++) {
+			if (conn->alpn_strings[i])
+				lws_free(conn->alpn_strings[i]);
+		}
+		lws_free(conn->alpn_strings);
+	}
+
 	lws_free(conn);
-	wsi->tls.ssl = NULL;
+	wsi->io->tls.ssl = NULL;
+
+	if (wsi->io->tls.ctx_ref) {
+		lws_tls_ctx_ref_unref(wsi->io->tls.ctx_ref);
+		wsi->io->tls.ctx_ref = NULL;
+	}
 
 	return 0;
-}
-
-void lws_ssl_SSL_CTX_destroy(struct lws_vhost *vhost)
-{
 }
 
 void lws_ssl_context_destroy(struct lws_context *context)
@@ -294,15 +380,57 @@ void lws_ssl_context_destroy(struct lws_context *context)
 
 lws_tls_ctx * lws_tls_ctx_from_wsi(struct lws *wsi)
 {
-	struct lws_tls_conn *conn = (struct lws_tls_conn *)wsi->tls.ssl;
+	struct lws_tls_conn *conn = (struct lws_tls_conn *)wsi->io->tls.ssl;
 	if (!conn)
 		return NULL;
 	return conn->ctx;
 }
 
-enum lws_ssl_capable_status __lws_tls_shutdown(struct lws *wsi)
+/*
+ * Queue our close_notify, then flush the records the engine has for the peer,
+ * ending with it.  Nothing is read here: once it has gone the staged close
+ * shuts our write side and discards the peer's rx until his FIN.
+ */
+
+enum lws_ssl_capable_status
+__lws_tls_shutdown(struct lws *wsi)
 {
-	return LWS_SSL_CAPABLE_ERROR;
+	struct lws_tls_conn *conn = (struct lws_tls_conn *)wsi->io->tls.ssl;
+	br_ssl_engine_context *eng;
+	unsigned char *buf;
+	unsigned int st;
+	size_t len;
+	int n;
+
+	if (!conn)
+		return LWS_SSL_CAPABLE_ERROR;
+
+	eng = &conn->u.engine;
+
+	if (!conn->close_notify_queued) {
+		conn->close_notify_queued = 1;
+		br_ssl_engine_close(eng);
+	}
+
+	while ((st = br_ssl_engine_current_state(eng)) & BR_SSL_SENDREC) {
+		buf = br_ssl_engine_sendrec_buf(eng, &len);
+		n = (int)send(wsi->io->desc.sockfd, (const char *)buf,
+			      LWS_POSIX_LENGTH_CAST(len), MSG_NOSIGNAL);
+		if (n > 0) {
+			br_ssl_engine_sendrec_ack(eng, (size_t)n);
+			continue;
+		}
+		if (n < 0 && (LWS_ERRNO == LWS_EAGAIN ||
+			      LWS_ERRNO == LWS_EWOULDBLOCK))
+			return LWS_SSL_CAPABLE_MORE_SERVICE_WRITE;
+
+		return LWS_SSL_CAPABLE_ERROR;
+	}
+
+	if (st == BR_SSL_CLOSED && br_ssl_engine_last_error(eng))
+		return LWS_SSL_CAPABLE_ERROR;
+
+	return LWS_SSL_CAPABLE_DONE;
 }
 
 static int
@@ -312,7 +440,7 @@ tops_fake_POLLIN_for_buffered_bearssl(struct lws_context_per_thread *pt)
 }
 
 const struct lws_tls_ops tls_ops_bearssl = {
-	/* fake_POLLIN_for_buffered */	tops_fake_POLLIN_for_buffered_bearssl,
+	.fake_POLLIN_for_buffered = tops_fake_POLLIN_for_buffered_bearssl,
 };
 
 int lws_context_init_ssl_library(struct lws_context *cx,
@@ -350,6 +478,106 @@ lws_tls_session_cache(struct lws_vhost *vh, uint32_t ttl)
 #else
 int lws_tls_session_dump_save(struct lws_vhost *vh, const char *host, uint16_t port, lws_tls_sess_cb_t cb_save, void *opq) { return -1; }
 int lws_tls_session_dump_load(struct lws_vhost *vh, const char *host, uint16_t port, lws_tls_sess_cb_t cb_load, void *opq) { return -1; }
+int lws_tls_session_dump_save_flags(struct lws_vhost *vh, const char *host, uint16_t port, unsigned int flags, lws_tls_sess_cb_t cb_save, void *opq) { return -1; }
+int lws_tls_session_dump_load_flags(struct lws_vhost *vh, const char *host, uint16_t port, unsigned int flags, lws_tls_sess_cb_t cb_load, void *opq) { return -1; }
 int lws_tls_session_is_reused(struct lws *wsi) { return 0; }
 int lws_tls_session_vh_destroy(struct lws_vhost *vh) { return 0; }
 #endif
+
+void
+lws_tls_vhost_backend_free_ctx(lws_tls_ctx *ctx)
+{
+	if (!ctx)
+		return;
+
+	if (ctx->trust_anchors) {
+		size_t n;
+
+		for (n = 0; n < ctx->num_trust_anchors; n++) {
+			br_x509_trust_anchor *ta = &ctx->trust_anchors[n];
+
+			lws_free(ta->dn.data);
+			switch (ta->pkey.key_type) {
+			case BR_KEYTYPE_RSA:
+				lws_free(ta->pkey.key.rsa.n);
+				lws_free(ta->pkey.key.rsa.e);
+				break;
+			case BR_KEYTYPE_EC:
+				lws_free(ta->pkey.key.ec.q);
+				break;
+			}
+		}
+		lws_free(ctx->trust_anchors);
+	}
+
+	if (ctx->chain) {
+		size_t i;
+		for (i = 0; i < ctx->chain_len; i++)
+			if (ctx->chain[i].data)
+				lws_free(ctx->chain[i].data);
+		lws_free(ctx->chain);
+	}
+
+	/* rsa_key / ec_key point into key_buf */
+	lws_free(ctx->key_buf);
+
+#if defined(LWS_WITH_TLS_SESSIONS)
+	if (ctx->lru_buffer)
+		lws_free(ctx->lru_buffer);
+#endif
+
+	lws_free(ctx);
+}
+
+int
+lws_bearssl_set_alpn(struct lws_tls_conn *conn, const uint8_t *alpn, size_t alpn_len)
+{
+	size_t count = 0;
+	size_t offset = 0;
+	size_t idx = 0;
+
+	if (!alpn || !alpn_len)
+		return 0;
+
+	/* 1. Count strings */
+	while (offset < alpn_len) {
+		uint8_t len = alpn[offset];
+		if (offset + 1 + len > alpn_len)
+			break;
+		count++;
+		offset += 1 + len;
+	}
+
+	if (!count)
+		return 0;
+
+	/* 2. Allocate the array of string pointers */
+	conn->alpn_strings = lws_malloc(sizeof(char *) * count, "bearssl alpn");
+	if (!conn->alpn_strings)
+		return -1;
+
+	/* 3. Allocate and copy each string */
+	offset = 0;
+	while (offset < alpn_len && idx < count) {
+		uint8_t len = alpn[offset];
+		conn->alpn_strings[idx] = lws_malloc(len + 1, "bearssl alpn str");
+		if (!conn->alpn_strings[idx]) {
+			/* Cleanup previously allocated strings on failure */
+			while (idx > 0)
+				lws_free(conn->alpn_strings[--idx]);
+			lws_free(conn->alpn_strings);
+			conn->alpn_strings = NULL;
+			return -1;
+		}
+		memcpy(conn->alpn_strings[idx], &alpn[offset + 1], len);
+		conn->alpn_strings[idx][len] = '\0';
+		idx++;
+		offset += 1 + len;
+	}
+	conn->alpn_strings_count = count;
+
+	/* 4. Set the protocols on the engine */
+	br_ssl_engine_set_protocol_names(&conn->u.engine, (const char **)conn->alpn_strings, count);
+
+	return 0;
+}

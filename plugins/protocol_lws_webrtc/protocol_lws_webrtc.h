@@ -5,6 +5,22 @@
 #include <libwebsockets/lws-srtp.h>
 #include <libwebsockets/lws-stun.h>
 
+/*
+ * Most ICE agents offer a handful of candidates; anything past this is either
+ * broken or an attempt to use us as a UDP reflector, so we stop punching.
+ */
+#define LWS_WEBRTC_MAX_PUNCHES 16
+
+/*
+ * How often we poll the DTLS state machine while its handshake is in
+ * progress.  Flight retransmission and the overall handshake deadline are
+ * both driven from lws_gendtls_get_rx() / lws_gendtls_get_tx(), so without
+ * an independent poll nothing happens at all once the peer goes quiet: a
+ * lost flight is never retransmitted, and an abandoned handshake sits there
+ * holding its ctx and media object until the ws session happens to close.
+ */
+#define LWS_WEBRTC_DTLS_POLL_US (100 * LWS_US_PER_MS)
+
 struct vhd_webrtc {
 	struct lws_context      *context;
 	struct lws_vhost        *vhost;
@@ -43,6 +59,7 @@ struct lws_webrtc_peer_media {
 	struct lws              *wsi_udp;
 	lws_sockaddr46          peer_sa46;
 	int                     has_peer_sa46;
+	uint8_t                 peer_stun_received;
 
 	struct lws_rtp_ctx      rtp_ctx_video;
 	struct lws_rtp_ctx      rtp_ctx_audio;
@@ -99,14 +116,27 @@ struct pss_webrtc {
 
 	uint8_t                 is_client;
 	uint8_t                 handshake_started;
-	char                    ice_ufrag[32];
+	/*
+	 * Q-21: RFC 8445 §5.3 says the ICE ufrag SHOULD have at least 128 bits
+	 * of randomness to resist off-path spoofing of STUN connectivity checks.
+	 * Hex-encoding 16 random bytes needs 32 chars + NUL; [40] gives room.
+	 * (ice_pwd already carried 128 bits.)
+	 */
+	char                    ice_ufrag[40];
 	char                    ice_pwd[64];
-	char                    ice_ufrag_remote[32];
+	char                    ice_ufrag_remote[40];
 	char                    ice_pwd_remote[64];
 	char                    fingerprint_remote[128];
 
 	int                     last_tu_id;
 	lws_usec_t              last_pli_req_time;
+
+	/*
+	 * How many ICE candidates from the peer we have already hole-punched
+	 * for this session.  Capped, since each one is an HMAC + a STUN
+	 * datagram to an address the peer chose, ie, a reflector.
+	 */
+	uint16_t                stun_punches;
 
 	struct lws_buflist      *buflist;
 

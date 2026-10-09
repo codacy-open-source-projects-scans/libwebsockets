@@ -62,7 +62,7 @@ lws_get_mimetype(const char *file, const struct lws_http_mount *m);
  *
  * Returns NULL or a pointer to the matching mount.
  */
-#if defined(LWS_ROLE_H1) || defined(LWS_ROLE_H2)
+#if defined(LWS_ROLE_H1) || defined(LWS_ROLE_H2) || defined(LWS_ROLE_H3)
 LWS_VISIBLE LWS_EXTERN const struct lws_http_mount *
 lws_find_mount(struct lws *wsi, const char *uri_ptr, int uri_len);
 #endif
@@ -125,6 +125,9 @@ enum http_status {
 	HTTP_STATUS_REQ_RANGE_NOT_SATISFIABLE,
 	HTTP_STATUS_EXPECTATION_FAILED,
 
+	HTTP_STATUS_UPGRADE_REQUIRED				= 426,
+	HTTP_STATUS_REQ_HEADER_FIELDS_TOO_LARGE			= 431,
+
 	HTTP_STATUS_INTERNAL_SERVER_ERROR			= 500,
 	HTTP_STATUS_NOT_IMPLEMENTED,
 	HTTP_STATUS_BAD_GATEWAY,
@@ -155,9 +158,10 @@ struct lws_process_html_args {
 typedef const char *(*lws_process_html_state_cb)(void *data, int index);
 
 struct lws_process_html_state {
-	char *start; /**< pointer to start of match */
-	char swallow[16]; /**< matched character buffer */
-	int pos; /**< position in match */
+	char *start; /**< unused */
+	char swallow[16]; /**< the start of a variable the last lump ended
+			   * with, held back for the next */
+	int pos; /**< how much is held back in swallow; start at 0 */
 	void *data; /**< opaque pointer */
 	const char * const *vars; /**< list of variable names */
 	int count_vars; /**< count of variable names */
@@ -169,6 +173,13 @@ struct lws_process_html_state {
 /*! lws_chunked_html_process() - generic chunked substitution
  * \param args: buffer to process using chunked encoding
  * \param s: current processing state
+ *
+ * Replaces the variables named in \p s in one lump of the file, in place,
+ * and adds the chunk framing when \p args->chunked.  Variables can be up to
+ * 14 characters, and one may be split across two lumps: the part at the end
+ * of a lump is held back in \p s and processed with the next one, so
+ * \p args->len can come back 0 for a lump that is not the last.  Returns 0,
+ * or -1 if the content would outgrow \p args->max_len.
  */
 LWS_VISIBLE LWS_EXTERN int
 lws_chunked_html_process(struct lws_process_html_args *args,
@@ -204,8 +215,12 @@ lws_chunked_html_process(struct lws_process_html_args *args,
  *  you can use the fragment-aware api lws_hdr_copy_fragment() to access each
  *  argument in turn: the fragments contain urldecoded strings like x=1 or y=2.
  *
+ *  The parser refuses (403 on h1) any request whose URI contains a C0
+ *  control byte or DEL, raw or percent-encoded, so urlarg values only ever
+ *  contain printable and high (>= 0x80, eg UTF-8) bytes.
+ *
  *  As a convenience, lws has an api that will find the fragment with a
- *  given name= part, lws_get_urlarg_by_name().
+ *  given name= part, lws_get_urlarg_by_name_safe().
  */
 ///@{
 
@@ -249,7 +264,7 @@ enum lws_token_indexes {
 	WSI_TOKEN_NONCE,
 #endif
 	WSI_TOKEN_HTTP,
-#if defined(LWS_ROLE_H2) || defined(LWS_HTTP_HEADERS_ALL)
+#if defined(LWS_ROLE_H2) || defined(LWS_ROLE_H3) || defined(LWS_HTTP_HEADERS_ALL)
 	WSI_TOKEN_HTTP2_SETTINGS, /* 16 */
 #endif
 	WSI_TOKEN_HTTP_ACCEPT,
@@ -276,7 +291,7 @@ enum lws_token_indexes {
 	WSI_TOKEN_VERSION,
 	WSI_TOKEN_SWORIGIN,
 #endif
-#if defined(LWS_ROLE_H2) || defined(LWS_HTTP_HEADERS_ALL)
+#if defined(LWS_ROLE_H2) || defined(LWS_ROLE_H3) || defined(LWS_HTTP_HEADERS_ALL)
 	WSI_TOKEN_HTTP_COLON_AUTHORITY,
 	WSI_TOKEN_HTTP_COLON_METHOD,
 	WSI_TOKEN_HTTP_COLON_PATH,
@@ -346,7 +361,7 @@ enum lws_token_indexes {
 	WSI_TOKEN_TE,
 	WSI_TOKEN_REPLAY_NONCE, /* ACME */
 #endif
-#if defined(LWS_ROLE_H2) || defined(LWS_HTTP_HEADERS_ALL)
+#if defined(LWS_ROLE_H2) || defined(LWS_ROLE_H3) || defined(LWS_HTTP_HEADERS_ALL)
 	WSI_TOKEN_COLON_PROTOCOL,
 #endif
 	WSI_TOKEN_X_AUTH_TOKEN,
@@ -416,6 +431,15 @@ lws_token_to_string(enum lws_token_indexes token);
  */
 LWS_VISIBLE LWS_EXTERN int LWS_WARN_UNUSED_RESULT
 lws_hdr_total_length(struct lws *wsi, enum lws_token_indexes h);
+
+/**
+ * lws_hdr_extant: check if a header is present
+ *
+ * \param wsi: websocket connection
+ * \param h: which header index we are interested in
+ */
+LWS_VISIBLE LWS_EXTERN int LWS_WARN_UNUSED_RESULT
+lws_hdr_extant(struct lws *wsi, enum lws_token_indexes h);
 
 /**
  * lws_hdr_fragment_length: report length of a single fragment of a header
@@ -533,20 +557,44 @@ lws_hdr_custom_name_foreach(struct lws *wsi, lws_hdr_custom_fe_cb_t cb, void *op
  * lws_get_urlarg_by_name_safe() - get copy and return length of y for x=y urlargs
  *
  * \param wsi: the connection to check
- * \param name: the arg name, like "token" or "token="
- * \param buf: the buffer to receive the urlarg value only (the name= prefix is
- *             stripped from the result via memmove); buf must be large enough
- *             for the full "name=value" fragment plus 2 bytes, because the
- *             check is fraglen + 1 < len
- * \param len: the length of buf
+ * \param name: the arg name to look for.  Including the trailing '=' is
+ *              recommended (eg "token="); if you omit it, a single '=' separator
+ *              in the matched arg is still trimmed from the result for you
+ * \param buf: the buffer to receive the urlarg *value* (the name= prefix is
+ *             not copied).  It only needs to be large enough for the value you
+ *             want back, plus the NUL terminator -- the name= prefix match is
+ *             done against the in-place parsed header storage and does not
+ *             depend on the size of buf
+ * \param len: the usable size of buf in bytes
  *
- * Returns -1 if not present, else the length of y in the urlarg name=y.  If
- * zero or greater, then buf contains a copy of the string y.  Any = after the
- * name match is trimmed off if the name does not end with = itself.
+ * Looks up the URI query arg "name" (from the request's ?... part) and copies
+ * its value into buf.
  *
- * This returns the explicit length and so can deal with binary blobs that are
- * percent-encoded.  It also makes sure buf has a NUL just after the valid
- * length so it can work with NUL-based apis if you don't care about truncation.
+ * Urlarg values may be fragmented in the parsed-header storage when the request
+ * line contains multiple ?x=y&w=z style args; this helper walks the full arg
+ * fragment chain to find the named one, so the buf size has no effect on which
+ * arg is matched -- only on whether the matched value fits.
+ *
+ * Returns one of:
+ *
+ *   >= 0: the arg was present and its value (length \p return_value, NUL not
+ *         included) is in buf, with a NUL written at buf[return_value].  A
+ *         returned length of 0 means the arg was given as a bare "name=" with
+ *         an empty value
+ *   -1:    the arg was not present, or there is no parsed header storage
+ *   -2:    the arg was found but its value will not fit in buf (len bytes,
+ *         including room for the NUL); buf is left unmodified.  Call again with
+ *         a larger buf if you need the value
+ *
+ * The parser refuses any request whose URI contains a C0 control byte or
+ * DEL (raw or percent-encoded), so the returned value only ever contains
+ * printable and high (>= 0x80, eg UTF-8) bytes.
+ *
+ * This returns the explicit length and so can deal with values that are
+ * percent-encoded (the parser already percent-decodes the URI-args before they
+ * reach here).  It always writes a NUL just after the valid length so the
+ * result can also be used with NUL-based apis when you don't care about
+ * truncation.
  *
  * buf may have been written even when -1 is returned indicating no match.
  *
@@ -561,20 +609,20 @@ lws_get_urlarg_by_name_safe(struct lws *wsi, const char *name, char *buf, int le
  *
  * \param wsi: the connection to check
  * \param name: the arg name, like "token="
- * \param buf: the buffer to receive the urlarg value only (the name= prefix is
- *             stripped from the result via memmove); buf must be large enough
- *             for the full "name=value" fragment plus 2 bytes, because the
- *             check is fraglen + 1 < len
- * \param len: the length of buf
+ * \param buf: the buffer to receive the urlarg *value* (the name= prefix is
+ *             not returned); it only needs to be large enough for the value
+ *             you want back, plus the NUL terminator
+ * \param len: the usable size of buf in bytes
  *
- *     Returns NULL if not found or a pointer inside buf to just after the
- *     name= part.
+ *     Returns NULL if not found (or if the value did not fit in buf), or a
+ *     pointer to buf holding just the value (NUL-terminated).
  *
  * This assumed the argument can be represented with a NUL-terminated string.
  * It can't correctly deal with binary values encoded with %XX, eg. %00 will
  * be understood to terminate the string.
  *
- * Use lws_get_urlarg_by_name_safe() instead of this, which returns the length.
+ * Use lws_get_urlarg_by_name_safe() instead of this, which returns the length
+ * and distinguishes "not present" (-1) from "did not fit" (-2).
  */
 LWS_VISIBLE LWS_EXTERN const char *
 lws_get_urlarg_by_name(struct lws *wsi, const char *name, char *buf, int len)
@@ -612,6 +660,124 @@ lws_http_remove_urlarg(struct lws *wsi, const char *name);
 LWS_VISIBLE LWS_EXTERN int
 lws_http_zap_header(struct lws *wsi, const char *name);
 
+/**
+ * lws_http_add_onward_header() - add a header to be forwarded to the proxy
+ *                                  backend
+ *
+ * \param wsi: the connection (typically the browser-side wsi an interceptor
+ *             sees during LWS_CALLBACK_HTTP_INTERCEPTOR_CHECK)
+ * \param name: the header name, eg "x-lws-login-admin"
+ * \param value: the header value (NUL-terminated)
+ *
+ * Interceptors authenticate the request and may want to pass the cooked,
+ * trusted result (eg logged-in subject, admin flag) to the backend app served
+ * behind a reverse-proxy mount, so the app does no auth of its own.  This
+ * appends "name: value\r\n" to the wsi's "extra onward headers" blob, which
+ * the HTTP and WS proxy paths forward to the backend.
+ *
+ * To prevent spoofing, any client-supplied copy of the same header is
+ * removed from the request headers (as by lws_http_zap_header()) before the
+ * trusted one is appended, so it cannot reach the backend or be read from
+ * the ah by anything downstream.  An interceptor that decides NOT to stamp
+ * a header it normally would (eg, it refused the request, or waved it
+ * through on some bypass) should still lws_http_zap_header() it, so the
+ * peer's copy is gone on every path.
+ *
+ * Returns 0 on success or nonzero on OOM.
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_http_add_onward_header(struct lws *wsi, const char *name,
+			   const char *value);
+
+/**
+ * lws_http_get_onward_header() - read a header an interceptor stamped on
+ *				  this request
+ *
+ * \param wsi: the connection, during the request (LWS_CALLBACK_HTTP etc)
+ * \param name: the header name, eg LWS_LOGIN_HDR_STATE
+ * \param buf: receives the value, NUL terminated
+ * \param len: size of buf
+ *
+ * The counterpart of lws_http_add_onward_header() for an app served
+ * IN-PROCESS behind a gated mount, rather than through the reverse proxy.
+ * The proxy forwards the stamped headers to a remote backend as request
+ * headers; an in-process protocol handling the same request gets them from
+ * here instead.  Only an interceptor can put something in this list (the
+ * peer's own copy of the name is removed from the request when it is
+ * stamped), so unlike a header read from the request, the value is
+ * trustworthy without any "is there a proxy in front of me" configuration.
+ *
+ * Returns the value length, -1 if nothing of that name was stamped, or -2
+ * if the value does not fit in buf.  Reads the transaction's state, so it
+ * must be called while the request is being handled, not from a later
+ * timer.
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_http_get_onward_header(struct lws *wsi, const char *name, char *buf,
+			   size_t len);
+
+///@}
+
+/*! \defgroup lws-login-state Login state injection (lws-login)
+ * \ingroup http
+ *
+ * ## Login state injection
+ *
+ * When a mount is guarded by the `lws-login` bouncer plugin, the bouncer
+ * authenticates the request, decides the requestor's role from the verified
+ * JWT grants, and stamps the cooked, trusted result onto the browser-side wsi
+ * as "extra onward headers" (set with lws_http_add_onward_header(), which
+ * first anti-spoofs any client-supplied copy; the bouncer also snips them on
+ * every path through its check, stamped or not).  The HTTP/WS
+ * proxy paths then forward these to the backend app behind the mount, so the
+ * app does no JWT/grant work of its own -- it just reads the headers.
+ *
+ * The authoritative summary is the single header \ref LWS_LOGIN_HDR_STATE,
+ * whose value is the stringified \ref lws_login_state.  The finer-grained
+ * \ref LWS_LOGIN_HDR_GRANT_LEVEL (the raw integer grant level the bouncer used
+ * to decide the role for this mount) and \ref LWS_LOGIN_HDR_SUB (the subject
+ * identity) are also injected for apps that want the detail.  \ref
+ * LWS_LOGIN_HDR_ADMIN is kept for back-compat and is exactly equivalent to
+ * `state == LWS_LOGIN_STATE_GLOBAL_ADMIN`.
+ *
+ * Crucially, \ref LWS_LOGIN_STATE_APP_ADMIN (admin of THIS app only) and \ref
+ * LWS_LOGIN_STATE_GLOBAL_ADMIN (the TOFU "*" / "god" account, admin of the
+ * whole system) are distinct: a backend must not treat an app admin as a
+ * system-wide admin.  The states are strictly ordered by privilege, so
+ * `state >= LWS_LOGIN_STATE_APP_ADMIN` selects "any kind of admin" and
+ * `state == LWS_LOGIN_STATE_GLOBAL_ADMIN` selects "system-wide only".
+ *
+ * These headers are only trustworthy when they reach the backend through the
+ * bouncer's proxy path: the bouncer zaps any client-supplied copy first.  A
+ * backend reachable directly (bypassing the mount) must not trust them.
+ */
+///@{
+#define LWS_LOGIN_HDR_STATE        "x-lws-login-state"
+#define LWS_LOGIN_HDR_ADMIN        "x-lws-login-admin"
+#define LWS_LOGIN_HDR_GRANT_LEVEL  "x-lws-login-grant-level"
+#define LWS_LOGIN_HDR_SUB          "x-lws-login-sub"
+
+/**
+ * enum lws_login_state - summary role of the identity reaching a backend
+ *
+ * Value of \ref LWS_LOGIN_HDR_STATE as injected by the lws-login bouncer into
+ * backend apps behind a protected mount.  Members are ordered by privilege;
+ * higher == strictly more authority.
+ */
+enum lws_login_state {
+	/** No valid JWT.  Only observable on mounts with unauth-allow=1. */
+	LWS_LOGIN_STATE_ANON = 0,
+	/** Valid JWT, but no grant (and no "*" wildcard) for this service. */
+	LWS_LOGIN_STATE_NO_GRANT = 1,
+	/** Holds this service's grant at level >= 1 but < 2, no "*". */
+	LWS_LOGIN_STATE_USER = 2,
+	/** Holds this service's grant at level >= 2, no "*": admin of THIS
+	 * app only, NOT a system-wide admin. */
+	LWS_LOGIN_STATE_APP_ADMIN = 3,
+	/** Holds the "*" wildcard grant (the TOFU "god" account): admin of the
+	 * whole system.  Any "*" level >= 1 qualifies. */
+	LWS_LOGIN_STATE_GLOBAL_ADMIN = 4,
+};
 ///@}
 
 /*! \defgroup HTTP-headers-create HTTP headers: create
@@ -662,6 +828,21 @@ lws_add_http_header_status(struct lws *wsi,
  * \param end: pointer to end of buffer
  *
  * Appends name: value to the headers
+ *
+ * The add fails (returns 1, nothing emitted) if the name or the value
+ * contains a C0 control byte other than TAB, or DEL: header values are
+ * RFC 9110 field-content (VCHAR / SP / HTAB / obs-text), and emitting
+ * such bytes is at best invalid and at worst response splitting over
+ * h1.  This also fences misconfiguration (CR/LF in vhost header strings).
+ *
+ * A NULL name composes the value with no field name (used for the h1
+ * status line); h2/h3 have no such representation (the status is the
+ * :status pseudo-header from the _status helpers), so over h2/h3 a NULL
+ * name fails the add (returns 1, nothing emitted).
+ *
+ * A header that does not fit before \p end also fails the add, and leaves
+ * nothing of itself behind: *p is where it was before the call, so the
+ * caller may go on to add something smaller, or fail its own composition.
  */
 LWS_VISIBLE LWS_EXTERN int LWS_WARN_UNUSED_RESULT
 lws_add_http_header_by_name(struct lws *wsi, const unsigned char *name,
@@ -679,6 +860,9 @@ lws_add_http_header_by_name(struct lws *wsi, const unsigned char *name,
  *
  * Appends name=value to the headers, but is able to take advantage of better
  * HTTP/2 coding mechanisms where possible.
+ *
+ * As with lws_add_http_header_by_name(), the add fails (returns 1, nothing
+ * emitted) if the value contains a C0 control byte other than TAB, or DEL.
  */
 LWS_VISIBLE LWS_EXTERN int LWS_WARN_UNUSED_RESULT
 lws_add_http_header_by_token(struct lws *wsi, enum lws_token_indexes token,
@@ -712,15 +896,24 @@ lws_finalize_http_header(struct lws *wsi, unsigned char **p,
 			 unsigned char *end);
 
 /**
- * lws_finalize_write_http_header() - Helper finializing and writing http headers
+ * lws_finalize_write_http_header() - Helper finalizing and writing http headers
  *
  * \param wsi: the connection to check
  * \param start: pointer to the start of headers in the buffer, eg &buf[LWS_PRE]
  * \param p: pointer to current position in buffer pointer
  * \param end: pointer to end of buffer
  *
- * Terminates the headers correctly accoring to the protocol in use (h1 / h2)
+ * Terminates the headers correctly according to the protocol in use (h1 / h2)
  * and writes the headers.  Returns nonzero for error.
+ *
+ * This is a convenience wrapper around lws_finalize_write_http_header_flags()
+ * (declared in lws-write.h, alongside the write-protocol enum) that passes
+ * plain LWS_WRITE_HTTP_HEADERS, suitable for responses that will send a body
+ * afterwards.  For a headers-only response (eg a 302 with no body), use
+ * lws_finalize_write_http_header_flags() with
+ * LWS_WRITE_HTTP_HEADERS | LWS_WRITE_H2_STREAM_END so that under h2 / h3 the
+ * HEADERS frame carries END_STREAM -- otherwise the stream hangs open waiting
+ * for a body that never comes and the client sees no response.
  */
 LWS_VISIBLE LWS_EXTERN int LWS_WARN_UNUSED_RESULT
 lws_finalize_write_http_header(struct lws *wsi, unsigned char *start,
@@ -1010,19 +1203,84 @@ lws_http_is_redirected_to_get(struct lws *wsi);
  * \param wsi: the wsi to check
  * \param name: name of the cookie
  * \param buf: buffer to store the cookie contents into
- * \param max_len: on entry, maximum length of buf... on exit, used len of buf
+ * \param max: on entry, maximum length of buf... on exit, used len of buf
  *
- * If no cookie header, or no cookie of the requested name, or the value is
- * larger than can fit in buf, returns nonzero.
+ * If no cookie header, or no cookie of the requested name, returns 1.  If the
+ * value, with its terminating NUL, is larger than can fit in buf, returns 2.
+ * In those cases, buf and *max are untouched: a partial value is never handed
+ * out.
  *
- * If the cookie is found, copies its value into buf with a terminating NUL,
- * sets *max_len to the used length, and returns 0.
+ * If the cookie is found, copies its whole value into buf with a terminating
+ * NUL, sets *max to the used length, and returns 0.
  *
  * This handles the parsing of the possibly multi-cookie header string and
  * terminating the requested cookie at the next ; if present.
  */
 LWS_VISIBLE LWS_EXTERN int
 lws_http_cookie_get(struct lws *wsi, const char *name, char *buf, size_t *max);
+
+/**
+ * lws_http_cookie_get_nth() - return copy of the n-th same-named cookie
+ *
+ * \param wsi: the wsi to check
+ * \param name: name of the cookie
+ * \param n: the 0-based occurrence of the cookie to fetch
+ * \param buf: buffer to store the cookie contents into
+ * \param max: on entry, maximum length of buf... on exit, used len of buf
+ *
+ * Browsers can legitimately present multiple cookies with the same name (eg a
+ * host-only cookie alongside a Domain-scoped one set by a different flow), and
+ * RFC 6265 orders same-path cookies oldest-first.  This lets credential
+ * resolution walk every value with n = 0, 1, ... rather than trusting that the
+ * first one is the live one.
+ *
+ * If no n-th cookie of the requested name exists, returns 1.  If the value,
+ * with its terminating NUL, is larger than can fit in buf, returns 2.  In
+ * those cases, buf and *max are untouched: a partial value is never handed
+ * out.  Otherwise copies the whole value into buf with a terminating NUL,
+ * sets *max to the used length, and returns 0.
+ *
+ * Unlike lws_http_cookie_get(), no __Host- / __Secure- prefixed aliases of the
+ * name are considered; exactly \p name is resolved.
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_http_cookie_get_nth(struct lws *wsi, const char *name, int n,
+			char *buf, size_t *max);
+
+/**
+ * lws_http_cookie_compose() - compose a complete set-cookie: header value
+ *
+ * \param buf: buffer to compose the header value into, or NULL to only measure
+ * \param len: bytes available at buf; ignored when buf is NULL
+ * \param name: cookie name; must be non-NULL (use "" never to clear)
+ * \param value: cookie value; must be non-NULL ("" for a clearing cookie)
+ * \param domain: optional Domain attribute; NULL or "" for a host-only cookie
+ * \param max_age: Max-Age attribute, seconds (0 when clearing)
+ * \param expires: optional Expires attribute (RFC 1123 date string), or NULL
+ *
+ * Composes "name=value; Path=/; [Domain=..; ][Expires=..; ]Max-Age=N;
+ * HttpOnly; SameSite=Lax; Secure" -- the fixed scoping the lws SSO plugins
+ * mint their session cookies with -- into buf, ready to pass to
+ * lws_add_http_header_by_name() as a set-cookie: value.
+ *
+ * The attribute tail is never silently truncated: a Set-Cookie whose
+ * HttpOnly / SameSite / Secure attributes were chopped off is
+ * browser-readable and http-sendable, exactly what the attribute tail exists
+ * to prevent.  If the complete string with its full attribute set does not
+ * fit in buf, nothing is composed, buf[0] is set to '\0' (when buf and len
+ * are usable) and -1 is returned; callers must fail the response or skip the
+ * cookie, never emit the partial string.
+ *
+ * With buf set to NULL, returns the length the composed string would have
+ * (excluding the terminating NUL), so callers can size a buffer first.
+ *
+ * Returns the length of the composed string in buf (excluding the NUL), or
+ * -1 if it would not fit / the arguments are unusable.
+ */
+LWS_VISIBLE LWS_EXTERN int
+lws_http_cookie_compose(char *buf, size_t len, const char *name,
+			const char *value, const char *domain,
+			unsigned long long max_age, const char *expires);
 
 /**
  * lws_http_client_http_error() - determine if the response code indicates an error
@@ -1077,6 +1335,47 @@ lws_h2_update_peer_txcredit(struct lws *wsi, unsigned int sid, int bump);
  */
 LWS_VISIBLE LWS_EXTERN int
 lws_h2_get_peer_txcredit_estimate(struct lws *wsi);
+
+
+/**
+ * enum lws_h2_errors - HTTP/2 error code values
+ *
+ * These are the RST_STREAM and GOAWAY error codes defined in RFC 7540
+ * section 11.4.  They are returned by lws_h2_get_peer_rst_status() and used
+ * internally when emitting RST_STREAM frames.
+ */
+enum lws_h2_errors {
+	H2_ERR_NO_ERROR,		/**< Graceful shutdown */
+	H2_ERR_PROTOCOL_ERROR,		/**< Protocol error detected */
+	H2_ERR_INTERNAL_ERROR,		/**< Implementation fault */
+	H2_ERR_FLOW_CONTROL_ERROR,	/**< Flow-control limits exceeded */
+	H2_ERR_SETTINGS_TIMEOUT,	/**< Settings not acknowledged */
+	H2_ERR_STREAM_CLOSED,		/**< Frame received for closed stream */
+	H2_ERR_FRAME_SIZE_ERROR,	/**< Frame size incorrect */
+	H2_ERR_REFUSED_STREAM,		/**< Stream not processed */
+	H2_ERR_CANCEL,			/**< Stream cancelled */
+	H2_ERR_COMPRESSION_ERROR,	/**< Compression state not updated */
+	H2_ERR_CONNECT_ERROR,		/**< TCP connection error for CONNECT */
+	H2_ERR_ENHANCE_YOUR_CALM,	/**< Processing capacity exceeded */
+	H2_ERR_INADEQUATE_SECURITY,	/**< Negotiated TLS params not acceptable */
+	H2_ERR_HTTP_1_1_REQUIRED,	/**< Use HTTP/1.1 for the request */
+};
+
+/**
+ * lws_h2_get_peer_rst_status() - return the peer's RST_STREAM error code
+ *
+ * \param wsi: the h2 stream wsi that was reset by the peer
+ *
+ * Returns the RFC 7540 section 11.4 error code the peer carried in the
+ * RST_STREAM that closed this h2 stream, or 0 (H2_ERR_NO_ERROR) if the stream
+ * was not reset by the peer.  Valid from the stream's close callbacks
+ * (eg LWS_CALLBACK_CLOSED_CLIENT_HTTP, LWS_CALLBACK_CLIENT_CONNECTION_ERROR).
+ *
+ * This lets user code distinguish, for example, H2_ERR_REFUSED_STREAM (the
+ * stream was never processed and may be retried elsewhere) from other failures.
+ */
+LWS_VISIBLE LWS_EXTERN uint32_t
+lws_h2_get_peer_rst_status(struct lws *wsi);
 
 ///@}
 

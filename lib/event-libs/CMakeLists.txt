@@ -40,9 +40,6 @@ macro(create_evlib_plugin PLUGIN_NAME MAIN_SRC PLUGIN_HDR EVLIB)
 		set_property(TARGET websockets-${PLUGIN_NAME} PROPERTY MACOSX_RPATH YES)
 	endif()
 
-	foreach(libpath ${LWS_DEP_LIB_PATHS})
-		target_link_directories(websockets-${PLUGIN_NAME} PRIVATE ${libpath})
-	endforeach()
 
 	set(STRIPPED_EVLIB "")
 	foreach(lib_path ${EVLIB})
@@ -71,19 +68,20 @@ macro(create_evlib_plugin PLUGIN_NAME MAIN_SRC PLUGIN_HDR EVLIB)
 	target_include_directories(websockets-${PLUGIN_NAME} PRIVATE
 			${PLUGIN_INCLUDE} ${LWS_LIB_BUILD_INC_PATHS}
 			"${CMAKE_CURRENT_SOURCE_DIR}/../../core"
-			"${CMAKE_CURRENT_SOURCE_DIR}/../../roles"
-			"${CMAKE_CURRENT_SOURCE_DIR}/../../roles/http"
-			"${CMAKE_CURRENT_SOURCE_DIR}/../../roles/h1"
-			"${CMAKE_CURRENT_SOURCE_DIR}/../../roles/h2"
-			"${CMAKE_CURRENT_SOURCE_DIR}/../../roles/http/compression"
-			"${CMAKE_CURRENT_SOURCE_DIR}/../../roles/ws"
-			"${CMAKE_CURRENT_SOURCE_DIR}/../../roles/cgi"
-			"${CMAKE_CURRENT_SOURCE_DIR}/../../roles/listen"
-			"${CMAKE_CURRENT_SOURCE_DIR}/../../roles/dbus"
-			"${CMAKE_CURRENT_SOURCE_DIR}/../../roles/mqtt"
-			"${CMAKE_CURRENT_SOURCE_DIR}/../../roles/raw-skt"
-			"${CMAKE_CURRENT_SOURCE_DIR}/../../roles/raw-file"
-			"${CMAKE_CURRENT_SOURCE_DIR}/../../roles/raw-proxy"
+			"${CMAKE_CURRENT_SOURCE_DIR}/../../sansio"
+			"${CMAKE_CURRENT_SOURCE_DIR}/../../io"
+			"${CMAKE_CURRENT_SOURCE_DIR}/../../sansio/http"
+			"${CMAKE_CURRENT_SOURCE_DIR}/../../sansio/h1"
+			"${CMAKE_CURRENT_SOURCE_DIR}/../../sansio/h2"
+			"${CMAKE_CURRENT_SOURCE_DIR}/../../sansio/http/compression"
+			"${CMAKE_CURRENT_SOURCE_DIR}/../../sansio/ws"
+			"${CMAKE_CURRENT_SOURCE_DIR}/../../io/cgi"
+			"${CMAKE_CURRENT_SOURCE_DIR}/../../io/listen"
+			"${CMAKE_CURRENT_SOURCE_DIR}/../../io/dbus"
+			"${CMAKE_CURRENT_SOURCE_DIR}/../../sansio/mqtt"
+			"${CMAKE_CURRENT_SOURCE_DIR}/../../sansio/raw-skt"
+			"${CMAKE_CURRENT_SOURCE_DIR}/../../io/raw-file"
+			"${CMAKE_CURRENT_SOURCE_DIR}/../../sansio/raw-proxy"
 			"${CMAKE_CURRENT_SOURCE_DIR}/../../core-net"
 			"${CMAKE_CURRENT_SOURCE_DIR}/../../tls"
 			"${CMAKE_CURRENT_SOURCE_DIR}/../../system/smd"
@@ -163,5 +161,11 @@ add_subdir_include_directories_local_end()
 #
 
 export_to_parent_intermediate()
+if (LIBUV_INCLUDE_DIRS)
+	set(LWS_PUBLIC_INCLUDES ${LWS_PUBLIC_INCLUDES} "${LIBUV_INCLUDE_DIRS}")
+endif()
+if (LWS_PUBLIC_INCLUDES)
+	set(LWS_PUBLIC_INCLUDES ${LWS_PUBLIC_INCLUDES} PARENT_SCOPE)
+endif()
 set(EVLIB_PLUGINS_LIST ${EVLIB_PLUGINS_LIST} PARENT_SCOPE)
 

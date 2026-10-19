@@ -19,6 +19,9 @@
  *    it once insisted on http-01, failing every dns-01 acquisition
  *  - ...but an answer about a different type of challenge is refused
  *  - an error body's detail is kept
+ *  - a failed challenge, fetched for the CA's reason after the order went
+ *    invalid, gives its status and its error's detail whole... the detail
+ *    was once kept in 64 bytes, and nothing asked for it anyway
  *  - a challenge token that is not base64url is refused, but only for the
  *    challenge we take up
  *
@@ -31,7 +34,14 @@
  *  - a refusal with no "req" (eg, authentication failed) is told apart
  *  - a validity answer gives its days, and a refused save that stores the
  *    cert is flagged
+ *  - an answer to get_auth_key is told apart
  *  - an overlong line is dropped without losing the line after it
+ *
+ * The account key the daemon hands back in its answer to get_auth_key:
+ *
+ *  - a P-256 private JWK, sent the way the daemon sends it (base64url in
+ *    "jwk"), is imported whole, private part and all
+ *  - an answer without it, or with something that is not a JWK, is refused
  *
  * And the collector for the issued cert's PEM body, fed in one read and a
  * byte at a time:
@@ -148,6 +158,7 @@ static const char *ajt_ipc_lines =
 	"{\"req\":\"cert_status\",\"subdomain\":\"www.npro.rs\",\"port\":443,\"status\":\"ok\",\"msg\":\"\",\"local_msg\":\"\",\"issuer\":\"R11\"}\n"
 	"{\"req\":\"save_cert\",\"status\":\"ok\"}\n"
 	"{\"req\":\"get_cert_validity\",\"status\":\"ok\",\"days_left\":4,\"total_days\":6}\n"
+	"{\"req\":\"get_auth_key\",\"status\":\"error\",\"none\":true,\"msg\":\"No account key\"}\n"
 	"{\"status\":\"error\",\"msg\":\"Authentication Failed\"}\n";
 
 static const struct acme_ipc_reply ajt_ipc_want[] = {
@@ -156,6 +167,7 @@ static const struct acme_ipc_reply ajt_ipc_want[] = {
 	{ ACME_IPC_LINE_UNRELATED,	0, 0, 1, 0 },
 	{ ACME_IPC_LINE_SAVE,		0, 0, 1, 1 },
 	{ ACME_IPC_LINE_VALIDITY,	4, 6, 1, 0 },
+	{ ACME_IPC_LINE_AUTH_KEY,	0, 0, 0, 0 },
 	{ ACME_IPC_LINE_REFUSED,	0, 0, 0, 0 },
 };
 
@@ -163,6 +175,26 @@ struct ajt_ipc_got {
 	struct acme_ipc_reply	r[LWS_ARRAY_SIZE(ajt_ipc_want) + 1];
 	size_t			count;
 };
+
+/* a dns-01 challenge the CA could not validate, as it answers a fetch of it */
+
+#define AJT_REASON "During secondary validation: Incorrect TXT record " \
+	"\\\"r7mw1lv3gqzR8vYQm0q9Zx8kq4hVnB2wQb2T0QyXzF0\\\" found at " \
+	"_acme-challenge.npro.rs"
+
+static const char *ajt_chac_invalid =
+	"{\n"
+	"  \"type\": \"dns-01\",\n"
+	"  \"url\": \"" AJT_LE "chall/3871165087/800702818627/HRf5UQ\",\n"
+	"  \"status\": \"invalid\",\n"
+	"  \"validated\": \"2026-10-16T11:13:13Z\",\n"
+	"  \"error\": {\n"
+	"    \"type\": \"urn:ietf:params:acme:error:unauthorized\",\n"
+	"    \"detail\": \"" AJT_REASON "\",\n"
+	"    \"status\": 403\n"
+	"  },\n"
+	"  \"token\": \"Ub6D315kflFKV8LXKceqovfdGeC0hvGNxO-zf9J9GkI\"\n"
+	"}";
 
 /* the http-01 challenge's token is not base64url */
 
@@ -339,6 +371,96 @@ ajt_error(int bw)
 	return ajt_expect("error detail", bw, ac.detail,
 			  "Account is not authorized") |
 	       ajt_expect("error chall token", bw, ac.chall_token, "");
+}
+
+static int
+ajt_chall_reason(int bw)
+{
+	int bad = 0;
+
+	memset(&ac, 0, sizeof(ac));
+	lws_strncpy(ac.chall_type, "dns-01", sizeof(ac.chall_type));
+
+	if (ajt_parse(acme_cb_chac, &ac, acme_jchac_tok,
+		      LWS_ARRAY_SIZE(acme_jchac_tok), ajt_chac_invalid, bw) < 0) {
+		lwsl_err("chall reason (%d): parse failed\n", bw);
+		return 1;
+	}
+
+	bad |= ajt_expect("chall reason status", bw, ac.status, "invalid");
+	bad |= ajt_expect("chall reason detail", bw, ac.detail,
+			  "During secondary validation: Incorrect TXT record "
+			  "\"r7mw1lv3gqzR8vYQm0q9Zx8kq4hVnB2wQb2T0QyXzF0\" "
+			  "found at _acme-challenge.npro.rs");
+
+	return bad;
+}
+
+/* RFC 7515 A.3's P-256 key */
+
+static const char *ajt_jwk_p256 =
+	"{\"kty\":\"EC\",\"crv\":\"P-256\","
+	"\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\","
+	"\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\","
+	"\"d\":\"jpsQnnGQmL-YBIffH1136cLSG9ln6Ur6SAh-fcQ9pXo\"}";
+
+static int
+ajt_auth_key(void)
+{
+	char exp[1024], exp2[1024], b64[1536], line[2048];
+	struct lws_jwk jwk, got;
+	int el = sizeof(exp), el2 = sizeof(exp2), n, bl, bad = 0;
+
+	memset(&jwk, 0, sizeof(jwk));
+	memset(&got, 0, sizeof(got));
+
+	if (lws_jwk_import(&jwk, NULL, NULL, ajt_jwk_p256,
+			   strlen(ajt_jwk_p256))) {
+		lwsl_err("auth key: unable to import the test key\n");
+		return 1;
+	}
+
+	/* as the daemon answers */
+	n = lws_jwk_export(&jwk, LWSJWKF_EXPORT_PRIVATE | LWSJWKF_EXPORT_NOCRLF,
+			   exp, &el);
+	bl = n > 0 ? lws_b64_encode_string_url(exp, n, b64, sizeof(b64)) : -1;
+	if (bl <= 0) {
+		lwsl_err("auth key: unable to export the test key\n");
+		lws_jwk_destroy(&jwk);
+		return 1;
+	}
+	n = lws_snprintf(line, sizeof(line), "{\"req\":\"get_auth_key\","
+			 "\"status\":\"ok\",\"jwk\":\"%.*s\"}", bl, b64);
+
+	if (acme_ipc_auth_key_import(line, (size_t)n, &got)) {
+		lwsl_err("auth key: refused\n");
+		bad = 1;
+	} else {
+		n = lws_jwk_export(&got, LWSJWKF_EXPORT_PRIVATE |
+				   LWSJWKF_EXPORT_NOCRLF, exp2, &el2);
+		bad |= ajt_expect("auth key", 0, n > 0 ? exp2 : "", exp);
+	}
+	lws_jwk_destroy(&got);
+	lws_jwk_destroy(&jwk);
+
+	n = lws_snprintf(line, sizeof(line), "{\"req\":\"get_auth_key\","
+			 "\"status\":\"ok\"}");
+	if (!acme_ipc_auth_key_import(line, (size_t)n, &got)) {
+		lwsl_err("auth key: accepted without one\n");
+		lws_jwk_destroy(&got);
+		bad = 1;
+	}
+
+	/* "hello world", as base64url */
+	n = lws_snprintf(line, sizeof(line), "{\"req\":\"get_auth_key\","
+			 "\"status\":\"ok\",\"jwk\":\"aGVsbG8gd29ybGQ\"}");
+	if (!acme_ipc_auth_key_import(line, (size_t)n, &got)) {
+		lwsl_err("auth key: accepted something that is not a JWK\n");
+		lws_jwk_destroy(&got);
+		bad = 1;
+	}
+
+	return bad;
 }
 
 static int
@@ -584,10 +706,12 @@ main(int argc, const char **argv)
 		ajt_result("dns-01", ajt_challenge(LWS_ACME_CHALLENGE_TYPE_DNS_01, bw));
 		ajt_result("http-01", ajt_challenge(LWS_ACME_CHALLENGE_TYPE_HTTP_01, bw));
 		ajt_result("error", ajt_error(bw));
+		ajt_result("chall reason", ajt_chall_reason(bw));
 		ajt_result("bad token", ajt_bad_token(bw));
 		ajt_result("ipc", ajt_ipc(bw));
 		ajt_result("cert", ajt_cert(bw));
 	}
+	ajt_result("auth key", ajt_auth_key());
 
 	lwsl_user("Completed: PASS: %d, FAIL: %d\n", oks, fails);
 

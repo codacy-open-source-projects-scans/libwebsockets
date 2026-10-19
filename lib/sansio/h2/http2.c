@@ -237,6 +237,52 @@ lws_h2_peer_ended_stream(struct lws *swsi)
 }
 
 /*
+ * Queue a WINDOW_UPDATE giving the peer \p credit more on stream \p sid, or
+ * the connection if sid is 0.
+ *
+ * They're additive, so if one for the same sid is still waiting to go out, the
+ * credit is added to that instead.  Each grant otherwise takes its own pending
+ * send, and a peer that grants in small steps faster than the connection gets
+ * writeable, eg, a stream doing its own rx flow control, or every DATA frame
+ * giving connection credit back, fills the pending sends and has us drop our
+ * own connection.
+ */
+
+static int
+lws_h2_pps_window_update(struct lws *wsi, unsigned int sid, unsigned int credit)
+{
+	struct lws *nwsi = lws_get_network_wsi(wsi);
+	struct lws_h2_protocol_send *pps;
+
+	if (nwsi && nwsi->h2.h2n)
+		lws_start_foreach_dll(struct lws_dll2 *, d,
+				      lws_dll2_get_head(&nwsi->h2.h2n->pps_owner)) {
+			pps = lws_container_of(d, struct lws_h2_protocol_send,
+					       list);
+
+			/* a window can't be more than 2^31 - 1 (RFC9113 6.9.1) */
+
+			if (pps->type == LWS_H2_PPS_UPDATE_WINDOW &&
+			    pps->u.update_window.sid == sid &&
+			    credit <= 0x7fffffffu - pps->u.update_window.credit) {
+				pps->u.update_window.credit += credit;
+				return 0;
+			}
+		} lws_end_foreach_dll(d);
+
+	pps = lws_h2_new_pps(LWS_H2_PPS_UPDATE_WINDOW);
+	if (!pps)
+		return 1;
+
+	pps->u.update_window.sid = sid;
+	pps->u.update_window.credit = credit;
+
+	lws_pps_schedule(wsi, pps);
+
+	return 0;
+}
+
+/*
  * Give the peer back connection-level (sid 0) flow control credit only:
  * for DATA on streams that are already gone, a stream-level update would
  * itself be a protocol error, but the frame still consumed connection
@@ -247,31 +293,19 @@ lws_h2_peer_ended_stream(struct lws *swsi)
 static int
 lws_h2_update_conn_txcredit(struct lws *nwsi, int bump)
 {
-	struct lws_h2_protocol_send *pps;
-
 	if (!bump)
 		return 0;
 
-	pps = lws_h2_new_pps(LWS_H2_PPS_UPDATE_WINDOW);
-	if (!pps)
-		return 1;
-
-	pps->u.update_window.sid = 0;
-	pps->u.update_window.credit = (unsigned int)bump;
 	nwsi->txc.peer_tx_cr_est += bump;
-
 	lws_wsi_txc_describe(&nwsi->txc, __func__, nwsi->mux.my_sid);
 
-	lws_pps_schedule(nwsi, pps);
-
-	return 0;
+	return lws_h2_pps_window_update(nwsi, 0, (unsigned int)bump);
 }
 
 int
 lws_h2_update_peer_txcredit(struct lws *wsi, unsigned int sid, int bump)
 {
 	struct lws *nwsi = lws_get_network_wsi(wsi);
-	struct lws_h2_protocol_send *pps;
 
 	assert(wsi);
 
@@ -284,31 +318,13 @@ lws_h2_update_peer_txcredit(struct lws *wsi, unsigned int sid, int bump)
 	lwsl_info("%s: sid %d: bump %d -> %d\n", __func__, sid, bump,
 			(int)wsi->txc.peer_tx_cr_est + bump);
 
-	pps = lws_h2_new_pps(LWS_H2_PPS_UPDATE_WINDOW);
-	if (!pps)
-		return 1;
-
-	pps->u.update_window.sid = (unsigned int)sid;
-	pps->u.update_window.credit = (unsigned int)bump;
 	wsi->txc.peer_tx_cr_est += bump;
-
 	lws_wsi_txc_describe(&wsi->txc, __func__, wsi->mux.my_sid);
 
-	lws_pps_schedule(wsi, pps);
-
-	pps = lws_h2_new_pps(LWS_H2_PPS_UPDATE_WINDOW);
-	if (!pps)
+	if (lws_h2_pps_window_update(wsi, sid, (unsigned int)bump))
 		return 1;
 
-	pps->u.update_window.sid = 0;
-	pps->u.update_window.credit = (unsigned int)bump;
-	nwsi->txc.peer_tx_cr_est += bump;
-
-	lws_wsi_txc_describe(&nwsi->txc, __func__, nwsi->mux.my_sid);
-
-	lws_pps_schedule(nwsi, pps);
-
-	return 0;
+	return lws_h2_update_conn_txcredit(nwsi, bump);
 }
 
 int
@@ -637,7 +653,15 @@ lws_pps_schedule(struct lws *wsi, struct lws_h2_protocol_send *pps)
 	lws_dll2_add_head(&pps->list, &h2n->pps_owner);
 	lws_rx_flow_control(wsi, LWS_RXFLOW_REASON_APPLIES_DISABLE |
 				 LWS_RXFLOW_REASON_H2_PPS_PENDING);
-	lws_callback_on_writable(wsi);
+
+	/*
+	 * The frame goes out on the connection.  A stream that is closing,
+	 * eg, sending the RST_STREAM for itself, can't ask for writeable any
+	 * more, so the connection must ask, or the frame waits until
+	 * something else writes, perhaps not until the connection times out
+	 */
+	if (lws_callback_on_writable(wsi) <= 0 && wsi != nwsi)
+		lws_callback_on_writable(nwsi);
 }
 
 int
@@ -1386,6 +1410,57 @@ static int
 lws_h2_parse_end_of_frame(struct lws *wsi);
 
 /*
+ * Frames arriving on the network connection let it live a bit longer while
+ * streams are active on it... unless it is a client connection being kept
+ * warm with no streams, whose keep-warm timeout a PING or WINDOW_UPDATE must
+ * not displace.
+ *
+ * A client waits for the server with the context's timeout_secs, the same as
+ * it does for anything else from the server.  The vhost keepalive_timeout is
+ * how long a server waits on an idle client: applied to a client it kills a
+ * response body after a short gap in its arrival, which on a lossy link with
+ * TCP retransmit backoff happens all the time.
+ *
+ * A short (5s) keepalive timeout on a server affects the reverse proxy if the
+ * onward box takes a long time to respond, eg to a POST.  The mount can
+ * override the keepalive timeout, eg, to give the right behaviour depending
+ * on reverse proxy for a particular server.
+ */
+static void
+lws_h2_nwsi_rx_renew_timeout(struct lws *wsi)
+{
+	if (wsi->immortal_substream_count || lwsi_state(wsi) == LRS_IDLING)
+		return;
+
+	if (lwsi_role_client(wsi))
+		lws_set_timeout(wsi, PENDING_TIMEOUT_HTTP_CONTENT,
+				(int)wsi->a.context->timeout_secs);
+	else
+		lws_set_timeout(wsi, PENDING_TIMEOUT_HTTP_KEEPALIVE_IDLE,
+				lws_wsi_keepalive_timeout_eff(wsi));
+}
+
+int
+lws_h2_sid_recently_closed(struct lws_h2_netconn *h2n, uint32_t sid)
+{
+	int n;
+
+	for (n = 0; n < LWS_H2_RECENT_CLOSED; n++)
+		if (sid && h2n->recent_closed_sid[n] == sid)
+			return 1;
+
+	return 0;
+}
+
+void
+lws_h2_sid_closed(struct lws_h2_netconn *h2n, uint32_t sid)
+{
+	h2n->recent_closed_sid[h2n->recent_closed_next] = sid;
+	h2n->recent_closed_next = (uint8_t)((h2n->recent_closed_next + 1) %
+					    LWS_H2_RECENT_CLOSED);
+}
+
+/*
  * The frame header part has just completely arrived.
  * Perform actions for header completion.
  */
@@ -1413,30 +1488,8 @@ lws_h2_parse_frame_header(struct lws *wsi)
 		return 0;
 	}
 
-	/*
-	 * let the network wsi live a bit longer if subs are active... unless
-	 * it is a client connection being kept warm with no streams, whose
-	 * keep-warm timeout a PING or WINDOW_UPDATE must not displace
-	 */
+	lws_h2_nwsi_rx_renew_timeout(wsi);
 
-	if (!wsi->immortal_substream_count && lwsi_state(wsi) != LRS_IDLING) {
-		int ds = lws_wsi_keepalive_timeout_eff(wsi);
-
-		/*
-		 * A short (5s) timeout here affects the reverse proxy if
-		 * the onward box takes a long time to respond, eg to a POST.
-		 * The mount can override the keepalive timeout, eg, to give
-		 * the right behaviour depending on reverse proxy for a particular
-		 * server.
-		 */
-		if (lwsi_role_client(wsi))
-			lws_set_timeout(wsi, PENDING_TIMEOUT_HTTP_CONTENT,
-					(int)wsi->a.context->timeout_secs);
-		else {
-			
-			lws_set_timeout(wsi, PENDING_TIMEOUT_HTTP_KEEPALIVE_IDLE, ds);
-		}
-	}
 	if (h2n->sid)
 		h2n->swsi = lws_wsi_mux_from_id(wsi, h2n->sid);
 
@@ -1610,6 +1663,22 @@ lws_h2_parse_frame_header(struct lws *wsi)
 				return 1;
 			break;
 		}
+
+#if defined(LWS_WITH_CLIENT)
+		/*
+		 * RFC 9113 8.1: a response starts with its HEADERS, the final
+		 * one after any 1xx, and DATA before them is malformed.  Taken,
+		 * it reached the app as body of a response it had no status
+		 * or headers for yet.
+		 */
+		if (h2n->swsi->client_mux_substream &&
+		    lwsi_hdrs_pending(h2n->swsi)) {
+			if (lws_h2_goaway(wsi, H2_ERR_PROTOCOL_ERROR,
+					  "DATA before response HEADERS"))
+				return 1;
+			break;
+		}
+#endif
 
 		break;
 
@@ -1846,10 +1915,53 @@ lws_h2_parse_frame_header(struct lws *wsi)
 
 					break;
 				}
+
+				/*
+				 * A response on a stream we have not sent a
+				 * request on yet (the peer's HEADERS on our
+				 * idle sid, RFC 9113 5.1) must be refused here,
+				 * before any of its payload reaches hpack.  The
+				 * stream's ah still holds the pending request's
+				 * headers, which the block would decode over,
+				 * leaving their fragment metadata describing
+				 * the peer's bytes, or none, when the request
+				 * is composed from it later.
+				 */
+				if (h2n->swsi->client_mux_substream &&
+				    lwsi_state(h2n->swsi) ==
+					    LRS_H2_WAITING_TO_SEND_HEADERS) {
+					if (lws_h2_goaway(wsi,
+						  H2_ERR_PROTOCOL_ERROR,
+						  "HEADERS on unsent stream"))
+						return 1;
+					break;
+				}
 			}
 			goto update_end_headers;
 		}
 #endif
+
+		/*
+		 * A stream of the peer's we finished with, its trailers
+		 * already on their way when we did.  That's not a new stream
+		 * on a lower id than one already opened, a connection error
+		 * (RFC 9113 5.1.1), and its block still has to be decoded:
+		 * the hpack dynamic table is shared by the whole connection.
+		 * Into the sink then, the way a client does for a stream it
+		 * closed.
+		 */
+		if (!h2n->swsi && lws_h2_sid_recently_closed(h2n, h2n->sid)) {
+			lwsl_info("%s: HEADERS for closed sid %u, sinking\n",
+				  __func__, (unsigned int)h2n->sid);
+			if (lws_h2_hpack_sink_start(wsi))
+				return 1;
+
+			h2n->cont_exp = !(h2n->flags & LWS_H2_FLAG_END_HEADERS);
+			h2n->cont_exp_sid = h2n->sid;
+			h2n->cont_exp_headers = 1;
+
+			break;
+		}
 
 		if (!h2n->swsi) {
 			/* no more children allowed by parent */
@@ -2513,19 +2625,10 @@ lws_h2_parse_end_of_frame(struct lws *wsi)
 
 #if defined(LWS_WITH_CLIENT)
 		/*
-		 * A response on a stream we have not sent a request on yet
-		 * (the peer's HEADERS on our idle sid, RFC 9113 5.1) passed
-		 * both trailers gates and reached the response handling from
-		 * H2_WAITING_TO_SEND_HEADERS, which has no row
+		 * A HEADERS on a stream still waiting to send its request was
+		 * refused at its frame header, before its block could decode
+		 * over the request's headers in the ah
 		 */
-		if (h2n->swsi->client_mux_substream &&
-		    lwsi_state(h2n->swsi) == LRS_H2_WAITING_TO_SEND_HEADERS) {
-			if (lws_h2_goaway(wsi, H2_ERR_PROTOCOL_ERROR,
-				      "HEADERS on unsent stream"))
-				return 1;
-			break;
-		}
-
 		if (h2n->swsi->client_mux_substream &&
 		    lws_client_interpret_server_handshake(h2n->swsi) !=
 							LWS_HPI_RET_HANDLED) {
@@ -2772,8 +2875,31 @@ lws_h2_parse_end_of_frame(struct lws *wsi)
 		 * and padding, arrives here with nothing latched yet.
 		 */
 
-		if (h2n->flags & LWS_H2_FLAG_END_STREAM)
+		if ((h2n->flags & LWS_H2_FLAG_END_STREAM) &&
+		    !h2n->swsi->h2.END_STREAM) {
 			lws_h2_peer_ended_stream(h2n->swsi);
+
+			/*
+			 * Nothing in the frame was body, so nothing took the
+			 * END_STREAM as the end of a body with no
+			 * content-length: that is still to be done.  The
+			 * stream's body before it all went in the frames
+			 * before, which we parsed in order.
+			 */
+			if (h2n->swsi->h2.END_STREAM &&
+			    lwsi_role_server(h2n->swsi) &&
+			    !h2n->swsi->h23_stream_carries_ws &&
+			    !h2n->swsi->http.content_length_given &&
+			    (lwsi_state(h2n->swsi) == LRS_BODY ||
+			     lwsi_state(h2n->swsi) == LRS_DISCARD_BODY) &&
+			    lws_read_h1(h2n->swsi, NULL, 0, 1) < 0) {
+				if (lws_h2_rst_stream(h2n->swsi,
+						      H2_ERR_INTERNAL_ERROR,
+						      "body completion failed"))
+					return 1;
+				break;
+			}
+		}
 
 		/*
 		 * He ended his side of the stream owing us body he promised in
@@ -2923,6 +3049,16 @@ lws_h2_parse_end_of_frame(struct lws *wsi)
 				return 1;
 			break;
 		}
+		/*
+		 * The peer only gives credit back for DATA it has consumed, so
+		 * what we sent reached it: the connection is valid, as a PING's
+		 * ack would say.  That ack can't say it in time while we keep
+		 * the peer busy: our PING waits behind the DATA already queued
+		 * for it, which over a slow link can take longer to drain than
+		 * the gap between the validity ping and the hangup.
+		 */
+		lws_validity_confirmed(wsi);
+
 		n = eff_wsi->txc.tx_cr;
 		eff_wsi->txc.tx_cr += (int32_t)h2n->hpack_e_dep;
 
@@ -2977,6 +3113,13 @@ lws_h2_parse_end_of_frame(struct lws *wsi)
 			 * close callbacks via lws_h2_get_peer_rst_status().
 			 */
 			h2n->swsi->h2.peer_rst_status = h2n->hpack_e_dep;
+			/*
+			 * Nothing more may go out on a reset stream (RFC 9113
+			 * 6.4): no flush and no ws Close, which would only
+			 * fail and leave the stream waiting for the close to
+			 * time out
+			 */
+			lwsi_set_skt_unusable(h2n->swsi, 1);
 			lws_close_free_wsi(h2n->swsi, LWS_CLOSE_STATUS_NOSTATUS,
 					   "peer RST_STREAM");
 			h2n->swsi = NULL;
@@ -3050,6 +3193,14 @@ lws_h2_parser(struct lws *wsi, unsigned char *in, lws_filepos_t _inlen,
 		case LRS_H2_WAITING_TO_SEND_HEADERS:
 		case LRS_ESTABLISHED:
 		case LRS_H2_AWAIT_SETTINGS:
+		/*
+		 * a client connection kept warm with no stream left: still
+		 * a live connection, whose PING, SETTINGS and GOAWAY come
+		 * all the same, and whose framing and hpack state must
+		 * keep in step for its next stream.  Here, they were all
+		 * dropped unparsed.
+		 */
+		case LRS_IDLING:
 
 			if (h2n->frame_state != LWS_H2_FRAME_HEADER_LENGTH)
 				goto try_frame_start;
@@ -3206,15 +3357,10 @@ lws_h2_parser(struct lws *wsi, unsigned char *in, lws_filepos_t _inlen,
 			//		  __func__, h2n->flags);
 
 				/*
-				 * let the network wsi live a bit longer if
-				 * subs are active... our frame may take a long
-				 * time to chew through
+				 * our frame may take a long time to chew
+				 * through
 				 */
-				if (!wsi->immortal_substream_count &&
-				    lwsi_state(wsi) != LRS_IDLING)
-					lws_set_timeout(wsi,
-						PENDING_TIMEOUT_HTTP_KEEPALIVE_IDLE,
-						lws_wsi_keepalive_timeout_eff(wsi));
+				lws_h2_nwsi_rx_renew_timeout(wsi);
 
 				if (!h2n->swsi || lwsi_skt_unusable(h2n->swsi))
 					break;
@@ -3580,7 +3726,7 @@ do_windows:
 					 * stream credit to run down until the
 					 * user code deals with it
 					 */
-					lws_h2_update_peer_txcredit(wsi, (unsigned int)0, n);
+					lws_h2_update_conn_txcredit(wsi, n);
 					h2n->swsi->txc.manual = 1;
 				}
 #endif
@@ -3765,7 +3911,7 @@ lws_h2_client_handshake_composed(struct lws *wsi)
 	char *meth = lws_hdr_simple_ptr(wsi, _WSI_TOKEN_CLIENT_METHOD),
 	     *uri = lws_hdr_simple_ptr(wsi, _WSI_TOKEN_CLIENT_URI), *simp;
 	struct lws *nwsi = lws_get_network_wsi(wsi);
-	const char *path = "/";
+	const char *path = "/", *scheme;
 	int n, m;
 	/*
 	 * The identifier of a newly established stream MUST be numerically
@@ -3838,10 +3984,16 @@ lws_h2_client_handshake_composed(struct lws *wsi)
 			goto fail_length;
 	}
 
+	/*
+	 * The scheme the connection really has: an h2 prior-knowledge
+	 * connection in the clear is "http" (RFC 9113 8.3.1), and a server
+	 * may refuse, or route differently, a request that says otherwise.
+	 */
+	scheme = lws_is_ssl(nwsi) ? "https" : "http";
 	if (lws_add_http_header_by_token(wsi,
 				WSI_TOKEN_HTTP_COLON_SCHEME,
-				(unsigned char *)"https", 5,
-				&p, end))
+				(unsigned char *)scheme,
+				(int)strlen(scheme), &p, end))
 		goto fail_length;
 
 

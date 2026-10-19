@@ -569,12 +569,18 @@ struct hls_webvtt_cue {
 	char  *text;
 };
 
-/* Cached decoded cues for one (filename, track id) pair. */
+/* Cached subtitle state for one (filename, track id) pair. */
 struct hls_sub_cache {
 	lws_dll2_t list;	/* vhd->sub_cache membership, MRU first */
 	char key[280];               /* "<filename>|<trackid>" */
+	/*
+	 * Sidecar tracks only: the cues of the whole file, parsed once.
+	 * Embedded tracks are decoded per segment from just that part of the
+	 * media, so their entries only keep rendered segments.
+	 */
 	struct hls_webvtt_cue *cues;
 	int n_cues;
+	int cues_loaded;
 
 	/*
 	 * Rendered VTT segment bodies, indexed by segment number.  Subtitle
@@ -1003,6 +1009,10 @@ char *
 lws_hls_sub_segment_cached(struct per_vhost_data__lws_hls *vhd,
 			   const char *filename, const char *trackid,
 			   int seg_idx, size_t *len);
+
+/* vhost teardown: free the subtitle cache, sub_lock held */
+void
+lws_hls_sub_cache_destroy(struct per_vhost_data__lws_hls *vhd);
 
 /* Discover every usable subtitle track for a media file: embedded text
  * streams first (ordered by stream index), then sibling .srt/.vtt sidecars

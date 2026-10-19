@@ -116,6 +116,22 @@ struct lws_tls_cert_file_id {
 #endif
 
 /*
+ * A tls ctx made for a vhost's renewed cert, set up like its first one but
+ * not served yet, see lws_tls_vhost_cert_prepare()
+ */
+struct lws_tls_vhost_cert_new {
+	struct lws_tls_ctx_ref		*ref;
+#if defined(LWS_TLS_CERT_WATCH)
+	/* the configured files as they were before the ctx was made */
+	struct lws_tls_cert_file_id	cert;
+	struct lws_tls_cert_file_id	key;
+#endif
+	time_t				not_after; /* 0 if unknown */
+	uint8_t				skipped_certs;
+	uint8_t				from_mem; /* not the files */
+};
+
+/*
  * Length of the digest that stands in for "which CA store is this", see
  * lws_tls_vhost_set_client_ca_id()
  */
@@ -203,6 +219,9 @@ struct lws_vhost_tls {
 	time_t watch_retry_at;
 	uint32_t watch_backoff_s;
 	uint32_t cert_grace_secs;
+	/* a renewal made ready, served from pending_due, after its grace */
+	struct lws_tls_vhost_cert_new pending;
+	time_t pending_due;
 	unsigned int watched:1;
 	unsigned int watch_dirs_added:1;
 	unsigned int watch_unseen:1;
@@ -345,6 +364,14 @@ lws_tls_generic_cert_checks(struct lws_vhost *vhost, const char *cert,
  void
  lws_tls_acme_sni_cert_destroy(struct lws_vhost *vhost);
  int
+ lws_tls_vhost_cert_prepare(struct lws_vhost *v,
+			    const char *mem_cert, size_t len_mem_cert,
+			    const char *mem_privkey, size_t len_mem_privkey,
+			    struct lws_tls_vhost_cert_new *n);
+ void
+ lws_tls_vhost_cert_commit(struct lws_vhost *v,
+			   struct lws_tls_vhost_cert_new *n);
+ int
  lws_tls_vhost_cert_reload(struct lws_vhost *v,
 			   const char *mem_cert, size_t len_mem_cert,
 			   const char *mem_privkey, size_t len_mem_privkey);
@@ -362,6 +389,10 @@ lws_tls_generic_cert_checks(struct lws_vhost *vhost, const char *cert,
 			  const struct lws_tls_cert_file_id *key);
  void
  lws_tls_cert_watch_destroy(struct lws_context *cx);
+ int
+ lws_tls_cert_watch_updated(struct lws_vhost *v,
+			    const char *mem_cert, size_t len_mem_cert,
+			    const char *mem_privkey, size_t len_mem_privkey);
 #else
  #define lws_tls_cert_watch_destroy(_a)
 #endif
@@ -433,6 +464,13 @@ lws_tls_server_abort_connection(struct lws *wsi);
  * the top of lib/tls/tls-server.c.
  */
 
+/*
+ * The most of a ClientHello, with its record headers, we will gather from
+ * several records to find the name in.  Real ones are a few KB, even with
+ * post-quantum key shares; one bigger than this is treated as naming nothing.
+ */
+#define LWS_TLS_CH_MAX	(32 * 1024)
+
 enum {
 	LWS_TLS_CH_SNI_BAD	= -1, /* a server_name we will not act on */
 	LWS_TLS_CH_SNI_MORE	=  0, /* not enough of the ClientHello yet */
@@ -447,6 +485,9 @@ lws_tls_client_hello_sni(const uint8_t *buf, size_t len, char *name,
 int
 lws_tls_client_hello_msg_sni(const uint8_t *buf, size_t len, char *name,
 			     size_t name_len);
+
+size_t
+lws_tls_client_hello_want(const uint8_t *buf, size_t len);
 
 void
 lws_tls_server_send_alert(struct lws *wsi, const uint8_t *ver, uint8_t desc);

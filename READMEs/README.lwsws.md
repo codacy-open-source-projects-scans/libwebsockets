@@ -315,9 +315,9 @@ may have typed .../myapp, to get them to .../myapp/ where the app actually takes
 
  Each vhost may have its own certs, SNI is used during the initial connection negotiation to figure out which certs to use by the server name it's asking for from the request DNS name.
 
- When the cert and key files are renewed on disk, eg, by moving a `-latest` symlink onto new files the way the acme plugin, the cert distribution client or certbot do, the vhost notices and moves onto them without a restart and without disturbing its connections.  Connections made before the renewal carry on with the old cert until they close.  The files must still be readable by lwsws after it has dropped its privileges, or the renewal can't be seen; a warning is logged once if they aren't.
+ When the cert and key files are renewed on disk, eg, by moving a `-latest` symlink onto new files the way the acme plugin, the cert distribution client or certbot do, the vhost notices and moves onto them without a restart and without disturbing its connections.  Connections made before the renewal carry on with the old cert until they close.  The files must still be readable by lwsws after it has dropped its privileges for it to see the renewal by itself; a warning is logged once if they aren't.  A renewer that keeps them out of lwsws's reach, like the cert distribution client, hands the vhost copies of the new pair instead (`lws_tls_cert_updated()`).
 
- - "`host-ssl-cert-grace-secs`": "900" holds a renewed cert back for that many seconds after it was issued or written, whichever is later, before the vhost serves it.  Use it when the cert is published in DNS for DANE, so the new TLSA record has replaced cached copies of the old one first.  Default 0, the renewed cert is served as soon as it is seen.
+ - "`host-ssl-cert-grace-secs`": "900" holds a renewed cert back for that many seconds after it was issued or written, whichever is later, before the vhost serves it.  The renewed pair is loaded as soon as it is seen, so it is served when the time is up even if it can't be read by then; a restart serves it at once.  Use it when the cert is published in DNS for DANE, so the new TLSA record has replaced cached copies of the old one first.  Default 0, the renewed cert is served as soon as it is seen.
 
  - "`sni-fallback`": "1" makes this vhost the one that serves tls connections
 arriving on its listen port with an SNI name that matches no vhost there.  At
@@ -328,7 +328,17 @@ are happy for an unknown name to meet, typically the "main" vhost on the port.
 Connections that send no SNI at all never come here, they stay on the vhost that
 accepted them.
 
- - `keeplive-timeout` (in secs) defaults to 60 for lwsws, it may be set as a vhost option
+ - "`no-http-stream-compression`": "1" stops the vhost compressing its http
+responses on the fly, whatever the client's `Accept-Encoding` says.  Use it
+where a response mixes secrets with content the client influences, since the
+compressed length can leak the secret (BREACH).  Without it, in a build with
+`LWS_WITH_HTTP_STREAM_COMPRESSION`, text-ish responses are compressed when the
+client accepts it, and say `vary: accept-encoding` so caches keep the codings
+apart.
+
+ - `keepalive_timeout` (in secs, default 5) is how long the vhost waits on a
+   client connection with nothing outstanding on it before closing it.  A
+   mount can override it for requests to that mount with `keepalive-timeout`.
 
  - `interface` lets you specify which network interface to listen on, if not given listens on all.  If the network interface is not usable (eg, ethernet cable out) it will be logged at startup with such vhost not listening, and lws will poll for it and bind a listen socket to the interface if and when it becomes available.
 
@@ -672,6 +682,80 @@ protocol "myprotocol".
 	"allow-non-tls":		"1",
 	"allow-http-on-https":		"1",
 ```
+
+## Passing a vhost's tls through to another server
+
+A vhost can have its tls connections passed, still encrypted, to another
+server that terminates the tls itself, eg, a service on another host that
+keeps its own private key.  It is chosen by the SNI name in the ClientHello,
+like any vhost on a shared listener, and needs no certificate, mounts or
+protocols of its own.  This needs lws built with `LWS_WITH_TLS_PASSTHROUGH`.
+
+```
+	{
+		"name":				"auth.example.com",
+		"port":				"443",
+		"tls-passthrough":		"192.168.1.20:443",
+		"tls-passthrough-proxy-v2":	"1"
+	}
+```
+
+The connection's first bytes are only looked at, never consumed, so a
+connection naming any other vhost goes on to the listener's own tls exactly
+as before.  The ClientHello may arrive in several tcp segments, or be split
+across several tls records; up to 32KB of it is gathered to find the name.
+Make the vhosts that terminate tls on the port before any passed through one,
+so the listener is theirs; on a listener with only passed through vhosts,
+anything not for one of them is dropped.
+
+The server only sees the connection come from us, so with
+`"tls-passthrough-proxy-v2": "1"` we send it a PROXY v2 header first, as
+haproxy defined it, naming the real client and the SNI name it asked for.
+The server must expect it: an lws server is told to with
+`"proxy-v2-trusted"`, below.
+
+### QUIC (h3)
+
+When the passthrough target is a numeric address and
+`"tls-passthrough-proxy-v2"` is on, the vhost's QUIC is passed through too, to
+the same address and port over udp.  The front reads the SNI name from the
+client's first Initial packets, which anyone can decrypt (RFC 9001 5.2),
+without terminating anything; a connection for any other name goes on to the
+front's own QUIC as before.  Each datagram is relayed with a PROXY v2 header
+naming the client, and the server's datagrams back must carry one naming the
+client they are for, so the server's QUIC sees each client's real address.
+When a client moves, eg, a NAT rebinding gives it a new port, the front
+follows its flow by connection ID, and the server validates the new path
+itself; the front sends a client only to an address the server names that
+the flow has seen it at.
+
+The server behind it must list the front in `"proxy-v2-trusted"`, which
+applies to its udp listener as much as its tcp one.  A target given as a name
+is passed through for tcp only.  The headers add up to 52 bytes to each
+datagram between the front and the server, so that path wants an MTU a little
+above the clients'.  The front routes the server's packets by the connection
+IDs it sees in their long headers, which is all an lws server uses; a server
+that hands out more with NEW_CONNECTION_ID frames, which are encrypted, can't
+have a client that moves onto one of those followed.
+
+## Accepting PROXY v2 headers
+
+A vhost that is reached through a proxy that doesn't terminate the
+connection, eg, the passthrough above or haproxy, can be told which proxies
+send a PROXY v2 header ahead of what they forward:
+
+```
+	"proxy-v2-trusted":	"192.168.1.1, 2001:db8::/64"
+```
+
+It is a comma-separated list of numeric addresses or CIDR netblocks.  A
+connection from one of them must start with exactly one valid PROXY v2
+header, or it is dropped; the header is taken off the connection, and the
+client it names is the peer address lws reports from then on, eg, to a
+plugin keying rate limits on it.  A connection from anywhere else is never
+looked at for one, so nobody else can claim to be somebody they are not, and
+a header after the first, wherever it came from, is just the client's data.
+The list applies to every vhost on the same listener.
 
 ## Lwsws Plugins
 

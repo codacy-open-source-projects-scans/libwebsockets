@@ -240,6 +240,57 @@ enum lws_quic_frame_type {
 #define LWS_QUIC_PATH_CHALLENGE_LEN	8u
 
 /*
+ * DPLPMTUD (RFC 9000 14.3, RFC 8899).  The mtus are IP MTUs: a datagram on a
+ * path whose mtu is m carries at most m - LWS_QUIC_PMTU_OVERHEAD, room for the
+ * IPv6 and UDP headers.  The search starts from the base every path must
+ * carry, probes LWS_QUIC_PMTU_FIRST_PROBE, then up in steps to the ceiling, an
+ * Ethernet MTU, or less if the peer's max_udp_payload_size is smaller.  A size
+ * that lost LWS_QUIC_PMTUD_MAX_PROBES probes is too big, and the search
+ * settles on the size it has, and tries the size it settled under again after
+ * LWS_QUIC_PMTUD_RAISE_US (RFC 8899 5.1.1 PMTU_RAISE_TIMER), since the path
+ * may carry it by then.
+ */
+#define LWS_QUIC_PMTU_BASE		1280u
+#define LWS_QUIC_PMTU_FIRST_PROBE	1380u
+#define LWS_QUIC_PMTU_STEP		100u
+#define LWS_QUIC_PMTU_CEILING		1500u
+#define LWS_QUIC_PMTU_OVERHEAD		48u
+#define LWS_QUIC_PMTUD_MAX_PROBES	3u
+
+/*
+ * Black hole detection (RFC 8899 4.3): once LWS_QUIC_PMTUD_BH_LOSSES packets
+ * bigger than the base were lost with no bigger packet sent after them getting
+ * through, the path's MTU may have fallen.  The connection goes back to the
+ * base at once, as RFC 8899 5.2 says, and a probe of the base size confirms
+ * small packets still get through.  It can't wait for that before going back:
+ * the peer's ack of the probe may only come in its own big packets, and if the
+ * black hole is in both directions, neither side's would ever arrive.
+ *
+ * If a big packet sent before going back is acked after all, it was loss,
+ * not a black hole, and the connection goes back to the size it had.  If the
+ * base probe is lost too, everything is being lost, eg, the path is down for
+ * a while: it is probed again until one gets through.
+ *
+ * The base getting through only says the path is up again, not that big
+ * packets don't get through: after a short outage of everything, nothing big
+ * was sent since going back, so nothing big could be acked.  So then a probe
+ * of the size from before confirms it (RFC 8899 4.3): if it is acked, it was
+ * an outage, and the connection goes back to that size.  Like a search probe,
+ * one given up for lost may only be late, eg, a PTO fired while the peer was
+ * still working through a backlog: its ack coming after all says the same,
+ * and another is sent, until LWS_QUIC_PMTUD_MAX_PROBES of them are lost.
+ * Then the search starts again from the base (RFC 8899 5.2, BASE to
+ * SEARCHING), and settles on the size the path carries now.
+ *
+ * A search probe sent before going back is still the search's while the
+ * black hole is unconfirmed: its loss counts against its size, and no other
+ * probe of that size is sent while it is out.  If it was no black hole, the
+ * search goes on with it, as if it had never gone back.
+ */
+#define LWS_QUIC_PMTUD_BH_LOSSES	3u
+#define LWS_QUIC_PMTUD_RAISE_US		(600 * LWS_US_PER_SEC)
+
+/*
  * A logical frame queued for transmission or in-flight waiting for ACK.
  */
 struct lws_quic_tx_frame {
@@ -266,6 +317,12 @@ struct lws_quic_tx_frame {
 	uint16_t		packet_size;
 	lws_sockaddr46		dest_sa46;
 	uint8_t			has_dest;
+	/* a PING that is a PMTUD probe, see lws_quic_pmtud_kick() */
+#define LWS_QUIC_PMTUD_PROBE_SEARCH	1 /* of probed_mtu */
+#define LWS_QUIC_PMTUD_PROBE_BASE	2 /* of the base, black hole check */
+#define LWS_QUIC_PMTUD_PROBE_FROM	3 /* of pmtud_bh_from_mtu, confirming
+					   * a black hole */
+	uint8_t			pmtud_probe;
 };
 
 struct lws_quic_rx_chunk {
@@ -301,6 +358,25 @@ struct lws_quic_rx_held {
  * Represents a single QUIC stream (unidirectional or bidirectional).
  * Maps 1:1 with a child WSI.
  */
+/*
+ * The peer's stream ids of one type we have opened a stream for, as sorted,
+ * disjoint ranges of stream index (stream id >> 2), [lo, hi).  Opening a
+ * stream id implicitly opens all the lower ones of its type (RFC 9000 2.1),
+ * whose first frames may still be on their way, so a stream id with no
+ * stream below the highest one seen is not necessarily one we closed: this
+ * is what says.
+ */
+struct lws_quic_idtr_range {
+	uint64_t		lo;
+	uint64_t		hi;
+};
+
+struct lws_quic_idtr {
+	struct lws_quic_idtr_range	*r;
+	uint32_t			count;
+	uint32_t			alloc;
+};
+
 struct lws_quic_stream {
 	struct lws		*wsi; /* The child WSI representing this stream */
 	uint64_t		stream_id;
@@ -334,6 +410,15 @@ struct lws_quic_stream {
 					    * it without waiting for our own
 					    * in-flight frames to be acked */
 	uint8_t			sent_fin:1;
+
+#if defined(LWS_WITH_SYS_FAULT_INJECTION)
+	/*
+	 * quic_stream_replay: our first STREAM frame, sent once more a little
+	 * after the stream closes, as a retransmission whose ack was lost,
+	 * arriving after the peer finished with the stream, would be
+	 */
+	struct lws_quic_tx_frame *fi_replay;
+#endif
 };
 
 
@@ -359,6 +444,24 @@ struct lws_quic_reply {
 };
 
 #define LWS_QUIC_MAX_QUEUED_REPLIES 16
+
+/*
+ * A 1-RTT packet that reached a server before its handshake completed, kept
+ * still protected until it does (RFC 9001 5.7 allows a server to hold them,
+ * RFC 9001 4.1.4 to buffer what arrives early).  The datagram's peer and ECN
+ * go with it, for when it is processed.  A connection holds at most
+ * LWS_QUIC_EARLY_PKTS_MAX; any more are dropped as before, for the client's
+ * loss recovery to send again.
+ */
+struct lws_quic_early_pkt {
+	lws_dll2_t		list;
+	lws_sockaddr46		peer;
+	size_t			len;
+	uint8_t			ecn;
+	/* the packet follows */
+};
+
+#define LWS_QUIC_EARLY_PKTS_MAX 4
 
 struct lws_quic_netconn {
 	struct lws		*nwsi; /* the parent UDP network wsi */
@@ -419,8 +522,8 @@ struct lws_quic_netconn {
 
 	uint64_t		next_stream_id_bidi_local;
 	uint64_t		next_stream_id_unidi_local;
-	uint64_t		next_stream_id_bidi_remote;
-	uint64_t		next_stream_id_unidi_remote;
+	/* the peer's streams we opened, [0] bidi, [1] unidi */
+	struct lws_quic_idtr	peer_opened[2];
 
 	/* Frames waiting to be bundled into outgoing packets */
 	lws_dll2_owner_t	pending_tx[LWS_QUIC_LEVEL_COUNT];
@@ -453,6 +556,9 @@ struct lws_quic_netconn {
 	 */
 	uint32_t		consec_decrypt_fail[LWS_QUIC_LEVEL_COUNT];
 	uint32_t		kp_probe_fail;
+
+	/* a server's 1-RTT packets that came before its handshake completed */
+	lws_dll2_owner_t	early_pkts;
 
 	/* RX Crypto Reassembly Buffers (Streams are handled by child WSIs) */
 	uint64_t		rx_crypto_offset[LWS_QUIC_LEVEL_COUNT];
@@ -525,15 +631,55 @@ struct lws_quic_netconn {
 	uint32_t		current_mtu;
 	uint32_t		probed_mtu;
 	/*
-	 * PN of the packet currently in flight as a PMTUD probe.  PN 0 is a
-	 * perfectly valid probe PN (it's the usual case, since the first
-	 * app-data packet of a connection doubles as the probe), so "no probe
-	 * in flight" needs its own out-of-band sentinel rather than 0.
+	 * PN of the packet currently in flight as a PMTUD probe.  Any PN,
+	 * including 0, can be a probe's, so "no probe in flight" needs its own
+	 * out-of-band sentinel rather than 0.
 	 */
 #define LWS_QUIC_PMTUD_PROBE_NONE	((uint64_t)~0ull)
 	uint64_t		pmtud_probe_pn;
+	/* PN of the base size probe in flight checking for a black hole */
+	uint64_t		pmtud_bh_probe_pn;
+	/* PN of the probe of the size from before, confirming the black hole */
+	uint64_t		pmtud_bh_from_probe_pn;
+	/*
+	 * PN of the last of those given up for lost: if its ack comes after
+	 * all, it was only late, and it was no black hole
+	 */
+	uint64_t		pmtud_bh_from_late_pn;
+	/*
+	 * PN and size of the last search probe given up for lost: if its ack
+	 * comes after all, it was only late, and the path carries its size
+	 */
+	uint64_t		pmtud_late_probe_pn;
+	uint32_t		pmtud_late_probe_mtu;
+	/* after a black hole, when the search starts again */
+	lws_usec_t		pmtud_raise_at;
+	/* the peer's max_udp_payload_size transport parameter, 0 if none */
+	uint32_t		peer_max_udp_payload;
+	/*
+	 * 1 + the PN of the newest packet bigger than the base that was acked,
+	 * or 0 if none was: a big packet lost before that one says nothing
+	 * about the path's MTU
+	 */
+	uint64_t		pmtud_big_acked_pn1;
+	/*
+	 * While a black hole is suspected, not confirmed yet, the mtu and
+	 * pmtud_state from before it, to go back to if it was a false alarm;
+	 * pmtud_bh_from_mtu is 0 otherwise
+	 */
+	uint32_t		pmtud_bh_from_mtu;
+	/* packets bigger than the base lost since one of them got through */
 	uint16_t		consecutive_mtu_losses;
 	uint8_t			pmtud_state; /* 0=BASE, 1=SEARCHING, 2=SEARCH_COMPLETE */
+	uint8_t			pmtud_bh_from_state;
+	/* probes of probed_mtu lost so far */
+	uint8_t			pmtud_probe_fails;
+	/* probes of pmtud_bh_from_mtu lost so far, confirming a black hole */
+	uint8_t			pmtud_bh_from_fails;
+	/* a probe's PING is in pending_tx, not sent yet */
+	uint8_t			pmtud_probe_queued:1;
+	uint8_t			pmtud_bh_probe_queued:1;
+	uint8_t			pmtud_bh_from_probe_queued:1;
 
 	/* Path Validation (RFC 9000 Section 8.2) */
 	uint8_t			path_challenge[8];
@@ -547,13 +693,25 @@ struct lws_quic_netconn {
 	 * Server-side peer migration (RFC 9000 9.3): while probing_sa46 is
 	 * unvalidated we keep sending on the committed path (path_sa46) and
 	 * only PATH_CHALLENGE / PATH_RESPONSE go to the new address, limited
-	 * to 3x the bytes we received from it (9.3.1 / 8.1).  The probe is
-	 * abandoned when path_probe_sul fires without a matching
-	 * PATH_RESPONSE from that address (8.2.4).
+	 * to 3x the bytes we received from it (9.3.1 / 8.1).  path_probe_sul
+	 * sends the PATH_CHALLENGE again each PTO (8.2.1), and abandons the
+	 * probe if no matching PATH_RESPONSE came from that address by
+	 * probe_deadline (8.2.4).
 	 */
 	uint64_t		probe_bytes_received;
 	uint64_t		probe_bytes_sent;
 	lws_sorted_usec_list_t	path_probe_sul;
+	lws_usec_t		probe_deadline;
+	lws_usec_t		probe_pto;
+	/*
+	 * An address whose probes keep failing, eg, one an off-path attacker
+	 * forwards copies of the peer's packets from, or a middlebox's, would
+	 * otherwise have each packet from it start another probe: after a
+	 * failure we don't probe it again until probe_holdoff_until, a wait
+	 * that doubles with each failure in a row, probe_fails
+	 */
+	lws_usec_t		probe_holdoff_until;
+	uint8_t			probe_fails;
 
 	/*
 	 * Client preferred_address active migration (RFC 9000 Section 9.5/9.6).
@@ -574,6 +732,12 @@ struct lws_quic_netconn {
 	uint8_t			prefaddr_pending:1;	/* deferred until handshake done */
 	lws_sorted_usec_list_t	prefaddr_sul;
 
+#if defined(LWS_WITH_SYS_FAULT_INJECTION)
+	/* quic_stream_replay frames of closed streams, waiting to go again */
+	lws_dll2_owner_t	fi_replays;
+	lws_sorted_usec_list_t	fi_replay_sul;
+#endif
+
 	/* ECN (Explicit Congestion Notification) */
 	uint64_t		ecn_rx_ect0;
 	uint64_t		ecn_rx_ect1;
@@ -582,6 +746,11 @@ struct lws_quic_netconn {
 
 	uint8_t			is_server:1;
 	uint8_t			handshake_done:1;
+	/*
+	 * RFC 9001 4.1.2: a server's handshake is confirmed when it completes,
+	 * a client's when it gets HANDSHAKE_DONE
+	 */
+	uint8_t			handshake_confirmed:1;
 	uint8_t			tp_parsed:1;
 	uint8_t			alpn_migrated:1;
 	uint8_t			pto_probe_needed:2;
@@ -677,6 +846,24 @@ lws_quic_encrypt_payload(struct lws_quic_keys *keys, uint8_t *packet, size_t pac
 size_t
 lws_quic_parse_varint(const uint8_t *buf, size_t len, uint64_t *val);
 
+int
+lws_quic_long_hdr_cids(const uint8_t *p, size_t len, struct lws_quic_cid *dcid,
+		       struct lws_quic_cid *scid);
+struct lws *
+lws_quic_find_child_by_dcid(struct lws *listener,
+			    const struct lws_quic_cid *dcid);
+
+/* a CRYPTO frame from lws_quic_initial_crypto_peek() */
+typedef void (*lws_quic_crypto_peek_cb_t)(void *user, uint64_t offset,
+					  const uint8_t *buf, size_t len);
+
+int
+lws_quic_initial_crypto_peek(const uint8_t *dgram, size_t len,
+			     lws_quic_crypto_peek_cb_t cb, void *user);
+int
+lws_quic_dgram_cids(const uint8_t *dgram, size_t len, struct lws_quic_cid *dcid,
+		    struct lws_quic_cid *scid, int *initial);
+
 size_t
 lws_quic_get_pn_offset(const uint8_t *buf, size_t len, size_t *payload_len, size_t dcid_len);
 
@@ -710,10 +897,16 @@ lws_quic_sa46_same_path(const lws_sockaddr46 *a, const lws_sockaddr46 *b);
  * committed path.  Safe to call when no probe is active.
  */
 void
-lws_quic_path_probe_abandon(struct lws *nwsi);
+lws_quic_path_probe_abandon(struct lws *nwsi, const char *failed);
 
 void
 lws_quic_detect_loss(struct lws *nwsi, int level, uint64_t largest_acked);
+
+void
+lws_quic_pmtud_reset(struct lws_quic_netconn *qn);
+
+void
+lws_quic_pmtud_kick(struct lws_quic_netconn *qn);
 
 
 void
@@ -734,8 +927,20 @@ lws_quic_stream_cleanup(struct lws *wsi);
 struct lws *
 lws_quic_stream_find(struct lws *nwsi, uint64_t stream_id);
 
+int
+lws_quic_idtr_is_opened(const struct lws_quic_idtr *t, uint64_t idx);
+
+int
+lws_quic_idtr_open(struct lws_quic_idtr *t, uint64_t idx);
+
+void
+lws_quic_idtr_destroy(struct lws_quic_idtr *t);
+
 struct lws *
 lws_get_quic_network_wsi(struct lws *wsi);
+
+void
+lws_quic_dump_stalled(struct lws *wsi);
 
 void
 lws_quic_enter_closing_state(struct lws *wsi, uint64_t err_code, uint64_t frame_type, int is_app_error);
@@ -751,6 +956,9 @@ int
 lws_quic_parse_transport_parameters(struct lws *wsi, const uint8_t *buf, size_t len);
 
 #define LWS_QUIC_DEFAULT_PTO_US 500000 /* 500ms baseline PTO for early dev */
+/* the wait before probing an address again doubles from this to 64x it */
+#define LWS_QUIC_PROBE_HOLDOFF_US	LWS_US_PER_SEC
+#define LWS_QUIC_PROBE_HOLDOFF_MAX_SHIFT 6
 
 struct _lws_quic_related {
         struct lws_quic_netconn *qn; /* malloc'd for root net conn */

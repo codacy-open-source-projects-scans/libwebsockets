@@ -421,7 +421,12 @@ enum lws_callback_reasons {
 	 */
 
 	LWS_CALLBACK_CLIENT_HTTP_REDIRECT			= 104,
-	/**< we're handling a 3xx redirect... return nonzero to hang up */
+	/**< we're handling a 3xx redirect... return nonzero to hang up.
+	 * in is the Location, as the server sent it.  If we go on, lws resolves
+	 * it against the request as RFC 3986 5.2 says (so "//host/path" names
+	 * another authority, and a relative path is merged with ours), and
+	 * refuses one that is not a valid http(s) URI reference, has userinfo
+	 * or a port outside 1 - 65535, or comes with a second Location */
 
 	LWS_CALLBACK_CLIENT_HTTP_BIND_PROTOCOL			= 85,
 	LWS_CALLBACK_CLIENT_HTTP_DROP_PROTOCOL			= 76,
@@ -903,12 +908,16 @@ enum lws_callback_reasons {
 	/**< When a message is fully sent, if QoS0 this callback is generated
 	 * to locally "acknowledge" it, from the event loop after the send
 	 * call returned.  For QoS1, this callback is only generated when the
-	 * matching PUBACK is received.  Return nonzero to close the wsi.
+	 * matching PUBACK is received, and for QoS2 when the PUBREC is: lws
+	 * completes the exchange.  The stream may start its next operation from
+	 * here.  Return nonzero to close the wsi.
 	 */
 	LWS_CALLBACK_MQTT_RESEND				= 210,
 	/**< In QoS1 or QoS2, this callback is generated instead of the _ACK one
 	 * if we timed out waiting for a PUBACK or a PUBREC, and we must resend
-	 * the message.  Return nonzero to close the wsi.
+	 * the message, with .dup set.  The stream may instead go on to another
+	 * operation, abandoning the message.  An ack that still comes for it
+	 * before either gives the _ACK as usual.  Return nonzero to close the wsi.
 	 */
 	LWS_CALLBACK_MQTT_UNSUBSCRIBE_TIMEOUT			= 211,
 	/**< When a UNSUBSCRIBE is sent, this callback is generated instead of

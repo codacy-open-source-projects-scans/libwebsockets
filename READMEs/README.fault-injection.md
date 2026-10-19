@@ -298,6 +298,7 @@ thing by giving, eg, `"myfault(10%),myfault_delay(123..456)"`
 |context||`ctx_createfail_ss_pol3`|Fail context creation due to ss policy set failed (if policy enabled)|
 |context||`cache_createfail`|Fail `lws_cache` creation due to OOM|
 |context||`cache_lookup_oom`|Fail `lws_cache` lookup due to OOM|
+|context||`netlink_lost`|Lose a read from netlink, as if the kernel had dropped route messages (ENOBUFS): lws gets all the routes again|
 |context||`async_queue_full`|The async worker queue seems saturated, so tls accepts and file reads are done inline on the service thread (LWS_WITH_ASYNC_QUEUE)|
 |vhost|`vh`|`vh_create_oom`|Fail vh creation on vh object alloc OOM|
 |vhost|`vh`|`vh_create_oom`|Fail vh creation on vh object alloc OOM|
@@ -313,6 +314,13 @@ thing by giving, eg, `"myfault(10%),myfault_delay(123..456)"`
 |cli wsi|`wsi`|`sendfail`|Attempts to send data on the wsi socket fail|
 |cli wsi|`wsi`|`connfail`|Attempts to connect on the wsi socket fail|
 |cli wsi|`wsi`|`createfail`|Creating the client wsi itself fails|
+|cli wsi|`wsi`|`h3_body_with_headers`|An h3 client request with a body makes its first body write right after the HEADERS, so the server sees the request, its body and maybe the FIN all at once (LWS_ROLE_H3)|
+|srv vhost|`vh`|`wt_stream_without_session`|`lws_wt_create_stream()` opens a stream from a wsi that is no WebTransport session, as a peer opening a bidi stream on a plain h3 connection would (LWS_ROLE_WT)|
+|cli wsi|`wsi`|`h3_second_qpack_enc`|An h3 connection opens a second QPACK encoder stream, where there may be only one (LWS_ROLE_H3)|
+|cli wsi|`wsi`|`h3_req_frame_settings`|An h3 client request stream starts with an empty SETTINGS frame, which only the control stream may carry (LWS_ROLE_H3)|
+|cli wsi|`wsi`|`h3_trailer_field`|An h3 client request with no body ends with a trailers block holding `user-agent: trailer-ua` (LWS_ROLE_H3)|
+|cli wsi|`wsi`|`h3_trailer_pseudo`|An h3 client request with no body ends with a trailers block holding a `:path`, which trailers may not (LWS_ROLE_H3)|
+|cli wsi|`wsi`|`quic_stream_replay`|A QUIC stream's first STREAM frame is sent once more 100ms after the stream closed, as a retransmission whose ack was lost would be, after the peer finished with the stream (LWS_ROLE_QUIC)|
 |udp wsi|`wsi`|`udp_rx_loss`|Drop UDP RX that was actually received, useful with probabalistic mode|
 |udp wsi|`wsi`|`udp_tx_loss`|Drop UDP TX so that it's not actually sent, useful with probabalistic mode|
 |srv ss|`ss`|`ss_srv_vh_fail`|Secure Streams Server vhost creation forced to fail|

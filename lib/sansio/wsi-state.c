@@ -535,6 +535,8 @@ static const struct lws_wsi_event_edge lws_wsi_event_edges[] = {
 	R("*", "S", LRS_HEADERS,		LWS_WSIEV_RAW_UPGRADED, "?", NULL, LRS_ESTABLISHED),
 	/* the non-tls fallback on a tls listener, from the first byte peek in the accept */
 	R("*", "S", LRS_SSL_ACK_PENDING,	LWS_WSIEV_RAW_UPGRADED, "?", NULL, LRS_ESTABLISHED),
+	/* a tls passthrough, from the look at the ClientHello before the accept */
+	R("*", "S", LRS_SSL_INIT,		LWS_WSIEV_RAW_UPGRADED, "?", NULL, LRS_ESTABLISHED),
 	/* a later request on a kept-alive connection, and a listener already in the raw role */
 	R("*", "S", LRS_ESTABLISHED,		LWS_WSIEV_RAW_UPGRADED, "?", NULL, LRS_ESTABLISHED),
 	/* ---- transport machine ---- */
@@ -589,6 +591,8 @@ static const struct lws_wsi_event_edge lws_wsi_event_edges[] = {
 	R("*", "*", ANY,			LWS_WSIEV_CLOSE_FLUSH, NULL, NULL, XC(LCS_FLUSHING_BEFORE_CLOSE)),
 	R("*", "*", ANY,			LWS_WSIEV_CLOSE_WHEN_FLUSHED, NULL, NULL, XC(LCS_CLOSE_WHEN_FLUSHED)),
 	R("*", "S", ANY,			LWS_WSIEV_CLOSE_STAGED, NULL, NULL, XC(LCS_SHUTDOWN)),
+	/* an h2 client connection that told the peer GOAWAY waits for his FIN too */
+	R("h2", "C", ANY,			LWS_WSIEV_CLOSE_STAGED, NULL, NULL, XC(LCS_SHUTDOWN)),
 	R("*", "*", ANY,			LWS_WSIEV_SOCKET_GONE, NULL, NULL, XC(LCS_DEAD_SOCKET)),
 	R("*", "*", LRS_DEAD_SOCKET,		LWS_WSIEV_USER_TOLD, NULL, NULL, XC(LCS_USER_TOLD)),
 
@@ -1025,8 +1029,9 @@ lws_state_invariant(struct lws *wsi, lws_wsi_state_t to)
 			return "RETURNED_CLOSE on a non-ws role";
 		break;
 	case LRS_SHUTDOWN:
-		if (to & LWSIFR_CLIENT)
-			return "SHUTDOWN staging on a client wsi";
+		if ((to & LWSIFR_CLIENT) && !lws_wsi_is_mux_nwsi(wsi))
+			return "SHUTDOWN staging on a client wsi that is not "
+			       "a mux network connection";
 		if (wsi->role_ops == &role_ops_raw_skt)
 			return "SHUTDOWN staging on a raw socket";
 		if (wsi->mux_substream)

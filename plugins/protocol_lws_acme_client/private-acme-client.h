@@ -29,7 +29,8 @@
 /*
  * Private to the ACME client plugin, and to api-test-acme-json, which
  * checks its parsing of the ACME server's JSON (see acme-json.c) against
- * canned responses
+ * canned responses, and api-test-acme-renew, which checks the per-cert
+ * renewal decisions and backoff (see acme-renew.c)
  */
 
 #if !defined(__LWS_PRIVATE_ACME_CLIENT_H__)
@@ -47,6 +48,7 @@ typedef enum {
 	ACME_STATE_POLLING,	/* he should be trying our challenge */
 	ACME_STATE_POLLING_CSR, /* sent CSR, checking result */
 	ACME_STATE_DOWNLOAD_CERT,
+	ACME_STATE_CHALL_REASON, /* challenge failed, fetching the CA's reason */
 
 	ACME_STATE_FINISHED
 } lws_acme_state;
@@ -63,6 +65,7 @@ typedef enum {
 	ACME_IPC_LINE_UNRELATED,	/* not an answer to a request of ours */
 	ACME_IPC_LINE_SAVE,		/* answers one of our save-type requests */
 	ACME_IPC_LINE_VALIDITY,		/* answers get_cert_validity */
+	ACME_IPC_LINE_AUTH_KEY,		/* answers get_auth_key */
 	ACME_IPC_LINE_REFUSED,		/* refuses a request of ours, unknown which */
 } acme_ipc_line_t;
 
@@ -74,9 +77,12 @@ struct acme_ipc_reply {
 	unsigned int		stores_cert:1;	/* SAVE of the cert or its key */
 };
 
-/* reassembles the daemon's lines across reads */
+/*
+ * reassembles the daemon's lines across reads: room for the longest we take,
+ * get_auth_key's answer carrying an RSA-4096 account key's private JWK
+ */
 struct acme_ipc_rx {
-	char			buf[2048];
+	char			buf[8192];
 	size_t			len;	/* sizeof(buf): overlong line, dropped */
 };
 
@@ -106,7 +112,7 @@ struct acme_connection {
 	char chall_token[64];
 	char chall_type[16];	/* the challenge authz picked, eg, "dns-01" */
 	char challenge_uri[256];
-	char detail[64];
+	char detail[256];
 	char status[16];
 	char key_auth[256];
 	char urls[6][256]; /* directory contents */
@@ -145,6 +151,7 @@ struct acme_connection {
 	unsigned int use:1;
 	unsigned int is_sni_02:1;
 	unsigned int saves_awaited:1;	/* cert fetched, waiting on IPC saves */
+	time_t not_after;		/* of the cert the CA issued, or 0 */
 	unsigned int save_refused:1;	/* the daemon refused to store cert / key */
 };
 
@@ -184,14 +191,6 @@ struct per_vhost_data__lws_acme_client {
     lws_sorted_usec_list_t sul_aging;
     lws_sorted_usec_list_t sul_acquisition;
     lws_sorted_usec_list_t sul_watchdog;
-    lws_usec_t last_acme_failure;
-    /*
-     * LE allows 5 duplicate certs / 7 days: repeated acquisition attempts
-     * for an unchanged cert must back off exponentially or we can be
-     * locked out of ordering for the rest of the week
-     */
-    int acme_fail_count;
-    lws_usec_t acme_retry_not_before;
 
 	int count_live_pss;
 	char *dest;
@@ -210,9 +209,11 @@ struct per_vhost_data__lws_acme_client {
 	/*
 	 * Save-type requests on the current IPC connection still waiting for
 	 * their answer line.  An aging validity request is outstanding while
-	 * aging_current_cert is set.  Both go when the connection does.
+	 * aging_current_cert is set, and the acquisition's get_auth_key while
+	 * ipc_key_pending is.  All go when the connection does.
 	 */
 	int ipc_pending_saves;
+	char ipc_key_pending;
 	char ipc_failing;
 
 	struct lws_dll2 *aging_current_cert;
@@ -268,6 +269,15 @@ void
 acme_ipc_classify(const char *line, size_t len, struct acme_ipc_reply *r);
 
 /*
+ * The account key from the daemon's ok answer to get_auth_key, whose "jwk" is
+ * the base64url of its private JWK, into jwk.  Returns 0 if it was imported.
+ */
+#define ACME_IPC_AUTH_KEY_B64_MAX	7168
+
+int
+acme_ipc_auth_key_import(const char *line, size_t len, struct lws_jwk *jwk);
+
+/*
  * Append len bytes of the cert body as it arrives.  Returns 1 if the body
  * would exceed ACME_CERT_CHAIN_MAX, or on OOM; what was collected before is
  * kept intact either way.
@@ -284,6 +294,30 @@ acme_cert_leaf_len(const struct acme_cert_rx *crx);
 
 void
 acme_cert_rx_free(struct acme_cert_rx *crx);
+
+/*
+ * Whether a cert is renewed on this evaluation, from the root daemon's answer
+ * about its validity, and keeping its backoff after failures, see
+ * acme-renew.c
+ */
+
+typedef enum {
+	ACME_RENEW_NOT_DUE,	/* enough of its life is left */
+	ACME_RENEW_BACKOFF,	/* due, but an acquisition for it failed recently */
+	ACME_RENEW_DUE,
+} acme_renew_t;
+
+acme_renew_t
+acme_renew_verdict(const struct lws_acme_cert_config *cfg,
+		   const struct acme_ipc_reply *r, lws_usec_t now);
+
+/* an acquisition for cfg failed: returns how long it now backs off */
+lws_usec_t
+acme_renew_failed(struct lws_acme_cert_config *cfg, lws_usec_t now);
+
+/* an acquisition for cfg succeeded: its backoff is over */
+void
+acme_renew_succeeded(struct lws_acme_cert_config *cfg);
 
 #if defined(LWS_WITH_SYS_ASYNC_DNS) && defined(LWS_WITH_AUTHORITATIVE_DNS)
 

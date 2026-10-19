@@ -118,6 +118,11 @@ typedef struct lws_adns_cache {
 	uint8_t			flags;	/* b0 = has ipv4, b1 = has ipv6 */
 	uint8_t			incomplete;
 	uint8_t			nxdomain; /* authoritative: name does not exist */
+	/*
+	 * Our TTL ran out while somebody still held us: we are no longer
+	 * listed in the cache, the last lws_adns_cache_unref() frees us
+	 */
+	uint8_t			expired;
 #if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
 	/*
 	 * The query that made us validated its results.  A later query that
@@ -223,6 +228,16 @@ typedef struct lws_adns_q {
 
 	lws_usec_t		issue_time;
 	uint8_t			broadsiding;
+	/*
+	 * Where we are in the search list: the candidate names are the name
+	 * under each search domain and the name as given, in the order
+	 * lws_adns_q_search_start() decides, and search_step is the one the
+	 * working copy of the name currently holds.  search_steps is 0 when
+	 * the search list doesn't apply, or is used up
+	 */
+	uint8_t			search_step;
+	uint8_t			search_steps;
+	uint8_t			search_bare_first:1;
 
 	/* name overallocated here */
 } lws_adns_q_t;
@@ -250,6 +265,9 @@ sul_cb_expire(struct lws_sorted_usec_list *sul);
 void
 lws_adns_cache_destroy(lws_adns_cache_t *c);
 
+void
+lws_adns_cache_unref(lws_adns_cache_t *c);
+
 #if defined(LWS_WITH_SYS_ASYNC_DNS_DNSSEC)
 void
 lws_adns_dnssec_q_destroy(lws_adns_q_t *q);
@@ -274,6 +292,9 @@ lws_async_dns_get_new_tid(struct lws_context *context, lws_adns_q_t *q);
 
 int
 lws_async_dns_create_tcp_wsi(lws_adns_q_t *q);
+
+int
+lws_async_dns_create_server_wsi(struct lws_context *context);
 
 
 
@@ -332,7 +353,13 @@ void
 lws_adns_direct_deinit(lws_async_dns_t *dns);
 
 int
+lws_adns_q_restart(lws_adns_q_t *q);
+int
 lws_adns_q_cname_restart(lws_adns_q_t *q, const char *target);
+void
+lws_adns_q_search_start(lws_adns_q_t *q);
+int
+lws_adns_q_search_next(lws_adns_q_t *q);
 
 #if defined(LWS_WITH_SYS_SMD)
 /*

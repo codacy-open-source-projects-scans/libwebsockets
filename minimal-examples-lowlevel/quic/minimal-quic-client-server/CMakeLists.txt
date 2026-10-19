@@ -59,6 +59,20 @@ if (requirements)
 					     TIMEOUT 20)
 
 		#
+		# The client spreads its writes over 8s, longer than the server
+		# reaps a connection that has been idle since its handshake:
+		# the server must keep the connection, and the stream, while
+		# the client is still sending on it
+		#
+		lws_get_free_port(PORT_QCS_SPREAD)
+		add_test(NAME ${SAMP}-spread COMMAND ${SAMP}
+				--server ${LWS_CTEST_SERVER_RESOLVE}
+				-p ${PORT_QCS_SPREAD} --spread 8000)
+		set_tests_properties(${SAMP}-spread PROPERTIES
+					     WORKING_DIRECTORY .
+					     TIMEOUT 60)
+
+		#
 		# The same through the reordering relay, with small writes: the
 		# handshake's CRYPTO and many small STREAM frames each way reach
 		# the peer out of order and must be reassembled.  The relay
@@ -105,6 +119,147 @@ if (requirements)
 				--server ${QCS_RELAY_ADS} -p ${PORT_QCS_STRAY}
 				--relay ${PORT_QCS_STRAY_RELAY} --stray)
 		set_tests_properties(${SAMP}-stray PROPERTIES
+					     WORKING_DIRECTORY .
+					     TIMEOUT 60)
+
+		#
+		# Through the relay losing all but the client's Initial packets
+		# for 2s after its first Initial: the server, with an RTT sample
+		# but left waiting for the client's Finished, must keep the
+		# half-open connection within its handshake deadline, so the
+		# handshake completes when the client's retransmissions get
+		# through again
+		#
+		lws_get_free_port(PORT_QCS_OUTAGE)
+		lws_get_free_port(PORT_QCS_OUTAGE_RELAY)
+		add_test(NAME ${SAMP}-outage COMMAND ${SAMP}
+				--server ${QCS_RELAY_ADS} -p ${PORT_QCS_OUTAGE}
+				--relay ${PORT_QCS_OUTAGE_RELAY} --outage 2000)
+		set_tests_properties(${SAMP}-outage PROPERTIES
+					     WORKING_DIRECTORY .
+					     TIMEOUT 60)
+
+		#
+		# Through the relay sending the client's first 1-RTT packet to
+		# the server ahead of its Finished, and then losing its other
+		# 1-RTT packets for 1s: the server must hold the early one until
+		# its handshake completes and then process it, not lose it
+		#
+		lws_get_free_port(PORT_QCS_EARLY)
+		lws_get_free_port(PORT_QCS_EARLY_RELAY)
+		add_test(NAME ${SAMP}-early-1rtt COMMAND ${SAMP}
+				--server ${QCS_RELAY_ADS} -p ${PORT_QCS_EARLY}
+				--relay ${PORT_QCS_EARLY_RELAY} --early-1rtt)
+		set_tests_properties(${SAMP}-early-1rtt PROPERTIES
+					     WORKING_DIRECTORY .
+					     TIMEOUT 60)
+
+		#
+		# Through the relay also sending the server copies of the
+		# client's small packets, ahead of the originals, from an
+		# address that never answers: the server must stay on its
+		# validated path, probe the other address no faster than RFC
+		# 9000 allows, and back off probing it after failing.  The
+		# client's writes are spread over 12s, so the copies go on for
+		# long enough to see the server fail and wait several times.
+		#
+		lws_get_free_port(PORT_QCS_FWD)
+		lws_get_free_port(PORT_QCS_FWD_RELAY)
+		add_test(NAME ${SAMP}-forwarder COMMAND ${SAMP}
+				--server ${QCS_RELAY_ADS} -p ${PORT_QCS_FWD}
+				--relay ${PORT_QCS_FWD_RELAY} --forwarder
+				--write-size 64 --spread 12000)
+		set_tests_properties(${SAMP}-forwarder PROPERTIES
+					     WORKING_DIRECTORY .
+					     TIMEOUT 60)
+
+		#
+		# Through the relay passing datagrams on as they come, as a path
+		# with an MTU of 1500: each side must probe its way up to the
+		# biggest datagrams lws sends, in probes of their own, and lose
+		# none.  Then losing those bigger than 1400: each side must
+		# settle on the biggest size that fits, after losing no more
+		# than three probes of the next one up.
+		#
+		lws_get_free_port(PORT_QCS_PMTU)
+		lws_get_free_port(PORT_QCS_PMTU_RELAY)
+		add_test(NAME ${SAMP}-pmtu COMMAND ${SAMP}
+				--server ${QCS_RELAY_ADS} -p ${PORT_QCS_PMTU}
+				--relay ${PORT_QCS_PMTU_RELAY} --pmtu 1500)
+		set_tests_properties(${SAMP}-pmtu PROPERTIES
+					     WORKING_DIRECTORY .
+					     TIMEOUT 60)
+
+		lws_get_free_port(PORT_QCS_PMTU_SMALL)
+		lws_get_free_port(PORT_QCS_PMTU_SMALL_RELAY)
+		add_test(NAME ${SAMP}-pmtu-small COMMAND ${SAMP}
+				--server ${QCS_RELAY_ADS} -p ${PORT_QCS_PMTU_SMALL}
+				--relay ${PORT_QCS_PMTU_SMALL_RELAY} --pmtu 1400)
+		set_tests_properties(${SAMP}-pmtu-small PROPERTIES
+					     WORKING_DIRECTORY .
+					     TIMEOUT 60)
+
+		#
+		# As a path with an MTU of 1500 again, but its delay spikes as
+		# each side starts probing, so the acks of its first probes come
+		# after it gave them up for lost: they must still count, and
+		# each side must still probe its way up to the biggest datagrams
+		#
+		lws_get_free_port(PORT_QCS_PMTU_SPIKE)
+		lws_get_free_port(PORT_QCS_PMTU_SPIKE_RELAY)
+		add_test(NAME ${SAMP}-pmtu-spike COMMAND ${SAMP}
+				--server ${QCS_RELAY_ADS} -p ${PORT_QCS_PMTU_SPIKE}
+				--relay ${PORT_QCS_PMTU_SPIKE_RELAY} --pmtu 1500
+				--delay-spike)
+		set_tests_properties(${SAMP}-pmtu-spike PROPERTIES
+					     WORKING_DIRECTORY .
+					     TIMEOUT 60)
+
+		#
+		# As a path with an MTU of 1400 again, but it is down for a
+		# moment partway through the server's transfer: losing big
+		# packets with the base getting through afterwards isn't a
+		# black hole, and each side must keep the size it found
+		#
+		lws_get_free_port(PORT_QCS_PMTU_OUTAGE)
+		lws_get_free_port(PORT_QCS_PMTU_OUTAGE_RELAY)
+		add_test(NAME ${SAMP}-pmtu-outage COMMAND ${SAMP}
+				--server ${QCS_RELAY_ADS} -p ${PORT_QCS_PMTU_OUTAGE}
+				--relay ${PORT_QCS_PMTU_OUTAGE_RELAY} --pmtu 1400
+				--pmtu-outage)
+		set_tests_properties(${SAMP}-pmtu-outage PROPERTIES
+					     WORKING_DIRECTORY .
+					     TIMEOUT 60)
+
+		#
+		# As a path with an MTU of 1400 again, but the relay, client
+		# and server, all in this process, aren't run for a moment, as
+		# on a busy machine: the PTOs fire before the acks held back
+		# come, which isn't a black hole, and each side must go on from
+		# where it was, losing no more than three probes too big
+		#
+		lws_get_free_port(PORT_QCS_PMTU_STALL)
+		lws_get_free_port(PORT_QCS_PMTU_STALL_RELAY)
+		add_test(NAME ${SAMP}-pmtu-stall COMMAND ${SAMP}
+				--server ${QCS_RELAY_ADS} -p ${PORT_QCS_PMTU_STALL}
+				--relay ${PORT_QCS_PMTU_STALL_RELAY} --pmtu 1400
+				--stall)
+		set_tests_properties(${SAMP}-pmtu-stall PROPERTIES
+					     WORKING_DIRECTORY .
+					     TIMEOUT 60)
+
+		#
+		# Through the relay losing, in each direction, every datagram
+		# bigger than an IP MTU of 1280 carries, once it has passed ten
+		# of them: each side must find the black hole and go back to
+		# 1280, or the transfer stalls
+		#
+		lws_get_free_port(PORT_QCS_BH)
+		lws_get_free_port(PORT_QCS_BH_RELAY)
+		add_test(NAME ${SAMP}-blackhole COMMAND ${SAMP}
+				--server ${QCS_RELAY_ADS} -p ${PORT_QCS_BH}
+				--relay ${PORT_QCS_BH_RELAY} --blackhole)
+		set_tests_properties(${SAMP}-blackhole PROPERTIES
 					     WORKING_DIRECTORY .
 					     TIMEOUT 60)
 

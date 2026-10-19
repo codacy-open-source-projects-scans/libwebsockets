@@ -740,6 +740,12 @@ lws_http_get_onward_header(struct lws *wsi, const char *name, char *buf,
  * LWS_LOGIN_HDR_ADMIN is kept for back-compat and is exactly equivalent to
  * `state == LWS_LOGIN_STATE_GLOBAL_ADMIN`.
  *
+ * The state, and the grant level, are about one service: the one the mount
+ * the request arrived on names in its "service-name".  \ref
+ * LWS_LOGIN_HDR_SERVICE says which, so a backend serving more than one mount,
+ * or wanting to be sure the mount it is behind is the one it expects, can
+ * check the state is about the grant it cares about.
+ *
  * Crucially, \ref LWS_LOGIN_STATE_APP_ADMIN (admin of THIS app only) and \ref
  * LWS_LOGIN_STATE_GLOBAL_ADMIN (the TOFU "*" / "god" account, admin of the
  * whole system) are distinct: a backend must not treat an app admin as a
@@ -756,6 +762,7 @@ lws_http_get_onward_header(struct lws *wsi, const char *name, char *buf,
 #define LWS_LOGIN_HDR_ADMIN        "x-lws-login-admin"
 #define LWS_LOGIN_HDR_GRANT_LEVEL  "x-lws-login-grant-level"
 #define LWS_LOGIN_HDR_SUB          "x-lws-login-sub"
+#define LWS_LOGIN_HDR_SERVICE      "x-lws-login-service"
 
 /**
  * enum lws_login_state - summary role of the identity reaching a backend
@@ -1174,6 +1181,12 @@ lws_h2_client_stream_long_poll_rxonly(struct lws *wsi);
  * formats are tried, and for non-decompression (server) mode the first that's
  * found on the client's accept-encoding header is chosen.
  *
+ * In server mode it also adds "vary: accept-encoding" to the headers, whether
+ * or not a compression is applied, since which representation is sent
+ * depends on that request header.  Returns -1 if a header did not fit.  On a
+ * vhost with LWS_SERVER_OPTION_NO_HTTP_STREAM_COMPRESSION, it's a NOP in
+ * server mode.
+ *
  * NOTE: the compression transform, same as h2 support, relies on the user
  * code using LWS_WRITE_HTTP and then LWS_WRITE_HTTP_FINAL on the last part
  * written.  The internal lws fileserving code already does this.
@@ -1192,7 +1205,10 @@ lws_http_compression_apply(struct lws *wsi, const char *name,
  * \param wsi: the wsi to check
  *
  * Check if the wsi is currently in GET mode, after, eg, doing a POST and
- * receiving a 303.
+ * receiving a 303.  As RFC 9110 15.4 says, a 303 turns any method but HEAD
+ * into a GET, a 301 or 302 turns only a POST into a GET, and 307 / 308 keep
+ * the method.  When this returns true, the request must not send its body
+ * again; when a redirect kept the method, it must send all of it again.
  */
 LWS_VISIBLE LWS_EXTERN int
 lws_http_is_redirected_to_get(struct lws *wsi);

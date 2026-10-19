@@ -809,6 +809,9 @@ int lws_callback_vhost_protocols_vhost(struct lws_vhost *vh, int reason,
 	return 0;
 }
 
+/* the reasons in an _enable, as opposed to the flags that say what to do */
+#define LWS_RXFLOW_REASON_MASK 0xfff
+
 int lws_rx_flow_control(struct lws *wsi, int _enable) {
 	struct lws_context_per_thread *pt = &wsi->a.context->pt[(int)wsi->tsi];
 	int en = _enable;
@@ -834,9 +837,11 @@ int lws_rx_flow_control(struct lws *wsi, int _enable) {
 
 	/* any bit set in rxflow_bitmap DISABLEs rxflow control */
 	if (en & LWS_RXFLOW_REASON_APPLIES_ENABLE_BIT)
-		wsi->rxflow_bitmap = (uint8_t)(wsi->rxflow_bitmap & ~(en & 0xff));
+		wsi->rxflow_bitmap = (uint16_t)(wsi->rxflow_bitmap &
+					~(en & LWS_RXFLOW_REASON_MASK));
 	else
-		wsi->rxflow_bitmap = (uint8_t)(wsi->rxflow_bitmap | (en & 0xff));
+		wsi->rxflow_bitmap = (uint16_t)(wsi->rxflow_bitmap |
+					(en & LWS_RXFLOW_REASON_MASK));
 
 	if ((LWS_RXFLOW_PENDING_CHANGE | (!wsi->rxflow_bitmap)) ==
 			wsi->rxflow_change_to)
@@ -2227,6 +2232,22 @@ void lws_wsi_mux_insert(struct lws *wsi, struct lws *parent_wsi,
 	lws_dll2_add_head(&wsi->mux.sibling_list, &parent_wsi->mux.child_list_owner);
 }
 
+/*
+ * A stream is busy while it has a timeout of its own running: something is
+ * in progress on it, eg, a response is being prepared, and that timeout
+ * bounds how long it can stay busy.
+ */
+int lws_wsi_mux_has_busy_child(struct lws *parent_wsi) {
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&parent_wsi->mux.child_list_owner)) {
+		struct lws *wsi = lws_container_of(d, struct lws, mux.sibling_list);
+		if (!lws_dll2_is_detached(&wsi->sul_timeout.list))
+			return 1;
+	}
+	lws_end_foreach_dll(d);
+
+	return 0;
+}
+
 struct lws *lws_wsi_mux_from_id(struct lws *parent_wsi, unsigned int sid) {
 	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(&parent_wsi->mux.child_list_owner)) {
 		struct lws *wsi = lws_container_of(d, struct lws, mux.sibling_list);
@@ -2267,6 +2288,9 @@ void lws_wsi_mux_close_children(struct lws *wsi, int reason) {
 
 		lwsl_wsi_info(w, "   closing child");
 		lwsi_set_skt_unusable(w, 1);
+		/* his stream ends for the reason its connection did */
+		lws_wsi_close_cause_set(w, wsi->close_cause,
+					wsi->close_cause_arg);
 		__lws_close_free_wsi(w, (enum lws_close_status)reason,
 				"mux child recurse");
 	}
@@ -2705,6 +2729,7 @@ lws_validity_cb(lws_sorted_usec_list_t *sul)
 
 		lws_context_lock(cx, __func__);
 		lws_pt_lock(pt, __func__);
+		lws_wsi_close_cause_set(wsi, "no reply to validity ping", 0);
 		__lws_close_free_wsi(wsi, LWS_CLOSE_STATUS_NOSTATUS,
 				     "validity timeout");
 		lws_pt_unlock(pt);

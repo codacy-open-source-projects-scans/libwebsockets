@@ -15,6 +15,8 @@ require_lws_config(LWS_WITH_NETWORK 1 requirements)
 require_lws_config(LWS_WITH_CLIENT 1 requirements)
 require_lws_config(LWS_WITHOUT_SERVER 0 requirements)
 require_lws_config(LWS_WITH_HTTP_STREAM_COMPRESSION 1 requirements)
+# lws_genhash, for the digest, comes from the tls library
+require_lws_config(LWS_WITH_TLS 1 requirements)
 require_lws_config(LWS_WITH_GENCRYPTO 1 requirements)
 
 if (requirements AND NOT WIN32)
@@ -40,10 +42,14 @@ if (requirements AND NOT WIN32)
 
 	lws_get_free_port(PORT_HTTP_COMP_H1)
 	lws_get_free_port(PORT_HTTP_COMP_H2)
+	lws_get_free_port(PORT_HTTP_COMP_NC_H1)
+	lws_get_free_port(PORT_HTTP_COMP_NC_H2)
 
 	add_test(NAME api-test-http-compression
 		 COMMAND lws-api-test-http-compression -p ${PORT_HTTP_COMP_H1}
 			 --h2-port ${PORT_HTTP_COMP_H2}
+			 --nc-port ${PORT_HTTP_COMP_NC_H1}
+			 --nc-h2-port ${PORT_HTTP_COMP_NC_H2}
 			 --tmpdir ${CMAKE_CURRENT_BINARY_DIR})
 	set_tests_properties(api-test-http-compression PROPERTIES
 			     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -55,10 +61,14 @@ if (requirements AND NOT WIN32)
 	#
 	lws_get_free_port(PORT_HTTP_COMP_E_H1)
 	lws_get_free_port(PORT_HTTP_COMP_E_H2)
+	lws_get_free_port(PORT_HTTP_COMP_E_NC_H1)
+	lws_get_free_port(PORT_HTTP_COMP_E_NC_H2)
 
 	add_test(NAME api-test-http-compression-empty
 		 COMMAND lws-api-test-http-compression -p ${PORT_HTTP_COMP_E_H1}
-			 --h2-port ${PORT_HTTP_COMP_E_H2} --size 0
+			 --h2-port ${PORT_HTTP_COMP_E_H2}
+			 --nc-port ${PORT_HTTP_COMP_E_NC_H1}
+			 --nc-h2-port ${PORT_HTTP_COMP_E_NC_H2} --size 0
 			 --tmpdir ${CMAKE_CURRENT_BINARY_DIR})
 	set_tests_properties(api-test-http-compression-empty PROPERTIES
 			     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}

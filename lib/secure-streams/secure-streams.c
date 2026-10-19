@@ -446,10 +446,17 @@ lws_ss_event_helper(lws_ss_handle_t *h, lws_ss_constate_t cs)
 	if (lws_ss_check_next_state_ss(h, &h->prev_ss_state, cs))
 		return LWSSSSRET_DESTROY_ME;
 
-	if (cs == LWSSSCS_CONNECTED)
+	if (cs == LWSSSCS_CONNECTED) {
 		h->ss_dangling_connected = 1;
+		h->close_cause = NULL;
+		h->close_cause_arg = 0;
+	}
 	if (cs == LWSSSCS_DISCONNECTED) {
 		h->ss_dangling_connected = 0;
+
+		/* the wsi goes now, keep why it ended for the state cb */
+		h->close_cause = h->wsi ? h->wsi->close_cause : NULL;
+		h->close_cause_arg = h->wsi ? h->wsi->close_cause_arg : 0;
 
 		h->subseq = 0;
 		h->txn_ok = 0;
@@ -1231,6 +1238,19 @@ _lws_ss_client_connect(lws_ss_handle_t *h, int is_retry, void *conn_if_sspc_onw)
 			if (puri)
 				lws_parse_uri_destroy(&puri);
 			return h->pending_ret;
+		}
+
+		if (h->wsi) {
+			/*
+			 * The user code connected again from a state callback
+			 * we issued for our failed attempt, eg, from
+			 * ALL_RETRIES_FAILED... that connection is in flight
+			 * now, don't report UNREACHABLE and start a retry
+			 * over it, or a second one joins it on this handle
+			 */
+			if (puri)
+				lws_parse_uri_destroy(&puri);
+			return LWSSSSRET_OK;
 		}
 
 fail_out:
@@ -2455,6 +2475,13 @@ lws_ss_http_rx_content_length(struct lws_ss_handle *h, uint64_t *len)
 }
 
 int
+lws_ss_close_cause(struct lws_ss_handle *h, char *buf, size_t len)
+{
+	return lws_close_cause_render(buf, len, h->close_cause,
+				      h->close_cause_arg);
+}
+
+int
 lws_ss_get_est_peer_tx_credit(struct lws_ss_handle *h)
 {
 	const struct ss_pcols *ssp;
@@ -2562,6 +2589,45 @@ lws_ss_validity_confirmed(struct lws_ss_handle *h)
 		lws_validity_confirmed(h->wsi);
 }
 
+
+/*
+ * The network got better, eg, a route appeared: a stream sitting out its
+ * backoff after failing to connect, likely because it had no way out then,
+ * tries again now rather than when its backoff runs out, which may be many
+ * seconds after it could have connected.  Its backoff starts again from the
+ * beginning, since what it was backing off from has changed.
+ */
+
+void
+lws_ss_network_improved(struct lws_context *cx)
+{
+	int n;
+
+	for (n = 0; n < cx->count_threads; n++) {
+		struct lws_context_per_thread *pt = &cx->pt[n];
+
+		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+					   lws_dll2_get_head(&pt->ss_owner)) {
+			struct lws_ss_handle *h = lws_container_of(d,
+						struct lws_ss_handle, list);
+
+			if (h->seqstate == SSSEQ_RECONNECT_WAIT &&
+			    !h->destroy_pending) {
+				/*
+				 * Rare, and it says when the network really
+				 * came, which a failing connection can't
+				 */
+				lwsl_notice("%s: %s: network improved, "
+					    "retrying now\n", __func__,
+					    lws_ss_tag(h));
+				h->retry = 0;
+				lws_sul_cancel(&h->sul);
+				lws_ss_set_timeout_us(h, 1);
+			}
+
+		} lws_end_foreach_dll_safe(d, d1);
+	}
+}
 
 #if defined(_DEBUG)
 void

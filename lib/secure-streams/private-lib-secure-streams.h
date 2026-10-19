@@ -93,6 +93,12 @@ typedef struct lws_ss_handle {
 	const lws_ss_policy_t	*policy;  /**< system policy for stream */
 
 	struct lws		*wsi;	  /**< the stream wsi if any */
+	/*
+	 * Why the last connection ended, kept from its wsi when it went: see
+	 * lws_ss_close_cause()
+	 */
+	const char		*close_cause;
+	int			close_cause_arg;
 
 	struct lws_sss_proxy_conn *conn_if_sspc_onw;
 
@@ -185,6 +191,8 @@ typedef struct lws_ss_handle {
 			uint32_t			unacked_size;
 			uint8_t				retry_count;
 			uint8_t				send_unacked:1;
+			/* a WRITEABLE waited for the stream's ack */
+			uint8_t				tx_deferred:1;
 		} mqtt;
 #endif
 #if defined(LWS_WITH_SYS_SMD)
@@ -664,6 +672,9 @@ _lws_ss_backoff(lws_ss_handle_t *h, lws_usec_t us_override);
 
 lws_ss_state_return_t
 lws_ss_backoff(lws_ss_handle_t *h);
+
+void
+lws_ss_network_improved(struct lws_context *cx);
 
 int
 _lws_ss_handle_state_ret_CAN_DESTROY_HANDLE(lws_ss_state_return_t r, struct lws *wsi,

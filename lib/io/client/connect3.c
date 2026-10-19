@@ -188,7 +188,7 @@ lws_client_h3_grace_cb(lws_sorted_usec_list_t *sul)
 
 		if (!ads || !host || !path ||
 		    !lws_client_reset(&wsi, !!(wsi->flags & LCCSCF_USE_SSL),
-				      ads, wsi->c_port, path, host, 1))
+				      ads, wsi->c_port, path, host, NULL, 1))
 			/*
 			 * No stash to restart from, or the reset failed:
 			 * the close below just fails the connection
@@ -266,7 +266,7 @@ lws_client_connect_check(struct lws *wsi, lws_sockfd_type fd, int *real_errno)
 			return LCCCR_CONNECTED;
 		}
 
-		lwsl_wsi_notice(wsi, "getsockopt fd %d says %s", fd,
+		lwsl_wsi_info(wsi, "getsockopt fd %d says %s", fd,
 				lws_errno_describe(e, t16, sizeof(t16)));
 
 		*real_errno = e;
@@ -1066,6 +1066,15 @@ ads_known:
 						   wsi->io->c_pri, wsi->flags))
 			lwsl_wsi_warn(wsi, "unable to set ip options");
 
+#if defined(LWS_ROLE_QUIC)
+		/* QUIC finds the path MTU itself */
+		if (want_udp && wsi->role_ops &&
+		    !strcmp(wsi->role_ops->name, "quic") &&
+		    lws_plat_set_socket_dontfrag(new_fd,
+					wsi->io->sa46_peer.sa4.sin_family))
+			lwsl_wsi_info(wsi, "unable to set Don't Fragment");
+#endif
+
 #if !defined(WIN32) && !defined(_WIN32)
                 if (want_udp && wsi->role_ops && !strcmp(wsi->role_ops->name, "quic")) {
                         int opt = 1;
@@ -1489,6 +1498,7 @@ ads_known:
 	} else if (!is_parallel && wsi->role_ops && !strcmp(wsi->role_ops->name, "quic")) {
 		/* QUIC connect immediately succeeds. Schedule grace and happy eyeballs. */
 		uint32_t grace_us = LWS_QUIC_GRACE_DEFAULT_US;
+		int tcp_fallback;
 		if (wsi->a.context->h3_cap_cache && wsi->stash && wsi->stash->cis[CIS_HOST]) {
 			const void *item = NULL;
 			size_t item_len = 0;
@@ -1539,8 +1549,21 @@ ads_known:
 		 */
 		if (grace_us < LWS_QUIC_GRACE_DEFAULT_US)
 			grace_us = LWS_QUIC_GRACE_DEFAULT_US;
-		if (wsi->io->disable_h3_fallback) {
-			lwsl_wsi_info(wsi, "QUIC socket created, H3 fallback disabled");
+		/*
+		 * The fallback is to the same requests over h2 or http/1.1
+		 * on TCP, which only h3 has.  Any other protocol over QUIC,
+		 * eg, a raw QUIC protocol or hq-interop, has no TCP form to
+		 * fall back to: abandoning a slow handshake to TCP only
+		 * kills a connection that would have completed.  (Without
+		 * tls, there is no QUIC, so no h3 either.)
+		 */
+		tcp_fallback = 0;
+#if defined(LWS_WITH_TLS)
+		tcp_fallback = !wsi->io->disable_h3_fallback &&
+			       !!strstr(wsi->alpn, "h3");
+#endif
+		if (!tcp_fallback) {
+			lwsl_wsi_info(wsi, "QUIC socket created, no TCP fallback");
 		} else {
 			lwsl_wsi_info(wsi, "QUIC socket created, starting grace timer %uus", (unsigned int)grace_us);
 			lws_sul_schedule(wsi->a.context, wsi->tsi, &wsi->io->sul_h3_grace,
@@ -1829,6 +1852,23 @@ try_next_dns_result:
 		if (any_valid) {
 			/* some connection is still running */
 			lwsl_wsi_info(wsi, "attempt failed, others still running");
+			/*
+			 * While we are waiting to connect, the attempts still
+			 * running are bounded by the connect timeout, and
+			 * coming back here to find it not armed is taken as
+			 * it having fired.  An attempt that failed inside its
+			 * connect() never armed it, eg, a racer refused at
+			 * once on FreeBSD loopback, whose start also took a
+			 * QUIC primary back to waiting to connect: the
+			 * primary's first datagram abandoned the connection.
+			 */
+			if (lwsi_transport(wsi) == LTS_WAITING_CONNECT &&
+			    !lws_dll2_owner(&wsi->io->sul_connect_timeout.list))
+				lws_sul_schedule(wsi->a.context, wsi->tsi,
+						 &wsi->io->sul_connect_timeout,
+						 lws_client_conn_wait_timeout,
+						 wsi->a.context->timeout_secs *
+							LWS_USEC_PER_SEC);
 			return wsi;
 		}
 	}

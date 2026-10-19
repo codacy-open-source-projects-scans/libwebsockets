@@ -78,6 +78,21 @@ lws_ntpc_retry_conn(struct lws_sorted_usec_list *sul)
 	if (v->wsi_udp || !lws_dll2_is_detached(&v->sul_conn.list))
 		return;
 
+#if defined(LWS_WITH_ROUTING)
+	/*
+	 * No interface has an address yet, eg, wifi reassociated but DHCP is
+	 * not done: anything we send now just fails.  Keep looking on the
+	 * outer backoff, an "ipacq" triggers us straight away anyway.
+	 */
+	if (_lws_route_table_known_empty(v->context)) {
+		lwsl_info("%s: no route out yet\n", __func__);
+		lws_retry_sul_schedule(v->context, 0, &v->sul_conn, &bo,
+				       lws_ntpc_retry_conn,
+				       &v->retry_count_conn);
+		return;
+	}
+#endif
+
 	/* create the UDP socket aimed at the server */
 
 	lwsl_notice("%s: server %s\n", __func__, v->ntp_server_ads);
@@ -334,14 +349,23 @@ cancel_conn_timer:
 	return 0;
 }
 
-void
+int
 lws_ntpc_trigger(struct lws_context *ctx)
 {
 	struct vhd_ntpc *v = (struct vhd_ntpc *)ctx->ntpclient_priv;
 
+	if (!v)
+		return 1;
+
 	lwsl_notice("%s\n", __func__);
+	/* an answer to an earlier query doesn't answer this one */
+	v->set_time = 0;
 	v->retry_count_conn = 0;
+	/* now, not whenever a pending backoff retry would have got to it */
+	lws_sul_cancel(&v->sul_conn);
 	lws_ntpc_retry_conn(&v->sul_conn);
+
+	return 0;
 }
 
 struct lws_protocols lws_system_protocol_ntpc =

@@ -16,7 +16,6 @@ struct vhd_cert_dist_client {
 	const struct lws_protocols      *protocol;
 	char                            base_dir[256];
 	char                            secret[129];
-	char                            reload_cmd[256];
 	struct lws_stub_manager         *stub_mgr;
 	struct lws_dll2_owner           clients;
 	const char                      *server_url;
@@ -24,25 +23,23 @@ struct vhd_cert_dist_client {
 
 /*
  * Stub child only: what the plugin init (cert_dist_client_init()) was handed
- * by the parent on stdin, the secret, base_dir and reload_cmd.  Requests
+ * by the parent on stdin, the secret and base_dir.  Requests
  * arrive on the UDS listener vhost, where no vhost instantiates us, so they
  * find their config through this.
  */
 static struct vhd_cert_dist_client *cdc_stub;
 
 /*
- * The parent hands its stub {"base_dir":"...","reload_cmd":"..."} as the stub
- * extra payload.  Room for both fields JSON-escaped at the worst case of 6
- * chars per input char, and the rest of the object; it stays below PIPE_BUF,
- * so the parent's write of it is atomic
+ * The parent hands its stub {"base_dir":"..."} as the stub extra payload.
+ * Room for it JSON-escaped at the worst case of 6 chars per input char, and
+ * the rest of the object; it stays below PIPE_BUF, so the parent's write of
+ * it is atomic
  */
 #define CDC_PAYLOAD_MAX \
-	((sizeof(((struct vhd_cert_dist_client *)0)->base_dir) + \
-	  sizeof(((struct vhd_cert_dist_client *)0)->reload_cmd)) * 6 + 64)
+	(sizeof(((struct vhd_cert_dist_client *)0)->base_dir) * 6 + 64)
 
 static const char * const cdc_payload_paths[] = {
 	"base_dir",
-	"reload_cmd",
 };
 
 struct cdc_payload_parse {
@@ -60,16 +57,8 @@ cdc_payload_cb(struct lejp_ctx *ctx, char reason)
 	if (!ctx->path_match)
 		return 0;
 
-	switch (ctx->path_match - 1) {
-	case 0:
-		dest = pp->v->base_dir;
-		cap = sizeof(pp->v->base_dir);
-		break;
-	default:
-		dest = pp->v->reload_cmd;
-		cap = sizeof(pp->v->reload_cmd);
-		break;
-	}
+	dest = pp->v->base_dir;
+	cap = sizeof(pp->v->base_dir);
 
 	switch (reason) {
 	case LEJPCB_VAL_STR_START:
@@ -147,6 +136,21 @@ struct pss_cert_dist_client {
 	int                             uds_tx_len;
 	int                             uds_tx_pos;
 	lws_stub_req_h                  stub_req;
+
+	/*
+	 * The pair our install request is installing: once the stub says it
+	 * is in place, the vhosts serving it are handed these copies, since
+	 * they can't read what the stub wrote
+	 */
+	char                            *inst_cert;
+	char                            *inst_key;
+	int                             inst_cert_len;
+	int                             inst_key_len;
+
+	/* the root stub's answer to our install request */
+	char                            install_why[64];
+	uint8_t                         install_ok;
+	uint8_t                         install_unchanged;
 };
 
 struct dist_client_conn {
@@ -164,6 +168,15 @@ struct dist_client_conn {
 	char                            hash[65];
 	int                             fetching_hash;
 	lws_stub_req_h                  hash_req;
+
+	/*
+	 * Set when a cert the server sent could not be installed: the link
+	 * is dropped so the reconnect, which tells the server the hash of
+	 * the cert we still have, fetches it again.  Whatever failed may well
+	 * fail again, so these retries back off further each time.
+	 */
+	uint16_t                        install_retry_count;
+	uint8_t                         install_failed;
 };
 
 /*
@@ -197,8 +210,8 @@ cert_dist_valid_name(const char *s, size_t max)
 }
 
 /*
- * Create or open a file we are about to write a cert or a key into, as root,
- * in a directory an unprivileged local user may be able to create entries in
+ * Create or open a file we are about to write a cert or a key into, as the
+ * stub (root, or its "stub-user"), in a directory an unprivileged local user may be able to create entries in
  * if it pre-existed.  It must not already exist and must not be a symlink.
  */
 
@@ -217,22 +230,29 @@ cert_dist_create_excl(int dfd, const char *name)
 
 /*
  * Atomically point the symlink \p name in the directory \p dfd at \p target,
- * a sibling file in the same directory
+ * a sibling file in the same directory.  Returns 0 if OK.
  */
 
-static void
+static int
 cert_dist_symlink_at(int dfd, const char *target, const char *name)
 {
 	char tmp[80];
 
 	lws_snprintf(tmp, sizeof(tmp), "%s.tmp", name);
 	unlinkat(dfd, tmp, 0);
-	if (symlinkat(target, dfd, tmp))
+	if (symlinkat(target, dfd, tmp)) {
 		lwsl_err("%s: symlink %s failed: %s\n", __func__, tmp,
 			 strerror(errno));
-	else if (renameat(dfd, tmp, dfd, name))
+		return 1;
+	}
+	if (renameat(dfd, tmp, dfd, name)) {
 		lwsl_err("%s: rename %s failed: %s\n", __func__, name,
 			 strerror(errno));
+		unlinkat(dfd, tmp, 0);
+		return 1;
+	}
+
+	return 0;
 }
 
 static const uint32_t backoff_ms[] = { 1000, 2000, 3000, 4000, 5000 };
@@ -243,6 +263,24 @@ static const lws_retry_bo_t retry = {
 	.conceal_count			= LWS_RETRY_CONCEAL_ALWAYS,
 	.secs_since_valid_ping		= 30,
 	.secs_since_valid_hangup	= 35,
+	.jitter_percent			= 20,
+};
+
+/*
+ * Backoff for refetching a cert we could not install.  It starts slower than
+ * reconnecting after a dropped link, since it is more likely to be a local
+ * problem (a full disk, bad permissions) that will not have gone away in a
+ * second, and it keeps growing: while it lasts, every retry has the server
+ * send us the whole cert and key again.
+ */
+static const uint32_t install_backoff_ms[] = {
+	10000, 30000, 60000, 300000, 900000, 3600000
+};
+
+static const lws_retry_bo_t install_retry = {
+	.retry_ms_table			= install_backoff_ms,
+	.retry_ms_table_count		= LWS_ARRAY_SIZE(install_backoff_ms),
+	.conceal_count			= LWS_RETRY_CONCEAL_ALWAYS,
 	.jitter_percent			= 20,
 };
 
@@ -279,6 +317,141 @@ connect_client(lws_sorted_usec_list_t *sul)
 			lwsl_err("%s: connection attempts exhausted\n", __func__);
 		}
 	}
+}
+
+static const char * const install_paths[] = { "installed", "why",
+					      "unchanged" };
+
+/* we are done with the pair an install request was for */
+
+static void
+cdc_inst_free(struct pss_cert_dist_client *pss)
+{
+	free(pss->inst_cert);
+	pss->inst_cert = NULL;
+	pss->inst_cert_len = 0;
+	if (pss->inst_key) {
+		lws_explicit_bzero(pss->inst_key, (size_t)pss->inst_key_len);
+		free(pss->inst_key);
+	}
+	pss->inst_key = NULL;
+	pss->inst_key_len = 0;
+}
+
+/*
+ * The stub put a new pair in place under <base_dir>/<name>/, as files we
+ * can't read.  Hand the vhosts serving them our copies, so they move onto
+ * them, after their grace period if they have one.
+ */
+
+static void
+cdc_inst_hand_over(struct pss_cert_dist_client *pss,
+		   struct dist_client_conn *conn)
+{
+	char crt[384], key[384];
+
+	if (!conn->vhd || !pss->inst_cert || !pss->inst_key)
+		return;
+
+	lws_snprintf(crt, sizeof(crt), "%s/%s/fullchain.pem",
+		     conn->vhd->base_dir, conn->name);
+	lws_snprintf(key, sizeof(key), "%s/%s/privkey.pem",
+		     conn->vhd->base_dir, conn->name);
+
+	/*
+	 * lws_tls_cert_updated() logs what each vhost does with it, and warns
+	 * if no vhost uses those paths at all
+	 */
+	lwsl_notice("%s: handing the new cert for '%s' to the vhosts serving "
+		    "%s\n", __func__, conn->name, crt);
+	if (lws_tls_cert_updated(conn->vhd->cx, crt, key,
+				 pss->inst_cert, (size_t)pss->inst_cert_len,
+				 pss->inst_key, (size_t)pss->inst_key_len))
+		lwsl_err("%s: a vhost serving %s could not load the new cert "
+			 "for '%s' and still serves the old one, see above\n",
+			 __func__, crt, conn->name);
+}
+
+/*
+ * The cert we were sent could not be installed, so we are still serving the
+ * old one: say why, and drop the link so the reconnect refetches it.  The
+ * reconnect is held back by install_retry, see CLIENT_CLOSED.
+ */
+static void
+cdc_install_failed(struct pss_cert_dist_client *pss,
+		   struct dist_client_conn *conn, const char *why)
+{
+	lwsl_wsi_err(pss->wsi, "cert for '%s' from %s:%d was not installed: "
+		     "%s.  Still serving the previous cert; dropping the link "
+		     "to fetch it again after a backoff (failure %u in a row)",
+		     conn->name, conn->addr, conn->port, why,
+		     (unsigned int)conn->install_retry_count + 1);
+
+	conn->install_failed = 1;
+	lws_set_timeout(pss->wsi, PENDING_TIMEOUT_USER_OK, LWS_TO_KILL_ASYNC);
+}
+
+static signed char
+install_rx_cb(struct lejp_ctx *ctx, char reason)
+{
+	struct pss_cert_dist_client *pss =
+				(struct pss_cert_dist_client *)ctx->user;
+	struct dist_client_conn *conn;
+
+	switch (reason) {
+	case LEJPCB_VAL_TRUE:
+		if (ctx->path_match == 1) /* "installed" */
+			pss->install_ok = 1;
+		if (ctx->path_match == 3) /* "unchanged" */
+			pss->install_unchanged = 1;
+		break;
+
+	case LEJPCB_VAL_STR_END:
+		if (ctx->path_match == 2) /* "why" */
+			lws_strncpy(pss->install_why, ctx->buf,
+				    sizeof(pss->install_why));
+		break;
+
+	case LEJPCB_DESTRUCTED:
+		/*
+		 * The request is over, however it ended.  If we cleared our
+		 * handle first, we cancelled it ourselves: the link is going,
+		 * or a newer cert superseded this one.
+		 */
+		if (!pss->stub_req)
+			break;
+		pss->stub_req = 0;
+
+		conn = pss->wsi ? (struct dist_client_conn *)
+				lws_get_opaque_user_data(pss->wsi) : NULL;
+		if (!conn)
+			break;
+
+		if (pss->install_ok) {
+			lwsl_wsi_notice(pss->wsi, "cert for '%s' installed",
+					conn->name);
+			conn->install_retry_count = 0;
+			/*
+			 * An unchanged pair was handed over when it was
+			 * installed, or loaded from the files at startup
+			 */
+			if (!pss->install_unchanged)
+				cdc_inst_hand_over(pss, conn);
+			cdc_inst_free(pss);
+			break;
+		}
+
+		cdc_inst_free(pss);
+
+		/* the stub answers every install it acts on */
+		cdc_install_failed(pss, conn, pss->install_why[0] ?
+				pss->install_why : "the root stub did not "
+				"answer (it refused the request, or its "
+				"connection dropped)");
+		break;
+	}
+
+	return 0;
 }
 
 static signed char
@@ -553,6 +726,183 @@ struct stub_req_args {
 	uint8_t                     seen; /* bit per stub_req_paths member */
 };
 
+/*
+ * Install the cert and key in a request into <base_dir>/<name>/, as the
+ * stub's user.
+ *
+ * Returns 0 if they were installed, 1 if the same cert was already installed,
+ * or -1 if nothing could be installed, with *why set to the reason, which
+ * goes back to the parent to be logged there too.
+ */
+
+static int
+cdc_install(struct stub_req_args *a, const char **why)
+{
+	char path[512], fn_fc[80], fn_pk[80], timestamp[64];
+	struct timeval tv;
+	struct stat sd;
+	int fd, dfd;
+
+	/*
+	 * Nothing that arrives here may replace working key material with
+	 * junk: both sides must be non-empty and actually look like PEM.
+	 * Empty strings reach here as zero-length buffers, and write(fd,
+	 * NULL-ish, 0) "succeeds", so without this the symlink flip would
+	 * atomically install 0-byte certs.
+	 */
+	if (a->fc_len <= 0 || a->pk_len <= 0 ||
+	    !strstr(a->fullchain, "-----BEGIN CERTIFICATE-----") ||
+	    !strstr(a->fullchain, "-----END CERTIFICATE-----") ||
+	    !strstr(a->privkey, "-----BEGIN") ||
+	    !strstr(a->privkey, "PRIVATE KEY-----")) {
+		lwsl_err("%s: refusing to install non-PEM cert or key for %s "
+			 "(fc %d, pk %d)\n", __func__, a->subdomain, a->fc_len,
+			 a->pk_len);
+		*why = "cert or key is not PEM";
+
+		return -1;
+	}
+
+	gettimeofday(&tv, NULL);
+	lws_snprintf(timestamp, sizeof(timestamp), "%lld.%06lld",
+		     (long long)tv.tv_sec, (long long)tv.tv_usec);
+
+	lws_snprintf(path, sizeof(path), "%s/%s", a->vhd->base_dir,
+		     a->subdomain);
+	if (mkdir(path, 0700) < 0 && errno != EEXIST) {
+		lwsl_err("%s: Failed to create directory '%s': %s (errno=%d)\n",
+			 __func__, path, strerror(errno), errno);
+		*why = "unable to create the cert directory";
+
+		return -1;
+	}
+
+	/*
+	 * We are privileged and about to write a private key in there: if the
+	 * directory already existed, it must be a real directory that we own
+	 * and that nobody else can write to, or a local user could have
+	 * planted symlinks in it.
+	 *
+	 * Open it (refusing to follow a symlink) and check the open fd rather
+	 * than the path, then do everything below relative to that fd, so
+	 * what we checked and what we write into are the same directory even
+	 * if the path is swapped out from under us in between.
+	 */
+	dfd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+	if (dfd < 0 || fstat(dfd, &sd) || !S_ISDIR(sd.st_mode) ||
+	    sd.st_uid != geteuid() ||
+	    (sd.st_mode & (S_IWGRP | S_IWOTH))) {
+		/* eg, still root's from before the stub had a stub-user */
+		lwsl_err("%s: '%s' is not a private directory we own: it must "
+			 "be a directory owned by uid %u, and not writable by "
+			 "its group or others\n", __func__, path,
+			 (unsigned int)geteuid());
+		if (dfd >= 0)
+			close(dfd);
+		*why = "the cert directory is not a private directory we own";
+
+		return -1;
+	}
+
+	/* Has the certificate actually changed? */
+	fd = openat(dfd, "fullchain.pem", O_RDONLY);
+	if (fd >= 0) {
+		struct stat st;
+
+		if (!fstat(fd, &st) && st.st_size == a->fc_len) {
+			char *buf = malloc((size_t)st.st_size);
+
+			if (buf) {
+				if (read(fd, buf, (size_t)st.st_size) ==
+							st.st_size &&
+				    !memcmp(buf, a->fullchain,
+					    (size_t)st.st_size)) {
+					lwsl_notice("%s: Cert for %s is "
+						    "unchanged, skipping "
+						    "update\n", __func__,
+						    a->subdomain);
+					free(buf);
+					close(fd);
+					close(dfd);
+
+					return 1;
+				}
+				free(buf);
+			}
+		}
+		close(fd);
+	}
+
+	lws_snprintf(fn_fc, sizeof(fn_fc), "fullchain.pem.%s", timestamp);
+	fd = cert_dist_create_excl(dfd, fn_fc);
+	if (fd < 0) {
+		*why = "unable to create the fullchain file";
+		goto bail;
+	}
+	if (write(fd, a->fullchain, (size_t)a->fc_len) != (ssize_t)a->fc_len ||
+	    fsync(fd)) {
+		lwsl_err("%s: Failed writing fullchain: %s\n", __func__,
+			 strerror(errno));
+		close(fd);
+		*why = "unable to write the fullchain file";
+		goto bail_fc;
+	}
+	close(fd);
+
+	lws_snprintf(fn_pk, sizeof(fn_pk), "privkey.pem.%s", timestamp);
+	fd = cert_dist_create_excl(dfd, fn_pk);
+	if (fd < 0) {
+		*why = "unable to create the private key file";
+		goto bail_fc;
+	}
+	if (write(fd, a->privkey, (size_t)a->pk_len) != (ssize_t)a->pk_len ||
+	    fsync(fd)) {
+		lwsl_err("%s: Failed writing privkey: %s\n", __func__,
+			 strerror(errno));
+		close(fd);
+		*why = "unable to write the private key file";
+		goto bail_pk;
+	}
+	close(fd);
+
+	/*
+	 * Atomic symlink update, targets are siblings in the dir.  The key
+	 * goes first, because the "unchanged" check above looks only at
+	 * fullchain.pem: if the cert were switched first and the key switch
+	 * then failed, a retry would find the new cert in place, call it
+	 * unchanged and leave it paired with the old key for good.
+	 */
+	if (cert_dist_symlink_at(dfd, fn_pk, "privkey.pem")) {
+		*why = "unable to switch privkey.pem to the new key";
+		goto bail_pk;
+	}
+	if (cert_dist_symlink_at(dfd, fn_fc, "fullchain.pem")) {
+		/*
+		 * privkey.pem already names the new key: leave both files,
+		 * so a retry can complete the pair
+		 */
+		*why = "unable to switch fullchain.pem to the new cert";
+		close(dfd);
+
+		return -1;
+	}
+
+	/* the parent hands its vhosts copies once we say this went well */
+	lwsl_notice("%s: Files updated for %s\n", __func__, a->subdomain);
+	close(dfd);
+
+	return 0;
+
+bail_pk:
+	unlinkat(dfd, fn_pk, 0);
+bail_fc:
+	unlinkat(dfd, fn_fc, 0);
+bail:
+	close(dfd);
+
+	return -1;
+}
+
 static signed char
 stub_req_cb(struct lejp_ctx *ctx, char reason)
 {
@@ -562,7 +912,8 @@ stub_req_cb(struct lejp_ctx *ctx, char reason)
 	 * Each member we act on may appear once in a request.  A repeat
 	 * would otherwise quietly replace, or extend, what the first one
 	 * set, so anything that managed to end a string early in the parent
-	 * could choose where we write as root.  Refuse the whole request.
+	 * could choose where we write, with our privileges.  Refuse the whole
+	 * request.
 	 */
 	if (ctx->path_match &&
 	    (reason == LEJPCB_VAL_STR_START || reason == LEJPCB_VAL_TRUE)) {
@@ -638,10 +989,8 @@ stub_req_cb(struct lejp_ctx *ctx, char reason)
 	}
 
 	if (reason == LEJPCB_OBJECT_END) {
-		char path[512], fn_fc[80], fn_pk[80], timestamp[64];
-		struct timeval tv;
-		struct stat sd;
-		int fd, dfd;
+		const char *why = NULL;
+		int n;
 
 		lwsl_notice("%s: LEJPCB_OBJECT_END reached, validating secret\n", __func__);
 
@@ -693,119 +1042,28 @@ stub_req_cb(struct lejp_ctx *ctx, char reason)
 		lwsl_notice("%s: Valid command for %s\n", __func__, a->subdomain);
 
 		/*
-		 * Nothing that arrives here may replace working key material
-		 * with junk: both sides must be non-empty and actually look
-		 * like PEM.  Empty strings reach here as zero-length buffers,
-		 * and write(fd, NULL-ish, 0) "succeeds", so without this the
-		 * symlink flip would atomically install 0-byte certs.
+		 * The parent always waits for the outcome of an install, so
+		 * it can retry one that failed instead of serving the old
+		 * cert until its link happens to drop.  why is one of our
+		 * own constant strings, never anything from the request.
 		 */
-		if (a->fc_len <= 0 || a->pk_len <= 0 ||
-		    !strstr(a->fullchain, "-----BEGIN CERTIFICATE-----") ||
-		    !strstr(a->fullchain, "-----END CERTIFICATE-----") ||
-		    !strstr(a->privkey, "-----BEGIN") ||
-		    !strstr(a->privkey, "PRIVATE KEY-----")) {
-			lwsl_err("%s: refusing to install non-PEM cert or key for %s (fc %d, pk %d)\n",
-				 __func__, a->subdomain, a->fc_len, a->pk_len);
-
+		n = cdc_install(a, &why);
+		a->response = malloc(LWS_PRE + 160);
+		if (!a->response)
 			return 1;
-		}
-
-		gettimeofday(&tv, NULL);
-		lws_snprintf(timestamp, sizeof(timestamp), "%lld.%06lld",
-			     (long long)tv.tv_sec, (long long)tv.tv_usec);
-
-		/* 1. Ensure directory exists */
-		lws_snprintf(path, sizeof(path), "%s/%s", a->vhd->base_dir, a->subdomain);
-		if (mkdir(path, 0700) < 0 && errno != EEXIST) {
-			lwsl_err("%s: Failed to create directory '%s': %s (errno=%d)\n", __func__, path, strerror(errno), errno);
-			return 1;
-		}
-
-		/*
-		 * We are root and about to write a private key in there: if
-		 * the directory already existed, it must be a real directory
-		 * that we own and that nobody else can write to, or a local
-		 * user could have planted symlinks in it.
-		 *
-		 * Open it (refusing to follow a symlink) and check the open
-		 * fd rather than the path, then do everything below relative
-		 * to that fd, so what we checked and what we write into are
-		 * the same directory even if the path is swapped out from
-		 * under us in between.
-		 */
-		dfd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-		if (dfd < 0 || fstat(dfd, &sd) || !S_ISDIR(sd.st_mode) ||
-		    sd.st_uid != geteuid() ||
-		    (sd.st_mode & (S_IWGRP | S_IWOTH))) {
-			lwsl_err("%s: '%s' is not a private directory "
-				 "we own\n", __func__, path);
-			if (dfd >= 0)
-				close(dfd);
-			return 1;
-		}
-
-		/* 1.5 Check if certificate actually changed */
-		fd = openat(dfd, "fullchain.pem", O_RDONLY);
-		if (fd >= 0) {
-			struct stat st;
-			if (!fstat(fd, &st) && st.st_size == a->fc_len) {
-				char *buf = malloc((size_t)st.st_size);
-				if (buf) {
-					if (read(fd, buf, (size_t)st.st_size) == st.st_size) {
-						if (!memcmp(buf, a->fullchain, (size_t)st.st_size)) {
-							lwsl_notice("%s: Cert for %s is unchanged, skipping update\n", __func__, a->subdomain);
-							free(buf);
-							close(fd);
-							close(dfd);
-							return 0; /* Success, no need to write again */
-						}
-					}
-					free(buf);
-				}
-			}
-			close(fd);
-		}
-
-		/* 2. Write fullchain */
-		lws_snprintf(fn_fc, sizeof(fn_fc), "fullchain.pem.%s", timestamp);
-		fd = cert_dist_create_excl(dfd, fn_fc);
-		if (fd < 0)
-			goto bail;
-		if (write(fd, a->fullchain, (size_t)a->fc_len) != (ssize_t)a->fc_len) {
-			lwsl_err("%s: Failed writing fullchain\n", __func__);
-			close(fd);
-			goto bail_fc;
-		}
-		close(fd);
-
-		/* 3. Write privkey */
-		lws_snprintf(fn_pk, sizeof(fn_pk), "privkey.pem.%s", timestamp);
-		fd = cert_dist_create_excl(dfd, fn_pk);
-		if (fd < 0)
-			goto bail_fc;
-		if (write(fd, a->privkey, (size_t)a->pk_len) != (ssize_t)a->pk_len) {
-			lwsl_err("%s: Failed writing privkey\n", __func__);
-			close(fd);
-			unlinkat(dfd, fn_pk, 0);
-			goto bail_fc;
-		}
-		close(fd);
-
-		/* 4. Atomic symlink update, targets are siblings in the dir */
-		cert_dist_symlink_at(dfd, fn_fc, "fullchain.pem");
-		cert_dist_symlink_at(dfd, fn_pk, "privkey.pem");
-
-		lwsl_notice("%s: Files updated for %s, active vhosts will rotate dynamically via proxy\n", __func__, a->subdomain);
-		close(dfd);
+		if (n < 0)
+			a->response_len = lws_snprintf(a->response + LWS_PRE,
+					160, "{\"installed\":false,"
+					"\"why\":\"%s\"}", why);
+		else
+			a->response_len = lws_snprintf(a->response + LWS_PRE,
+					160, "{\"installed\":true,"
+					"\"unchanged\":%s}",
+					n ? "true" : "false");
+		a->response_pos = 0;
+		lws_callback_on_writable(a->wsi);
 
 		return 0;
-
-bail_fc:
-		unlinkat(dfd, fn_fc, 0);
-bail:
-		close(dfd);
-
-		return 1;
 	}
 
 	return 0;
@@ -898,6 +1156,17 @@ callback_cert_dist_stub(struct lws *wsi, enum lws_callback_reasons reason,
 			p += len - (size_t)m;
 			len = (size_t)m;
 
+			/*
+			 * Whitespace after a request is not the start of
+			 * another one: the parent ends its install requests
+			 * with a newline
+			 */
+			while (len && (*p == ' ' || *p == '\t' ||
+				       *p == '\r' || *p == '\n')) {
+				p++;
+				len--;
+			}
+
 			if (!a->response)
 				/* nothing to answer, ready for the next */
 				cdc_stub_req_release(a);
@@ -983,12 +1252,24 @@ callback_cert_dist_client(struct lws *wsi, enum lws_callback_reasons reason,
 			lwsl_notice("%s: Received chunk of JSON from distribution server (%d bytes)\n", __func__, (int)len);
 			int m = lejp_parse(&pss->jctx, (uint8_t *)in, (int)len);
 			if (m < 0 && m != LEJP_CONTINUE) {
+				struct dist_client_conn *conn =
+					(struct dist_client_conn *)
+					lws_get_opaque_user_data(wsi);
+
 				/*
 				 * The parser is left in an indeterminate
 				 * state: drop the connection rather than
-				 * feed it more of what the server is saying
+				 * feed it more of what the server is saying.
+				 * It will likely say the same again when we
+				 * reconnect, so that backs off like a failed
+				 * install.
 				 */
-				lwsl_err("%s: lejp parse failed\n", __func__);
+				lwsl_wsi_err(wsi, "the server sent something "
+					     "we can't install (see above), "
+					     "dropping the link to fetch the "
+					     "cert again after a backoff");
+				if (conn)
+					conn->install_failed = 1;
 
 				return -1;
 			}
@@ -1096,31 +1377,54 @@ callback_cert_dist_client(struct lws *wsi, enum lws_callback_reasons reason,
 				 * link: an older install of ours that is still
 				 * queued is superseded by this one
 				 */
-				lws_stub_request_cancel(vhd->stub_mgr,
-							pss->stub_req);
+				{
+					lws_stub_req_h h = pss->stub_req;
+
+					pss->stub_req = 0; /* see install_rx_cb */
+					lws_stub_request_cancel(vhd->stub_mgr, h);
+				}
+				cdc_inst_free(pss);
+				pss->install_ok = 0;
+				pss->install_unchanged = 0;
+				pss->install_why[0] = '\0';
 				pss->stub_req = lws_stub_request_h(vhd->stub_mgr,
-						pss->uds_tx + LWS_PRE, NULL, 0,
-						NULL, NULL, pss);
+						pss->uds_tx + LWS_PRE,
+						install_paths,
+						LWS_ARRAY_SIZE(install_paths),
+						install_rx_cb, NULL, pss);
 				if (!pss->stub_req)
-					lwsl_err("%s: Failed pushing to UDS stub\n", __func__);
+					cdc_install_failed(pss, conn, "unable to "
+						"queue it to the root stub");
 				else
 					lwsl_notice("%s: Sent complete cert update to local UDS stub for %s\n", __func__, conn->name);
 
 				/*
 				 * The stub request took its own copy.  Clear
-				 * ours, it holds the private key, and so we
-				 * don't save it twice
+				 * ours, it holds the private key
 				 */
 				lws_explicit_bzero(pss->uds_tx + LWS_PRE,
 						   (size_t)pss->uds_tx_len);
 				free(pss->uds_tx);
 				pss->uds_tx = NULL;
 
-				free(pss->cert);
+				/*
+				 * The pair is kept for the vhosts until the
+				 * stub has answered, and moved out of the way
+				 * so it isn't saved twice
+				 */
+				if (pss->stub_req) {
+					pss->inst_cert = pss->cert;
+					pss->inst_cert_len = pss->cert_len;
+					pss->inst_key = pss->key;
+					pss->inst_key_len = pss->key_len;
+				} else {
+					free(pss->cert);
+					lws_explicit_bzero(pss->key,
+							   (size_t)pss->key_len);
+					free(pss->key);
+				}
 				pss->cert = NULL;
 				pss->cert_len = 0;
-				lws_explicit_bzero(pss->key, (size_t)pss->key_len);
-				free(pss->key);
 				pss->key = NULL;
 				pss->key_len = 0;
 			}
@@ -1170,7 +1474,21 @@ callback_cert_dist_client(struct lws *wsi, enum lws_callback_reasons reason,
 			struct pss_cert_dist_client *pss = (struct pss_cert_dist_client *)user;
 			struct dist_client_conn *conn = (struct dist_client_conn *)lws_get_opaque_user_data(wsi);
 
-			if (conn && conn->vhd) {
+			if (conn && conn->vhd && conn->install_failed) {
+				char conceal;
+				unsigned int ms = lws_retry_get_delay_ms(
+						conn->vhd->cx, &install_retry,
+						&conn->install_retry_count,
+						&conceal);
+
+				conn->install_failed = 0;
+				lwsl_notice("%s: refetching the cert for '%s' "
+					    "in %us\n", __func__, conn->name,
+					    (ms + 500) / 1000);
+				lws_sul_schedule(conn->vhd->cx, 0, &conn->sul,
+						 fetch_local_hash,
+						 (lws_usec_t)ms * LWS_US_PER_MS);
+			} else if (conn && conn->vhd) {
 				if (lws_retry_sul_schedule_retry_wsi(wsi, &conn->sul, fetch_local_hash, &conn->retry_count)) {
 					lwsl_err("%s: Main connection attempts exhausted\n", __func__);
 				}
@@ -1179,7 +1497,12 @@ callback_cert_dist_client(struct lws *wsi, enum lws_callback_reasons reason,
 			if (pss) {
 				if (pss->wsi == wsi) {
 					if (pss->cert) { free(pss->cert); pss->cert = NULL; }
-					if (pss->key) { free(pss->key); pss->key = NULL; }
+					if (pss->key) {
+						lws_explicit_bzero(pss->key,
+							(size_t)pss->key_len);
+						free(pss->key);
+						pss->key = NULL;
+					}
 					if (pss->uds_tx) { free(pss->uds_tx); pss->uds_tx = NULL; }
 					lejp_destruct(&pss->jctx);
 
@@ -1190,11 +1513,14 @@ callback_cert_dist_client(struct lws *wsi, enum lws_callback_reasons reason,
 					 * would have sent
 					 */
 					if (vhd) {
-						lws_stub_request_cancel(
-							vhd->stub_mgr,
-							pss->stub_req);
+						lws_stub_req_h h = pss->stub_req;
+
+						/* see install_rx_cb */
 						pss->stub_req = 0;
+						lws_stub_request_cancel(
+							vhd->stub_mgr, h);
 					}
+					cdc_inst_free(pss);
 
 					pss->wsi = NULL;
 				}
@@ -1217,7 +1543,7 @@ callback_cert_dist_client(struct lws *wsi, enum lws_callback_reasons reason,
 				return 0;
 
 			const char *vh_name = lws_get_vhost_name(lws_get_vhost(wsi));
-			const char *stub_dir = "/var/run";
+			const char *stub_dir = "/var/run", *stub_user = NULL;
 
 			vhd = lws_protocol_vh_priv_get(lws_get_vhost(wsi), lws_get_protocol(wsi));
 			if (vhd)
@@ -1260,10 +1586,10 @@ callback_cert_dist_client(struct lws *wsi, enum lws_callback_reasons reason,
 					certs_pvo = pvo->options;
 				if (!strcmp(pvo->name, "ca-filepath"))
 					ca_filepath = pvo->value;
-				if (!strcmp(pvo->name, "reload-cmd"))
-					lws_strncpy(vhd->reload_cmd, pvo->value, sizeof(vhd->reload_cmd));
 				if (!strcmp(pvo->name, "stub-dir"))
 					stub_dir = pvo->value;
+				if (!strcmp(pvo->name, "stub-user"))
+					stub_user = pvo->value;
 				pvo = pvo->next;
 			}
 
@@ -1302,25 +1628,30 @@ callback_cert_dist_client(struct lws *wsi, enum lws_callback_reasons reason,
 			sc.uds_path = uds_path;
 			sc.protocols = stub_protocols;
 			sc.parent_protocol_name = "lws-cert-dist-client";
+			/*
+			 * All the stub does is write the certs and keys it is
+			 * given into base-dir: it has no need to stay root
+			 */
+			sc.run_as = stub_user;
+			if (!stub_user && !getuid())
+				lwsl_vhost_notice(vhd->vh, "%s: the stub stays "
+					"root: give it a \"stub-user\" that "
+					"owns %s\n", __func__, vhd->base_dir);
 
 			/*
 			 * The stub child process starts with a clean context
 			 * and can't see our PVOs: pass it what it needs to
-			 * build file paths (base_dir) plus the reload command
-			 * via the stub extra payload
+			 * build file paths (base_dir) via the stub extra
+			 * payload
 			 */
 			char rc[CDC_PAYLOAD_MAX],
-			     ebd[sizeof(vhd->base_dir) * 6],
-			     erc[sizeof(vhd->reload_cmd) * 6];
+			     ebd[sizeof(vhd->base_dir) * 6];
 
 			lws_json_purify(ebd, vhd->base_dir, (int)sizeof(ebd),
 					NULL);
-			lws_json_purify(erc, vhd->reload_cmd, (int)sizeof(erc),
-					NULL);
 			sc.extra_payload = rc;
 			sc.extra_payload_len = (size_t)lws_snprintf(rc, sizeof(rc),
-				     "{\"base_dir\":\"%s\",\"reload_cmd\":\"%s\"}",
-				     ebd, erc) + 1;
+				     "{\"base_dir\":\"%s\"}", ebd) + 1;
 
 			vhd->stub_mgr = lws_stub_spawn(&sc);
 			if (!vhd->stub_mgr)
@@ -1536,8 +1867,8 @@ static const struct lws_protocols protocols[] = {
 
 /*
  * Once per context, however many vhosts instantiate us.  Only our own stub
- * child has anything to do here: read the secret and the base_dir and
- * reload_cmd the parent hands it on stdin, and listen on the UDS the parent
+ * child has anything to do here: read the secret and the base_dir the parent
+ * hands it on stdin, and listen on the UDS the parent
  * will connect to.
  */
 static int
@@ -1582,7 +1913,7 @@ cert_dist_client_init(struct lws_context *cx)
 				 sizeof(payload) - 1))
 		goto bail;
 
-	/* the parent packs {"base_dir":...,"reload_cmd":...} as the payload */
+	/* the parent packs {"base_dir":...} as the payload */
 	if (!payload[0])
 		return 0; /* nothing from the parent, keep the defaults */
 

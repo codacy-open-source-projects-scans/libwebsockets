@@ -44,6 +44,20 @@
 #define ATK_DOCROOT_MARK	"lws-attack-docroot-index"
 #define ATK_SECRET_MARK	"lws-attack-secret"
 
+/* the path the server counts requests for, see h3_attacks[] */
+#define ATK_REPLAYED_PATH	"/replayed"
+/* the path the server answers with a request pseudo-header, see h3_attacks[] */
+#define ATK_RESP_METHOD_PATH	"/respond-method"
+
+/*
+ * h2: how long after the server ended the case's first stream the rest of
+ * what was held back goes, for the server to have finished with the stream
+ */
+#define ATK_H2_HOLD_MS		100
+
+/* how long a replay gets to arrive before its probe */
+#define ATK_REPLAY_SETTLE_MS	500
+
 /* what we keep of the server's reply */
 #define ATK_RX_MAX		(64 * 1024)
 #define ATK_H2_FRAME_MAX	(32 * 1024)	/* h2 frame reassembly */
@@ -664,6 +678,15 @@ struct h3_attack {
 	 */
 	unsigned int	static_fields;
 	uint8_t		v;
+	/* the request's method, or NULL for GET */
+	const char	*method;
+	/*
+	 * a fault for the client, or NULL.  With quic_stream_replay the
+	 * request's first STREAM frame comes again once its stream closed, as
+	 * a retransmission whose ack was lost does, and the server must act
+	 * on it only once.
+	 */
+	const char	*fault;
 };
 
 /* a field sent as a raw literal, name and value exactly these bytes */
@@ -672,15 +695,39 @@ struct h3_attack {
 static const struct h3_attack h3_attacks[] = {
 	/* a field named "get " once smuggled an unnormalized request path */
 	{ "\"get \" field smuggling a path", "/alive", "get ",
-	  "/f/../secret.txt", 0, 0, 0, V_REFUSED },
+	  "/f/../secret.txt", 0, 0, 0, V_REFUSED, NULL, NULL },
+	/* a name lws doesn't know, not the token where it keeps urlargs */
+	{ "\"uri-args\" field adding urlargs", "/alive",
+	  H3_LIT("uri-args", "evil=1"), 0, V_ECHO, NULL, NULL },
 	{ "CR LF in a field value", "/alive",
-	  H3_LIT("user-agent", "a\r\nb"), 0, V_REFUSED },
+	  H3_LIT("user-agent", "a\r\nb"), 0, V_REFUSED, NULL, NULL },
 	{ "NUL in a raw literal value", "/alive",
-	  H3_LIT("user-agent", "a\0b"), 0, V_REFUSED },
+	  H3_LIT("user-agent", "a\0b"), 0, V_REFUSED, NULL, NULL },
 	{ "NUL in a raw literal name", "/alive",
-	  H3_LIT("user-agent\0x", "a"), 0, V_REFUSED },
+	  H3_LIT("user-agent\0x", "a"), 0, V_REFUSED, NULL, NULL },
+	/* the client must refuse it: RFC 9114 4.3.2 */
+	{ "a response with a request's pseudo-header", ATK_RESP_METHOD_PATH,
+	  NULL, NULL, 0, 0, 0, V_REFUSED, NULL, NULL },
 	/* far more fields than any request has, for almost no bytes */
-	{ "1100 field lines", "/alive", NULL, NULL, 0, 0, 1100, V_REFUSED },
+	{ "1100 field lines", "/alive", NULL, NULL, 0, 0, 1100, V_REFUSED, NULL, NULL },
+#if defined(LWS_WITH_SYS_FAULT_INJECTION)
+	{ "request stream arriving again after it closed", ATK_REPLAYED_PATH,
+	  NULL, NULL, 0, 0, 0, V_ECHO, NULL, "quic_stream_replay" },
+	/*
+	 * A POST is answered once its body is in, after its trailers came:
+	 * a User-Agent there must not be one of the request's
+	 */
+	{ "trailers adding a field to the request", "/alive",
+	  NULL, NULL, 0, 0, 0, V_ECHO, "POST", "h3_trailer_field" },
+	{ "a pseudo-header in trailers", "/alive",
+	  NULL, NULL, 0, 0, 0, V_REFUSED, "POST", "h3_trailer_pseudo" },
+	/* one qpack encoder stream per peer: RFC 9204 4.2 */
+	{ "a second qpack encoder stream", "/alive",
+	  NULL, NULL, 0, 0, 0, V_REFUSED, NULL, "h3_second_qpack_enc" },
+	/* only the control stream carries SETTINGS: RFC 9114 7.2.4 */
+	{ "SETTINGS on a request stream", "/alive",
+	  NULL, NULL, 0, 0, 0, V_REFUSED, NULL, "h3_req_frame_settings" },
+#endif
 };
 
 static struct lws_context *context;
@@ -727,8 +774,16 @@ static struct {
 	uint8_t		lossy;
 
 	uint8_t		probe_next;	/* after an attack, a plain request */
+	/*
+	 * the attack was a replay: by the time its probe is answered, the
+	 * server must have acted on ATK_REPLAYED_PATH exactly once
+	 */
+	uint8_t		check_replayed;
 } tc = { XP_H1, PH_PATHS, -1, 0, "", NULL, NULL, NULL, NULL, 0, 0, NULL, 0,
-	 0 };
+	 0, 0 };
+
+/* requests the server acted on for ATK_REPLAYED_PATH */
+static int srv_replayed;
 
 /* the client's view of the case */
 
@@ -736,7 +791,10 @@ static struct {
 	uint8_t		*tx;
 	size_t		tx_len;
 	size_t		tx_pos;
-	size_t		trickle_from;	/* tx_len is held back to here */
+	size_t		trickle_from;	/* tx_len is held back to here: h1
+					 * trickles it, h2 lets it all go
+					 * once the first stream ended */
+	uint8_t		hold_released;	/* h2: ...which is on its way */
 
 	uint8_t		rx[ATK_RX_MAX];	/* h1: raw; h2 / h3: body bytes */
 	size_t		rx_len;
@@ -809,9 +867,34 @@ echo_respond(struct lws *wsi, struct pss *pss)
 {
 	uint8_t buf[LWS_PRE + 512], *start = &buf[LWS_PRE], *p = start,
 		*end = &buf[sizeof(buf) - 1];
+	char *uri;
+	int ulen;
 
-	if (echo_compose(wsi, pss) ||
-	    lws_add_http_common_headers(wsi, HTTP_STATUS_OK, "text/plain",
+	if (echo_compose(wsi, pss))
+		return 1;
+
+	/*
+	 * A client must refuse a response with a request's pseudo-header,
+	 * here straight after the :status, where it is no out of order one
+	 */
+	if (lws_http_get_uri_and_method(wsi, &uri, &ulen) >= 0 &&
+	    ulen == (int)strlen(ATK_RESP_METHOD_PATH) &&
+	    !memcmp(uri, ATK_RESP_METHOD_PATH, (size_t)ulen)) {
+		if (lws_add_http_header_status(wsi, HTTP_STATUS_OK, &p, end) ||
+		    lws_add_http_header_by_name(wsi,
+				(const unsigned char *)":method",
+				(const unsigned char *)"PUT", 3, &p, end) ||
+		    lws_add_http_header_content_length(wsi,
+				(lws_filepos_t)pss->len, &p, end) ||
+		    lws_finalize_write_http_header(wsi, start, &p, end))
+			return 1;
+
+		lws_callback_on_writable(wsi);
+
+		return 0;
+	}
+
+	if (lws_add_http_common_headers(wsi, HTTP_STATUS_OK, "text/plain",
 					(lws_filepos_t)pss->len, &p, end) ||
 	    lws_finalize_write_http_header(wsi, start, &p, end))
 		return 1;
@@ -828,13 +911,16 @@ callback_srv(struct lws *wsi, enum lws_callback_reasons reason,
 	struct pss *pss = (struct pss *)user;
 	uint8_t buf[LWS_PRE + sizeof(pss->body)];
 	char *uri;
-	int ulen;
+	int ulen, n;
 
 	switch (reason) {
 	case LWS_CALLBACK_HTTP:
 		/* a request with a body is answered once all of it is in */
-		if (lws_http_get_uri_and_method(wsi, &uri, &ulen) ==
-							LWSHUMETH_POST)
+		n = lws_http_get_uri_and_method(wsi, &uri, &ulen);
+		if (n >= 0 && ulen == (int)strlen(ATK_REPLAYED_PATH) &&
+		    !memcmp(uri, ATK_REPLAYED_PATH, (size_t)ulen))
+			srv_replayed++;
+		if (n == LWSHUMETH_POST)
 			return 0;
 
 		return echo_respond(wsi, pss);
@@ -985,6 +1071,14 @@ evaluate(void)
 			case_done(why);
 			return;
 		}
+		/* the probe after a replay: the replay came before it */
+		if (tc.check_replayed && !tc.h3a && srv_replayed != 1) {
+			lws_snprintf(why, sizeof(why), "the server acted on "
+				     "the replayed request %d times",
+				     srv_replayed);
+			case_done(why);
+			return;
+		}
 		break;
 
 	case V_STATUS:
@@ -1114,9 +1208,10 @@ evaluate(void)
 	/*
 	 * An h2 path case asks for the path twice, the second time by the
 	 * index of the first's :path in the server's dynamic table: whatever
-	 * the verdict, the two must have been answered alike
+	 * the verdict, the two must have been answered alike.  (An attack
+	 * case's first stream is only what it holds the rest back for.)
 	 */
-	if (tc.xport == XP_H2 && cn.first_sid && cn.goaway < 0 &&
+	if (tc.xport == XP_H2 && !tc.h2a && cn.first_sid && cn.goaway < 0 &&
 	    (cn.first_status != status || cn.first_rx_len != bl ||
 	     (bl && memcmp(cn.first_rx, b, bl)))) {
 		lws_snprintf(why, sizeof(why),
@@ -1159,7 +1254,13 @@ case_done(const char *why)
 	/* however an attack went, the server must still serve after it */
 	tc.probe_next = tc.h1a || tc.h2a || tc.h3a;
 
-	lws_sul_schedule(context, 0, &sul_next, next_case, 1);
+	/*
+	 * A replay goes again only some time after its stream closed, see
+	 * LWS_QUIC_FI_REPLAY_DELAY_MS: let it arrive before the probe
+	 */
+	lws_sul_schedule(context, 0, &sul_next, next_case,
+			 tc.check_replayed && tc.h3a ?
+				ATK_REPLAY_SETTLE_MS * LWS_US_PER_MS : 1);
 }
 
 static int
@@ -1216,6 +1317,16 @@ tx_more(struct lws *wsi)
 		lws_callback_on_writable(wsi);
 
 	return 0;
+}
+
+static void
+h2_hold_release_cb(lws_sorted_usec_list_t *sul)
+{
+	if (cn.done || !trickle_wsi)
+		return;
+
+	cn.trickle_from = 0;
+	lws_callback_on_writable(trickle_wsi);
 }
 
 static void
@@ -1431,6 +1542,7 @@ hp_lit_name(uint8_t *p, const char *n, const char *v)
 #define HP_METHOD_POST		0x83
 #define HP_SCHEME_HTTP		0x86
 #define HP_IDX_AUTHORITY	1
+#define HP_IDX_METHOD		2
 #define HP_IDX_PATH		4
 #define HP_IDX_ACCEPT_ENCODING	0x90	/* accept-encoding: gzip, deflate */
 #define HP_IDX_USER_AGENT	58
@@ -1725,6 +1837,88 @@ b_get_smuggle(struct txb *t)
 	return 1;
 }
 
+/*
+ * Fields named for lws tokens that are no field name: once stored against
+ * the token, "uri-args" added urlargs the :path never had, and "put" gave a
+ * request whose :method lws doesn't alias a URI of its choosing, neither
+ * through the :path decoding.  Both are just names lws doesn't know.
+ */
+
+static uint32_t
+b_uri_args_field(struct txb *t)
+{
+	h2_preface(t);
+	h2_get_with(t, "uri-args", "evil=1");
+
+	return 1;
+}
+
+static uint32_t
+b_put_field(struct txb *t)
+{
+	uint8_t hb[512], *p = hb;
+
+	p = hp_lit(p, HP_IDX_METHOD, "PROPFIND", 8);
+	*p++ = HP_SCHEME_HTTP;
+	p = hp_lit(p, HP_IDX_AUTHORITY, "localhost", 9);
+	p = hp_lit(p, HP_IDX_PATH, "/alive", 6);
+	p = hp_lit_name(p, "put", "/f/../secret.txt");
+	h2_preface(t);
+	h2_frame(t, H2_HEADERS, H2F_END_STREAM | H2F_END_HEADERS, 1, hb,
+		 lws_ptr_diff_size_t(p, hb));
+
+	return 1;
+}
+
+/*
+ * A pseudo-header's name matches on its last byte, so one going on past it
+ * once had the rest of its name become the start of that pseudo-header's
+ * value.  It's a pseudo-header lws doesn't know, which is malformed.
+ */
+
+static uint32_t
+b_pseudo_name_runs_on(struct txb *t)
+{
+	uint8_t hb[512], *p = hb;
+
+	p = hp_lit_name(p, ":methodx", "GET");
+	*p++ = HP_SCHEME_HTTP;
+	p = hp_lit(p, HP_IDX_AUTHORITY, "localhost", 9);
+	p = hp_lit(p, HP_IDX_PATH, "/alive", 6);
+	h2_preface(t);
+	h2_frame(t, H2_HEADERS, H2F_END_STREAM | H2F_END_HEADERS, 1, hb,
+		 lws_ptr_diff_size_t(p, hb));
+
+	return 1;
+}
+
+/*
+ * A POST the server answers without waiting for its body, whose trailers
+ * only come once the server has finished with the stream, as they may when
+ * they were already on their way: then a request on another stream.  The
+ * late HEADERS are for a stream the peer did open, not a new one, so they
+ * are decoded, to keep hpack in step, and dropped: the connection goes on.
+ */
+
+static uint32_t
+b_trailers_after_close(struct txb *t)
+{
+	uint8_t hb[512], *p = hp_request(hb, HP_METHOD_POST, "/f/index.html");
+
+	h2_preface(t);
+	h2_frame(t, H2_HEADERS, H2F_END_HEADERS, 1, hb,
+		 lws_ptr_diff_size_t(p, hb));
+	cn.first_sid = 1;
+	cn.trickle_from = t->len;
+
+	p = hp_lit_name(hb, "x-trailer", "1");
+	h2_frame(t, H2_HEADERS, H2F_END_STREAM | H2F_END_HEADERS, 1, hb,
+		 lws_ptr_diff_size_t(p, hb));
+	h2_get(t, 3, "/alive");
+
+	return 3;
+}
+
 static uint32_t
 b_uppercase_name(struct txb *t)
 {
@@ -1957,6 +2151,11 @@ static const struct h2_attack h2_attacks[] = {
 	/* a field named "get " once smuggled an unnormalized request path */
 	{ "\"get \" field smuggling a path", b_get_smuggle, V_GOAWAY,
 	  H2_ERR_PROTOCOL_ERROR, 0 },
+	{ "\"uri-args\" field adding urlargs", b_uri_args_field, V_ECHO,
+	  200, 0 },
+	{ "\"put\" field smuggling a URI", b_put_field, V_ECHO, 200, 0 },
+	{ "pseudo-header name running on past one lws knows",
+	  b_pseudo_name_runs_on, V_GOAWAY, H2_ERR_PROTOCOL_ERROR, 0 },
 	{ "uppercase field name", b_uppercase_name, V_GOAWAY,
 	  H2_ERR_PROTOCOL_ERROR, 0 },
 	{ "CR LF in a field value", b_crlf_value, V_NO_2XX, 0, 0 },
@@ -1973,6 +2172,8 @@ static const struct h2_attack h2_attacks[] = {
 	{ "1500 fields", b_many_fields, V_NO_2XX, 0, 0 },
 	{ "trailers referring to an entry lws could not keep",
 	  b_trailers_lost_entry, V_ECHO, 200, 0 },
+	{ "trailers arriving after the server finished their stream",
+	  b_trailers_after_close, V_ECHO, 200, 0 },
 };
 
 /*
@@ -2123,6 +2324,9 @@ callback_raw_h2(struct lws *wsi, enum lws_callback_reasons reason,
 	case LWS_CALLBACK_RAW_CONNECTED:
 		if (!is_current(wsi))
 			return -1;
+		/* a case holding back the rest until its first stream ended */
+		if (cn.trickle_from)
+			trickle_wsi = wsi;
 		return tx_more(wsi);
 
 	case LWS_CALLBACK_RAW_WRITEABLE:
@@ -2133,7 +2337,15 @@ callback_raw_h2(struct lws *wsi, enum lws_callback_reasons reason,
 	case LWS_CALLBACK_RAW_RX:
 		if (!is_current(wsi))
 			break;
-		return h2_rx(wsi, (const uint8_t *)in, len);
+		if (h2_rx(wsi, (const uint8_t *)in, len))
+			return -1;
+		if (cn.trickle_from && cn.first_ended && !cn.hold_released) {
+			cn.hold_released = 1;
+			lws_sul_schedule(context, 0, &sul_trickle,
+					 h2_hold_release_cb,
+					 ATK_H2_HOLD_MS * LWS_US_PER_MS);
+		}
+		return 0;
 
 	case LWS_CALLBACK_RAW_CLOSE:
 		if (is_current(wsi))
@@ -2444,8 +2656,11 @@ case_pick(void)
 			tc.h3a = &h3_attacks[tc.idx];
 			tc.path = tc.h3a->path;
 			tc.v = tc.h3a->v;
-			tc.status = 0;
-			tc.expect = NULL;
+			tc.status = tc.v == V_ECHO ? 200 : 0;
+			tc.expect = tc.v == V_ECHO ? tc.h3a->path : NULL;
+			tc.check_replayed = tc.h3a->fault &&
+				!strcmp(tc.h3a->fault, "quic_stream_replay");
+			srv_replayed = 0;
 			lws_strncpy(tc.name, tc.h3a->name, sizeof(tc.name));
 			if (only && !strstr(tc.name, only))
 				continue;
@@ -2523,12 +2738,23 @@ next_case(lws_sorted_usec_list_t *sul)
 	default:
 		i.port = port_h3;
 		i.path = tc.path;
-		i.method = "GET";
+		i.method = tc.h3a && tc.h3a->method ? tc.h3a->method : "GET";
 		i.alpn = "h3";
 		i.protocol = "h3";
 		i.local_protocol_name = "h3";
 		i.ssl_connection = LCCSCF_USE_SSL | LCCSCF_ALLOW_SELFSIGNED |
 				   LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK;
+#if defined(LWS_WITH_SYS_FAULT_INJECTION)
+		if (tc.h3a && tc.h3a->fault) {
+			lws_fi_t fi;
+
+			memset(&fi, 0, sizeof(fi));
+			fi.name = tc.h3a->fault;
+			fi.type = LWSFI_ALWAYS;
+			if (lws_fi_add(&i.fic, &fi))
+				goto oom;
+		}
+#endif
 		break;
 	}
 
@@ -2536,6 +2762,10 @@ next_case(lws_sorted_usec_list_t *sul)
 			 ATK_CASE_TIMEOUT_S * LWS_US_PER_SEC);
 
 	if (!lws_client_connect_via_info(&i)) {
+#if defined(LWS_WITH_SYS_FAULT_INJECTION)
+		/* the client wsi takes the faults, unless there was none */
+		lws_fi_destroy(&i.fic);
+#endif
 		cn.done = 1;
 		case_done("connect failed");
 	}

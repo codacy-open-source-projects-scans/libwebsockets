@@ -17,20 +17,18 @@ require_lws_config(LWS_WITH_JOSE 1 requirements)
 # the real lws-login / lws_login_client plugin protocols must be in the
 # vhost protocol table
 require_lws_config(LWS_WITH_PLUGINS_BUILTIN 1 requirements)
-# protocol_lws_login only builds when sqlite3 is available
-require_lws_config(LWS_WITH_STRUCT_SQLITE3 1 requirements)
+# protocol_lws_login only builds with lws_struct JSON, for the auth feed
+require_lws_config(LWS_WITH_STRUCT_JSON 1 requirements)
 
 if (requirements)
 	add_executable(${SAMP} ${SRCS})
 
-	# app + second app (relative auth-api-url) + mock auth vhosts listen on
-	# adjacent ports; the plugin's optional sqlite grants db stays inside the
-	# build dir
-	lws_get_free_ports(PORT_LOGINBFF 3)
+	# app + second app (relative auth-api-url) + mock auth + proxied echo
+	# backend vhosts listen on adjacent ports
+	lws_get_free_ports(PORT_LOGINBFF 4)
 
 	add_test(NAME api-test-lws-login-bff
-		 COMMAND lws-api-test-lws-login-bff -p ${PORT_LOGINBFF}
-			 --db-path ${CMAKE_CURRENT_BINARY_DIR}/apitest-login-bff.sqlite3)
+		 COMMAND lws-api-test-lws-login-bff -p ${PORT_LOGINBFF})
 	set_tests_properties(api-test-lws-login-bff PROPERTIES
 			     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 			     TIMEOUT 120)

@@ -10,7 +10,9 @@ and trailer fields; chunked on a GET followed by a pipelined request on the same
 connection; a Content-Length POST with a GET pipelined behind it in the same
 write, answered some time after its body completed, where the body must complete
 exactly once and the GET wait parked for the answer, without keeping the event
-loop busy, before it is served (direct and through the http proxy mount), and
+loop busy, before it is served (direct and through the http proxy mount, also
+with the POST's onward connection closing only once the GET is being relayed,
+which must not end the GET's transaction as well), and
 the same with two GETs to a callback mount that names its protocol as its
 origin, where the second must then be dispatched as itself, once (also with the
 second GET sent in its own write while the first is awaited, which must wait
@@ -27,8 +29,13 @@ gets 413); and `Expect: 100-continue` on Content-Length and chunked bodies, with
 an over-limit body refused instead of continued and an unknown expectation
 answered 417.
 
-Request bodies on h2 (cleartext, prior knowledge): Content-Length, no
-Content-Length (END_STREAM delimited), and no body.
+Request bodies on h2 (cleartext, prior knowledge) and h3: Content-Length, no
+Content-Length (ended by the END_STREAM or FIN that came with its last bytes, or
+by an empty one after them), and no body.  On h3, in a build with
+`LWS_WITH_SYS_FAULT_INJECTION`, the client's `h3_body_with_headers` fault also
+sends a body with no Content-Length together with the request, as many clients
+do for a small one, so the server has the body and the FIN before it acted on
+the request: what it stashed meanwhile must still end the body.
 
 Response bodies (server to client): Content-Length, hand-framed chunked with
 extensions and trailers, and unknown length (close-delimited on h1, END_STREAM

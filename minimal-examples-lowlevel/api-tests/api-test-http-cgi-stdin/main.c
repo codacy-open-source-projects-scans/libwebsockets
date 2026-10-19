@@ -31,10 +31,17 @@
  * and with --h2-post-stream as an h2 POST with no Content-Length, ended by
  * the stream: whatever the method or http version, the script must get the
  * whole body, see its end, and be told its Content-Length if it had one.
+ * --h2-post-stream-end is the same, but the stream is ended by a DATA frame
+ * of its own, with no body in it, after the last of the body, the way git
+ * ends a request body it streams: that frame is all that ends the body.
  *
  * With --no-headers, the script exits without writing anything: the
- * transaction must fail at once, not after the cgi timeout, and without the
- * service loop spinning on the hangup of the script's stdout meanwhile.
+ * transaction must fail once the script is gone, not after the cgi timeout,
+ * and without the service loop spinning on the hangup of the script's stdout
+ * meanwhile.  How long the script takes to start isn't ours to judge: on a
+ * loaded builder, starting a shell can take seconds.  So the mount's cgi
+ * timeout, CGI_TIMEOUT_S, is long, and the transaction only has to end well
+ * inside it, in NO_ANSWER_MAX_S.
  *
  * With --h2-starve, an h2 client GETs a 32KB answer from the script, but
  * opens its stream window only 1KB wide, and only opens it the rest of the
@@ -117,6 +124,7 @@ enum body_type {
 	BODY_CONTENT_LENGTH,
 	BODY_CHUNKED,
 	BODY_STREAM,		/* h2: no length, the stream ends it */
+	BODY_STREAM_END,	/* ... with an empty DATA after the body */
 };
 
 enum expect {
@@ -154,6 +162,8 @@ static const struct tcase cases[] = {
 	{ "h2-starve", "GET", "/big", BODY_NONE, EXPECT_BIG_BODY, 1, 1 },
 	{ "h2-post", "POST", "/", BODY_CONTENT_LENGTH, EXPECT_BODY_COUNT, 1, 0 },
 	{ "h2-post-stream", "POST", "/", BODY_STREAM, EXPECT_BODY_COUNT, 1, 0 },
+	{ "h2-post-stream-end", "POST", "/", BODY_STREAM_END, EXPECT_BODY_COUNT,
+	  1, 0 },
 #endif
 };
 
@@ -204,6 +214,13 @@ static const struct lws_http_mount mount_stamp = {
 };
 #endif
 
+/*
+ * --no-headers: the transaction must end inside NO_ANSWER_MAX_S, so well
+ * before the cgi timeout would end it, however slowly the script started
+ */
+#define CGI_TIMEOUT_S		30
+#define NO_ANSWER_MAX_S		15
+
 static const struct lws_http_mount mount = {
 #if defined(LWS_WITH_JOSE)
 	.mount_next		= &mount_stamp,
@@ -213,6 +230,7 @@ static const struct lws_http_mount mount = {
 	.origin			= cgi_script_path,	/* cgi script */
 	.def			= "/",
 	.origin_protocol	= LWSMPRO_CGI,
+	.cgi_timeout		= CGI_TIMEOUT_S,
 	.mountpoint_len		= 1,			/* char count */
 };
 
@@ -371,6 +389,7 @@ callback_cli(struct lws *wsi, enum lws_callback_reasons reason,
 				return -1;
 			break;
 		case BODY_STREAM:
+		case BODY_STREAM_END:
 			/* nothing: the END_STREAM on the last DATA ends it */
 			break;
 		}
@@ -381,8 +400,22 @@ callback_cli(struct lws *wsi, enum lws_callback_reasons reason,
 		break;
 
 	case LWS_CALLBACK_CLIENT_HTTP_WRITEABLE:
-		if (tc->body == BODY_NONE || pss->chunks_done >= CHUNKS)
+		if (tc->body == BODY_NONE || pss->chunks_done > CHUNKS ||
+		    (pss->chunks_done == CHUNKS && tc->body != BODY_STREAM_END))
 			return 0;
+
+		if (pss->chunks_done == CHUNKS) {
+			/*
+			 * The body has all gone: end the stream with a DATA
+			 * frame of its own, with nothing in it
+			 */
+			lws_client_http_body_pending(wsi, 0);
+			if (lws_write(wsi, &body[LWS_PRE], 0, LWS_WRITE_HTTP_FINAL))
+				return -1;
+			pss->chunks_done++;
+
+			return 0;
+		}
 
 		/*
 		 * Send the body one serv_buf-sized chunk per trip around
@@ -390,7 +423,8 @@ callback_cli(struct lws *wsi, enum lws_callback_reasons reason,
 		 * its read buffer exactly
 		 */
 		n = LWS_WRITE_HTTP;
-		if (pss->chunks_done == CHUNKS - 1) {
+		if (pss->chunks_done == CHUNKS - 1 &&
+		    tc->body != BODY_STREAM_END) {
 			/* this is the last piece */
 			lws_client_http_body_pending(wsi, 0);
 			n = LWS_WRITE_HTTP_FINAL;
@@ -894,7 +928,7 @@ int main(int argc, const char **argv)
 	case EXPECT_NO_ANSWER:
 		/*
 		 * The script is gone at once: so must the transaction be,
-		 * well inside the mount's cgi timeout (5s), with no response
+		 * well inside the mount's cgi timeout, with no response
 		 */
 		if (run_one(&info, info.fd_limit_per_thread))
 			goto done;
@@ -905,7 +939,8 @@ int main(int argc, const char **argv)
 			goto done;
 		}
 
-		if (run.us_end - run.us_start > 3 * LWS_US_PER_SEC) {
+		if (run.us_end - run.us_start >
+				(lws_usec_t)NO_ANSWER_MAX_S * LWS_US_PER_SEC) {
 			lwsl_err("--- the transaction outlived its script ---\n");
 			goto done;
 		}

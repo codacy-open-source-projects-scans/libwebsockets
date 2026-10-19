@@ -21,8 +21,10 @@
 #endif
 
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
-#include <sqlite3.h>
+
+#include "../lws-auth-feed.h"
 
 #define LWS_AUTH_MAX_COOKIE_LEN LWS_SSO_MAX_COOKIE
 
@@ -30,6 +32,42 @@ struct login_whitelist {
 	lws_dll2_t              list;
 	lws_sockaddr46          sa46;
 	int                     net_len;
+};
+
+#define LWS_LOGIN_FEED_MAGIC	0x6c466565u
+/* a snapshot bigger than this is not one we will hold */
+#define LWS_LOGIN_FEED_MAX	(16u * 1024u * 1024u)
+
+struct vhd_login;
+
+/* our subscription to the auth server's lws-auth-feed */
+struct lws_login_feed {
+	uint32_t		magic; /* tells its wsi from the side channel's */
+	struct vhd_login	*vhd;
+	struct lws		*wsi;
+	lws_sorted_usec_list_t	sul;
+	uint16_t		retry_count;
+	char			secret[LWS_AUTH_FEED_SECRET_MAX + 1];
+
+	/* the snapshot arriving */
+	struct lejp_ctx		ctx;
+	lws_struct_args_t	args;
+	size_t			rx;
+	char			parsing;
+
+	/* the newest snapshot that arrived whole, and its indexes */
+	struct lwsac		*ac;
+	lws_auth_feed_t		*snap;
+	lws_auth_feed_user_t	**users;	/* by uid */
+	lws_auth_feed_grant_t	**grants;	/* by uid */
+	lws_auth_feed_device_t	**devices;	/* by did */
+	size_t			n_users;
+	size_t			n_grants;
+	size_t			n_devices;
+
+	lws_usec_t		down_since;	/* 0 while the link is up */
+	unsigned int		grace_secs;
+	char			fail_closed;
 };
 
 struct vhd_login {
@@ -52,9 +90,6 @@ struct vhd_login {
 	const char              *unauth_protocols;
 	int                     min_grant_level;
 
-	char                    db_path[256];
-	sqlite3                 *db;
-	char                    auth_domain[128];
 	char                    cookie_domain[128];
 	uint64_t                jwt_validity_secs;
 	uint64_t                csrf_max_age_secs;	/* auth_csrf cookie lifetime
@@ -73,8 +108,15 @@ struct vhd_login {
 							 * TLS link */
 
 	struct lws_jwk          jwk;
+	char			jwk_pinned; /* by jwt-jwk, not the feed */
 	lws_dll2_owner_t        pending_refresh_list;
+
+	struct lws_login_feed	feed;
 };
+
+static int
+lws_login_feed_callback(struct lws_login_feed *f, struct lws *wsi,
+			enum lws_callback_reasons reason, void *in, size_t len);
 
 struct pss_login {
 	struct lws_jwt_auth     *ja;
@@ -120,6 +162,15 @@ struct pending_login_refresh {
 	 * contain exactly the auth_refresh_session the exchange needs.
 	 */
 	char                    cookie_hdr[LWS_SSO_MAX_COOKIE];
+
+	/*
+	 * The browser's address, told to the auth server as X-Forwarded-For:
+	 * otherwise what it keys its strikes and bans on is our address, and
+	 * once we are on another host from it, a run of bad renewals bans us,
+	 * and so everybody's renewals.  It believes the header only from the
+	 * addresses in its trusted-proxies.
+	 */
+	char                    client_ip[64];
 
 	/*
 	 * POST body for the renewal exchange.  The body proper starts
@@ -188,6 +239,15 @@ struct pending_login_refresh {
 	 */
 	char                    orig_host[128];
 	char                    orig_scheme[8];
+	/*
+	 * COLDLOAD: the token the request carried, if one verified at all,
+	 * live or not, and the service the mount is for.  The renewed token
+	 * is judged with them the way the request will be once we send the
+	 * browser back with it: if it wouldn't get through either, sending it
+	 * back only renews again, round and round until the browser gives up.
+	 */
+	struct lws_jwt_auth     *ja_probe;
+	char                    service_name[128];
 	int                     mode; /* LWS_LOGIN_REFRESH_* */
 };
 
@@ -453,9 +513,27 @@ pending_login_release(struct pending_login_refresh *ps)
 		ps->wsi_client = NULL;
 	}
 
+	lws_jwt_auth_destroy(&ps->ja_probe);
 	lws_sul_cancel(&ps->sul);
 	lws_dll2_remove(&ps->list);
 	free(ps);
+}
+
+/* the renewal a browser request is parked on, if any */
+
+static struct pending_login_refresh *
+lws_login_pending_find(struct vhd_login *vhd, struct lws *wsi)
+{
+	lws_start_foreach_dll(struct lws_dll2 *, d,
+			      lws_dll2_get_head(&vhd->pending_refresh_list)) {
+		struct pending_login_refresh *ps = lws_container_of(d,
+					struct pending_login_refresh, list);
+
+		if (ps->wsi_server == wsi)
+			return ps;
+	} lws_end_foreach_dll(d);
+
+	return NULL;
 }
 
 static void
@@ -701,6 +779,7 @@ lws_login_kick_refresh(struct vhd_login *vhd, struct lws *wsi, const char *cooki
 	 */
 
 	lws_login_orig_host(wsi, ps->orig_host, sizeof(ps->orig_host));
+	lws_get_peer_simple(wsi, ps->client_ip, sizeof(ps->client_ip));
 	lws_strncpy(ps->orig_scheme, lws_login_scheme(wsi, vhd),
 		    sizeof(ps->orig_scheme));
 
@@ -1250,6 +1329,12 @@ callback_lws_login_client(struct lws *wsi, enum lws_callback_reasons reason,
 			  void *user, void *in, size_t len)
 {
 	struct pending_login_refresh *ps = (struct pending_login_refresh *)lws_wsi_user(wsi);
+	struct lws_login_feed *f = (struct lws_login_feed *)
+					lws_get_opaque_user_data(wsi);
+
+	/* only the auth feed's link has opaque user data */
+	if (f && f->magic == LWS_LOGIN_FEED_MAGIC)
+		return lws_login_feed_callback(f, wsi, reason, in, len);
 
 	switch (reason) {
 	case LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER: {
@@ -1274,6 +1359,12 @@ callback_lws_login_client(struct lws *wsi, enum lws_callback_reasons reason,
 		if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_COOKIE,
 						 (unsigned char *)ps->cookie_hdr,
 						 (int)strlen(ps->cookie_hdr), p, end))
+			return -1;
+
+		if (ps->client_ip[0] &&
+		    lws_add_http_header_by_token(wsi, WSI_TOKEN_X_FORWARDED_FOR,
+						 (unsigned char *)ps->client_ip,
+						 (int)strlen(ps->client_ip), p, end))
 			return -1;
 
 		/*
@@ -1510,6 +1601,25 @@ callback_lws_login_client(struct lws *wsi, enum lws_callback_reasons reason,
 	return 0;
 }
 
+/*
+ * Replace jwk with just its public half, by exporting the public part and
+ * importing that back.  Returns 0 if OK.
+ */
+static int
+lws_login_jwk_drop_private(struct lws_jwk *jwk)
+{
+	char pub[2048];
+	int len = (int)sizeof(pub), n;
+
+	n = lws_jwk_export(jwk, LWSJWKF_EXPORT_NOCRLF, pub, &len);
+	lws_jwk_destroy(jwk);
+	if (n < 0)
+		return 1;
+
+	return lws_jwk_import(jwk, NULL, NULL, pub, (size_t)n) ||
+	       jwk->private_key;
+}
+
 static int
 lws_login_jwt_auth_cb(struct lws_jwt_auth *ja, int state, void *user)
 {
@@ -1544,6 +1654,548 @@ lws_login_jwt_expired(struct lws *wsi, struct lws_jwt_auth **pja)
 	lwsl_wsi_info(wsi, "%s: JWT expired (exp %llu, now %llu)", __func__,
 		      (unsigned long long)exp, (unsigned long long)now);
 	lws_jwt_auth_destroy(pja);
+
+	return 1;
+}
+
+/* ------------------------------------------------------------ the auth feed */
+
+/*
+ * The auth server tells us, over its lws-auth-feed ws protocol, what we need
+ * to know about its records to judge an authentic, unexpired token (see
+ * ../lws-auth-feed.h): each account's session epoch and grants, the device
+ * tokens not revoked, the oauth clients' redirect_uris and the public key
+ * tokens are signed with.  It sends a whole snapshot when we connect and
+ * again whenever any of that changes.  We keep the newest one, with indexes
+ * to look things up in it quickly, since every request is judged against it.
+ *
+ * The link is an ordinary ws client connection bound to our vhost, routed
+ * through the lws_login_client protocol like the renewal side channel, and
+ * told apart from that by its opaque user data (see
+ * callback_lws_login_client()).
+ */
+
+static const uint32_t lws_login_feed_backoff_ms[] = {
+	1000, 2000, 5000, 10000, 30000
+};
+
+static const lws_retry_bo_t lws_login_feed_retry = {
+	.retry_ms_table			= lws_login_feed_backoff_ms,
+	.retry_ms_table_count		= LWS_ARRAY_SIZE(lws_login_feed_backoff_ms),
+	.conceal_count			= LWS_RETRY_CONCEAL_ALWAYS,
+	/* the link is quiet until something changes: ping it */
+	.secs_since_valid_ping		= 30,
+	.secs_since_valid_hangup	= 45,
+	.jitter_percent			= 20,
+};
+
+static void
+lws_login_feed_connect(lws_sorted_usec_list_t *sul);
+
+static void
+lws_login_feed_abandon_rx(struct lws_login_feed *f)
+{
+	if (f->parsing)
+		lejp_destruct(&f->ctx);
+	f->parsing = 0;
+	lwsac_free(&f->args.ac);
+}
+
+static void
+lws_login_feed_lost(struct lws_login_feed *f, const char *why)
+{
+	lws_login_feed_abandon_rx(f);
+	f->wsi = NULL;
+
+	/* we are going too, there's nothing to reconnect for */
+	if (lws_context_is_being_destroyed(f->vhd->context))
+		return;
+
+	if (!f->down_since)
+		f->down_since = lws_now_usecs();
+
+	lwsl_vhost_warn(f->vhd->vhost, "auth feed from %s: %s, %s", f->vhd->auth_api_url, why,
+			f->snap ? "judging tokens by the last snapshot until "
+				  "it is back" :
+			(f->fail_closed ? "no snapshot yet, refusing every "
+					  "session" :
+					  "no snapshot yet, tokens are only "
+					  "checked for signature and expiry"));
+
+	lws_retry_sul_schedule(f->vhd->context, 0, &f->sul,
+			       &lws_login_feed_retry, lws_login_feed_connect,
+			       &f->retry_count);
+}
+
+static void
+lws_login_feed_connect(lws_sorted_usec_list_t *sul)
+{
+	struct lws_login_feed *f = lws_container_of(sul, struct lws_login_feed,
+						    sul);
+	struct vhd_login *vhd = f->vhd;
+	struct lws_client_connect_info i;
+	lws_parse_uri_t *puri;
+
+	puri = lws_parse_uri_create(vhd->auth_api_url);
+	if (!puri || !puri->host[0] || !puri->port) {
+		/* this can't change without a restart */
+		lwsl_vhost_err(vhd->vhost, "auth-api-url '%s' is not an "
+			       "absolute http(s) URL: the auth feed can't be "
+			       "reached", vhd->auth_api_url);
+		lws_parse_uri_destroy(&puri);
+		return;
+	}
+
+	memset(&i, 0, sizeof(i));
+	i.context		= vhd->context;
+	i.vhost			= vhd->vhost;
+	i.address		= puri->host;
+	i.port			= puri->port;
+	i.ssl_connection	= !strcmp(puri->scheme, "http") ? 0 :
+								LCCSCF_USE_SSL;
+	i.path			= "/";
+	i.host			= i.address;
+	i.origin		= i.address;
+	i.protocol		= LWS_AUTH_FEED_PROTOCOL;
+	/* a ws upgrade, which is h1 */
+	i.alpn			= "http/1.1";
+	i.local_protocol_name	= "lws_login_client";
+	i.retry_and_idle_policy	= &lws_login_feed_retry;
+	i.opaque_user_data	= f;
+	i.pwsi			= &f->wsi;
+
+	if (!lws_client_connect_via_info(&i))
+		lws_login_feed_lost(f, "unable to start connecting");
+
+	lws_parse_uri_destroy(&puri);
+}
+
+static int
+lws_login_feed_cmp_user(const void *a, const void *b)
+{
+	const lws_auth_feed_user_t *u1 = *(const lws_auth_feed_user_t **)a,
+				   *u2 = *(const lws_auth_feed_user_t **)b;
+
+	return u1->uid < u2->uid ? -1 : u1->uid > u2->uid;
+}
+
+static int
+lws_login_feed_cmp_grant(const void *a, const void *b)
+{
+	const lws_auth_feed_grant_t *g1 = *(const lws_auth_feed_grant_t **)a,
+				    *g2 = *(const lws_auth_feed_grant_t **)b;
+
+	return g1->uid < g2->uid ? -1 : g1->uid > g2->uid;
+}
+
+static int
+lws_login_feed_cmp_device(const void *a, const void *b)
+{
+	const lws_auth_feed_device_t *d1 = *(const lws_auth_feed_device_t **)a,
+				     *d2 = *(const lws_auth_feed_device_t **)b;
+
+	return strcmp(d1->did, d2->did);
+}
+
+/*
+ * An array of pointers to the n members of list owner o, sorted by cmp,
+ * allocated in ac.  NULL if it could not be allocated.
+ */
+static void *
+lws_login_feed_index(struct lwsac **ac, lws_dll2_owner_t *o, size_t ofs,
+		     size_t *n, int (*cmp)(const void *, const void *))
+{
+	void **arr;
+	size_t m = 0;
+
+	*n = (size_t)lws_dll2_count(o);
+	arr = lwsac_use_zero(ac, (*n + 1) * sizeof(void *), 4096);
+	if (!arr)
+		return NULL;
+
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(o)) {
+		arr[m++] = (uint8_t *)d - ofs;
+	} lws_end_foreach_dll(d);
+
+	qsort(arr, *n, sizeof(void *), cmp);
+
+	return arr;
+}
+
+/*
+ * The snapshot that has just arrived whole replaces the one we had.  Returns
+ * 0 if it was adopted.
+ */
+static int
+lws_login_feed_adopt(struct lws_login_feed *f)
+{
+	struct vhd_login *vhd = f->vhd;
+	lws_auth_feed_t *s = (lws_auth_feed_t *)f->args.dest;
+	lws_auth_feed_device_t **devices;
+	lws_auth_feed_grant_t **grants;
+	lws_auth_feed_user_t **users;
+	size_t nu, ng, nd;
+
+	users = lws_login_feed_index(&f->args.ac, &s->users,
+				     offsetof(lws_auth_feed_user_t, list), &nu,
+				     lws_login_feed_cmp_user);
+	grants = lws_login_feed_index(&f->args.ac, &s->grants,
+				      offsetof(lws_auth_feed_grant_t, list),
+				      &ng, lws_login_feed_cmp_grant);
+	devices = lws_login_feed_index(&f->args.ac, &s->devices,
+				       offsetof(lws_auth_feed_device_t, list),
+				       &nd, lws_login_feed_cmp_device);
+	if (!users || !grants || !devices)
+		return 1;
+
+	/*
+	 * The key tokens are signed with, unless jwt-jwk pinned one: then the
+	 * auth server can't change it by telling us another
+	 */
+	if (!vhd->jwk_pinned && s->jwk) {
+		struct lws_jwk jwk;
+
+		memset(&jwk, 0, sizeof(jwk));
+		if (lws_jwk_import(&jwk, NULL, NULL, s->jwk, strlen(s->jwk)) ||
+		    (jwk.private_key && lws_login_jwk_drop_private(&jwk))) {
+			lws_jwk_destroy(&jwk);
+			lwsl_vhost_err(vhd->vhost, "auth feed snapshot has an "
+				       "unusable jwk");
+			return 1;
+		}
+		lws_jwk_destroy(&vhd->jwk);
+		vhd->jwk = jwk;
+	}
+
+	lwsac_free(&f->ac);
+	f->ac		= f->args.ac;
+	f->args.ac	= NULL;
+	f->snap		= s;
+	f->users	= users;
+	f->grants	= grants;
+	f->devices	= devices;
+	f->n_users	= nu;
+	f->n_grants	= ng;
+	f->n_devices	= nd;
+
+	lwsl_vhost_notice(vhd->vhost, "auth feed snapshot: %u accounts, %u "
+			  "grants, %u devices", (unsigned int)nu,
+			  (unsigned int)ng, (unsigned int)nd);
+
+	return 0;
+}
+
+static int
+lws_login_feed_rx(struct lws_login_feed *f, struct lws *wsi, const void *in,
+		  size_t len)
+{
+	int m;
+
+	if (lws_is_first_fragment(wsi)) {
+		lws_login_feed_abandon_rx(f);
+		memset(&f->args, 0, sizeof(f->args));
+		f->args.map_st[0]		= lsm_auth_feed_schema;
+		f->args.map_entries_st[0]	= LWS_ARRAY_SIZE(
+							lsm_auth_feed_schema);
+		f->args.ac_block_size		= 4096;
+		lws_struct_json_init_parse(&f->ctx, NULL, &f->args);
+		f->parsing	= 1;
+		f->rx		= 0;
+	}
+
+	if (!f->parsing)
+		return -1;
+
+	f->rx += len;
+	if (f->rx > LWS_LOGIN_FEED_MAX) {
+		lwsl_vhost_err(f->vhd->vhost, "auth feed snapshot is larger "
+			       "than %u bytes", LWS_LOGIN_FEED_MAX);
+		return -1;
+	}
+
+	m = lejp_parse(&f->ctx, (const uint8_t *)in, (int)len);
+	if (m < 0 && m != LEJP_CONTINUE) {
+		lwsl_vhost_err(f->vhd->vhost, "auth feed snapshot unparseable: "
+			       "%s", lejp_error_to_string(m));
+		return -1;
+	}
+
+	if (!lws_is_final_fragment(wsi))
+		return 0;
+
+	if (m < 0 || !f->args.dest) {
+		lwsl_vhost_err(f->vhd->vhost, "auth feed snapshot incomplete");
+		return -1;
+	}
+
+	lejp_destruct(&f->ctx);
+	f->parsing = 0;
+
+	if (lws_login_feed_adopt(f)) {
+		lwsac_free(&f->args.ac);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int
+lws_login_feed_callback(struct lws_login_feed *f, struct lws *wsi,
+			enum lws_callback_reasons reason, void *in, size_t len)
+{
+	switch (reason) {
+	case LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER: {
+		unsigned char **p = (unsigned char **)in, *end = (*p) + len;
+		char auth[8 + LWS_AUTH_FEED_SECRET_MAX + 1];
+		int n;
+
+		n = lws_snprintf(auth, sizeof(auth), "Bearer %s", f->secret);
+		n = lws_add_http_header_by_token(wsi,
+				WSI_TOKEN_HTTP_AUTHORIZATION,
+				(unsigned char *)auth, n, p, end);
+		lws_explicit_bzero(auth, sizeof(auth));
+
+		return n ? -1 : 0;
+	}
+
+	case LWS_CALLBACK_CLIENT_ESTABLISHED:
+		lwsl_vhost_notice(f->vhd->vhost, "auth feed from %s connected",
+				  f->vhd->auth_api_url);
+		f->retry_count	= 0;
+		f->down_since	= 0;
+		break;
+
+	case LWS_CALLBACK_CLIENT_RECEIVE:
+		if (lws_login_feed_rx(f, wsi, in, len)) {
+			lws_login_feed_abandon_rx(f);
+			return -1;
+		}
+		break;
+
+	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+		lws_login_feed_lost(f, in ? (const char *)in :
+					    "connection failed");
+		break;
+
+	case LWS_CALLBACK_CLIENT_CLOSED:
+		lws_login_feed_lost(f, "link closed");
+		break;
+
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+/*
+ * The snapshot we may judge tokens by, or NULL.  With auth-feed-fail-closed,
+ * one older than auth-feed-grace-secs, ie, with the link down for longer
+ * than that, doesn't count; otherwise the last one does however old, since
+ * it still knows every revocation up to when the link went down.
+ */
+static const lws_auth_feed_t *
+lws_login_feed_current(struct vhd_login *vhd)
+{
+	struct lws_login_feed *f = &vhd->feed;
+
+	if (!f->snap)
+		return NULL;
+
+	if (f->fail_closed && f->down_since &&
+	    lws_now_usecs() - f->down_since >
+			(lws_usec_t)f->grace_secs * LWS_US_PER_SEC)
+		return NULL;
+
+	return f->snap;
+}
+
+static const lws_auth_feed_user_t *
+lws_login_feed_user(struct lws_login_feed *f, uint64_t uid)
+{
+	size_t lo = 0, hi = f->n_users;
+
+	while (lo < hi) {
+		size_t mid = lo + ((hi - lo) / 2);
+
+		if (f->users[mid]->uid == uid)
+			return f->users[mid];
+		if (f->users[mid]->uid < uid)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+
+	return NULL;
+}
+
+/* the index of the first of uid's grants, or n_grants if it has none */
+static size_t
+lws_login_feed_grants(struct lws_login_feed *f, uint64_t uid)
+{
+	size_t lo = 0, hi = f->n_grants;
+
+	while (lo < hi) {
+		size_t mid = lo + ((hi - lo) / 2);
+
+		if (f->grants[mid]->uid < uid)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+
+	return lo < f->n_grants && f->grants[lo]->uid == uid ? lo :
+							       f->n_grants;
+}
+
+static const lws_auth_feed_device_t *
+lws_login_feed_device(struct lws_login_feed *f, const char *did)
+{
+	size_t lo = 0, hi = f->n_devices;
+
+	while (lo < hi) {
+		size_t mid = lo + ((hi - lo) / 2);
+		int c = strcmp(f->devices[mid]->did, did);
+
+		if (!c)
+			return f->devices[mid];
+		if (c < 0)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+
+	return NULL;
+}
+
+/*
+ * A token can be authentic and unexpired and still not describe the session
+ * the way the auth server's records now do: a password reset bumps the user's
+ * session_epoch to revoke every live session, deleting a devices row revokes
+ * that device's token, deleting the user revokes everything, and an admin
+ * changing someone's grants leaves their token carrying the old ones.  We
+ * learn the records from the auth server's feed.
+ *
+ * We never repair such a token ourselves.  Re-signing it here once minted the
+ * current epoch into a token that had failed the epoch check, so a session
+ * revoked by a password reset was handed a fresh one whenever its grants had
+ * changed too; it also dropped "did", taking a device token out of reach of
+ * device revocation.  The caller treats a stale token as no session at all,
+ * and renewal goes through the auth server, which decides from its own
+ * records whether the long-term session behind the browser is still good.
+ *
+ * With no auth-feed-secret, there is no feed and only the signature and exp
+ * vouch for the token.  With one but no snapshot to judge by (see
+ * lws_login_feed_current()), the same goes, unless auth-feed-fail-closed
+ * says to refuse every token instead.
+ *
+ * Returns 1 (and destroys *pja, NULLing it) when the token is stale.
+ */
+static int
+lws_login_jwt_stale(struct lws *wsi, struct vhd_login *vhd,
+		    struct lws_jwt_auth **pja)
+{
+	struct lws_login_feed *f = &vhd->feed;
+	const lws_auth_feed_device_t *dev;
+	const lws_auth_feed_user_t *u;
+	const char *did, *why;
+	size_t n, count = 0;
+	uint32_t uid;
+
+	if (!pja || !*pja)
+		return 1;
+
+	uid = lws_jwt_auth_get_uid(*pja);
+
+	if (!f->secret[0])
+		return 0;
+
+	if (!lws_login_feed_current(vhd)) {
+		if (!f->fail_closed)
+			return 0;
+		why = "no current auth feed snapshot, and auth-feed-fail-closed";
+		goto stale;
+	}
+
+	u = lws_login_feed_user(f, uid);
+	if (!u) {
+		why = "user is gone";
+		goto stale;
+	}
+	if (u->sec != lws_jwt_auth_get_sec(*pja)) {
+		why = "session epoch revoked";
+		goto stale;
+	}
+
+	did = lws_jwt_auth_get_did(*pja);
+	if (did && did[0]) {
+		dev = lws_login_feed_device(f, did);
+		if (!dev || dev->uid != uid) {
+			why = "device revoked";
+			goto stale;
+		}
+	}
+
+	/* the token must carry exactly the grants the records hold now */
+	why = "grants changed";
+	for (n = lws_login_feed_grants(f, uid);
+	     n < f->n_grants && f->grants[n]->uid == uid; n++) {
+		if (!f->grants[n]->svc ||
+		    lws_jwt_auth_query_grant(*pja, f->grants[n]->svc) !=
+						(int)f->grants[n]->level)
+			goto stale;
+		count++;
+	}
+
+	if (count == lws_jwt_auth_count_grants(*pja))
+		return 0;
+
+stale:
+	lwsl_wsi_notice(wsi, "uid %u: %s, token no longer good",
+			(unsigned int)uid, why);
+	lws_jwt_auth_destroy(pja);
+
+	return 1;
+}
+
+/*
+ * Would the token a cold-load renewal brought get the request through, once
+ * we send the browser back with it?  Judged the way the gate will judge it:
+ * authentic, live, not stale, and holding the mount's grant.  Without a
+ * probe, ie, the request had no token that verified, there's nothing to
+ * judge it with, and it's taken as it is: if it's no good, the request it
+ * comes back with has one that verifies, and is judged then.
+ *
+ * Returns 1 if it would.
+ */
+static int
+lws_login_renewed_ok(struct lws *wsi, struct vhd_login *vhd,
+		     struct pending_login_refresh *ps)
+{
+	const char *why = NULL;
+	int level;
+
+	if (!ps->ja_probe)
+		return 1;
+
+	if (lws_jwt_auth_update(ps->ja_probe, ps->token, &why)) {
+		lwsl_wsi_notice(wsi, "renewed token unusable: %s",
+				why ? why : "?");
+		return 0;
+	}
+
+	if (lws_login_jwt_expired(wsi, &ps->ja_probe) ||
+	    lws_login_jwt_stale(wsi, vhd, &ps->ja_probe))
+		return 0;
+
+	level = lws_jwt_auth_query_grant(ps->ja_probe, ps->service_name);
+	if (level < vhd->min_grant_level) {
+		lwsl_wsi_notice(wsi, "uid %u: renewed token still lacks the "
+				"%s grant (has %d)",
+				(unsigned int)lws_jwt_auth_get_uid(ps->ja_probe),
+				ps->service_name, level);
+		return 0;
+	}
 
 	return 1;
 }
@@ -1595,13 +2247,18 @@ lws_login_target_sane(const char *t)
 	return 1;
 }
 
+/*
+ * 1 if redirect_uri is one of the redirect_uris an oauth client registered
+ * with the auth server, as its feed tells us.  Without a current snapshot,
+ * nothing is.
+ */
 static int
 auth_verify_redirect_uri(struct vhd_login *vhd, const char *redirect_uri)
 {
-	sqlite3_stmt *stmt;
+	const lws_auth_feed_t *snap = lws_login_feed_current(vhd);
 	int valid = 0;
 
-	if (!redirect_uri || !redirect_uri[0])
+	if (!redirect_uri || !redirect_uri[0] || !snap)
 		return 0;
 
 	if ((char *)strstr(redirect_uri, "../") ||
@@ -1609,32 +2266,30 @@ auth_verify_redirect_uri(struct vhd_login *vhd, const char *redirect_uri)
 	    (char *)strstr(redirect_uri, "..%2f"))
 		return 0;
 
-	if (sqlite3_prepare_v2(vhd->db, "SELECT redirect_uris FROM oauth_clients", -1, &stmt, NULL) == SQLITE_OK) {
-		while (!valid && sqlite3_step(stmt) == SQLITE_ROW) {
-			const char *uris = (const char *)sqlite3_column_text(stmt, 0);
-			if (uris) {
-				const char *p = uris;
-				while (p && *p) {
-					while (*p == ' ' || *p == '\r' || *p == '\n') p++;
-					const char *comma = strchr(p, ',');
-					size_t len = comma ? lws_ptr_diff_size_t(comma, p) : strlen(p);
-					while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\r' || p[len - 1] == '\n')) len--;
-					while (len > 0 && p[len - 1] == '/') len--;
-					if (len > 0) {
-						if (!strncasecmp(redirect_uri, p, len)) {
-							char next = redirect_uri[len];
-							if (next == '\0' || next == '/' || next == '?' || next == '#') {
-								valid = 1;
-								break;
-							}
-						}
-					}
-					p = comma ? comma + 1 : NULL;
-				}
+	lws_start_foreach_dll(struct lws_dll2 *, d,
+			      lws_dll2_get_head(&snap->ruris)) {
+		const char *uris = lws_container_of(d, lws_auth_feed_ruris_t,
+						    list)->uris;
+		const char *p = uris;
+
+		while (!valid && p && *p) {
+			while (*p == ' ' || *p == '\r' || *p == '\n') p++;
+			const char *comma = strchr(p, ',');
+			size_t len = comma ? lws_ptr_diff_size_t(comma, p) : strlen(p);
+			while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\r' || p[len - 1] == '\n')) len--;
+			while (len > 0 && p[len - 1] == '/') len--;
+			if (len > 0 && !strncasecmp(redirect_uri, p, len)) {
+				char next = redirect_uri[len];
+
+				if (next == '\0' || next == '/' || next == '?' || next == '#')
+					valid = 1;
 			}
+			p = comma ? comma + 1 : NULL;
 		}
-		sqlite3_finalize(stmt);
-	}
+		if (valid)
+			break;
+	} lws_end_foreach_dll(d);
+
 	return valid;
 }
 
@@ -1858,6 +2513,7 @@ lws_login_snip_headers(struct lws *wsi)
 	lws_http_zap_header(wsi, LWS_LOGIN_HDR_ADMIN);
 	lws_http_zap_header(wsi, LWS_LOGIN_HDR_GRANT_LEVEL);
 	lws_http_zap_header(wsi, LWS_LOGIN_HDR_SUB);
+	lws_http_zap_header(wsi, LWS_LOGIN_HDR_SERVICE);
 }
 
 /*
@@ -1870,6 +2526,7 @@ lws_login_snip_headers(struct lws *wsi)
  *   x-lws-login-admin:        1 iff state == GLOBAL_ADMIN (back-compat)
  *   x-lws-login-grant-level:  raw integer grant level used for this mount
  *   x-lws-login-sub:          subject identity ("" if anonymous)
+ *   x-lws-login-service:      the service the state and level are about
  *
  * x-lws-login-admin is derived from |state| so it stays consistent with
  * x-lws-login-state by construction; a backend that wants "admin of my own
@@ -1890,7 +2547,7 @@ lws_login_snip_headers(struct lws *wsi)
  */
 static void
 lws_login_inject_state(struct lws *wsi, const char *sub, int level,
-		       enum lws_login_state state)
+		       enum lws_login_state state, const char *service)
 {
 	char buf[32];
 
@@ -1905,6 +2562,14 @@ lws_login_inject_state(struct lws *wsi, const char *sub, int level,
 	lws_http_add_onward_header(wsi, LWS_LOGIN_HDR_GRANT_LEVEL, buf);
 
 	lws_http_add_onward_header(wsi, LWS_LOGIN_HDR_SUB, sub ? sub : "");
+
+	/*
+	 * Which grant the state is about: without it, a backend can't tell a
+	 * user of the service it guards from a user of another that the mount
+	 * in front of it was mistakenly configured with
+	 */
+	lws_http_add_onward_header(wsi, LWS_LOGIN_HDR_SERVICE,
+				   service ? service : "");
 }
 
 static int
@@ -1934,8 +2599,6 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 		vhd->cookie_name = "auth_session";
 		vhd->service_name = "default-service";
 		vhd->min_grant_level = 1;
-		lws_strncpy(vhd->auth_domain, "auth.warmcat.com", sizeof(vhd->auth_domain));
-		lws_strncpy(vhd->db_path, "/var/db/lws-auth.sqlite3", sizeof(vhd->db_path));
 		vhd->jwt_validity_secs = 86400;
 		vhd->csrf_max_age_secs = 30 * 24 * 3600; /* 30d: csrf must outlive JWT */
 
@@ -2008,6 +2671,31 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 		if (!lws_pvo_get_str(in, "min-grant-level", &cp))
 			vhd->min_grant_level = atoi(cp);
 
+		/*
+		 * The auth feed, if we have the secret to subscribe with:
+		 * without it nothing tells us about revocations
+		 */
+		vhd->feed.magic		= LWS_LOGIN_FEED_MAGIC;
+		vhd->feed.vhd		= vhd;
+		vhd->feed.grace_secs	= 300;
+		if (!lws_pvo_get_str(in, "auth-feed-secret", &cp) &&
+		    lws_auth_feed_secret_load(cp, vhd->feed.secret,
+					      sizeof(vhd->feed.secret))) {
+			lwsl_err("%s: auth-feed-secret must be %d to %d "
+				 "printable characters, or a file holding "
+				 "them\n", __func__, LWS_AUTH_FEED_SECRET_MIN,
+				 LWS_AUTH_FEED_SECRET_MAX);
+			return -1;
+		}
+		if (!lws_pvo_get_str(in, "auth-feed-fail-closed", &cp))
+			vhd->feed.fail_closed = (char)!!atoi(cp);
+		if (!lws_pvo_get_str(in, "auth-feed-grace-secs", &cp))
+			vhd->feed.grace_secs = (unsigned int)atoi(cp);
+
+		/*
+		 * The key tokens are signed with: pinned by jwt-jwk, or else
+		 * whatever the auth feed says it is
+		 */
 		if (!lws_pvo_get_str(in, "jwt-jwk", &cp)) {
 			if (cp[0] == '{' || lws_jwk_load(&vhd->jwk, cp, NULL, NULL)) {
 				if (lws_jwk_import(&vhd->jwk, NULL, NULL, cp, strlen(cp))) {
@@ -2015,17 +2703,35 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 					return -1;
 				}
 			}
-		} else {
-			lwsl_err("%s: jwt-jwk PVO required\n", __func__);
+			vhd->jwk_pinned = 1;
+		} else if (!vhd->feed.secret[0]) {
+			lwsl_err("%s: needs jwt-jwk, or auth-feed-secret to "
+				 "learn the key from the auth server\n",
+				 __func__);
 			return -1;
+		}
+
+		/*
+		 * We only ever verify tokens, never sign them, so a private
+		 * part in the key we were given is only a liability: whoever
+		 * can read it can mint any session for every vhost the auth
+		 * server serves.  Keep just the public half.
+		 */
+		if (vhd->jwk.private_key) {
+			lwsl_vhost_warn(vhd->vhost, "jwt-jwk carries the auth "
+					"server's private key, discarding it: "
+					"configure only the public key");
+			if (lws_login_jwk_drop_private(&vhd->jwk)) {
+				lwsl_err("%s: unable to reduce jwt-jwk to its "
+					 "public key\n", __func__);
+				return -1;
+			}
 		}
 
 		vhd->cookie_domain[0] = '\0';
 		if (!lws_pvo_get_str(in, "cookie-domain", &cp))
 			lws_strncpy(vhd->cookie_domain, cp, sizeof(vhd->cookie_domain));
 
-		if (!lws_pvo_get_str(in, "auth-domain", &cp))
-			lws_strncpy(vhd->auth_domain, cp, sizeof(vhd->auth_domain));
 
 		if (!lws_pvo_get_str(in, "jwt-validity-secs", &cp))
 			vhd->jwt_validity_secs = (uint64_t)atoll(cp);
@@ -2053,13 +2759,19 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 			vhd->trust_forwarded_proto = atoi(cp);
 
 		if (!lws_pvo_get_str(in, "db-path", &cp))
-			lws_strncpy(vhd->db_path, cp, sizeof(vhd->db_path));
+			lwsl_vhost_warn(vhd->vhost, "db-path is no longer used: "
+					"lws-login learns the auth server's "
+					"records from its feed, see "
+					"auth-feed-secret");
 
-		if (lws_struct_sq3_open(vhd->context, vhd->db_path, 1, &vhd->db)) {
-			lwsl_err("%s: could not open local database at %s. Dynamic grant revocation disabled.\n", __func__, vhd->db_path);
-			vhd->db = NULL;
-		}
-
+		if (vhd->feed.secret[0])
+			lws_sul_schedule(vhd->context, 0, &vhd->feed.sul,
+					 lws_login_feed_connect, 1);
+		else
+			lwsl_vhost_warn(vhd->vhost, "no auth-feed-secret: "
+					"sessions are only checked for "
+					"signature and expiry, revocations "
+					"and grant changes are not seen");
 
 		break;
 
@@ -2071,8 +2783,20 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 				free(w);
 			} lws_end_foreach_dll_safe(d, d1);
 			lws_jwk_destroy(&vhd->jwk);
-			if (vhd->db)
-				sqlite3_close(vhd->db);
+
+			lws_sul_cancel(&vhd->feed.sul);
+			if (vhd->feed.wsi) {
+				/* it outlives us: its callbacks must not find us */
+				lws_set_opaque_user_data(vhd->feed.wsi, NULL);
+				lws_set_timeout(vhd->feed.wsi,
+						PENDING_TIMEOUT_USER_OK,
+						LWS_TO_KILL_ASYNC);
+				vhd->feed.wsi = NULL;
+			}
+			lws_login_feed_abandon_rx(&vhd->feed);
+			lwsac_free(&vhd->feed.ac);
+			lws_explicit_bzero(vhd->feed.secret,
+					   sizeof(vhd->feed.secret));
 		}
 		break;
 
@@ -2126,28 +2850,13 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 			service_name = "";
 
 		ja = lws_jwt_auth_create(wsi, &vhd->jwk, vhd->cookie_name, lws_login_jwt_auth_cb, wsi, NULL);
-		if (ja && lws_login_jwt_expired(wsi, &ja))
-			return 1; /* the session has run out: unauthenticated */
+		if (ja && (lws_login_jwt_expired(wsi, &ja) ||
+			   lws_login_jwt_stale(wsi, vhd, &ja)))
+			return 1; /* not a live session: unauthenticated */
 		if (ja) {
-			int epoch_ok = 1;
-			if (vhd->db) {
-				uint32_t uid = lws_jwt_auth_get_uid(ja);
-				if (uid) {
-					sqlite3_stmt *stmt;
-					if (sqlite3_prepare_v2(vhd->db, "SELECT session_epoch FROM users WHERE uid = ?", -1, &stmt, NULL) == SQLITE_OK) {
-						sqlite3_bind_int(stmt, 1, (int)uid);
-						if (sqlite3_step(stmt) == SQLITE_ROW) {
-							uint32_t db_epoch = (uint32_t)sqlite3_column_int(stmt, 0);
-							if (db_epoch != lws_jwt_auth_get_sec(ja))
-								epoch_ok = 0;
-						}
-						sqlite3_finalize(stmt);
-					}
-				}
-			}
 			level = lws_jwt_auth_query_grant(ja, service_name);
 			lws_jwt_auth_destroy(&ja);
-			if (epoch_ok && level >= vhd->min_grant_level)
+			if (level >= vhd->min_grant_level)
 				return 0; /* Authentic and authorized */
 		}
 		return 1; /* Unauthenticated */
@@ -2296,77 +3005,23 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 		 * as the LWS_CALLBACK_HTTP path does */
 		if (ja)
 			lws_login_jwt_expired(wsi, &ja);
+		if (ja && lws_login_jwt_stale(wsi, vhd, &ja)) {
+			/*
+			 * A stale token goes on to our LWS_CALLBACK_HTTP even
+			 * on an unauth-allow mount, which renews it through
+			 * the auth server: letting it through as ANON would
+			 * show a logged-in user the mount logged out until
+			 * the token expired.  An unauth-protocols upgrade
+			 * cannot follow a redirect, it joins as ANON.
+			 */
+			if (unauth_proto)
+				goto anon;
+			return 1; /* Request to intercept */
+		}
 		if (ja) {
-			const char *did = lws_jwt_auth_get_did(ja);
-			if (did && vhd->db) {
-				sqlite3_stmt *stmt;
-				int found_device = 0;
-				if (sqlite3_prepare_v2(vhd->db, "SELECT 1 FROM devices WHERE device_id = ?", -1, &stmt, NULL) == SQLITE_OK) {
-					sqlite3_bind_text(stmt, 1, did, -1, SQLITE_STATIC);
-					if (sqlite3_step(stmt) == SQLITE_ROW)
-						found_device = 1;
-					sqlite3_finalize(stmt);
-				}
-				if (!found_device) {
-					lwsl_notice("%s: Device %s rejected (not found in DB %s), rejecting JWT\n", __func__, did, vhd->db_path);
-					lws_jwt_auth_destroy(&ja);
-					if (unauth_proto)
-						goto anon;
-					return 1; /* Request to intercept */
-				}
-			}
-
 			lwsl_info("%s: Valid cookie found! User authenticated.\n", __func__);
 			level = lws_jwt_auth_query_grant(ja, service_name);
 			if (level >= vhd->min_grant_level) {
-				if (vhd->db) {
-					uint32_t uid = lws_jwt_auth_get_uid(ja);
-					if (uid) {
-						sqlite3_stmt *stmt;
-						int mismatch = 0;
-						int count_db = 0;
-
-						if (sqlite3_prepare_v2(vhd->db, "SELECT s.name, g.grant_level FROM grants g JOIN services s ON g.service_id = s.service_id WHERE g.uid = ?", -1, &stmt, NULL) == SQLITE_OK) {
-							sqlite3_bind_int(stmt, 1, (int)uid);
-							while (sqlite3_step(stmt) == SQLITE_ROW) {
-								const char *svc_name = (const char *)sqlite3_column_text(stmt, 0);
-								int gl = sqlite3_column_int(stmt, 1);
-								if (!svc_name) continue;
-
-								count_db++;
-								int old_gl = lws_jwt_auth_query_grant(ja, svc_name);
-								if (old_gl != gl)
-									mismatch = 1;
-							}
-							sqlite3_finalize(stmt);
-						}
-
-						if (sqlite3_prepare_v2(vhd->db, "SELECT session_epoch FROM users WHERE uid = ?", -1, &stmt, NULL) == SQLITE_OK) {
-							sqlite3_bind_int(stmt, 1, (int)uid);
-							if (sqlite3_step(stmt) == SQLITE_ROW) {
-								uint32_t db_epoch = (uint32_t)sqlite3_column_int(stmt, 0);
-								if (db_epoch != lws_jwt_auth_get_sec(ja)) {
-									lwsl_info("%s: session epoch mismatch! DB=%u JWT=%u\n", __func__, db_epoch, lws_jwt_auth_get_sec(ja));
-									mismatch = 1;
-								}
-							}
-							sqlite3_finalize(stmt);
-						}
-
-						if (count_db != (int)lws_jwt_auth_count_grants(ja))
-							mismatch = 1;
-
-						if (mismatch) {
-							lws_jwt_auth_destroy(&ja);
-							lwsl_info("%s: Need dynamic JWT rewrite\n", __func__);
-							if (unauth_proto)
-								goto anon;
-							return 1; /* Request to intercept */
-					}
-				}
-			}
-
-			{
 				/* capture login state before destroying ja, and
 				 * stamp it for the proxy to forward to backend.
 				 * The single lws_login_state encodes the role
@@ -2390,14 +3045,14 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 
 				lws_jwt_auth_destroy(&ja);
 
-				lws_login_inject_state(wsi, sub, level, state);
+				lws_login_inject_state(wsi, sub, level, state,
+						       service_name);
+				lwsl_info("%s: ALLOWING (User has required grant)\n", __func__);
+				return 0; /* Let traffic through to the real mount */
 			}
-			lwsl_info("%s: ALLOWING (User has required grant)\n", __func__);
-			return 0; /* Let traffic through to the real mount */
+			lwsl_info("%s: JWT valid but lacks required %s grant (has %d), INTERCEPTING\n", __func__, service_name, level);
+			lws_jwt_auth_destroy(&ja);
 		}
-		lwsl_info("%s: JWT valid but lacks required %s grant (has %d), INTERCEPTING\n", __func__, service_name, level);
-		lws_jwt_auth_destroy(&ja);
-	}
 
 	lwsl_info("%s: INTERCEPTING (NO VALID COOKIE FOUND)\n", __func__);
 
@@ -2406,7 +3061,8 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 
 anon:
 	/* anonymous: explicit ANON state for the backend */
-	lws_login_inject_state(wsi, NULL, -1, LWS_LOGIN_STATE_ANON);
+	lws_login_inject_state(wsi, NULL, -1, LWS_LOGIN_STATE_ANON,
+			       service_name);
 	lwsl_info("%s: ALLOWING UNAUTH (%s)\n", __func__,
 		  unauth_proto ? "unauth-protocols" : "unauth-allow");
 
@@ -2420,7 +3076,7 @@ anon:
 		int whitelist_failed = 0;
 		const char *service_name;
 		const char *pmo_val;
-		int n;
+		int n, stale = 0;
 
 		if (!vhd)
 			return 1;
@@ -2520,137 +3176,16 @@ anon:
 		if (pss->ja)
 			lws_login_jwt_expired(wsi, &pss->ja);
 
+		/*
+		 * A stale token is never re-signed here (see
+		 * lws_login_jwt_stale()): it is treated as no session, and the
+		 * cold-load renewal below asks the auth server for a fresh one
+		 */
+		if (pss->ja && lws_login_jwt_stale(wsi, vhd, &pss->ja))
+			stale = 1;
+
 		if (!pss->ja && lws_login_ends_with(path, "/.lws-login-status"))
 			lws_login_diag_jar(wsi, vhd);
-
-		if (pss->ja) {
-			int level = lws_jwt_auth_query_grant(pss->ja, service_name);
-			if (level >= vhd->min_grant_level) {
-				if (vhd->db && !pss->silent_update_jwt) {
-					uint32_t uid = lws_jwt_auth_get_uid(pss->ja);
-					if (uid) {
-						char current_grants[512];
-						char svc_esc[256];
-						char *g_p = current_grants;
-						char *g_end = current_grants + sizeof(current_grants);
-						sqlite3_stmt *stmt;
-						int first = 1;
-						int mismatch = 0;
-						int count_db = 0;
-
-						g_p += lws_snprintf(g_p, lws_ptr_diff_size_t(g_end, g_p), "\"grants\":{");
-
-						if (sqlite3_prepare_v2(vhd->db, "SELECT s.name, g.grant_level FROM grants g JOIN services s ON g.service_id = s.service_id WHERE g.uid = ?", -1, &stmt, NULL) == SQLITE_OK) {
-							sqlite3_bind_int(stmt, 1, (int)uid);
-							while (sqlite3_step(stmt) == SQLITE_ROW) {
-								const char *svc_name = (const char *)sqlite3_column_text(stmt, 0);
-								int gl = sqlite3_column_int(stmt, 1);
-								if (!svc_name) continue;
-
-								count_db++;
-								int old_gl = lws_jwt_auth_query_grant(pss->ja, svc_name);
-								if (old_gl != gl)
-									mismatch = 1;
-
-								if (!first)
-									g_p += lws_snprintf(g_p, lws_ptr_diff_size_t(g_end, g_p), ",");
-								first = 0;
-								/*
-								 * The service name is db content: a '"'
-								 * in it would inject extra members (eg
-								 * "*":9) into a payload WE then sign.
-								 */
-								lws_json_purify(svc_esc, svc_name, (int)sizeof(svc_esc), NULL);
-								g_p += lws_snprintf(g_p, lws_ptr_diff_size_t(g_end, g_p), "\"%s\":%d", svc_esc, gl);
-							}
-							sqlite3_finalize(stmt);
-						}
-						g_p += lws_snprintf(g_p, lws_ptr_diff_size_t(g_end, g_p), "}");
-
-						if (count_db != (int)lws_jwt_auth_count_grants(pss->ja))
-							mismatch = 1;
-
-						if (mismatch) {
-							char temp[1024];
-							char out[2048];
-							size_t out_len = sizeof(out);
-							uint64_t now = (uint64_t)time(NULL);
-							uint64_t exp = now + vhd->jwt_validity_secs;
-							const char *sub = lws_jwt_auth_get_sub(pss->ja);
-							/* sub is JWT content: escape it, or it can
-							 * append its own claims to a payload we
-							 * are about to SIGN (6x for \u00XX of
-							 * ja's sub[128]) */
-							char sub_esc[6 * 128];
-							uint32_t session_epoch = 0;
-							sqlite3_stmt *stmt2;
-
-							lws_json_purify(sub_esc, sub ? sub : "Unknown",
-									(int)sizeof(sub_esc), NULL);
-
-							/*
-							 * The rewritten JWT must carry the
-							 * CURRENT session_epoch from the db:
-							 * the interceptor gates every later
-							 * request on sec matching the db, so a
-							 * sec-less rewrite (as this used to
-							 * mint) could never satisfy the gate
-							 * again -> redirect loop.
-							 */
-							if (sqlite3_prepare_v2(vhd->db,
-									"SELECT session_epoch FROM users WHERE uid = ?",
-									-1, &stmt2, NULL) == SQLITE_OK) {
-								sqlite3_bind_int(stmt2, 1, (int)uid);
-								if (sqlite3_step(stmt2) == SQLITE_ROW)
-									session_epoch = (uint32_t)sqlite3_column_int(stmt2, 0);
-								sqlite3_finalize(stmt2);
-							}
-
-							if (!lws_jwt_sign_compact(vhd->context, &vhd->jwk, "ES256",
-													  out, &out_len, temp, sizeof(temp),
-													  "{\"iss\":\"%s\",\"sub\":\"%s\",\"uid\":%u,"
-													  "\"sec\":%u,"
-													  "\"iat\":%llu,\"exp\":%llu,%s}",
-													  vhd->auth_domain, sub_esc, uid,
-													  session_epoch,
-													  (unsigned long long)now, (unsigned long long)exp,
-													  current_grants)) {
-								pss->silent_update_jwt = strdup(out);
-							}
-						}
-					}
-				}
-			}
-
-			if (pss->silent_update_jwt) {
-				/*
-				 * Re-mint the cookie and bounce him back to
-				 * the SAME url.  It must come from whichever
-				 * method token this request actually used: the
-				 * interceptor gates every method, so taking
-				 * only WSI_TOKEN_GET_URI left an intercepted
-				 * POST / PUT / PATCH self-redirecting to an
-				 * empty Location.
-				 */
-				if (lws_login_request_uri(wsi, path,
-							 sizeof(path)))
-					lwsl_debug("%s: URI copy failed\n",
-						   __func__);
-
-				if (!lws_login_serve_self_redirect_with_cookie(
-						wsi, pss, vhd, pss->silent_update_jwt,
-						path, (unsigned char *)buf,
-						(unsigned char **)&p,
-						(unsigned char *)end, NULL,
-						NULL, NULL)) {
-					free(pss->silent_update_jwt);
-					pss->silent_update_jwt = NULL;
-					return lws_http_transaction_completed(wsi);
-				}
-				/* header build failed */
-				return 1;
-			}
-		}
 
 		/*
 		 * From here on, path is the url this request asked for, for
@@ -2970,8 +3505,12 @@ anon:
 		 * them on an auth-server "you lack the grant" page they cannot
 		 * escape.  (CONFIRM_REQ_OK already let them through; this keeps
 		 * the HTTP path consistent with that decision.)
+		 *
+		 * A stale token is the exception: the interceptor sent it here
+		 * to be renewed through the auth server below, and if that
+		 * cannot happen the user is sent to log in again.
 		 */
-		if (unauth_allow) {
+		if (unauth_allow && !stale) {
 			lwsl_info("%s: ALLOWING unauth-allow fall-through\n",
 				  __func__);
 			return 0;
@@ -2991,6 +3530,13 @@ anon:
 		 * Only on a hard failure (long-term session genuinely gone) do we
 		 * fall through to the 303 below, landing the user on the form to
 		 * actually log in again.  Cookieless requests skip the hop entirely.
+		 *
+		 * A live token that lacks the grant is renewed too: the grant may
+		 * have been given since it was minted.  But the renewed token only
+		 * comes back to the page if it would get through: otherwise the
+		 * auth server only minted it again without the grant, and sending
+		 * it back renewed again, round and round until the browser gave up
+		 * on the redirects.  See lws_login_renewed_ok().
 		 */
 			{
 				int ck_len2 = lws_hdr_total_length(wsi,
@@ -3054,8 +3600,24 @@ anon:
 							else
 								kicked = 0;
 							free(cookie2);
-							if (kicked)
+							if (kicked) {
+								struct pending_login_refresh *ps =
+									lws_login_pending_find(vhd, wsi);
+
+								if (ps) {
+									/* what the gate saw, see ja_probe */
+									ps->ja_probe = pss->ja ? pss->ja :
+										lws_jwt_auth_create(wsi,
+											&vhd->jwk,
+											vhd->cookie_name,
+											NULL, NULL, NULL);
+									pss->ja = NULL;
+									lws_strncpy(ps->service_name,
+										    service_name,
+										    sizeof(ps->service_name));
+								}
 								return 0; /* suspend */
+							}
 						}
 					}
 				}
@@ -3242,12 +3804,10 @@ anon:
 							}
 							if (h && !strcasecmp(puri_tgt->host, h)) {
 								final_target = target;
-							} else if (vhd->db) {
-								if (auth_verify_redirect_uri(vhd, target)) {
-									final_target = target;
-								} else {
-									lwsl_err("%s: untrusted absolute target %s\n", __func__, target);
-								}
+							} else if (auth_verify_redirect_uri(vhd, target)) {
+								final_target = target;
+							} else {
+								lwsl_err("%s: untrusted absolute target %s\n", __func__, target);
 							}
 							lws_parse_uri_destroy(&puri_tgt);
 						}
@@ -3315,17 +3875,8 @@ anon:
 	case LWS_CALLBACK_HTTP_WRITEABLE:
 	{
 		unsigned char ubuf[LWS_LOGIN_HTTP_BUFL], *up = ubuf + LWS_PRE, *uend = ubuf + sizeof(ubuf) - 1;
-		struct pending_login_refresh *ps = NULL;
-
-		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
-					   lws_dll2_get_head(&vhd->pending_refresh_list)) {
-			struct pending_login_refresh *s = lws_container_of(d, struct pending_login_refresh, list);
-
-			if (s->wsi_server == wsi) {
-				ps = s;
-				break;
-			}
-		} lws_end_foreach_dll_safe(d, d1);
+		struct pending_login_refresh *ps =
+					lws_login_pending_find(vhd, wsi);
 
 		if (ps) {
 			/*
@@ -3354,7 +3905,8 @@ anon:
 				 * 303 to the auth server login form we pre-built,
 				 * landing the user where they can actually log in.
 				 */
-				if (ps->token[0]) {
+				if (ps->token[0] &&
+				    lws_login_renewed_ok(wsi, vhd, ps)) {
 					/*
 					 * Rotate auth_csrf alongside the re-minted
 					 * JWT, same rationale as the BFF path: the
@@ -3404,7 +3956,13 @@ anon:
 					char html[1024];
 					int html_len;
 
-					if (ps->resp_status)
+					if (ps->token[0])
+						lwsl_wsi_notice(wsi, "cold-load "
+							"renewal wouldn't get "
+							"through %s, bouncing to "
+							"auth form",
+							ps->orig_path);
+					else if (ps->resp_status)
 						lwsl_wsi_notice(wsi, "cold-load "
 							"renewal denied: auth server "
 							"answered HTTP %u '%s', "

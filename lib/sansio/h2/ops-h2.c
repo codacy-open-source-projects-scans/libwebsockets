@@ -383,6 +383,7 @@ rops_tx_sent_h2(struct lws *wsi, int n)
 {
 	struct lws_h2_netconn *h2n = wsi->h2.h2n;
 	struct lws_h2_protocol_send *pps = h2n->pps_tx;
+	int goaway = pps && pps->type == LWS_H2_PPS_GOAWAY;
 
 	h2n->pps_tx = NULL;
 	if (n < 0) {
@@ -392,7 +393,15 @@ rops_tx_sent_h2(struct lws *wsi, int n)
 	}
 
 	if (lws_h2_pps_done(wsi, pps)) {
-		lwsi_set_skt_unusable(wsi, 1);
+		/*
+		 * Our GOAWAY went: the connection is finished with, but the
+		 * socket is fine, and its close must wait for the peer's FIN
+		 * the polite way, see __lws_close_free_wsi().  Closed at once
+		 * with his rx unread, the kernel resets the connection, and
+		 * the peer may drop the GOAWAY unread.
+		 */
+		if (!goaway)
+			lwsi_set_skt_unusable(wsi, 1);
 		return -1;
 	}
 
@@ -493,16 +502,33 @@ rops_write_role_protocol_h2(struct lws *wsi, unsigned char *buf, size_t len,
 	 * repeated body-less FINAL (eg, the proxy's stream close after the
 	 * content-length already ended the stream) is pointless but
 	 * harmless, drop it quietly.
+	 *
+	 * If the stream has ended both ways, it's gone: nothing will ever be
+	 * sent or received on it again.  Binning the write would leave the
+	 * user writing into it for as long as the connection lasts, eg, a ws
+	 * stream fed from a timer, where the ws role reports the write as
+	 * sent.  Fail it, so the user closes the stream like any other dead
+	 * connection.
 	 */
 
 	if (wsi->h2.h2_state == LWS_H2_STATE_HALF_CLOSED_LOCAL ||
 	    wsi->h2.h2_state == LWS_H2_STATE_CLOSED) {
-		if (len)
-			lwsl_wsi_notice(wsi, "binning %d byte write after "
-					     "END_STREAM (h2 state %d)",
-					     (int)len, (int)wsi->h2.h2_state);
+		if (!len)
+			return 0;
 
-		return 0;
+		if (!wsi->h2.told_write_after_end) {
+			wsi->h2.told_write_after_end = 1;
+			lwsl_wsi_notice(wsi, "%s %d byte write after END_STREAM"
+					" (h2 %s, protocol %s)",
+					wsi->h2.h2_state == LWS_H2_STATE_CLOSED ?
+						"failing" : "binning", (int)len,
+					wsi->h2.h2_state == LWS_H2_STATE_CLOSED ?
+						"closed" : "half-closed local",
+					wsi->a.protocol ? wsi->a.protocol->name :
+							  "none");
+		}
+
+		return wsi->h2.h2_state == LWS_H2_STATE_CLOSED ? -1 : 0;
 	}
 
 	/* compression transform... */
@@ -895,6 +921,30 @@ rops_close_kill_connection_h2(struct lws *wsi, enum lws_close_status reason)
 	 * stream to send headers first, and waited for itself forever.
 	 */
 	if (wsi->mux.parent_wsi) {
+
+		struct lws_h2_netconn *h2n = wsi->mux.parent_wsi->h2.h2n;
+
+		/* a stream the peer opened on us: its late HEADERS are dropped */
+		if (h2n && lwsi_role_server(wsi->mux.parent_wsi) &&
+		    (wsi->mux.my_sid & 1))
+			lws_h2_sid_closed(h2n, (uint32_t)wsi->mux.my_sid);
+
+		/*
+		 * Closing in the middle of its own header block, eg, a client
+		 * stream timing out between the frames of a response's: the
+		 * rest of the block is still decoded, into the sink, since the
+		 * hpack dynamic table is the whole connection's.  Without, its
+		 * remaining bytes went undecoded, and a CONTINUATION for it
+		 * failed the connection, other streams and all.
+		 */
+		if (h2n && !h2n->hpack_no_store &&
+		    ((h2n->cont_exp && h2n->cont_exp_sid == wsi->mux.my_sid) ||
+		     (h2n->frame_state == LWS_H2_FRAME_HEADER_LENGTH &&
+		      h2n->sid == wsi->mux.my_sid &&
+		      (h2n->type == LWS_H2_FRAME_TYPE_HEADERS ||
+		       h2n->type == LWS_H2_FRAME_TYPE_CONTINUATION))) &&
+		    lws_h2_hpack_sink_start(wsi->mux.parent_wsi))
+			lwsl_wsi_info(wsi, "no sink, connection failing");
 
 		if (wsi->mux.parent_wsi->h2.h2n &&
 		    wsi->mux.parent_wsi->h2.h2n->swsi == wsi) {
@@ -1924,8 +1974,19 @@ rops_perform_user_POLLOUT_h2(struct lws *wsi)
 			lws_close_free_wsi(w, LWS_CLOSE_STATUS_NOSTATUS,
 					   "h2 pollout handle");
 		} else {
-			if (w->h2.send_END_STREAM)
-				lws_h2_state(w, LWS_H2_STATE_HALF_CLOSED_LOCAL);
+			/*
+			 * Our END_STREAM has gone: if the peer had ended his
+			 * side already, the stream is now closed both ways,
+			 * RFC 9113 5.1.  Once it's closed, it stays closed.
+			 */
+			if (w->h2.send_END_STREAM) {
+				if (w->h2.h2_state == LWS_H2_STATE_OPEN)
+					lws_h2_state(w,
+					      LWS_H2_STATE_HALF_CLOSED_LOCAL);
+				else if (w->h2.h2_state ==
+					 LWS_H2_STATE_HALF_CLOSED_REMOTE)
+					lws_h2_state(w, LWS_H2_STATE_CLOSED);
+			}
 
 #if defined(LWS_WITH_CLIENT)
 			/*

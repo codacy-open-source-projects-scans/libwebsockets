@@ -24,6 +24,10 @@
  *
  * Scenarios:
  *
+ * Every exchange must tell the auth server the browser's address in
+ * X-Forwarded-For, or once lws-login is on another host from it, a run of bad
+ * renewals gets lws-login's own address banned, and so everybody's renewals.
+ *
  *  - "paired-jar": both cookies present -> renewal runs, 200 + rotated
  *    auth_session / auth_csrf cookies;  the mock answers with the real
  *    minted multi-KB JWT, and the rotation fence asserts the planted
@@ -122,10 +126,59 @@
  *    "<exempt>, <privileged>" still reach the waiting room, and an offer
  *    led by a name the vhost does not know binds the next one it does.
  *
+ * plus stale-token scenarios: the mock auth server also serves the
+ * lws-auth-feed ws protocol, and tells lws-login its records (users, grants,
+ * devices) in a snapshot, against which the test presents genuinely-signed,
+ * unexpired session JWTs that the records no longer back.  The sequence only
+ * starts once lws-login has subscribed with the right feed secret and been
+ * sent the snapshot.
+ * lws-login must never repair one by signing a token itself: it once re-minted
+ * a token whose grants had changed with the CURRENT session_epoch, so a
+ * session revoked by a password reset was handed a fresh one whenever its
+ * grants had changed too.
+ *
+ *  - "stale-revoked-regranted": old epoch AND changed grants, no refresh
+ *    cookie -> 303 to the auth form with no auth_session planted (pre-fix:
+ *    302 planting a locally minted, live token);
+ *
+ *  - "stale-grants-renewed": current epoch, changed grants, a paired refresh
+ *    jar -> renewal through the mock auth server's /api/sso_exchange, 302
+ *    planting the token the auth server minted, not one of our own;
+ *
+ *  - "stale-device", "stale-user-gone": a device token whose devices row is
+ *    gone, and a token for a uid with no users row -> 303, nothing planted;
+ *
+ *  - "live-lacks-grant": a token the records do back, with a paired refresh
+ *    jar, but without the gated mount's grant.  It's renewed, since the
+ *    grant may have been given since, but the auth server mints it again
+ *    without the grant, as its records say: that must end in 303 to the auth
+ *    server, nothing planted.  It used to 302 back to the page with the
+ *    renewed token, which renewed again, until the browser gave up on the
+ *    redirects;
+ *
+ *  - "ws-live-session" (positive control): a token the records do back opens
+ *    the privileged ws protocol on the gated mount;
+ *
+ *  - "ws-stale-session": the revoked token is refused the same upgrade.
+ *
+ * plus the headers lws-login stamps for what it lets through:
+ *
+ *  - "stamps-live": a live token reaching an in-process http app behind the
+ *    gated mount, while the client sends its own x-lws-login-service.  The
+ *    app must read the stamps lws-login made, a user (state 2) of the
+ *    service the mount is for, "default-service", and the client's copy of
+ *    the header must be gone from the request.  The service is what lets an
+ *    app check the state is about the grant it guards, so a wrong mount in
+ *    front of it fails closed.
+ *
+ *  - "stamps-proxied": the same, but the gated mount reverse-proxies to a
+ *    backend on another vhost, which says what it received: each stamp
+ *    exactly once, with the stamped values, and no client copy.
+ *
  * The app vhost runs the real lws-login plugin (builtin plugins build) with
  * lws_login_client enabled on the same vhost as the side channel requires,
  * against an in-process mock auth server.  Ports come from the CI port
- * allocator; the plugin's sqlite db-path points into the build dir.
+ * allocator.
  */
 
 #include <libwebsockets.h>
@@ -135,6 +188,7 @@
 #include <unistd.h>
 #include <limits.h>
 #include <stdlib.h>
+#include <time.h>
 
 /* -------------------------------------------------------------- scenarios */
 
@@ -148,9 +202,10 @@ struct scenario {
 	unsigned	expect_status;
 	int		expect_pair;	/* mock must see a matching csrf pair */
 	int		expect_rotate;	/* response must rotate the auth cookies */
-	int		expect_sso;	/* /.lws-login-sso outcome: 1 = must plant
-					 * the submitted token as auth_session,
-					 * -1 = must plant nothing, 0 = n/a */
+	int		expect_sso;	/* 1 = must plant the submitted SSO
+					 * token as auth_session, -1 = must
+					 * plant no auth_session at all,
+					 * 0 = n/a */
 	const char	*method;	/* "POST" (as before) or "GET" */
 	int		expect_js;	/* 1 = response body is lws-login.js and
 					 * must carry the F-021 render-boundary
@@ -179,10 +234,46 @@ struct scenario {
 #define BFF_WS_PRIV	"lws-api-test-lws-login-bff-priv"
 #define BFF_WS_WAITING	"lws-api-test-lws-login-bff-waiting"
 
+/*
+ * An http app behind another gated mount, telling what lws-login stamped on
+ * the request.  The client sends its own x-lws-login-service, which must not
+ * be what the app sees.
+ */
+#define BFF_STAMPS_PROT	"lws-api-test-lws-login-bff-stamps"
+#define BFF_STAMPS_PATH	"/stamps"
+#define BFF_STAMPS_SPOOF "spoofed-service"
+/* ... and a gated mount reverse-proxied to a backend that reports the same */
+#define BFF_ECHO_PROT	"lws-api-test-lws-login-bff-echo"
+#define BFF_PROXIED_PATH "/proxied"
+/* what's asked for: a mount's own path without the / is redirected */
+#define BFF_PROXIED_REQ	BFF_PROXIED_PATH "/"
+
+static int
+bff_stamps_path(const char *path)
+{
+	return !strcmp(path, BFF_STAMPS_PATH) ||
+	       !strcmp(path, BFF_PROXIED_REQ);
+}
+
 /* minted in main() once the context and allocated ports exist */
 static char	minted_jwt[LWS_SSO_MAX_COOKIE];
 static char	sso_body[LWS_SSO_MAX_COOKIE * 3 + 64];
 static char	o_origin_good[64], o_origin_evil[64], o_referer_good[64];
+
+/*
+ * Cookie headers carrying session JWTs minted in main() against the records
+ * the mock's feed snapshot holds: uid 1 is at session_epoch 5 holding
+ * default-service:1, and owns device "dev-ok"
+ */
+#define BFF_REFRESH_JAR	"auth_refresh_session=0123456789abcdef0123456789abcdef; " \
+			"auth_csrf=fedcba9876543210fedcba9876543210"
+/* uid 2's long-term session: the mock auth server renews it as uid 2 */
+#define BFF_REFRESH_U2	"2222222222222222222222222222222a"
+#define BFF_REFRESH_JAR_U2 "auth_refresh_session=" BFF_REFRESH_U2 "; " \
+			"auth_csrf=fedcba9876543210fedcba9876543210"
+static char	ck_live[1024], ck_revoked[1024], ck_regranted[1024],
+		ck_dev_gone[1024], ck_user_gone[1024], ck_nogrant[1024],
+		ck_u2_renewed[1024];
 
 /*
  * Throwaway P-256 keypair: parsed by the plugin at init to validate tokens,
@@ -219,6 +310,34 @@ static const struct scenario scenarios[] = {
 	{ "alg-less-session-jwt", "/", NULL, NULL, NULL,
 	  "auth_session=eyJ0eXAiOiJKV1QifQ.e30.AQ", 303u, 0, 0, 0,
 	  "GET", 0, 0, 0, 0, NULL, NULL },
+
+	/* stale tokens: authentic and unexpired, but the records no longer
+	 * back them.  None may be repaired by a token we sign ourselves */
+	{ "stale-revoked-regranted", "/gated", NULL, NULL, NULL, ck_revoked,
+	  303u, 0, 0, -1, "GET", 0, 0, 0, 0, NULL, NULL },
+	{ "stale-grants-renewed", "/gated", NULL, NULL, NULL, ck_regranted,
+	  302u, 1, 1, 0, "GET", 0, 0, 0, 0, NULL, NULL },
+	{ "stale-device", "/gated", NULL, NULL, NULL, ck_dev_gone,
+	  303u, 0, 0, -1, "GET", 0, 0, 0, 0, NULL, NULL },
+	{ "stale-user-gone", "/gated", NULL, NULL, NULL, ck_user_gone,
+	  303u, 0, 0, -1, "GET", 0, 0, 0, 0, NULL, NULL },
+	/* live and current, but not for this mount: renewing can't help */
+	{ "live-lacks-grant", "/gated", NULL, NULL, NULL, ck_nogrant,
+	  303u, 1, 0, -1, "GET", 0, 0, 0, 0, NULL, NULL },
+	/* positive control: a token the records back opens the mount */
+	{ "ws-live-session", "/gated", NULL, NULL, NULL, ck_live, 101u, 0, 0, 0,
+	  NULL, 0, 0, 0, 0, BFF_WS_PRIV, BFF_WS_PRIV },
+	{ "ws-stale-session", "/gated", NULL, NULL, NULL, ck_revoked, 401u, 0, 0,
+	  0, NULL, 0, 0, 0, 0, BFF_WS_PRIV, NULL },
+
+	/* what lws-login stamps for an app it lets a live token through to */
+	{ "stamps-live", BFF_STAMPS_PATH, NULL, NULL, NULL, ck_live, 200u, 0, 0,
+	  0, "GET", 0, 0, 0, 0, NULL, NULL },
+#if defined(LWS_WITH_HTTP_PROXY)
+	/* ... and what reaches a backend it's reverse-proxied to */
+	{ "stamps-proxied", BFF_PROXIED_REQ, NULL, NULL, NULL, ck_live, 200u, 0,
+	  0, 0, "GET", 0, 0, 0, 0, NULL, NULL },
+#endif
 
 	/* F-020: the token below is genuinely signed by the plugin's own JWK
 	 * (the throwaway key carries its private member), so these scenarios
@@ -284,7 +403,7 @@ static const struct scenario scenarios[] = {
 
 static struct lws_context *context;
 
-static int	g_port_app, g_port_auth, g_port_app2;
+static int	g_port_app, g_port_auth, g_port_app2, g_port_echo;
 static struct lws_vhost *g_vh_cli, *g_vh_app;
 
 static int	step;
@@ -312,7 +431,7 @@ static size_t	got_body_len;
 static int	got_body_trunc;
 
 /* Captured by the mock auth server from the side-channel exchange. */
-static int	mock_hits, mock_got_refresh, mock_pair_ok;
+static int	mock_hits, mock_got_refresh, mock_pair_ok, mock_xff_ok;
 
 static int	tests, fail;
 static volatile sig_atomic_t sequence_done;
@@ -344,6 +463,9 @@ struct pss_auth {
  * auth_session cookie assertions below catch any such truncation.
  */
 static char MOCK_TOKEN_JSON[LWS_SSO_MAX_COOKIE];
+/* ... and what it mints renewing uid 2's session: still without the grant */
+static char MOCK_TOKEN_JSON_U2[1024];
+static int mock_u2;
 
 /*
  * The response is written from its own sul callback a few ms after the POST
@@ -359,7 +481,8 @@ sul_respond_cb(lws_sorted_usec_list_t *sul)
 	uint8_t buf[LWS_PRE + sizeof(MOCK_TOKEN_JSON) + 64],
 		*start = &buf[LWS_PRE], *p = start,
 		*end = &buf[sizeof(buf) - 1];
-	size_t blen = strlen(MOCK_TOKEN_JSON);
+	const char *tj = mock_u2 ? MOCK_TOKEN_JSON_U2 : MOCK_TOKEN_JSON;
+	size_t blen = strlen(tj);
 
 	if (!wsi)
 		return;
@@ -370,7 +493,7 @@ sul_respond_cb(lws_sorted_usec_list_t *sul)
 	    lws_finalize_http_header(wsi, &p, end))
 		return;
 
-	memcpy(p, MOCK_TOKEN_JSON, blen);
+	memcpy(p, tj, blen);
 	p += blen;
 
 	if (lws_write(wsi, start, lws_ptr_diff_size_t(p, start),
@@ -431,15 +554,26 @@ callback_authmock(struct lws *wsi, enum lws_callback_reasons reason,
 		 */
 		char csrf_ck[64] = {0};
 		size_t csrf_ck_len = sizeof(csrf_ck);
-		char refresh[128] = {0};
+		char refresh[128] = {0}, xff[64];
 		size_t refresh_len = sizeof(refresh);
 		int got_cookie_csrf;
 
 		mock_hits++;
+
+		/*
+		 * The side channel tells the auth server the browser's
+		 * address, so its strikes don't land on lws-login's host: here
+		 * the test client, connecting from 127.0.0.1
+		 */
+		mock_xff_ok = lws_hdr_copy(wsi, xff, sizeof(xff),
+					   WSI_TOKEN_X_FORWARDED_FOR) > 0 &&
+			      !strcmp(xff, "127.0.0.1");
 		mock_got_refresh =
 			lws_http_cookie_get(wsi, "auth_refresh_session",
 					    refresh, &refresh_len) == 0 &&
 			refresh[0];
+		/* the session's user is who the renewed token is for */
+		mock_u2 = mock_got_refresh && !strcmp(refresh, BFF_REFRESH_U2);
 		got_cookie_csrf =
 			lws_http_cookie_get(wsi, "auth_csrf",
 					    csrf_ck, &csrf_ck_len) == 0 &&
@@ -494,6 +628,76 @@ callback_authmock(struct lws *wsi, enum lws_callback_reasons reason,
 	}
 
 	return lws_callback_http_dummy(wsi, reason, user, in, len);
+}
+
+/* ------------------------------------------------------ mock auth feed */
+
+#define BFF_FEED_SECRET "apitest-bff-feed-secret-0123456789abcdef"
+
+/*
+ * What the mock auth server's records are, as its lws-auth-feed tells
+ * lws-login: uid 1 at session_epoch 5, holding default-service:1 and owning
+ * device "dev-ok", and uid 2 at session_epoch 5, holding only
+ * other-service:1
+ */
+static const char feed_snapshot[] =
+	"{\"schema\":\"lws-auth-feed-1\","
+	"\"users\":[{\"uid\":1,\"sec\":5},{\"uid\":2,\"sec\":5}],"
+	"\"grants\":[{\"svc\":\"default-service\",\"uid\":1,"
+		"\"level\":1},{\"svc\":\"other-service\",\"uid\":2,"
+		"\"level\":1}],"
+	"\"devices\":[{\"did\":\"dev-ok\",\"uid\":1}],"
+	"\"ruris\":[]}";
+
+static lws_sorted_usec_list_t sul_next;
+static int feed_sent;
+
+static void
+start_step(lws_sorted_usec_list_t *sul);
+
+static int
+callback_feedmock(struct lws *wsi, enum lws_callback_reasons reason,
+		  void *user, void *in, size_t len)
+{
+	uint8_t buf[LWS_PRE + sizeof(feed_snapshot)];
+	char auth[128];
+
+	switch (reason) {
+	case LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION:
+		/* only a subscriber with the feed secret */
+		if (lws_hdr_copy(wsi, auth, sizeof(auth),
+				 WSI_TOKEN_HTTP_AUTHORIZATION) <= 0 ||
+		    strcmp(auth, "Bearer " BFF_FEED_SECRET)) {
+			lwsl_err("%s: feed subscriber without the secret\n",
+				 __func__);
+			return 1;
+		}
+		break;
+
+	case LWS_CALLBACK_ESTABLISHED:
+		lws_callback_on_writable(wsi);
+		break;
+
+	case LWS_CALLBACK_SERVER_WRITEABLE:
+		if (feed_sent)
+			break;
+		memcpy(buf + LWS_PRE, feed_snapshot, sizeof(feed_snapshot) - 1);
+		if (lws_write(wsi, buf + LWS_PRE, sizeof(feed_snapshot) - 1,
+			      LWS_WRITE_TEXT) < (int)sizeof(feed_snapshot) - 1)
+			return -1;
+		feed_sent = 1;
+		lwsl_user("  mock auth feed snapshot sent\n");
+
+		/* give lws-login a moment to take it in, then start */
+		lws_sul_schedule(lws_get_context(wsi), 0, &sul_next,
+				 start_step, 200 * LWS_US_PER_MS);
+		break;
+
+	default:
+		break;
+	}
+
+	return 0;
 }
 
 /* ---------------------------------------------------------------- client */
@@ -588,6 +792,14 @@ callback_cli(struct lws *wsi, enum lws_callback_reasons reason,
 				(const unsigned char *)scenarios[step].cookie,
 				(int)strlen(scenarios[step].cookie), p, end))
 			return -1;
+
+		/* a client claiming to have been judged for another service */
+		if (bff_stamps_path(scenarios[step].path) &&
+		    lws_add_http_header_by_name(wsi,
+				(const unsigned char *)LWS_LOGIN_HDR_SERVICE ":",
+				(const unsigned char *)BFF_STAMPS_SPOOF,
+				(int)strlen(BFF_STAMPS_SPOOF), p, end))
+			return -1;
 		break;
 	}
 
@@ -636,11 +848,13 @@ callback_cli(struct lws *wsi, enum lws_callback_reasons reason,
 		got_sc_nfrags++;
 	}
 
-		if (scenarios[step].expect_js || scenarios[step].expect_css) {
+		if (scenarios[step].expect_js || scenarios[step].expect_css ||
+		    bff_stamps_path(scenarios[step].path)) {
 			/*
-			 * The body (the served lws-login.js / lws-login.css)
-			 * is what the fence scenarios assert on: keep the
-			 * connection and drain it via RECEIVE_CLIENT_HTTP(_READ).
+			 * The body (the served lws-login.js / lws-login.css,
+			 * or what the stamps app saw) is what these scenarios
+			 * assert on: keep the connection and drain it via
+			 * RECEIVE_CLIENT_HTTP(_READ).
 			 */
 			got_body_len = 0;
 			got_body_trunc = 0;
@@ -738,21 +952,203 @@ callback_gated_ws(struct lws *wsi, enum lws_callback_reasons reason,
 	return lws_callback_http_dummy(wsi, reason, user, in, len);
 }
 
+/*
+ * The http app behind the gated stamps mount: it does no auth of its own and
+ * answers with what lws-login stamped on the request, and with any
+ * x-lws-login-service still among the request's own headers, which there
+ * must not be.
+ */
+
+struct pss_stamps {
+	char		body[512];
+	size_t		len;
+};
+
+static int
+callback_stamps(struct lws *wsi, enum lws_callback_reasons reason,
+		void *user, void *in, size_t len)
+{
+	struct pss_stamps *ps = (struct pss_stamps *)user;
+	uint8_t buf[LWS_PRE + 512], *start = &buf[LWS_PRE], *p = start,
+		*end = &buf[sizeof(buf) - 1];
+	char state[8], sub[128], service[64], ah[64];
+
+	switch (reason) {
+	case LWS_CALLBACK_HTTP:
+		if (lws_http_get_onward_header(wsi, LWS_LOGIN_HDR_STATE, state,
+					       sizeof(state)) < 0)
+			lws_strncpy(state, "-", sizeof(state));
+		if (lws_http_get_onward_header(wsi, LWS_LOGIN_HDR_SUB, sub,
+					       sizeof(sub)) < 0)
+			lws_strncpy(sub, "-", sizeof(sub));
+		if (lws_http_get_onward_header(wsi, LWS_LOGIN_HDR_SERVICE,
+					       service, sizeof(service)) < 0)
+			lws_strncpy(service, "-", sizeof(service));
+		if (lws_hdr_custom_copy(wsi, ah, sizeof(ah),
+					LWS_LOGIN_HDR_SERVICE ":",
+					(int)strlen(LWS_LOGIN_HDR_SERVICE ":")) < 0)
+			lws_strncpy(ah, "-", sizeof(ah));
+
+		ps->len = (size_t)lws_snprintf(ps->body, sizeof(ps->body),
+				"state=%s;sub=%s;service=%s;request-copy=%s;",
+				state, sub, service, ah);
+
+		if (lws_add_http_common_headers(wsi, HTTP_STATUS_OK,
+						"text/plain", ps->len, &p, end) ||
+		    lws_finalize_write_http_header(wsi, start, &p, end))
+			return 1;
+
+		lws_callback_on_writable(wsi);
+		return 0;
+
+	case LWS_CALLBACK_HTTP_WRITEABLE:
+		if (!ps || !ps->len)
+			break;
+		memcpy(start, ps->body, ps->len);
+		if (lws_write(wsi, start, ps->len, LWS_WRITE_HTTP_FINAL) !=
+							(int)ps->len)
+			return 1;
+		ps->len = 0;
+
+		return lws_http_transaction_completed(wsi) ? -1 : 0;
+
+	default:
+		break;
+	}
+
+	return lws_callback_http_dummy(wsi, reason, user, in, len);
+}
+
+#if defined(LWS_WITH_HTTP_PROXY)
+/*
+ * The backend the proxied mount forwards to: it can only see request headers,
+ * like any remote app behind lws-login, and reports each stamp with how many
+ * copies of it arrived
+ */
+
+struct echo_count {
+	const char	*name;
+	int		count;
+};
+
+static void
+echo_count_cb(const char *name, int nlen, void *opaque)
+{
+	struct echo_count *c = (struct echo_count *)opaque;
+
+	if ((size_t)nlen == strlen(c->name) &&
+	    !strncasecmp(name, c->name, (size_t)nlen))
+		c->count++;
+}
+
+static int
+callback_echo(struct lws *wsi, enum lws_callback_reasons reason,
+	      void *user, void *in, size_t len)
+{
+	static const char * const names[] = {
+		LWS_LOGIN_HDR_STATE ":", LWS_LOGIN_HDR_SUB ":",
+		LWS_LOGIN_HDR_SERVICE ":"
+	};
+	static const char * const keys[] = { "state", "sub", "service" };
+	struct pss_stamps *ps = (struct pss_stamps *)user;
+	uint8_t buf[LWS_PRE + 512], *start = &buf[LWS_PRE], *p = start,
+		*end = &buf[sizeof(buf) - 1];
+	struct echo_count c;
+	char v[128];
+	size_t n;
+
+	switch (reason) {
+	case LWS_CALLBACK_HTTP:
+		ps->len = 0;
+		for (n = 0; n < LWS_ARRAY_SIZE(names); n++) {
+			c.name = names[n];
+			c.count = 0;
+			lws_hdr_custom_name_foreach(wsi, echo_count_cb, &c);
+			if (lws_hdr_custom_copy(wsi, v, sizeof(v), names[n],
+						(int)strlen(names[n])) < 0)
+				lws_strncpy(v, "-", sizeof(v));
+			ps->len += (size_t)lws_snprintf(ps->body + ps->len,
+					sizeof(ps->body) - ps->len,
+					"%s=%s#%d;", keys[n], v, c.count);
+		}
+
+		if (lws_add_http_common_headers(wsi, HTTP_STATUS_OK,
+						"text/plain", ps->len, &p, end) ||
+		    lws_finalize_write_http_header(wsi, start, &p, end))
+			return 1;
+
+		lws_callback_on_writable(wsi);
+		return 0;
+
+	case LWS_CALLBACK_HTTP_WRITEABLE:
+		if (!ps || !ps->len)
+			break;
+		memcpy(start, ps->body, ps->len);
+		if (lws_write(wsi, start, ps->len, LWS_WRITE_HTTP_FINAL) !=
+							(int)ps->len)
+			return 1;
+		ps->len = 0;
+
+		return lws_http_transaction_completed(wsi) ? -1 : 0;
+
+	default:
+		break;
+	}
+
+	return lws_callback_http_dummy(wsi, reason, user, in, len);
+}
+#endif
+
 /* ------------------------------------------------------------- protocols */
 
 static const struct lws_protocols
 	defprot = { "defprot", lws_callback_http_dummy, 0, 0, 0, NULL, 0 },
 	prot_auth = { "lws-api-test-lws-login-bff-authmock", callback_authmock,
 		      sizeof(struct pss_auth), 0, 0, NULL, 0 },
+	prot_feed = { "lws-auth-feed", callback_feedmock, 0, 0, 0, NULL, 0 },
 	prot_cli = { "lws-api-test-lws-login-bff-cli", callback_cli,
 		     0, 0, 0, NULL, 0 },
 	prot_priv = { BFF_WS_PRIV, callback_gated_ws, 0, 0, 0, NULL, 0 },
-	prot_waiting = { BFF_WS_WAITING, callback_gated_ws, 0, 0, 0, NULL, 0 };
+	prot_waiting = { BFF_WS_WAITING, callback_gated_ws, 0, 0, 0, NULL, 0 },
+	prot_stamps = { BFF_STAMPS_PROT, callback_stamps,
+			sizeof(struct pss_stamps), 0, 0, NULL, 0 };
+#if defined(LWS_WITH_HTTP_PROXY)
+static const struct lws_protocols
+	prot_echo = { BFF_ECHO_PROT, callback_echo,
+		      sizeof(struct pss_stamps), 0, 0, NULL, 0 };
+static const struct lws_protocols
+	*pprotocols_echo[] = { &defprot, &prot_echo, NULL };
+#endif
 
 static const struct lws_protocols
-	*pprotocols_auth[] = { &defprot, &prot_auth, NULL },
+	*pprotocols_auth[] = { &defprot, &prot_auth, &prot_feed, NULL },
 	*pprotocols_cli[]  = { &defprot, &prot_cli, NULL },
-	*pprotocols_app[]  = { &defprot, &prot_priv, &prot_waiting, NULL };
+	*pprotocols_app[]  = { &defprot, &prot_priv, &prot_waiting,
+			       &prot_stamps, NULL };
+
+#if defined(LWS_WITH_HTTP_PROXY)
+/* the echo backend's port is only known in main() */
+static char		proxied_origin[64];
+
+static struct lws_http_mount
+	mount_echo = {
+		.mountpoint		= "/",
+		.protocol		= BFF_ECHO_PROT,
+		.origin_protocol	= LWSMPRO_CALLBACK,
+		.mountpoint_len		= 1,
+	},
+	/*
+	 * A gated mount reverse-proxied to the echo backend, as sai-web is
+	 * behind the front end's lws-login
+	 */
+	mount_proxied = {
+		.mountpoint		= BFF_PROXIED_PATH,
+		.origin			= proxied_origin,
+		.origin_protocol	= LWSMPRO_HTTP,
+		.mountpoint_len		= sizeof(BFF_PROXIED_PATH) - 1,
+		.interceptor_path	= "/",
+	};
+#endif
 
 static const struct lws_http_mount
 	mount_auth = {
@@ -762,10 +1158,24 @@ static const struct lws_http_mount
 		.mountpoint_len		= 1,
 	},
 	/*
+	 * Another gated mount, served in-process by the stamps app
+	 */
+	mount_stamps = {
+#if defined(LWS_WITH_HTTP_PROXY)
+		.mount_next		= &mount_proxied,
+#endif
+		.mountpoint		= BFF_STAMPS_PATH,
+		.protocol		= BFF_STAMPS_PROT,
+		.origin_protocol	= LWSMPRO_CALLBACK,
+		.mountpoint_len		= sizeof(BFF_STAMPS_PATH) - 1,
+		.interceptor_path	= "/",
+	},
+	/*
 	 * A mount on the app vhost that lws-login gates (its interceptor_path
 	 * is the lws-login mount below): the C-774 ws upgrades target it
 	 */
 	mount_gated = {
+		.mount_next		= &mount_stamps,
 		.mountpoint		= "/gated",
 		.protocol		= "defprot",
 		.origin_protocol	= LWSMPRO_CALLBACK,
@@ -794,7 +1204,8 @@ static const struct lws_http_mount
  * known.
  */
 static struct lws_protocol_vhost_options
-	pvo_dbpath	= { NULL, NULL, "db-path", NULL },
+	/* lws-login subscribes to the mock's auth feed with this */
+	pvo_feed	= { NULL, NULL, "auth-feed-secret", BFF_FEED_SECRET },
 	/*
 	 * cookie-domain set so the Domain= variants of the rotated
 	 * auth_session / auth_csrf cookies (the longest csrf cookie string
@@ -818,7 +1229,6 @@ static struct lws_protocol_vhost_options
  * refused rather than kicked against the empty host it parses to.
  */
 static struct lws_protocol_vhost_options
-	pvo_dbpath2	= { NULL, NULL, "db-path", NULL },
 	pvo_cdom2	= { NULL, NULL, "cookie-domain", "127.0.0.1" },
 	pvo_asu2	= { NULL, NULL, "auth-server-url", "/oauth/login" },
 	pvo_jwk2	= { NULL, NULL, "jwt-jwk", jwk_json },
@@ -827,15 +1237,18 @@ static struct lws_protocol_vhost_options
 
 /* -------------------------------------------------------------- driver */
 
-static lws_sorted_usec_list_t sul_next;
 static lws_sorted_usec_list_t sul_timeout;
 
 static void
 sul_timeout_cb(lws_sorted_usec_list_t *sul)
 {
 	(void)sul;
-	lwsl_err("%s: scenario '%s' timed out\n", __func__,
-		 scenarios[step].name);
+	if (!feed_sent)
+		lwsl_err("%s: lws-login never took the mock auth feed\n",
+			 __func__);
+	else
+		lwsl_err("%s: scenario '%s' timed out\n", __func__,
+			 scenarios[step].name);
 	step_done = -1;
 	step_advance();
 }
@@ -945,6 +1358,7 @@ start_step(lws_sorted_usec_list_t *sul)
 	mock_hits = 0;
 	mock_got_refresh = 0;
 	mock_pair_ok = 0;
+	mock_xff_ok = 0;
 	got_ws_established = 0;
 	got_ws_refused = 0;
 	g_ws_bound[0] = '\0';
@@ -1053,12 +1467,13 @@ step_advance(void)
 	}
 
 	if (scenarios[step].expect_pair &&
-	    (!mock_hits || !mock_got_refresh || !mock_pair_ok)) {
+	    (!mock_hits || !mock_got_refresh || !mock_pair_ok ||
+	     !mock_xff_ok)) {
 		fail++;
 		lwsl_err("%s: FAIL scenario '%s': exchange not "
-			 "validated (hits=%d refresh=%d pair=%d)\n",
+			 "validated (hits=%d refresh=%d pair=%d xff=%d)\n",
 			 __func__, scenarios[step].name, mock_hits,
-			 mock_got_refresh, mock_pair_ok);
+			 mock_got_refresh, mock_pair_ok, mock_xff_ok);
 		result = 1;
 		sequence_done = 1;
 		lws_cancel_service(context);
@@ -1223,6 +1638,49 @@ step_advance(void)
 		}
 	}
 
+	if (!strcmp(scenarios[step].path, BFF_PROXIED_REQ)) {
+		/*
+		 * each stamp exactly once at the backend, with the values
+		 * lws-login stamped, and the client's copy of the service
+		 * header gone
+		 */
+		got_body[got_body_len] = '\0';
+		if (got_body_trunc ||
+		    !strstr(got_body, "state=2#1;") ||
+		    !strstr(got_body, "service=default-service#1;") ||
+		    strstr(got_body, "sub=-") ||
+		    strstr(got_body, BFF_STAMPS_SPOOF)) {
+			lwsl_err("%s: FAIL scenario '%s': the backend saw '%s'\n",
+				 __func__, scenarios[step].name, got_body);
+			fail++;
+			result = 1;
+			sequence_done = 1;
+			lws_cancel_service(context);
+			return;
+		}
+	}
+
+	if (!strcmp(scenarios[step].path, BFF_STAMPS_PATH)) {
+		/*
+		 * a user (2) of the mount's service, as stamped, and the
+		 * client's own copy of the service header gone
+		 */
+		got_body[got_body_len] = '\0';
+		if (got_body_trunc ||
+		    !strstr(got_body, "state=2;") ||
+		    !strstr(got_body, ";service=default-service;") ||
+		    !strstr(got_body, ";request-copy=-;") ||
+		    strstr(got_body, BFF_STAMPS_SPOOF)) {
+			lwsl_err("%s: FAIL scenario '%s': the app saw '%s'\n",
+				 __func__, scenarios[step].name, got_body);
+			fail++;
+			result = 1;
+			sequence_done = 1;
+			lws_cancel_service(context);
+			return;
+		}
+	}
+
 	lwsl_user("  scenario[%d] '%s': PASS\n", step,
 		  scenarios[step].name);
 
@@ -1247,6 +1705,37 @@ sigint_handler(int sig)
 	(void)sig;
 	result = 1;
 	lws_default_loop_exit(context);
+}
+
+/*
+ * A Cookie: header carrying a genuinely-signed, unexpired session JWT in the
+ * shape the auth server mints, optionally followed by more of the jar
+ */
+static int
+mint_session_cookie(struct lws_jwk *jwk, char *ck, size_t ck_len,
+		    unsigned int uid, unsigned int sec, const char *grants,
+		    const char *did, const char *jar)
+{
+	unsigned long long now = (unsigned long long)time(NULL);
+	char tok[1024], temp[2048];
+	size_t tok_len = sizeof(tok);
+
+	if (lws_jwt_sign_compact(context, jwk, "ES256", tok, &tok_len, temp,
+				 sizeof(temp),
+				 "{\"iss\":\"apitest\",\"sub\":\"alice\","
+				 "\"uid\":%u,\"sec\":%u,%s%s%s\"iat\":%llu,"
+				 "\"exp\":%llu,\"grants\":{%s}}",
+				 uid, sec, did ? "\"did\":\"" : "",
+				 did ? did : "", did ? "\"," : "", now,
+				 now + 3600, grants)) {
+		lwsl_err("%s: session token mint failed\n", __func__);
+		return 1;
+	}
+
+	lws_snprintf(ck, ck_len, "auth_session=%s%s%s", tok, jar ? "; " : "",
+		     jar ? jar : "");
+
+	return 0;
 }
 
 int main(int argc, const char **argv)
@@ -1275,10 +1764,7 @@ int main(int argc, const char **argv)
 		g_port_app = atoi(p);
 	g_port_auth = g_port_app + 1;
 	g_port_app2 = g_port_app + 2;
-
-	pvo_dbpath.value = lws_cmdline_option(argc, argv, "--db-path");
-	if (!pvo_dbpath.value)
-		pvo_dbpath.value = "lws-api-test-lws-login-bff.sqlite3";
+	g_port_echo = g_port_app + 3;
 
 	signal(SIGINT, sigint_handler);
 
@@ -1295,12 +1781,12 @@ int main(int argc, const char **argv)
 	}
 
 	/* options chain for lws-login:
-	 * jwk -> auth-server-url -> cookie-domain -> db-path ->
+	 * jwk -> auth-server-url -> cookie-domain -> auth-feed-secret ->
 	 * unauth-protocols */
 	pvo_jwk.next	= &pvo_asu;
 	pvo_asu.next	= &pvo_cdom;
-	pvo_cdom.next	= &pvo_dbpath;
-	pvo_dbpath.next	= &pvo_uap;
+	pvo_cdom.next	= &pvo_feed;
+	pvo_feed.next	= &pvo_uap;
 	pvo_login.options = &pvo_jwk;
 
 	/* protocol-enabling chain: lws-login (with options) then the
@@ -1309,11 +1795,10 @@ int main(int argc, const char **argv)
 
 	/* second app vhost's chain: same shape but the relative BFF-delegate
 	 * auth-server-url and no auth-api-url, exactly the misconfiguration
-	 * the relative-authapi scenario fences (db-path shared with app) */
-	pvo_dbpath2.value = pvo_dbpath.value;
+	 * the relative-authapi scenario fences.  It has no auth feed either:
+	 * it could not reach one */
 	pvo_jwk2.next	= &pvo_asu2;
 	pvo_asu2.next	= &pvo_cdom2;
-	pvo_cdom2.next	= &pvo_dbpath2;
 	pvo_login2.options = &pvo_jwk2;
 	pvo_login2.next	= &pvo_lc2;
 
@@ -1344,7 +1829,7 @@ int main(int argc, const char **argv)
 		static char pad[LWS_SSO_MAX_COOKIE];
 		/* must hold the b64 jose + payload + sig segments at once */
 		char temp[LWS_SSO_MAX_COOKIE * 2];
-		size_t padlen = 2900;
+		size_t padlen = 2780;
 		int tries = 0;
 
 		memset(&jwk, 0, sizeof(jwk));
@@ -1363,7 +1848,12 @@ int main(int argc, const char **argv)
 						 minted_jwt, &out_len, temp,
 						 sizeof(temp),
 						 "{\"iss\":\"apitest\",\"sub\":"
-						 "\"sso\",\"pad\":\"%.*s\"}",
+						 "\"sso\",\"uid\":1,\"sec\":5,"
+						 "\"iat\":%llu,\"exp\":%llu,"
+						 "\"grants\":{\"default-service\":1},"
+						 "\"pad\":\"%.*s\"}",
+						 (unsigned long long)time(NULL),
+						 (unsigned long long)time(NULL) + 3600,
 						 (int)padlen, pad)) {
 				lws_jwk_destroy(&jwk);
 				lwsl_err("%s: SSO token mint failed\n",
@@ -1387,10 +1877,46 @@ int main(int argc, const char **argv)
 			}
 			padlen += (4060 - out_len) * 3 / 4;
 		}
+
+		/*
+		 * Session tokens against the seeded records: one they back,
+		 * and one stale each way the records can stop backing one
+		 */
+		if (mint_session_cookie(&jwk, ck_live, sizeof(ck_live), 1, 5,
+					"\"default-service\":1", NULL, NULL) ||
+		    /* revoked by an epoch bump, and its grants differ too */
+		    mint_session_cookie(&jwk, ck_revoked, sizeof(ck_revoked),
+					1, 4, "\"default-service\":2", NULL,
+					NULL) ||
+		    mint_session_cookie(&jwk, ck_regranted,
+					sizeof(ck_regranted), 1, 5,
+					"\"default-service\":2", NULL,
+					BFF_REFRESH_JAR) ||
+		    mint_session_cookie(&jwk, ck_dev_gone, sizeof(ck_dev_gone),
+					1, 5, "\"default-service\":1",
+					"dev-gone", NULL) ||
+		    mint_session_cookie(&jwk, ck_user_gone,
+					sizeof(ck_user_gone), 9, 0,
+					"\"default-service\":1", NULL, NULL) ||
+		    /* backed by the records, but not for the gated mount */
+		    mint_session_cookie(&jwk, ck_nogrant, sizeof(ck_nogrant),
+					2, 5, "\"other-service\":1", NULL,
+					BFF_REFRESH_JAR_U2) ||
+		    /* what renewing it gets: the same, uid 2's records */
+		    mint_session_cookie(&jwk, ck_u2_renewed,
+					sizeof(ck_u2_renewed), 2, 5,
+					"\"other-service\":1", NULL, NULL)) {
+			lws_jwk_destroy(&jwk);
+			goto bail;
+		}
+
 		lws_jwk_destroy(&jwk);
 
 		lws_snprintf(MOCK_TOKEN_JSON, sizeof(MOCK_TOKEN_JSON),
 			     "{\"token\":\"%s\"}", minted_jwt);
+		lws_snprintf(MOCK_TOKEN_JSON_U2, sizeof(MOCK_TOKEN_JSON_U2),
+			     "{\"token\":\"%s\"}",
+			     ck_u2_renewed + sizeof("auth_session=") - 1);
 
 		lws_snprintf(sso_body, sizeof(sso_body), "token=%s&target=/",
 			     minted_jwt);
@@ -1440,6 +1966,22 @@ int main(int argc, const char **argv)
 		goto bail;
 	}
 
+#if defined(LWS_WITH_HTTP_PROXY)
+	/* the backend the app vhost's /proxied mount forwards to */
+	lws_snprintf(proxied_origin, sizeof(proxied_origin), "127.0.0.1:%d/",
+		     g_port_echo);
+	info.port		= g_port_echo;
+	info.vhost_name		= "echo";
+	info.pprotocols		= pprotocols_echo;
+	info.mounts		= &mount_echo;
+	info.pvo		= NULL;
+
+	if (!lws_create_vhost(context, &info)) {
+		lwsl_err("Failed to create echo backend vhost\n");
+		goto bail;
+	}
+#endif
+
 	/* client vhost: no listener */
 	info.port		= CONTEXT_PORT_NO_LISTEN;
 	info.vhost_name		= "cli";
@@ -1453,9 +1995,14 @@ int main(int argc, const char **argv)
 		goto bail;
 	}
 
-	/* kick off the scenario sequence */
+	/*
+	 * The scenario sequence starts once the mock auth feed has sent
+	 * lws-login its snapshot; the deadline makes a feed that never
+	 * connects a failure
+	 */
 	step = 0;
-	lws_sul_schedule(context, 0, &sul_next, start_step, 1);
+	lws_sul_schedule(context, 0, &sul_timeout, sul_timeout_cb,
+			 10 * LWS_US_PER_SEC);
 
 	while (n >= 0 && !sequence_done)
 		n = lws_service(context, 0);

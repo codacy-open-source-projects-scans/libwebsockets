@@ -52,6 +52,42 @@ lws_close_trans_q_leader(struct lws_dll2 *d, void *user)
 
 	return 0;
 }
+
+/*
+ * The client connection is going: nothing may piggyback on it any more, and
+ * what was queued on it goes too
+ */
+static void
+lws_client_conn_withdraw(struct lws *wsi)
+{
+	/* we are no longer an active client connection that can piggyback */
+	lws_dll2_remove(&wsi->dll_cli_active_conns);
+
+	lws_dll2_foreach_safe(&wsi->dll2_cli_txn_queue_owner, NULL,
+			      lws_close_trans_q_leader);
+}
+
+/*
+ * A client's close is not staged: it closes at once, nobody waits for it.
+ * Except for an h2 client connection that told the peer GOAWAY: closed with
+ * some of the peer's rx still unread, eg, a SETTINGS ACK or PING that crossed
+ * the GOAWAY, the kernel aborts the connection, and a peer told of the abort
+ * may drop what it had not read yet, the GOAWAY with it (Windows does).  Its
+ * streams have closed by now, so like a server's, its close waits for the
+ * peer's FIN.
+ */
+static int
+lws_close_client_stages(struct lws *wsi)
+{
+#if defined(LWS_ROLE_H2)
+	return lws_wsi_is_mux_nwsi(wsi) && lws_wsi_client_nwsi_migrated(wsi) &&
+	       wsi->h2.h2n->we_told_goaway;
+#else
+	(void)wsi;
+
+	return 0;
+#endif
+}
 #endif
 
 void
@@ -80,11 +116,7 @@ __lws_reset_wsi(struct lws *wsi)
 	 */
 	if (wsi->a.vhost) {
 
-		/* we are no longer an active client connection that can piggyback */
-		lws_dll2_remove(&wsi->dll_cli_active_conns);
-
-		lws_dll2_foreach_safe(&wsi->dll2_cli_txn_queue_owner, NULL,
-				      lws_close_trans_q_leader);
+		lws_client_conn_withdraw(wsi);
 
 		/*
 		 * !!! If we are closing, but we have pending pipelined
@@ -493,6 +525,47 @@ lws_async_worker_wait_and_reap(struct lws *wsi)
 /* requires cx and pt lock */
 
 /*
+ * Note why the connection is ending, if nothing has yet: the first cause is
+ * the one that matters, what follows from it, eg, the close it leads to, is
+ * not news.  cause must be a static string.
+ */
+void
+lws_wsi_close_cause_set(struct lws *wsi, const char *cause, int arg)
+{
+	if (wsi->close_cause || !cause)
+		return;
+
+	wsi->close_cause = cause;
+	wsi->close_cause_arg = arg;
+}
+
+int
+lws_close_cause_render(char *buf, size_t len, const char *cause, int arg)
+{
+	if (!len)
+		return 0;
+
+	buf[0] = '\0';
+	if (!cause)
+		return 0;
+
+	if (arg)
+		return lws_snprintf(buf, len, "%s %d", cause, arg);
+
+	return lws_snprintf(buf, len, "%s", cause);
+}
+
+int
+lws_wsi_close_cause(struct lws *wsi, char *buf, size_t len)
+{
+	if (!wsi)
+		return lws_close_cause_render(buf, len, NULL, 0);
+
+	return lws_close_cause_render(buf, len, wsi->close_cause,
+				      wsi->close_cause_arg);
+}
+
+/*
  * Returns LWS_HPI_RET_WSI_ALREADY_DIED when the wsi was freed, or
  * LWS_HPI_RET_CLOSING when it lives on in its close: flushing, a polite ws
  * close, a staged shutdown, an event library finishing it later, a restart,
@@ -536,6 +609,9 @@ __lws_close_free_wsi(struct lws *wsi, enum lws_close_status reason,
 		 */
 		return LWS_HPI_RET_CLOSING;
 
+	/* nothing lower down saw why: it's whatever decided to close it */
+	lws_wsi_close_cause_set(wsi, caller, 0);
+
 	lws_access_log(wsi);
 
 	if (!lws_dll2_is_detached(&wsi->dll_buflist))
@@ -576,6 +652,9 @@ __lws_close_free_wsi(struct lws *wsi, enum lws_close_status reason,
 					struct lws, sibling_list);
 		/* stop it doing shutdown processing */
 		lwsi_set_skt_unusable(wsi2, 1);
+		/* his stream ends for the reason its connection did */
+		lws_wsi_close_cause_set(wsi2, wsi->close_cause,
+					wsi->close_cause_arg);
 		__lws_close_free_wsi(wsi2, reason, "general child recurse");
 		if (lws_dll2_get_head(&wsi->child_list_owner) == &wsi2->sibling_list) {
 			/*
@@ -693,12 +772,17 @@ __lws_close_free_wsi(struct lws *wsi, enum lws_close_status reason,
 #endif
 		    ) &&
 		    /*
-		     * A ws stream whose frames have all been sent, over h3
-		     * only not acknowledged yet, has nothing to flush ahead of
-		     * its Close: that goes after them on the stream, and the
-		     * close is the polite one
+		     * A ws stream has nothing to flush ahead of its Close
+		     * unless lws itself still holds some of what it wrote.
+		     * Over h3, what quic has for the stream, still to send
+		     * or not acknowledged yet, is already on it ahead of
+		     * where the Close goes, eg, the upgrade's response
+		     * HEADERS when the app closes or refuses the connection
+		     * as soon as it is established.  The close is the
+		     * polite one: flushing first would end the stream with
+		     * no Close at all.
 		     */
-		    !(lwsi_role_ws(wsi) && !lws_has_unsent_buffered_out(wsi))) {
+		    !(lwsi_role_ws(wsi) && !lws_has_buflist_out(wsi))) {
 			lwsl_wsi_info(wsi, "LRS_FLUSHING_BEFORE_CLOSE");
 			lws_wsi_event(wsi, LWS_WSIEV_CLOSE_FLUSH);
 			__lws_set_timeout(wsi,
@@ -789,10 +873,16 @@ just_kill_connection:
 #if defined(LWS_ROLE_WS)
 		/*
 		 * If our goal is a ws upgrade, effectively we did not reach
-		 * ESTABLISHED if we did not get the upgrade server reply
+		 * ESTABLISHED if we did not get the upgrade server reply.  Over
+		 * h2 or h3 the stream only takes the ws role once the reply
+		 * came, so its goal is known from do_ws
 		 */
 		(lwsi_state(wsi) == LRS_WAITING_SERVER_REPLY &&
-		 wsi->role_ops == &role_ops_ws) ||
+		 (wsi->role_ops == &role_ops_ws
+#if defined(LWS_WITH_CLIENT)
+		  || (lwsi_role_client(wsi) && wsi->do_ws)
+#endif
+		 )) ||
 #endif
 	     lwsi_transport(wsi) == LTS_WAITING_DNS ||
 	     lwsi_transport(wsi) == LTS_WAITING_CONNECT ||
@@ -816,11 +906,25 @@ just_kill_connection:
 	 * for the POLLIN to show a zero-size rx before coming back and doing
 	 * the actual close.
 	 */
-	if (wsi->role_ops != &role_ops_raw_skt && !lwsi_role_client(wsi) &&
+	if (wsi->role_ops != &role_ops_raw_skt &&
+	    (!lwsi_role_client(wsi)
+#if defined(LWS_WITH_CLIENT)
+	     || lws_close_client_stages(wsi)
+#endif
+	    ) &&
 	    lwsi_close(wsi) != LCS_SHUTDOWN &&
 	    lwsi_state(wsi) != LRS_UNCONNECTED &&
 	    reason != LWS_CLOSE_STATUS_NOSTATUS_CONTEXT_DESTROY &&
 	    !lwsi_skt_unusable(wsi)) {
+
+#if defined(LWS_WITH_CLIENT)
+		/*
+		 * a client connection waiting for the peer's FIN is not one
+		 * anything can still join or queue on
+		 */
+		if (lwsi_role_client(wsi) && wsi->a.vhost)
+			lws_client_conn_withdraw(wsi);
+#endif
 
 		/*
 		 * Don't mark the socket unusable here: the LRS_SHUTDOWN
@@ -948,7 +1052,15 @@ just_kill_connection:
 		ccb = 0;
 
 #if defined(LWS_WITH_CLIENT)
-	if (!ccb && !est_at_entry && lwsi_role_client(wsi))
+	/*
+	 * An h2 client network wsi is established at the transport, but until
+	 * the server's SETTINGS migrates the user's ask on to sid 1 it is still
+	 * the user's wsi, never told it was established, and there is no child
+	 * stream to tell him anything about the close
+	 */
+	if (!ccb && lwsi_role_client(wsi) &&
+	    (!est_at_entry || (lws_wsi_is_mux_nwsi(wsi) &&
+			       !lws_wsi_client_nwsi_migrated(wsi))))
 		/* it declines to say anything on a restart */
 		lws_inform_client_conn_fail(wsi, "Closed before conn", 18);
 #endif
@@ -1181,6 +1293,9 @@ _lws_close_free_wsi_final(struct lws *wsi)
 		if (wsi->a.protocol)
 			lws_bind_protocol(wsi, wsi->a.protocol, "client_reset");
 		wsi->pending_timeout = NO_PENDING_TIMEOUT;
+		/* the new connection hasn't ended for any reason yet */
+		wsi->close_cause = NULL;
+		wsi->close_cause_arg = 0;
 
 #if defined(LWS_WITH_TLS)
 		/* guarded like the CIS_ADDRESS use further down */

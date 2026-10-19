@@ -18,6 +18,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/resource.h>
 /*
  * We test the platform DNS server watcher end to end by pointing the whole
  * discovery machinery at a scratch resolv.conf we control, and checking the
@@ -294,8 +295,10 @@ smd_dns_cb(void *opaque, lws_smd_class_t _class, lws_usec_t timestamp,
  *
  * 1) wait for the gratuitous initial publication of the server set from the
  *    scratch resolv.conf (one nameserver),
- * 2) append a second nameserver to the scratch file,
- * 3) wait for a new publication that contains it.
+ * 2) append a second nameserver to the scratch file, and an IPv6 one,
+ * 3) wait for a new publication that contains it, and in builds with IPv6,
+ *    the IPv6 one: a ':' used to end the token, so IPv6 nameservers were
+ *    dropped, and an IPv6-only build pointed only at "::1" had none at all.
  *
  * When the leg is done (or has failed), the real async dns subtests start.
  */
@@ -321,7 +324,8 @@ sul_watch_leg_cb(lws_sorted_usec_list_t *s)
 				lwsl_err("%s: can't append to " RESOLV_TEST_CONF "\n", __func__);
 				goto fail;
 			}
-			if (write(fd, "nameserver 127.0.0.2\n", 21) < 0) {
+			if (write(fd, "nameserver 127.0.0.2\n"
+				      "nameserver 2001:db8::53\n", 45) < 0) {
 				close(fd);
 				goto fail;
 			}
@@ -331,7 +335,11 @@ sul_watch_leg_cb(lws_sorted_usec_list_t *s)
 		break;
 
 	case 1: /* waiting for the change to be detected and published */
-		if (strstr(watch_last_payload, "127.0.0.2"))
+		if (strstr(watch_last_payload, "127.0.0.2")
+#if defined(LWS_WITH_IPV6)
+		    && strstr(watch_last_payload, "2001:db8::53")
+#endif
+		)
 			goto pass;
 		break;
 	}
@@ -576,6 +584,14 @@ bail:
  *    which is what proves wsi->udp->sa46 was put back to the chosen server
  *    instead of being left pointing at the foreign source.
  *
+ * A third leg uses the same fake nameserver to check the cache entry's
+ * lifetime: the A half of the pair is answered with a TTL of 0, and the AAAA
+ * half only a few ticks later.  The entry made from the A answer expires in
+ * between, while the query that owns it is still waiting to chain the AAAA
+ * answer on to it, so the entry must outlive its TTL until the query is done
+ * with it.  It used to be freed at the expiry and then written to by the AAAA
+ * answer, seen as a use-after-free under ASAN.
+ *
  * This is a unit test of our own filtering against sockets we own on
  * loopback; nothing leaves the machine.
  */
@@ -585,6 +601,7 @@ bail:
 #define SC_QUIET_TICKS		2	/* no new query = lws asked all it will */
 #define SC_FOREIGN_TICKS	10	/* > the 300ms first async-dns retry */
 #define SC_DEADLINE_TICKS	120	/* ~6s */
+#define SC_TTL0_TICKS		4	/* < the 300ms first async-dns retry */
 #define SC_MAX_QUERIES		8
 
 /* the fake nameserver's answer, and the one the foreign socket tries */
@@ -604,7 +621,13 @@ static struct sc_query sc_q[SC_MAX_QUERIES];
 static struct lws_context *sc_cx;
 static lws_sorted_usec_list_t sul_sc;
 static int sc_fd = -1, sc_foreign_fd = -1;
-static int sc_fail, sc_foreign_mode, sc_done;
+enum {
+	SC_MODE_PLAIN,
+	SC_MODE_FOREIGN,
+	SC_MODE_TTL0,
+};
+
+static int sc_fail, sc_mode, sc_done;
 static int sc_qs, sc_ticks, sc_quiet, sc_phase, sc_phase_ticks;
 static int sc_resolved, sc_bad_ads, sc_redirected;
 
@@ -659,24 +682,36 @@ sc_qtype_ofs(const uint8_t *pkt, size_t len)
 	return o + 1;
 }
 
+/* the QTYPE a captured query asks for, or 0 if it's not a whole question */
+
+static uint16_t
+sc_qtype(const struct sc_query *q)
+{
+	size_t qo = sc_qtype_ofs(q->pkt, q->len);
+
+	if (!qo)
+		return 0;
+
+	return (uint16_t)((q->pkt[qo] << 8) | q->pkt[qo + 1]);
+}
+
 /*
- * Answer one captured query from the given socket: A gets the given address,
- * anything else (ie, the AAAA half of the A/AAAA pair lws asks) gets an empty
- * NOERROR answer, which is enough for the query to be considered answered for
- * that family.
+ * Answer one captured query from the given socket: A gets the given address
+ * with the given TTL, anything else (ie, the AAAA half of the A/AAAA pair lws
+ * asks) gets an empty NOERROR answer, which is enough for the query to be
+ * considered answered for that family.
  */
 
 static void
-sc_answer(struct sc_query *q, int fd, const uint8_t *ads)
+sc_answer(struct sc_query *q, int fd, const uint8_t *ads, uint8_t ttl)
 {
 	uint8_t resp[sizeof(q->pkt) + 16];
 	size_t qo = sc_qtype_ofs(q->pkt, q->len), o;
-	uint16_t qtype;
+	uint16_t qtype = sc_qtype(q);
 
 	if (!qo)
 		return;
 
-	qtype = (uint16_t)((q->pkt[qo] << 8) | q->pkt[qo + 1]);
 	o = qo + 4; /* the question section ends after QTYPE + QCLASS */
 
 	memcpy(resp, q->pkt, o);
@@ -695,7 +730,7 @@ sc_answer(struct sc_query *q, int fd, const uint8_t *ads)
 		resp[o++] = (uint8_t)LWS_ADNS_RECORD_A;
 		resp[o++] = 0; resp[o++] = 1;	/* CLASS IN */
 		resp[o++] = 0; resp[o++] = 0;
-		resp[o++] = 0; resp[o++] = 60;	/* TTL 60s */
+		resp[o++] = 0; resp[o++] = ttl;	/* TTL, seconds */
 		resp[o++] = 0; resp[o++] = 4;	/* RDLENGTH */
 		memcpy(&resp[o], ads, 4);
 		o += 4;
@@ -706,14 +741,18 @@ sc_answer(struct sc_query *q, int fd, const uint8_t *ads)
 		lwsl_err("%s: sendto failed, errno %d\n", __func__, errno);
 }
 
+/* answer what's not been answered, only queries for qtype if it's nonzero */
+
 static void
-sc_answer_all(int fd, const uint8_t *ads, int mark)
+sc_answer_all(int fd, const uint8_t *ads, uint16_t qtype, uint8_t ttl,
+	      int mark)
 {
 	int n;
 
 	for (n = 0; n < sc_qs; n++)
-		if (!sc_q[n].answered) {
-			sc_answer(&sc_q[n], fd, ads);
+		if (!sc_q[n].answered &&
+		    (!qtype || sc_qtype(&sc_q[n]) == qtype)) {
+			sc_answer(&sc_q[n], fd, ads, ttl);
 			if (mark)
 				sc_q[n].answered = 1;
 		}
@@ -802,14 +841,23 @@ sul_sc_cb(lws_sorted_usec_list_t *s)
 		if (!sc_qs || ++sc_quiet < SC_QUIET_TICKS)
 			break;
 
-		if (!sc_foreign_mode) {
+		if (sc_mode == SC_MODE_TTL0) {
+			lwsl_user("%s: answering A with TTL 0, AAAA later\n",
+					__func__);
+			sc_answer_all(sc_fd, sc_ads_good, LWS_ADNS_RECORD_A,
+				      0, 1);
+			sc_phase = 3;
+			break;
+		}
+
+		if (sc_mode != SC_MODE_FOREIGN) {
 			sc_phase = 2;
 			break;
 		}
 
 		lwsl_user("%s: answering from the wrong source port\n",
 				__func__);
-		sc_answer_all(sc_foreign_fd, sc_ads_foreign, 0);
+		sc_answer_all(sc_foreign_fd, sc_ads_foreign, 0, 60, 0);
 		sc_phase = 1;
 		break;
 
@@ -828,11 +876,16 @@ sul_sc_cb(lws_sorted_usec_list_t *s)
 		break;
 
 	case 2: /* the nameserver we actually asked answers */
-		sc_answer_all(sc_fd, sc_ads_good, 1);
+		sc_answer_all(sc_fd, sc_ads_good, 0, 60, 1);
 		if (sc_resolved) {
 			sc_done = 1;
 			lws_default_loop_exit(sc_cx);
 		}
+		break;
+
+	case 3: /* the A answer's entry expires while the AAAA is held back */
+		if (++sc_phase_ticks >= SC_TTL0_TICKS)
+			sc_phase = 2;
 		break;
 	}
 
@@ -848,8 +901,12 @@ sul_sc_cb(lws_sorted_usec_list_t *s)
 		lws_sul_schedule(sc_cx, 0, &sul_sc, sul_sc_cb, SC_TICK_US);
 }
 
+static const char * const sc_mode_names[] = {
+	"plain", "foreign answer", "ttl 0 expiry"
+};
+
 static void
-sc_run(int foreign)
+sc_run(int mode)
 {
 	static const char *sc_servers[] = { "127.0.0.1", NULL };
 	struct lws_context_creation_info ci;
@@ -861,10 +918,9 @@ sc_run(int foreign)
 	memset(sc_q, 0, sizeof(sc_q));
 	sc_qs = sc_ticks = sc_quiet = sc_phase = sc_phase_ticks = 0;
 	sc_resolved = sc_bad_ads = sc_redirected = sc_done = 0;
-	sc_foreign_mode = foreign;
+	sc_mode = mode;
 
-	lwsl_user("*** resolver source-check leg (%s)\n",
-			foreign ? "foreign answer" : "plain");
+	lwsl_user("*** resolver source-check leg (%s)\n", sc_mode_names[mode]);
 
 	sc_fd = sc_socket(&port);
 	sc_foreign_fd = sc_socket(&foreign_port);
@@ -960,7 +1016,608 @@ bail:
 
 	if (!sc_fail)
 		lwsl_user("Resolver source-check leg (%s): PASS\n",
-				foreign ? "foreign answer" : "plain");
+				sc_mode_names[mode]);
+}
+
+/*
+ * Search list legs
+ *
+ * resolv.conf's "search" line gives the domains a name with fewer than ndots
+ * dots is tried under, and ndots decides whether that is before or after the
+ * name as given.  The fake nameserver from the source-check legs captures
+ * what the resolver asks about, so each leg checks the sequence of names
+ * asked about, and what the requester is told in the end:
+ *
+ *  - a single-label name is asked about under the search domain first, and
+ *    the answer for that is what the requester gets, as the name it asked
+ *    for
+ *
+ *  - a name with as many dots as ndots is asked about as given first, and
+ *    then under the search domain; NXDOMAIN for both is NXDOMAIN
+ *
+ *  - a name ending in a dot is absolute: only asked about as given
+ *
+ * The scratch resolv.conf the main context's discovery is pointed at holds
+ * the search list for the legs' private contexts; it is emptied again after.
+ */
+
+#define SRCH_TICK_US		(50 * LWS_US_PER_MS)
+#define SRCH_DEADLINE_TICKS	120	/* ~6s */
+#define SRCH_MAX_NAMES		4
+
+struct srch_leg {
+	const char	*name;		/* what we ask lws for */
+	const char	*asked[3];	/* what lws must ask about, in order */
+	const char	*answer;	/* the one answered with an address */
+	int		expect;		/* what the requester must be told */
+};
+
+static const struct srch_leg srch_legs[] = {
+	{ "srchtest", { "srchtest.lan", NULL, NULL }, "srchtest.lan",
+	  LADNS_RET_FOUND },
+	{ "nx.srchtest", { "nx.srchtest", "nx.srchtest.lan", NULL }, NULL,
+	  LADNS_RET_NXDOMAIN },
+	{ "srchtest.", { "srchtest", NULL, NULL }, NULL, LADNS_RET_NXDOMAIN },
+};
+
+static const struct srch_leg *srch_leg;
+static int srch_fail, srch_completed, srch_ret, srch_names, srch_bad_ads,
+	   srch_bad_name;
+static char srch_seen[SRCH_MAX_NAMES][64];
+
+/* the dotted QNAME of a captured query, or NULL if it's not a whole one */
+
+static const char *
+sc_qname(const struct sc_query *q, char *buf, size_t len)
+{
+	size_t o = 12, used = 0;
+
+	if (!sc_qtype_ofs(q->pkt, q->len))
+		return NULL;
+
+	while (q->pkt[o]) {
+		size_t l = q->pkt[o++];
+
+		if (used + l + 2 > len)
+			return NULL;
+		if (used)
+			buf[used++] = '.';
+		memcpy(buf + used, &q->pkt[o], l);
+		used += l;
+		o += l;
+	}
+	buf[used] = '\0';
+
+	return buf;
+}
+
+/* answer a captured query with an empty NXDOMAIN */
+
+static void
+sc_answer_nxdomain(struct sc_query *q, int fd)
+{
+	uint8_t resp[sizeof(q->pkt)];
+	size_t qo = sc_qtype_ofs(q->pkt, q->len), o;
+
+	if (!qo)
+		return;
+
+	o = qo + 4;
+	memcpy(resp, q->pkt, o);
+
+	resp[2] = 0x81;			/* QR + RD */
+	resp[3] = 0x83;			/* RA, rcode NXDOMAIN */
+	resp[6] = 0; resp[7] = 0;	/* ANCOUNT */
+	resp[8] = 0; resp[9] = 0;	/* NSCOUNT */
+	resp[10] = 0; resp[11] = 0;	/* ARCOUNT */
+
+	if (sendto(fd, (const char *)resp, o, 0, (struct sockaddr *)&q->peer,
+		   q->peer_len) < 0)
+		lwsl_err("%s: sendto failed, errno %d\n", __func__, errno);
+}
+
+static struct lws *
+srch_cb(struct lws *wsi_unused, const char *ads, const struct addrinfo *a,
+	int n, void *opaque)
+{
+	const struct addrinfo *ac = a;
+
+	(void)wsi_unused;
+	(void)opaque;
+
+	srch_ret = n;
+	srch_completed = 1;
+
+	/* the requester is told about the name it asked for */
+	if (!ads || strcmp(ads, srch_leg->name))
+		srch_bad_name = 1;
+
+	if (n == LADNS_RET_FOUND) {
+		srch_bad_ads = 1;
+		while (ac) {
+			if (ac->ai_family == AF_INET &&
+			    !memcmp(&((struct sockaddr_in *)ac->ai_addr)->sin_addr,
+				    sc_ads_good, sizeof(sc_ads_good)))
+				srch_bad_ads = 0;
+			ac = ac->ai_next;
+		}
+	}
+
+	if (a)
+		lws_async_dns_freeaddrinfo(&a);
+
+	return NULL;
+}
+
+static void
+sul_srch_cb(lws_sorted_usec_list_t *s)
+{
+	int n;
+
+	(void)s;
+
+	sc_harvest();
+
+	/* answer whatever came, as the leg says, noting each new name */
+
+	for (n = 0; n < sc_qs; n++) {
+		char qn[64];
+
+		if (sc_q[n].answered || !sc_qname(&sc_q[n], qn, sizeof(qn)))
+			continue;
+
+		if (!srch_names || strcmp(srch_seen[srch_names - 1], qn)) {
+			if (srch_names < SRCH_MAX_NAMES)
+				lws_strncpy(srch_seen[srch_names], qn,
+					    sizeof(srch_seen[0]));
+			srch_names++;
+		}
+
+		if (srch_leg->answer && !strcmp(qn, srch_leg->answer))
+			sc_answer(&sc_q[n], sc_fd, sc_ads_good, 60);
+		else
+			sc_answer_nxdomain(&sc_q[n], sc_fd);
+		sc_q[n].answered = 1;
+	}
+
+	/* once told, nothing more may be asked: wait a little to be sure */
+	if (srch_completed && ++sc_quiet >= SC_QUIET_TICKS) {
+		sc_done = 1;
+		lws_default_loop_exit(sc_cx);
+	}
+
+	if (++sc_ticks >= SRCH_DEADLINE_TICKS) {
+		lwsl_err("%s: timed out (%d queries seen)\n", __func__, sc_qs);
+		srch_fail++;
+		sc_done = 1;
+		lws_default_loop_exit(sc_cx);
+	}
+
+	if (!sc_done)
+		lws_sul_schedule(sc_cx, 0, &sul_sc, sul_srch_cb, SRCH_TICK_US);
+}
+
+static void
+srch_run(const struct srch_leg *leg)
+{
+	static const char *srch_servers[] = { "127.0.0.1", NULL };
+	struct lws_context_creation_info ci;
+	char saved[16], portstr[16];
+	uint16_t port = 0;
+	const char *env;
+	int had_saved, n, fd;
+
+	memset(sc_q, 0, sizeof(sc_q));
+	memset(srch_seen, 0, sizeof(srch_seen));
+	sc_qs = sc_ticks = sc_quiet = sc_done = 0;
+	srch_completed = srch_names = srch_bad_ads = srch_bad_name = 0;
+	srch_ret = LADNS_RET_CONTINUING;
+	srch_leg = leg;
+
+	lwsl_user("*** search list leg (%s)\n", leg->name);
+
+	fd = open(RESOLV_TEST_CONF, O_WRONLY | O_TRUNC, 0600);
+	if (fd < 0 || write(fd, "search lan\noptions ndots:1\n", 27) < 0) {
+		lwsl_err("%s: can't write " RESOLV_TEST_CONF "\n", __func__);
+		if (fd >= 0)
+			close(fd);
+		srch_fail++;
+		return;
+	}
+	close(fd);
+
+	sc_fd = sc_socket(&port);
+	if (sc_fd < 0) {
+		lwsl_err("%s: can't make the loopback socket\n", __func__);
+		srch_fail++;
+		goto bail;
+	}
+
+	env = getenv("LWS_ASYNCDNS_PORT");
+	had_saved = !!env;
+	if (env)
+		lws_strncpy(saved, env, sizeof(saved));
+	lws_snprintf(portstr, sizeof(portstr), "%u", port);
+	setenv("LWS_ASYNCDNS_PORT", portstr, 1);
+
+	lws_context_info_defaults(&ci, NULL);
+	ci.port			= CONTEXT_PORT_NO_LISTEN;
+	ci.options		= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+	ci.async_dns_servers	= srch_servers;
+
+	sc_cx = lws_create_context(&ci);
+	if (!sc_cx) {
+		lwsl_err("%s: context create failed\n", __func__);
+		srch_fail++;
+		goto restore;
+	}
+
+	if (lws_async_dns_query(sc_cx, 0, leg->name,
+				(adns_query_type_t)(LWS_ADNS_RECORD_A |
+						LWS_ADNS_NOCACHE |
+						LWS_ADNS_IGNORE_HOSTS_FILE |
+						LWS_ADNS_INDICATE_LACKS_DNSSEC),
+				srch_cb, NULL, NULL, NULL) !=
+						LADNS_RET_CONTINUING) {
+		lwsl_err("%s: query did not start\n", __func__);
+		srch_fail++;
+		goto destroy;
+	}
+
+	lws_sul_schedule(sc_cx, 0, &sul_sc, sul_srch_cb, SRCH_TICK_US);
+
+	while (lws_service(sc_cx, 0) >= 0)
+		;
+
+destroy:
+	lws_sul_cancel(&sul_sc);
+	lws_context_destroy(sc_cx);
+	sc_cx = NULL;
+
+restore:
+	if (had_saved)
+		setenv("LWS_ASYNCDNS_PORT", saved, 1);
+	else
+		unsetenv("LWS_ASYNCDNS_PORT");
+
+bail:
+	if (sc_fd >= 0)
+		close(sc_fd);
+	sc_fd = -1;
+
+	fd = open(RESOLV_TEST_CONF, O_WRONLY | O_TRUNC, 0600);
+	if (fd >= 0)
+		close(fd);
+
+	if (!srch_completed) {
+		lwsl_err("%s: query never completed\n", __func__);
+		srch_fail++;
+		return;
+	}
+
+	if (srch_ret != leg->expect) {
+		lwsl_err("%s: requester told %d, expected %d\n", __func__,
+			 srch_ret, leg->expect);
+		srch_fail++;
+	}
+
+	if (srch_bad_name) {
+		lwsl_err("%s: requester told about the wrong name\n",
+			 __func__);
+		srch_fail++;
+	}
+
+	if (srch_bad_ads) {
+		lwsl_err("%s: completed without the nameserver's address\n",
+			 __func__);
+		srch_fail++;
+	}
+
+	for (n = 0; n < (int)LWS_ARRAY_SIZE(leg->asked); n++) {
+		const char *seen = n < srch_names && n < SRCH_MAX_NAMES ?
+							srch_seen[n] : NULL;
+
+		if ((!leg->asked[n] && !seen) ||
+		    (leg->asked[n] && seen && !strcmp(leg->asked[n], seen)))
+			continue;
+
+		lwsl_err("%s: asked about '%s' at step %d, expected '%s'\n",
+			 __func__, seen ? seen : "(nothing)", n,
+			 leg->asked[n] ? leg->asked[n] : "(nothing)");
+		srch_fail++;
+		break;
+	}
+
+	if (!srch_fail)
+		lwsl_user("Search list leg (%s): PASS\n", leg->name);
+}
+
+/*
+ * Send-failure leg
+ *
+ * A send that fails on the resolver's UDP socket leaves it unusable: eg, the
+ * socket took the icmp error for an earlier datagram the nameserver refused.
+ * If a query sent on it earlier in the same pass had asked for a writeable
+ * to send its AAAA half, the socket also kept POLLOUT armed, and the
+ * level-triggered poll reported it on every pass from then on, since nothing
+ * dropped POLLOUT on a socket that can no longer write.  The resolver also
+ * kept the dead socket, so its later queries could not be sent at all.
+ *
+ * Two queries go out together to a loopback port nothing is listening on.
+ * On Linux the first send's icmp port unreachable is back before the second
+ * send, which fails with it.  The failed query must fail promptly, then our
+ * fake nameserver comes up on that port, and the other query must be
+ * answered through the resolver's new socket.  Elsewhere the second send
+ * may not fail, and both queries are answered once the nameserver is up.
+ * Either way, the leg must not burn the cpu.  That is measured as cpu time
+ * rather than by counting service passes: the poll loop also returns many
+ * times, polling with no wait, through the last fraction of a millisecond
+ * before each timer is due.
+ */
+
+#define SF_TICK_US		(20 * LWS_US_PER_MS)
+#define SF_UP_US		(200 * LWS_US_PER_MS) /* if no send failed */
+#define SF_PROMPT_US		(100 * LWS_US_PER_MS)
+#define SF_DEADLINE_US		(5 * LWS_US_PER_SEC)
+#define SF_MAX_CPU_US		(100 * LWS_US_PER_MS) /* a spin uses ~all */
+
+static const char * const sf_names[] = { "sf1.invalid", "sf2.invalid" };
+static const uint8_t sf_ads[] = { 127, 0, 0, 9 };
+
+static struct sc_query sf_q;
+static struct lws_context *sf_cx;
+static lws_sorted_usec_list_t sul_sf, sul_sf_deadline;
+static lws_usec_t sf_issued;
+static uint16_t sf_port;
+static int sf_fd = -1, sf_fail, sf_failed, sf_resolved, sf_completed;
+
+static void
+sf_finish(int failed)
+{
+	sf_fail += failed;
+	lws_sul_cancel(&sul_sf);
+	lws_sul_cancel(&sul_sf_deadline);
+	lws_default_loop_exit(sf_cx);
+}
+
+/* the fake nameserver comes up on the port the queries were refused at */
+
+static void
+sf_nameserver_up(void)
+{
+	struct sockaddr_in sin;
+
+	if (sf_fd >= 0)
+		return;
+
+	sf_fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sf_fd < 0)
+		goto bail;
+
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family		= AF_INET;
+	sin.sin_addr.s_addr	= htonl(INADDR_LOOPBACK);
+	sin.sin_port		= htons(sf_port);
+
+	if (!bind(sf_fd, (struct sockaddr *)&sin, sizeof(sin)) &&
+	    fcntl(sf_fd, F_SETFL, O_NONBLOCK) >= 0)
+		return;
+
+	close(sf_fd);
+	sf_fd = -1;
+
+bail:
+	lwsl_err("%s: can't bring the nameserver up on %u\n", __func__,
+		 sf_port);
+	sf_finish(1);
+}
+
+static struct lws *
+sf_cb(struct lws *wsi_unused, const char *ads, const struct addrinfo *a, int n,
+      void *opaque)
+{
+	lws_usec_t took = lws_now_usecs() - sf_issued;
+	const struct addrinfo *ac = a;
+
+	(void)wsi_unused;
+	(void)n;
+	(void)opaque;
+
+	sf_completed++;
+
+	if (!a) {
+		lwsl_user("%s: %s failed after %dms\n", __func__, ads,
+			  (int)(took / LWS_US_PER_MS));
+		sf_failed++;
+		if (took > SF_PROMPT_US) {
+			lwsl_err("%s: %s was slow to fail\n", __func__, ads);
+			sf_fail++;
+		}
+
+		/* its send failed: what is left can be answered now */
+		sf_nameserver_up();
+	} else {
+		while (ac) {
+			if (ac->ai_family == AF_INET &&
+			    !memcmp(&((struct sockaddr_in *)ac->ai_addr)->sin_addr,
+				    sf_ads, sizeof(sf_ads)))
+				sf_resolved++;
+			ac = ac->ai_next;
+		}
+		lws_async_dns_freeaddrinfo(&a);
+	}
+
+	if (sf_completed == (int)LWS_ARRAY_SIZE(sf_names))
+		sf_finish(0);
+
+	return NULL;
+}
+
+/* the fake nameserver answers each datagram that arrives */
+
+static void
+sul_sf_cb(lws_sorted_usec_list_t *s)
+{
+	(void)s;
+
+	if (lws_now_usecs() - sf_issued >= SF_UP_US)
+		sf_nameserver_up();
+
+	while (sf_fd >= 0) {
+		ssize_t r;
+
+		sf_q.peer_len = sizeof(sf_q.peer);
+		r = recvfrom(sf_fd, (char *)sf_q.pkt, sizeof(sf_q.pkt), 0,
+			     (struct sockaddr *)&sf_q.peer, &sf_q.peer_len);
+		if (r < 12)
+			break;
+
+		sf_q.len = (size_t)r;
+		sc_answer(&sf_q, sf_fd, sf_ads, 60);
+	}
+
+	lws_sul_schedule(sf_cx, 0, &sul_sf, sul_sf_cb, SF_TICK_US);
+}
+
+static void
+sul_sf_deadline_cb(lws_sorted_usec_list_t *s)
+{
+	(void)s;
+
+	lwsl_err("%s: timed out, %d of %d queries completed\n", __func__,
+		 sf_completed, (int)LWS_ARRAY_SIZE(sf_names));
+	sf_finish(1);
+}
+
+static lws_usec_t
+sf_cpu_us(void)
+{
+	struct rusage ru;
+
+	if (getrusage(RUSAGE_SELF, &ru))
+		return 0;
+
+	return ((lws_usec_t)ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) *
+						LWS_US_PER_SEC +
+	       ru.ru_utime.tv_usec + ru.ru_stime.tv_usec;
+}
+
+static void
+sf_run(void)
+{
+	static const char *sf_servers[] = { "127.0.0.1", NULL };
+	struct lws_context_creation_info ci;
+	char saved[16], portstr[16];
+	lws_usec_t cpu = 0;
+	int had_saved;
+	const char *env;
+	size_t n;
+
+	lwsl_user("*** resolver send-failure leg\n");
+
+	sf_fail = sf_failed = sf_resolved = sf_completed = 0;
+
+	/* a loopback port that refuses, until the nameserver comes up on it */
+
+	sf_fd = sc_socket(&sf_port);
+	if (sf_fd < 0) {
+		lwsl_err("%s: can't make the loopback socket\n", __func__);
+		sf_fail++;
+		return;
+	}
+	close(sf_fd);
+	sf_fd = -1;
+
+	env = getenv("LWS_ASYNCDNS_PORT");
+	had_saved = !!env;
+	if (env)
+		lws_strncpy(saved, env, sizeof(saved));
+	lws_snprintf(portstr, sizeof(portstr), "%u", sf_port);
+	setenv("LWS_ASYNCDNS_PORT", portstr, 1);
+
+	lws_context_info_defaults(&ci, NULL);
+	ci.port			= CONTEXT_PORT_NO_LISTEN;
+	ci.options		= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+	ci.async_dns_servers	= sf_servers;
+
+	sf_cx = lws_create_context(&ci);
+	if (!sf_cx) {
+		lwsl_err("%s: context create failed\n", __func__);
+		sf_fail++;
+		goto restore;
+	}
+
+	/* only the pinned nameserver, ie, only our own fake one */
+
+	{
+		lws_sockaddr46 sa46;
+		int index = 0;
+
+		while (!lws_plat_asyncdns_get_server(sf_cx, index++, &sa46))
+			lws_async_dns_server_remove(sf_cx, &sa46);
+	}
+
+	/* both queries are sent on the same writeable */
+
+	sf_issued = lws_now_usecs();
+	for (n = 0; n < LWS_ARRAY_SIZE(sf_names); n++)
+		if (lws_async_dns_query(sf_cx, 0, sf_names[n],
+				(adns_query_type_t)(LWS_ADNS_RECORD_A |
+						LWS_ADNS_NOCACHE |
+						LWS_ADNS_IGNORE_HOSTS_FILE |
+						LWS_ADNS_INDICATE_LACKS_DNSSEC),
+				sf_cb, NULL, NULL, NULL) !=
+						LADNS_RET_CONTINUING) {
+			lwsl_err("%s: %s did not start\n", __func__,
+				 sf_names[n]);
+			sf_fail++;
+			goto destroy;
+		}
+
+	lws_sul_schedule(sf_cx, 0, &sul_sf, sul_sf_cb, SF_TICK_US);
+	lws_sul_schedule(sf_cx, 0, &sul_sf_deadline, sul_sf_deadline_cb,
+			 SF_DEADLINE_US);
+
+	cpu = sf_cpu_us();
+	while (lws_service(sf_cx, 0) >= 0)
+		;
+	cpu = sf_cpu_us() - cpu;
+
+	if (cpu > SF_MAX_CPU_US) {
+		lwsl_err("%s: used %dms of cpu, spinning\n", __func__,
+			 (int)(cpu / LWS_US_PER_MS));
+		sf_fail++;
+	}
+
+destroy:
+	lws_sul_cancel(&sul_sf);
+	lws_sul_cancel(&sul_sf_deadline);
+	lws_context_destroy(sf_cx);
+	sf_cx = NULL;
+
+restore:
+	if (had_saved)
+		setenv("LWS_ASYNCDNS_PORT", saved, 1);
+	else
+		unsetenv("LWS_ASYNCDNS_PORT");
+
+	if (sf_fd >= 0)
+		close(sf_fd);
+	sf_fd = -1;
+
+	if (sf_fail)
+		return;
+
+	if (sf_failed + sf_resolved != (int)LWS_ARRAY_SIZE(sf_names) ||
+	    !sf_resolved) {
+		lwsl_err("%s: %d failed and %d resolved\n", __func__,
+			 sf_failed, sf_resolved);
+		sf_fail++;
+		return;
+	}
+
+	lwsl_user("Resolver send-failure leg: PASS (%d send failed, %dms cpu)\n",
+		  sf_failed, (int)(cpu / LWS_US_PER_MS));
 }
 #endif
 
@@ -980,11 +1637,13 @@ bail:
  * what proves the suppression legs are really testing suppression rather
  * than the resolver just not asking for the other family.
  *
- * Only meaningful when both families are in the build.
+ * Only meaningful when both families are in the build.  The -4 / -6 parse
+ * check below is not, so it counts its failure here too.
  */
-#if defined(LWS_WITH_IPV4) && defined(LWS_WITH_IPV6)
 
 static int ff_fail;
+
+#if defined(LWS_WITH_IPV4) && defined(LWS_WITH_IPV6)
 
 #define FF_TICK_US		(50 * LWS_US_PER_MS)
 #define FF_QUIET_TICKS		3	/* no new query = lws asked all it will */
@@ -1542,8 +2201,34 @@ main(int argc, const char **argv)
 		 * Own context, own fake nameserver on loopback.
 		 */
 
-		sc_run(0);
-		sc_run(1);
+		sc_run(SC_MODE_PLAIN);
+		sc_run(SC_MODE_FOREIGN);
+
+		/*
+		 * A cache entry whose TTL runs out while its query still
+		 * holds it lives until the query is done with it
+		 */
+
+		sc_run(SC_MODE_TTL0);
+
+		/*
+		 * A failed send on the resolver's socket drops it for a new
+		 * one, instead of leaving it to spin the loop
+		 */
+
+		sf_run();
+
+		/*
+		 * A name with fewer dots than ndots is tried under the
+		 * resolv.conf search list, in libc's order
+		 */
+
+		{
+			int m;
+
+			for (m = 0; m < (int)LWS_ARRAY_SIZE(srch_legs); m++)
+				srch_run(&srch_legs[m]);
+		}
 
 		/*
 		 * Client connects with one family disabled (what -4 / -6
@@ -1749,8 +2434,11 @@ evloop:
 		  watch_fail ? "FAIL" : "PASS", watch_msgs);
 	lwsl_user("Resolver source-check legs: %s\n", sc_fail ? "FAIL" : "PASS");
 	lwsl_user("Forced-family: %s\n", ff_fail ? "FAIL" : "PASS");
+	lwsl_user("Resolver send-failure leg: %s\n", sf_fail ? "FAIL" : "PASS");
+	lwsl_user("Search list legs: %s\n", srch_fail ? "FAIL" : "PASS");
 
-	return !(ok == _exp && !fail && !watch_fail && !sc_fail && !ff_fail);
+	return !(ok == _exp && !fail && !watch_fail && !sc_fail && !ff_fail &&
+		 !sf_fail && !srch_fail);
 #else
 
 	return !(ok == _exp && !fail && !watch_fail);

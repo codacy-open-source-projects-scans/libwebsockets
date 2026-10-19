@@ -724,6 +724,15 @@ spill:
 				lwsl_parser("seen client close ack\n");
 				goto ret_asking_close;
 			}
+
+			/* he started the close: that's why it's ending */
+			if (wsi->ws->rx_ubuf_head >= 2)
+				lws_wsi_close_cause_set(wsi,
+					"peer sent ws close, status",
+					(pp[0] << 8) | pp[1]);
+			else
+				lws_wsi_close_cause_set(wsi,
+					"peer sent ws close", 0);
 			if (wsi->ws->rx_ubuf_head >= 2) {
 				close_code = (unsigned short)((pp[0] << 8) | pp[1]);
 				if (close_code < 1000 ||
@@ -1260,6 +1269,9 @@ lws_close_reason(struct lws *wsi, enum lws_close_status status,
 	assert(lwsi_role_ws(wsi));
 
 	start = p = &wsi->ws->ping_payload_buf[LWS_PRE];
+
+	/* lws or the app is closing it, eg, the peer broke the protocol */
+	lws_wsi_close_cause_set(wsi, "closing with ws status", (int)status);
 
 	*p++ = (uint8_t)((((int)status) >> 8) & 0xff);
 	*p++ = (uint8_t)(((int)status) & 0xff);
@@ -2246,6 +2258,18 @@ send_raw:
 static int
 rops_close_kill_connection_ws(struct lws *wsi, enum lws_close_status reason)
 {
+#if defined(LWS_ROLE_H3)
+	/*
+	 * ws over h3 (RFC 9220): the h3 role ends the stream, a RESET_STREAM
+	 * if our side never sent its FIN, a STOP_SENDING if the peer's never
+	 * came, and frees the stream's quic state
+	 */
+	if (wsi->mux_substream && wsi->h23_stream_carries_ws && wsi->quic.qs)
+		return lws_rops_func_fidx(&role_ops_h3,
+				   LWS_ROPS_close_kill_connection).
+				close_kill_connection(wsi, reason);
+#endif
+
 	/* deal with ws encapsulation in h2 */
 #if defined(LWS_WITH_HTTP2)
 	if (wsi->mux_substream && wsi->h23_stream_carries_ws)

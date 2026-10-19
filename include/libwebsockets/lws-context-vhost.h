@@ -322,6 +322,15 @@
 	 * disabled family are filtered out and no listeners are created for
 	 * it */
 
+#define LWS_SERVER_OPTION_NO_HTTP_STREAM_COMPRESSION		 (1ll << 55)
+	/**< (VH) This vhost never compresses its http responses on the fly
+	 * (LWS_WITH_HTTP_STREAM_COMPRESSION), whatever the client's
+	 * Accept-Encoding, eg, where responses mix secrets with what the
+	 * client controls and compression would leak them (BREACH).  Its
+	 * responses do not depend on Accept-Encoding then, so they carry no
+	 * "vary: accept-encoding" for it either.  Files served already
+	 * gzipped from a zip are not affected */
+
         /****** add new things just above ---^ ******/
 
 
@@ -1306,12 +1315,42 @@ struct lws_context_creation_info {
 	/**< VHOST: a tls server vhost whose cert and key are files
 	 * (.ssl_cert_filepath, .ssl_private_key_filepath) notices them being
 	 * renewed on disk, eg, by a symlink moving onto new files, and
-	 * switches to the new ones without disturbing its connections.  This
-	 * is how long after the new cert was issued or written, whichever is
-	 * later, it waits before doing so: 0 switches as soon as it is seen.
-	 * A cert published in DNS for DANE should wait for the new record to
-	 * have replaced cached copies of the old one.  Renewals told to
-	 * lws_tls_cert_updated() are applied at once. */
+	 * switches to the new ones without disturbing its connections.  The
+	 * new pair is loaded as soon as it is seen: this is how long after the
+	 * new cert was issued or written, whichever is later, the vhost waits
+	 * before serving it.  0 serves it at once.  A cert published in DNS
+	 * for DANE should wait for the new record to have replaced cached
+	 * copies of the old one.  Renewals handed to lws_tls_cert_updated()
+	 * wait the same way.  A restart serves the newest pair at once. */
+
+	const char			*tls_passthrough;
+	/**< VHOST: NULL, or "host:port" ("[v6addr]:port" for an IPv6
+	 * literal) of a server this vhost's TLS connections are passed to as
+	 * they are, without being decrypted, so the server terminates the TLS
+	 * itself.  The vhost is chosen as usual by the SNI name in the
+	 * ClientHello, from the vhost names on the listener, and needs no
+	 * certificate, mounts or protocols of its own.  The connection's first
+	 * bytes are only looked at, not consumed, so a connection that is not
+	 * for such a vhost goes on to the listener's own TLS as if nothing
+	 * had happened.  Needs LWS_WITH_TLS_PASSTHROUGH. */
+
+	uint8_t				tls_passthrough_proxy_v2;
+	/**< VHOST: with .tls_passthrough, nonzero to tell the server who the
+	 * client is in a PROXY v2 header (see lws-proxy-v2.h) before its
+	 * bytes, along with the SNI name it asked for.  The server must then
+	 * expect one from us, eg, with .proxy_v2_trusted. */
+
+	const char			*proxy_v2_trusted;
+	/**< VHOST: NULL, or a comma-separated list of numeric addresses or
+	 * CIDR netblocks of proxies, eg, a tls passthrough, that send a PROXY
+	 * v2 header ahead of the connections they forward to this vhost's
+	 * listener.  A connection from one of them must start with exactly
+	 * one valid header, or it is dropped, and the client it names is then
+	 * the connection's peer address as lws reports it, eg, from
+	 * lws_get_peer_simple().  A connection from anywhere else is never
+	 * looked at for one, so nobody else can claim to be somebody they are
+	 * not.  The list applies to every vhost sharing the listener.  Needs
+	 * LWS_WITH_TLS_PASSTHROUGH. */
 
 #if !defined(__STRICT_ANSI__)
 	void *_unused[1]; /**< dummy */

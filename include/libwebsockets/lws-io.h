@@ -39,6 +39,7 @@
  * lws-adopt.h today; it moves when the type does
  */
 #include <libwebsockets/lws-network-helper.h>
+#include <libwebsockets/lws-proxy-v2.h>
 #endif
 
 #include <libwebsockets/lws-ota.h>
@@ -81,6 +82,7 @@
 #include <libwebsockets/lws-stub.h>
 
 #include <libwebsockets/lws-async-dns.h>
+#include <libwebsockets/lws-sysinfo.h>
 #if defined(LWS_WITH_AUTHORITATIVE_DNS)
 #include <libwebsockets/lws-auth-dns.h>
 #endif

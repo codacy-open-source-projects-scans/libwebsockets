@@ -311,6 +311,14 @@ struct lws_h2_netconn {
 	uint32_t inside;
 	uint32_t highest_sid;
 	uint32_t highest_sid_opened;
+	/*
+	 * The peer's streams we finished with last, whose HEADERS (trailers
+	 * on their way when we did) are dropped, not a new stream's going
+	 * down: see lws_h2_sid_recently_closed()
+	 */
+#define LWS_H2_RECENT_CLOSED 8
+	uint32_t recent_closed_sid[LWS_H2_RECENT_CLOSED];
+	uint8_t recent_closed_next;
 	uint32_t cont_exp_sid;
 	uint8_t cont_count;
 	uint32_t dep;
@@ -374,6 +382,8 @@ struct _lws_h2_related {
 	 * the request is answered with 431 instead of being acted on
 	 */
 	uint8_t			hdrs_oversized:1;
+	/* we said a write came after the stream ended, don't repeat it */
+	uint8_t			told_write_after_end:1;
 	/*
 	 * Transmit-side duplicate-pseudoheader detection.  Reset to 0 at the
 	 * start of each HEADERS block build; each pseudo-header add sets its
@@ -446,6 +456,14 @@ int LWS_WARN_UNUSED_RESULT
 lws_h2_goaway(struct lws *wsi, uint32_t err, const char *reason);
 int
 lws_h2_hpack_sink_start(struct lws *wsi);
+
+/* whether sid is one of the peer's streams we finished with last */
+int
+lws_h2_sid_recently_closed(struct lws_h2_netconn *h2n, uint32_t sid);
+
+/* the peer's stream sid is done with */
+void
+lws_h2_sid_closed(struct lws_h2_netconn *h2n, uint32_t sid);
 void
 lws_h2_hpack_sink_destroy(struct lws *wsi);
 int

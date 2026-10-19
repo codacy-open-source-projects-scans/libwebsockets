@@ -1613,11 +1613,16 @@ handle_req_update_zone(struct vhd *vhd, struct pss *root_pss, struct monitor_req
 	fd = open(d_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
 	if (fd >= 0) {
 		if (write(fd, zbuf, zlen) == (ssize_t)zlen) {
-			char signed_path[1024];
-			lws_snprintf(signed_path, sizeof(signed_path), "%s/domains/%s/%s.zone.signed", vhd->base_dir, a->domain, a->domain);
-			lwsl_user("%s: Unlinking signed zone %s to trigger immediate resign\n", __func__, signed_path);
+			/*
+			 * Not unlinked: the signing bumps the serial on from
+			 * the signed zone's, since the editor may have sent
+			 * the serial it loaded, which signings since have
+			 * passed
+			 */
+			lwsl_user("%s: zone of %s saved, resigning\n", __func__,
+				  a->domain);
 			fsync(fd);
-			unlink(signed_path);
+			monitor_zone_needs_resign(vhd, a->domain);
 
 			/* Immediately trigger the fast timer to sign, and the parent timer to publish */
 			lws_sul_schedule(vhd->context, 0, &vhd->sul_fast_timer, dnssec_monitor_fast_timer_cb, 1);
@@ -1952,6 +1957,75 @@ static void
 handle_req_save_auth_key(struct vhd *vhd, struct pss *root_pss, struct monitor_req_args *a)
 {
 	handle_req_save_acme_file(vhd, root_pss, a, "", 0600);
+}
+
+/*
+ * The ACME client can't read back the account key it had us store, so it
+ * asks for it at each acquisition: without it, it would make a new key, and
+ * so a new account at the CA, every time.  Only the ACME client may ask (see
+ * monitor-ipc-auth.c), and only for a "<name>-auth.jwk" in the domain's
+ * directory.  The answer is the key's private JWK as base64url, or "none"
+ * when there isn't one, so it knows to make one.
+ */
+static void
+handle_req_get_auth_key(struct vhd *vhd, struct pss *root_pss, struct monitor_req_args *a)
+{
+	char *tx = (char *)&root_pss->tx[LWS_PRE + root_pss->tx_len];
+	char *tx_end = (char *)root_pss->tx + sizeof(root_pss->tx);
+	size_t sl = strlen(a->subdomain);
+	char path[1024], *exp = NULL, *b64 = NULL;
+	int el = 8192, n, bl = 0;
+	struct lws_jwk jwk;
+	struct stat st;
+
+	memset(&jwk, 0, sizeof(jwk));
+
+	/* the request handling already refused traversal and non-DNS names */
+	if (sl <= 9 || strcmp(a->subdomain + sl - 9, "-auth.jwk")) {
+		tx += lws_snprintf(tx, lws_ptr_diff_size_t(tx_end, tx), "{\"req\":\"%s\",\"status\":\"error\",\"msg\":\"Not an account key\"}\n", a->req);
+		goto done;
+	}
+
+	lws_snprintf(path, sizeof(path), "%s/domains/%s/%s", vhd->base_dir, a->domain, a->subdomain);
+
+	if (lstat(path, &st) && errno == ENOENT) {
+		tx += lws_snprintf(tx, lws_ptr_diff_size_t(tx_end, tx), "{\"req\":\"%s\",\"status\":\"error\",\"none\":true,\"msg\":\"No account key\"}\n", a->req);
+		goto done;
+	}
+
+	/* we only ever store it as a plain file, see handle_req_save_acme_file() */
+	if (!S_ISREG(st.st_mode) || lws_jwk_load(&jwk, path, NULL, NULL)) {
+		lwsl_notice("%s: unable to load %s\n", __func__, path);
+		tx += lws_snprintf(tx, lws_ptr_diff_size_t(tx_end, tx), "{\"req\":\"%s\",\"status\":\"error\",\"msg\":\"Unable to load account key\"}\n", a->req);
+		goto done;
+	}
+
+	exp = malloc((size_t)el);
+	b64 = malloc((size_t)el * 2);
+	if (exp && b64) {
+		n = lws_jwk_export(&jwk, LWSJWKF_EXPORT_PRIVATE | LWSJWKF_EXPORT_NOCRLF, exp, &el);
+		if (n > 0)
+			bl = lws_b64_encode_string_url(exp, n, b64, 8192 * 2);
+	}
+
+	/* the whole line, or none of it */
+	if (bl <= 0 || (size_t)bl + 128 > lws_ptr_diff_size_t(tx_end, tx))
+		tx += lws_snprintf(tx, lws_ptr_diff_size_t(tx_end, tx), "{\"req\":\"%s\",\"status\":\"error\",\"msg\":\"Unable to send account key\"}\n", a->req);
+	else
+		tx += lws_snprintf(tx, lws_ptr_diff_size_t(tx_end, tx), "{\"req\":\"%s\",\"status\":\"ok\",\"jwk\":\"%.*s\"}\n", a->req, bl, b64);
+
+	if (exp) {
+		lws_explicit_bzero(exp, 8192);
+		free(exp);
+	}
+	if (b64) {
+		lws_explicit_bzero(b64, 8192 * 2);
+		free(b64);
+	}
+
+done:
+	lws_jwk_destroy(&jwk);
+	root_pss->tx_len = lws_ptr_diff_size_t(tx, (char *)&root_pss->tx[LWS_PRE]);
 }
 
 /*
@@ -2382,9 +2456,7 @@ handle_req_regen_keys(struct vhd *vhd, struct pss *root_pss, struct monitor_req_
 		else { kargs.type = "EC"; kargs.curve = "P-256"; kargs.bits = 256; }
 
 		if (!vhd->ops->keygen(vhd->context, &kargs)) {
-			char signed_path[1024];
-			lws_snprintf(signed_path, sizeof(signed_path), "%s/%s.zone.signed", wd, a->domain);
-			unlink(signed_path);
+			monitor_zone_needs_resign(vhd, a->domain);
 			tx += lws_snprintf(tx, lws_ptr_diff_size_t(tx_end, tx), "{\"req\":\"%s\",\"status\":\"ok\"}\n", a->req);
 		} else {
 			tx += lws_snprintf(tx, lws_ptr_diff_size_t(tx_end, tx), "{\"req\":\"%s\",\"status\":\"error\",\"msg\":\"Key generation failed\"}\n", a->req);
@@ -3087,6 +3159,7 @@ static const struct monitor_req_map {
 	{ "create_tls", handle_req_create_tls },
 	{ "delete_tls", handle_req_delete_tls },
 	{ "save_auth_key", handle_req_save_auth_key },
+	{ "get_auth_key", handle_req_get_auth_key },
 	{ "save_cert", handle_req_save_cert },
 	{ "save_key", handle_req_save_key },
 	{ "save_dns_challenge", handle_req_save_dns_challenge },
@@ -3172,31 +3245,15 @@ handle_monitor_request(struct vhd *vhd, struct pss *root_pss, const char *in, si
 
 	lwsl_debug("[INSTRUMENT] handle_monitor_request: Routed valid requested endpoint: '%s'\n", a.req);
 
-	if (vhd->auth_jwk.kty == LWS_GENCRYPTO_KTY_OCT) {
-		char jwt_out[2048];
-		size_t jwt_out_len = sizeof(jwt_out);
-		char jwt_temp[2048];
-		unsigned long exp_time;
-
-		if (!a.jwt[0]) {
-			lwsl_notice("[INSTRUMENT] Missing JWT preamble token\n");
-			tx += lws_snprintf(tx, lws_ptr_diff_size_t(tx_end, tx), "{\"status\":\"error\",\"msg\":\"Authentication Failed\"}\n");
-			goto done;
-		}
-
-		if (lws_jwt_signed_validate(vhd->context, &vhd->auth_jwk, "HS256", a.jwt, strlen(a.jwt), jwt_temp, sizeof(jwt_temp), jwt_out, &jwt_out_len)) {
-			lwsl_notice("[INSTRUMENT] Invalid/Forged JWT preamble token\n");
-			tx += lws_snprintf(tx, lws_ptr_diff_size_t(tx_end, tx), "{\"status\":\"error\",\"msg\":\"Authentication Failed\"}\n");
-			goto done;
-		}
-
-		if (lws_jwt_token_sanity(jwt_out, jwt_out_len, "acme-ipc", "dnssec-monitor", NULL, NULL, 0, &exp_time)) {
-			lwsl_notice("[INSTRUMENT] Expired/Invalid JWT claims\n");
-			tx += lws_snprintf(tx, lws_ptr_diff_size_t(tx_end, tx), "{\"status\":\"error\",\"msg\":\"Authentication Failed\"}\n");
-			goto done;
-		}
-	} else {
-		lwsl_notice("[INSTRUMENT] Warning: UDS monitor secret not bootstrapped, rejecting request!\n");
+	switch (monitor_ipc_authorize(vhd->context, &vhd->auth_jwk, a.jwt,
+				      a.req)) {
+	case MON_IPC_AUTH_OK:
+		break;
+	case MON_IPC_AUTH_NOT_PERMITTED:
+		/* authenticated, so it knows what it asked for */
+		tx += lws_snprintf(tx, lws_ptr_diff_size_t(tx_end, tx), "{\"req\":\"%s\",\"status\":\"error\",\"msg\":\"Not permitted\"}\n", a.req);
+		goto done;
+	default:
 		tx += lws_snprintf(tx, lws_ptr_diff_size_t(tx_end, tx), "{\"status\":\"error\",\"msg\":\"Authentication Failed\"}\n");
 		goto done;
 	}
@@ -3910,7 +3967,8 @@ callback_dht_dnssec_monitor(struct lws *wsi, enum lws_callback_reasons reason,
 			char temp[2048];
 			char *first_brace;
 
-			lws_snprintf(claims, sizeof(claims), "{\"iss\":\"acme-ipc\",\"aud\":\"dnssec-monitor\",\"iat\":%llu,\"nbf\":%llu,\"exp\":%llu}", now, now - 60, now + 60);
+			/* a browser's request: see monitor-ipc-auth.c */
+			lws_snprintf(claims, sizeof(claims), "{\"iss\":\"acme-ipc\",\"aud\":\"dnssec-monitor\",\"sub\":\"" MON_IPC_SUB_UI "\",\"iat\":%llu,\"nbf\":%llu,\"exp\":%llu}", now, now - 60, now + 60);
 
 			if (!lws_jwt_sign_compact(vhd->context, &vhd->auth_jwk, "HS256", jwt_buf, &jwt_len, temp, sizeof(temp), "%s", claims)) {
 				first_brace = (char *)memchr(in, '{', len);

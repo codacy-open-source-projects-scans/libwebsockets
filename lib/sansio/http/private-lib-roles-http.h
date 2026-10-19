@@ -313,6 +313,9 @@ lws_http_field_name_char_valid(unsigned char c, int first)
 	return c != ':' || first;
 }
 
+int
+lws_http_token_is_field_name(int n);
+
 /* how many 1xx interim responses a client swallows before giving up */
 #define LWS_HTTP_INTERIM_RESPONSE_LIMIT 8
 
@@ -479,6 +482,10 @@ struct _lws_http_mode_related {
 	unsigned int did_stream_close:1;
 	unsigned int multipart:1;
 	unsigned int cgi_transaction_complete:1;
+	unsigned int interceptors_evaluated:1;
+	/**< lws_http_evaluate_interceptors() has run for this transaction, and
+	 * interceptor_hit / interceptor_result hold what it decided.  Cleared
+	 * on transaction rearm. */
 	unsigned int interceptor_diverted:1;
 	/**< set by lws_http_evaluate_interceptors() for the duration of this
 	 * transaction when a mount interceptor took the request away from the
@@ -509,6 +516,14 @@ struct _lws_http_mode_related {
 
 	char *digest_auth_hdr;
 	char *extra_onward_headers;
+
+	/*
+	 * What lws_http_evaluate_interceptors() decided for this transaction:
+	 * the mount it was asked about, and where the request goes, that mount
+	 * or an interceptor's.  Valid while interceptors_evaluated.
+	 */
+	const struct lws_http_mount *interceptor_hit;
+	const struct lws_http_mount *interceptor_result;
 };
 
 
@@ -615,6 +630,20 @@ lws_read_h1(struct lws *wsi, unsigned char *buf, lws_filepos_t len,
 #define lws_read_h1(_a, _b, _c, _d) (0)
 #endif
 
+#if defined(LWS_ROLE_H1) && (defined(LWS_ROLE_H2) || defined(LWS_ROLE_H3))
+/*
+ * A mux stream's request body with no content-length is ended by the peer
+ * ending its half of the stream: END_STREAM on h2, the FIN on h3.  Nonzero
+ * once that has come after all the body, and none of the body is still
+ * parked on the stream's own buflist, where it was stashed while the action
+ * was deferred: then lws_read_h1() with no bytes completes it.
+ */
+int
+lws_http_mux_body_ended_by_peer(struct lws *wsi);
+#else
+#define lws_http_mux_body_ended_by_peer(_a) (0)
+#endif
+
 /*
  * Result from lws_header_table_attach()
  *
@@ -711,6 +740,11 @@ lws_hdr_token_is_credential(enum lws_token_indexes tok);
  */
 int
 lws_hdr_add_value_bad(const unsigned char *value, int length);
+
+/* adds "vary: accept-encoding", for a response whose coding was negotiated */
+int
+lws_http_add_vary_accept_encoding(struct lws *wsi, unsigned char **p,
+				  unsigned char *end);
 
 int
 lws_http_date_render_from_unix(char *buf, size_t len, const time_t *t);

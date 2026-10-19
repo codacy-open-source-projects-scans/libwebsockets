@@ -49,6 +49,18 @@ The plugin dynamically generates paths for your authentication keys, certificate
 
 The plugin creates versioned files with timestamps and maintains a `-latest` symlink pointing to the most recently generated file for easy references by the web server (e.g., `$dns_base_dir/domains/<domain-name>/certs/crt/<common-name>-latest.crt`).
 
+### The account key
+
+Each certificate's ACME account key is kept at
+`$dns_base_dir/domains/<domain-name>/<common-name>-auth.jwk`, and the same key,
+so the same account at the CA, is used for every acquisition: given a key it
+already knows, the CA's `newAccount` answers with the existing account.  When
+the ACME client runs unprivileged alongside `lws-dht-dnssec-monitor`, it can't
+read that file itself, so it asks the monitor's root process for the key over
+their IPC.  Only when there is no stored key does it make a new one, which
+the root process stores for next time.  If the stored key exists but can't be
+had, the acquisition fails rather than replacing it.
+
 ## Example `lwsws` JSON Configuration
 
 Here is an example of configuring `lwsws` to enable the ACME client plugin on a secure vhost.
@@ -94,7 +106,18 @@ Here is an example of configuring `lwsws` to enable the ACME client plugin on a 
 ### Forcing a reissue
 
 Certificates are evaluated at startup and hourly after that, and renewed once
-a quarter or less of their validity is left.  To reissue a certificate
+a quarter or less of their validity is left.  One certificate is acquired at a
+time: an evaluation stops at the first certificate it starts an acquisition
+for, and the certificates are evaluated again a few seconds after the
+acquisition ends, either way.
+
+After a failed acquisition, that certificate backs off for 2h, doubling after
+each further failure up to 24h, before it is tried again (Let's Encrypt allows
+5 duplicate certificates in 7 days).  The backoff belongs to the certificate:
+while one backs off, the others are still evaluated and renewed as usual.  If
+the CA says the challenge failed, the reason it gives is logged.
+
+To reissue a certificate
 before then, eg, to move it to a different `profile` straight away, send on
 SMD class `LWSSMDCL_CERTS`
 

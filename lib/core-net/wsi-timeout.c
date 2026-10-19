@@ -75,6 +75,43 @@ lws_sul_wsitimeout_cb(lws_sorted_usec_list_t *sul)
 	struct lws_context *cx = wsi->a.context;
 	struct lws_context_per_thread *pt = &cx->pt[(int)wsi->tsi];
 
+#if defined(LWS_ROLE_H2) || defined(LWS_ROLE_MQTT) || defined(LWS_ROLE_QUIC)
+	/*
+	 * keepalive_timeout is how long a server waits on an idle client.  A
+	 * network connection whose client is waiting on a stream we have not
+	 * finished answering, eg, a reverse proxy's slow onward server, or a
+	 * plugin building the response on a thread, is not idle: the peer has
+	 * no reason to send anything meanwhile.  Closing it would fail every
+	 * stream on it.  The busy stream's own timeout bounds the wait; look
+	 * again after another keepalive period.
+	 */
+	if (!wsi->close_decided &&
+	    wsi->pending_timeout == PENDING_TIMEOUT_HTTP_KEEPALIVE_IDLE &&
+	    !wsi->mux_substream && lws_wsi_mux_has_busy_child(wsi)) {
+		lws_set_timeout(wsi, PENDING_TIMEOUT_HTTP_KEEPALIVE_IDLE,
+				lws_wsi_keepalive_timeout_eff(wsi));
+		return;
+	}
+#endif
+
+	/* the close is happening now, its own timeouts can be set again */
+	wsi->close_decided = 0;
+
+#if defined(LWS_ROLE_QUIC)
+	/*
+	 * A stream that timed out sending its close, waiting for the peer's
+	 * answer to it, or flushing what it sent before it closes, or a
+	 * connection timing out with streams like that: say what they were
+	 * stuck on
+	 */
+	if ((wsi->quic.qs &&
+	     (wsi->pending_timeout == PENDING_TIMEOUT_CLOSE_SEND ||
+	      wsi->pending_timeout == PENDING_TIMEOUT_CLOSE_ACK ||
+	      wsi->pending_timeout == PENDING_FLUSH_STORED_SEND_BEFORE_CLOSE)) ||
+	    wsi->quic.qn)
+		lws_quic_dump_stalled(wsi);
+#endif
+
 	/* no need to log normal idle keepalive timeout */
 //		if (wsi->pending_timeout != PENDING_TIMEOUT_HTTP_KEEPALIVE_IDLE)
 	if (wsi->pending_timeout == PENDING_TIMEOUT_HTTP_RESPONSE)
@@ -150,6 +187,8 @@ lws_sul_wsitimeout_cb(lws_sorted_usec_list_t *sul)
 
 	lws_context_lock(cx, __func__);
 	lws_pt_lock(pt, __func__);
+	lws_wsi_close_cause_set(wsi, "timed out, pending timeout",
+				(int)wsi->pending_timeout);
 	__lws_close_free_wsi(wsi, LWS_CLOSE_STATUS_NOSTATUS, "timeout");
 	lws_pt_unlock(pt);
 	lws_context_unlock(cx);
@@ -159,6 +198,17 @@ void
 __lws_set_timeout(struct lws *wsi, enum pending_timeout reason, int secs)
 {
 	struct lws_context_per_thread *pt = &wsi->a.context->pt[(int)wsi->tsi];
+
+	/*
+	 * Once the wsi's close has been decided, eg, a route to its peer is
+	 * gone, whatever the wsi does next, such as its connect moving on to
+	 * the next phase with a timeout of its own, must not undo it: it may
+	 * have lost what it needs to do its job.  The close stands.
+	 */
+	if (wsi->close_decided) {
+		lwsl_wsi_debug(wsi, "close decided, ignoring reason %d", reason);
+		return;
+	}
 
 	if (reason == PENDING_TIMEOUT_HTTP_KEEPALIVE_IDLE && secs > 0) {
 		if (wsi->immortal_substream_count > 0) {
@@ -182,6 +232,13 @@ lws_set_timeout(struct lws *wsi, enum pending_timeout reason, int secs)
 	struct lws_context_per_thread *pt = &wsi->a.context->pt[(int)wsi->tsi];
 
 	lws_context_lock(pt->context, __func__);
+
+	/* a decided close stands, see __lws_set_timeout() */
+	if (wsi->close_decided && secs != LWS_TO_KILL_SYNC) {
+		lwsl_wsi_debug(wsi, "close decided, ignoring reason %d", reason);
+		goto bail;
+	}
+
 	lws_pt_lock(pt, __func__);
 	lws_dll2_remove(&wsi->sul_timeout.list);
 	lws_pt_unlock(pt);
@@ -217,6 +274,9 @@ lws_set_timeout(struct lws *wsi, enum pending_timeout reason, int secs)
 
 	lws_pt_lock(pt, __func__);
 	__lws_set_timeout(wsi, reason, secs);
+	if (!secs)
+		/* LWS_TO_KILL_ASYNC */
+		wsi->close_decided = 1;
 	lws_pt_unlock(pt);
 
 bail:
@@ -227,6 +287,12 @@ void
 lws_set_timeout_us(struct lws *wsi, enum pending_timeout reason, lws_usec_t us)
 {
 	struct lws_context_per_thread *pt = &wsi->a.context->pt[(int)wsi->tsi];
+
+	/* a decided close stands, see __lws_set_timeout() */
+	if (wsi->close_decided) {
+		lwsl_wsi_debug(wsi, "close decided, ignoring reason %d", reason);
+		return;
+	}
 
 	lws_pt_lock(pt, __func__);
 	lws_dll2_remove(&wsi->sul_timeout.list);

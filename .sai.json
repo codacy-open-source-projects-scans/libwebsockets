@@ -6,7 +6,7 @@
                         "build": [
                                 "mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib cmake .. ${cmake}",
                                 "cd build && make -j$SAI_PARALLEL && rm -rf ../destdir && make -j$SAI_PARALLEL DESTDIR=../destdir install",
-				"cd build && LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib ctest -j$SAI_PARALLEL --output-on-failure --repeat until-pass:3",
+				"cd build && LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib ctest -j8 --output-on-failure --repeat until-pass:3",
                                 "cd build && SAI_CPACK=\"-G RPM\" ${cpack}"
                         ]
 		},
@@ -19,17 +19,17 @@
 		},
 		"netbsd-OSX-bigsur/x86_64-intel-i3/llvm": {
                         "build": [
-				"mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib MACOSX_DEPLOYMENT_TARGET=15.7 cmake .. -DCMAKE_MAKE_PROGRAM=/usr/bin/make -DLWS_GNUTLS_INCLUDE_DIRS=/usr/local/include -DLWS_GNUTLS_LIBRARIES=/usr/local/lib/libgnutls.dylib ${cmake}",
+				"mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib MACOSX_DEPLOYMENT_TARGET=15.7 cmake .. -DCMAKE_MAKE_PROGRAM=/usr/bin/make ${cmake}",
                                 "cd build && make -j$SAI_PARALLEL && rm -rf ../destdir && make -j$SAI_PARALLEL DESTDIR=../destdir install",
-				"cd build ; export LD_LIBRARY_PATH=\"$HOME/jobs/$SAI_VN/src/build/lib\" ; ctest -j$SAI_PARALLEL --output-on-failure --repeat until-pass:3",
+				"cd build ; export LD_LIBRARY_PATH=\"$HOME/jobs/$SAI_VN/src/build/lib\" ; ctest -j8 --output-on-failure --repeat until-pass:3",
                                 "cd build && SAI_CPACK=\"-G ZIP\" ${cpack}"
 			]
 		},
 		"netbsd-OSX-tahoe/aarch64-apple-m1/llvm": {
                         "build": [
-				"mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib MACOSX_DEPLOYMENT_TARGET=26 cmake .. -DCMAKE_MAKE_PROGRAM=/usr/bin/make -DLWS_GNUTLS_INCLUDE_DIRS=/System/Volumes/Data/opt/homebrew/Cellar/gnutls/3.8.13_2/include -DLWS_GNUTLS_LIBRARIES=/System/Volumes/Data/opt/homebrew/Cellar/gnutls/3.8.13_2/lib/libgnutls.dylib ${cmake}",
+				"mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib MACOSX_DEPLOYMENT_TARGET=26 cmake .. -DCMAKE_MAKE_PROGRAM=/usr/bin/make ${cmake}",
                                 "cd build && make -j$SAI_PARALLEL && rm -rf ../destdir && make -j$SAI_PARALLEL DESTDIR=../destdir install",
-				"cd build ; export LD_LIBRARY_PATH=\"$HOME/jobs/$SAI_VN/src/build/lib\" ; ctest -j$SAI_PARALLEL --output-on-failure --repeat until-pass:3",
+				"cd build ; export LD_LIBRARY_PATH=\"$HOME/jobs/$SAI_VN/src/build/lib\" ; ctest -j8 --output-on-failure --repeat until-pass:3",
                                 "cd build && SAI_CPACK=\"-G ZIP\" ${cpack}"
 			]
 		},
@@ -37,7 +37,7 @@
                         "build": [
 				"mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib cmake .. ${cmake}",
                                 "cd build && make -j$SAI_PARALLEL && rm -rf ../destdir && make -j$SAI_PARALLEL DESTDIR=../destdir install",
-				"cd build && LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib ctest -j$SAI_PARALLEL --output-on-failure --repeat until-pass:3",
+				"cd build && LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib ctest -j8 --output-on-failure --repeat until-pass:3",
                                 "cd build && SAI_CPACK=\"-G DEB\" ${cpack}"
 			]
 		},
@@ -45,7 +45,7 @@
                         "build": [
 				"mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib cmake .. ${cmake}",
                                 "cd build && make -j$SAI_PARALLEL && rm -rf ../destdir && make -j$SAI_PARALLEL DESTDIR=../destdir install",
-				"cd build && LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib ctest -j$SAI_PARALLEL --output-on-failure --repeat until-pass:3",
+				"cd build && LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib ctest -j8 --output-on-failure --repeat until-pass:3",
                                 "cd build && SAI_CPACK=\"-G RPM\" ${cpack}"
 			]
 		},
@@ -53,7 +53,7 @@
 			"build": [
 				"mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib cmake .. ${cmake}",
 				"cd build && make -j$SAI_PARALLEL && rm -rf ../destdir && make -j$SAI_PARALLEL DESTDIR=../destdir install",
-				"cd build && LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib ctest -j$SAI_PARALLEL --output-on-failure --repeat until-pass:3",
+				"cd build && LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib ctest -j8 --output-on-failure --repeat until-pass:3",
 				"cd build && SAI_CPACK=\"-G RPM\" ${cpack}"
 			]
 		},
@@ -61,7 +61,7 @@
                         "build": [
 				"mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib cmake .. ${cmake}",
                                 "cd build && make -j$SAI_PARALLEL && rm -rf ../destdir && make -j$SAI_PARALLEL DESTDIR=../destdir install",
-				"cd build && LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib ctest -j$SAI_PARALLEL --output-on-failure --repeat until-pass:3",
+				"cd build && LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib ctest -j8 --output-on-failure --repeat until-pass:3",
                                 "cd build && SAI_CPACK=\"-G DEB\" ${cpack}"
 			]
 		},
@@ -93,7 +93,7 @@
                         "build": [
 				"mkdir -p build destdir; cd build; CCACHE_DISABLE=1 LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib cmake .. ${cmake}",
                                 "cd build && make -j$SAI_PARALLEL && rm -rf ../destdir && make -j$SAI_PARALLEL DESTDIR=../destdir install",
-				"cd build && LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib /usr/local/bin/ctest -j$SAI_PARALLEL --output-on-failure --repeat until-pass:3"
+				"cd build && LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib /usr/local/bin/ctest -j8 --output-on-failure --repeat until-pass:3"
 			]
 		},
 		"w11/x86_64-amd/msvc": {
@@ -101,7 +101,7 @@
 			"build": [
 				"\"C:\\Program Files\\CMake\\bin\\cmake.exe\" -S . -B build -DLWS_WITH_HTTP3=0 -DLWS_WITH_SCHANNEL=0 -DOPENSSL_ROOT_DIR=\"C:\\Users\\andy\\vcpkg\\packages\\openssl_x64-windows\" -DLWS_EXT_PTHREAD_INCLUDE_DIR=\"C:\\Program Files (x86)\\pthreads\\include\" -DLWS_EXT_PTHREAD_LIBRARIES=\"C:\\Program Files (x86)\\pthreads\\lib\\x64\\libpthreadGC2.a\" ${cmake}",
 				"\"C:\\Program Files\\CMake\\bin\\cmake.exe\" --build build --config DEBUG --parallel %SAI_PARALLEL%",
-				"\"C:\\Program Files\\CMake\\bin\\ctest.exe\" --test-dir build -C DEBUG -j%SAI_PARALLEL% --output-on-failure --repeat until-pass:3"
+				"\"C:\\Program Files\\CMake\\bin\\ctest.exe\" --test-dir build -C DEBUG -j8 --output-on-failure --repeat until-pass:3"
 			]
 		},
 		"w11/x86_64-amd/msvc-schannel": {
@@ -109,7 +109,7 @@
 			"build": [
 				"\"C:\\Program Files\\CMake\\bin\\cmake.exe\" -S . -B build -DLWS_WITH_SCHANNEL=1 ${cmake}",
 				"\"C:\\Program Files\\CMake\\bin\\cmake.exe\" --build build --config DEBUG --parallel %SAI_PARALLEL%",
-				"\"C:\\Program Files\\CMake\\bin\\ctest.exe\" --test-dir build -C DEBUG -j%SAI_PARALLEL% --output-on-failure --repeat until-pass:3"
+				"\"C:\\Program Files\\CMake\\bin\\ctest.exe\" --test-dir build -C DEBUG -j8 --output-on-failure --repeat until-pass:3"
 			]
 		},
 
@@ -118,7 +118,7 @@
 			"build": [
 		"\"C:\\Program Files\\CMake\\bin\\cmake.exe\" -S . -B build -DLWS_WITH_MBEDTLS=1 -DLWS_WITH_HTTP3=0 -DLWS_ROLE_QUIC=0 -DCMAKE_PREFIX_PATH=\"C:\\mbedtls\" ${cmake}",
 		"\"C:\\Program Files\\CMake\\bin\\cmake.exe\" --build build --config DEBUG --parallel %SAI_PARALLEL%",
-		"\"C:\\Program Files\\CMake\\bin\\ctest.exe\" --test-dir build -C DEBUG -j%SAI_PARALLEL% --output-on-failure --repeat until-pass:3"
+		"\"C:\\Program Files\\CMake\\bin\\ctest.exe\" --test-dir build -C DEBUG -j8 --output-on-failure --repeat until-pass:3"
 			]
 		},
 
@@ -126,7 +126,7 @@
                         "default": false,
                         "build": [
 				"rm -rf ebuild ; mkdir ebuild; cd ebuild;cp -rp ../minimal-examples/embedded/esp32/${cpack} . ;  cd ${cpack} ; rm -f libwebsockets ; ln -sf ../.. libwebsockets",
-				"cd ebuild/${cpack} ; . /opt/esp/esp-idf/export.sh ; rm -rf build ; idf.py set-target esp32 && cp partitions.csv sdkconfig.h build && cp -rp sdkconfig.old sdkconfig && cp sdkconfig build && idf.py ${cmake} build size size-components size-files",
+				"cd ebuild/${cpack} ; . /opt/esp/esp-idf/export.sh ; rm -rf build ; idf.py -DLWS_WITH_HTTP3=0 -DLWS_ROLE_QUIC=0 set-target esp32 && cp partitions.csv sdkconfig.h build && cp -rp sdkconfig.old sdkconfig && cp sdkconfig build && idf.py -DLWS_WITH_HTTP3=0 -DLWS_ROLE_QUIC=0 ${cmake} build size size-components size-files",
 				". /opt/esp/esp-idf/export.sh && pwd && cd ebuild/${cpack}/build && /usr/local/bin/sai-device ${cpack} ESPPORT=0 ctest --output-on-failure"
 			]
 		},
@@ -268,13 +268,16 @@
 		# clang platform's own steps stop at scan-build, so the build, install
 		# and ctest ride along in the cmake string like quic-interop does;
 		# ctest's result still decides the step, the report never does.
+		# All of it is one step, against the builder's step timeout, so the
+		# ctest runs -j8 like the platforms' own ctest steps: at
+		# -j$SAI_PARALLEL, two at a time, it alone took over 20 minutes.
 		# Fault injection is on for its extra tests; the http stream
 		# compression (deflate + brotli) and ws permessage-deflate that
 		# distro_recommended already implies are spelled out so they cannot
 		# quietly drop out of the coverage run.  Needs brotli-devel and
 		# llvm-cov on the builder.
 		"coverage": {
-			"cmake":	"-DLWS_WITH_DISTRO_RECOMMENDED=1 -DLWS_WITH_MINIMAL_EXAMPLES=1 -DLWS_WITH_GCOV=1 -DLWS_WITH_SYS_FAULT_INJECTION=1 -DLWS_WITH_HTTP_STREAM_COMPRESSION=1 -DLWS_WITH_HTTP_BROTLI=1 -DLWS_WITHOUT_EXTENSIONS=0 && make -j$SAI_PARALLEL && rm -rf ../destdir && make -j$SAI_PARALLEL DESTDIR=../destdir install && ( LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib ctest -j$SAI_PARALLEL --output-on-failure --repeat until-pass:3 ; R=$? ; python3 ../scripts/coverage-report.py --json ; exit $R )",
+			"cmake":	"-DLWS_WITH_DISTRO_RECOMMENDED=1 -DLWS_WITH_MINIMAL_EXAMPLES=1 -DLWS_WITH_GCOV=1 -DLWS_WITH_SYS_FAULT_INJECTION=1 -DLWS_WITH_HTTP_STREAM_COMPRESSION=1 -DLWS_WITH_HTTP_BROTLI=1 -DLWS_WITHOUT_EXTENSIONS=0 && make -j$SAI_PARALLEL && rm -rf ../destdir && make -j$SAI_PARALLEL DESTDIR=../destdir install && ( LD_LIBRARY_PATH=../destdir/usr/local/share/libwebsockets-test-server/plugins:../destdir/usr/local/lib ctest -j8 --output-on-failure --repeat until-pass:3 ; R=$? ; python3 ../scripts/coverage-report.py --json ; exit $R )",
 			"platforms":	"none, rocky9-ca/aarch64-a72a55-rk3588/clang",
 			"artifacts":	"build/coverage-summary.json"
 		},
@@ -327,8 +330,10 @@
 		"ipv6-off":	{
 			"cmake":	"-DLWS_IPV6=OFF"
 		},
+		# authoritative DNS brings in api-test-async-dns and adns-direct,
+		# which resolve through an IPv4 nameserver: mapped in this build
 		"ipv4-off":	{
-			"cmake":	"-DLWS_IPV4=OFF"
+			"cmake":	"-DLWS_IPV4=OFF -DLWS_WITH_AUTHORITATIVE_DNS=1"
 		},
 		"nonetlink":	{
 			"cmake":	"-DLWS_WITH_NETLINK=0"
@@ -418,7 +423,7 @@
 		# only applies to the coverity builder, and on pushes to "coverity" branch
 
 		"coverity": {
-			"cmake":	"-DLWS_WITHOUT_EXTENSIONS=0 -DLWS_WITH_CGI=1 -DLWS_IPV6=1 -DLWS_WITH_HTTP_PROXY=1 -DLWS_WITH_RANGES=1 -DLWS_WITH_THREADPOOL=1 -DLWS_WITH_CBOR=1 -DLWS_WITH_JOSE=1 -DLWS_WITH_COSE=1 -DLWS_WITH_SYS_DHCP_CLIENT=1 -DLWS_WITH_FTS=1 -DLWS_WITH_STRUCT_SQLITE3=1 -DLWS_ROLE_DBUS=1 -DLWS_WITH_SYS_ASYNC_DNS=1 -DLWS_WITH_SYS_ASYNC_DNS_DNSSEC=1 -DLWS_WITH_WEBRTC=1 -DLWS_WITH_DHT=1 -DLWS_WITH_ASYNC_QUEUE=1  -DLWS_WITH_SYS_FAULT_INJECTION=1 -DLWS_WITH_TLS_JIT_TRUST=1 -DLWS_ROLE_MQTT=1 -DLWS_ROLE_RAW_PROXY=1 -DLWS_WITH_EVENT_LIBS=1 -DLWS_WITH_LIBUV=1 -DLWS_WITH_STRUCT_JSON=1 -DLWS_WITH_LWS_DSH=1 -DLWS_WITH_SECURE_STREAMS_PROXY_API=1 -DLWS_WITH_AUTHORITATIVE_DNS=1 -DLWS_WITH_DHT=1 -DLWS_WITH_DHT_BACKEND=1 -DLWS_WITH_PLUGINS=1 -DLWS_WITH_QUIC=1 -DLWS_WITH_HTTP3=1",
+			"cmake":	"-DLWS_WITHOUT_EXTENSIONS=0 -DLWS_WITH_CGI=1 -DLWS_IPV6=1 -DLWS_WITH_HTTP_PROXY=1 -DLWS_WITH_RANGES=1 -DLWS_WITH_THREADPOOL=1 -DLWS_WITH_CBOR=1 -DLWS_WITH_JOSE=1 -DLWS_WITH_COSE=1 -DLWS_WITH_SYS_DHCP_CLIENT=1 -DLWS_WITH_FTS=1 -DLWS_WITH_STRUCT_SQLITE3=1 -DLWS_ROLE_DBUS=1 -DLWS_WITH_SYS_ASYNC_DNS=1 -DLWS_WITH_SYS_ASYNC_DNS_DNSSEC=1 -DLWS_WITH_WEBRTC=1 -DLWS_WITH_DHT=1 -DLWS_WITH_ASYNC_QUEUE=1  -DLWS_WITH_SYS_FAULT_INJECTION=1 -DLWS_WITH_TLS_JIT_TRUST=1 -DLWS_ROLE_MQTT=1 -DLWS_ROLE_RAW_PROXY=1 -DLWS_WITH_EVENT_LIBS=1 -DLWS_WITH_LIBUV=1 -DLWS_WITH_STRUCT_JSON=1 -DLWS_WITH_LWS_DSH=1 -DLWS_WITH_SECURE_STREAMS_PROXY_API=1 -DLWS_WITH_AUTHORITATIVE_DNS=1 -DLWS_WITH_DHT=1 -DLWS_WITH_DHT_BACKEND=1 -DLWS_WITH_PLUGINS=1 -DLWS_ROLE_QUIC=1 -DLWS_WITH_HTTP3=1",
 			"platforms":	"none, coverity/x86_64/gcc",
 			"cpack":	"export STAMP=`git log -1 --pretty=format:%h` && rm -f libwebsockets.tar.xz && tar cJvf libwebsockets.tar.xz cov-int && script -e -q -c \"cat /etc/coverity/secrets.sh | lws-minimal-http-client-post-form --h1 https://scan.coverity.com:443/builds?project=warmcat%2Flibwebsockets --form file=@libwebsockets.tar.xz --form version=${STAMP} --form 'description=lws qa'\" /dev/null",
 			"branches":	"coverity"
@@ -465,7 +470,7 @@
 		#,
 		# awkward, we also want to test mbedtls, but coverity blocks on SSL build needing manual intervention
 #		"coverity-mbedtls": {
-#			"cmake":	"-DLWS_WITH_MBEDTLS=1 -DLWS_WITHOUT_EXTENSIONS=0 -DLWS_WITH_CGI=1 -DLWS_IPV6=1 -DLWS_WITH_HTTP_PROXY=1 -DLWS_WITH_RANGES=1 -DLWS_WITH_THREADPOOL=1 -DLWS_WITH_CBOR=1 -DLWS_WITH_JOSE=1 -DLWS_WITH_COSE=1 -DLWS_WITH_SYS_DHCP_CLIENT=1 -DLWS_WITH_FTS=1 -DLWS_WITH_STRUCT_SQLITE3=1 -DLWS_ROLE_DBUS=1 -DLWS_WITH_SYS_ASYNC_DNS=1 -DLWS_WITH_SYS_ASYNC_DNS_DNSSEC=1 -DLWS_WITH_WEBRTC=1 -DLWS_WITH_DHT=1  -DLWS_WITH_ASYNC_QUEUE=1 -DLWS_WITH_SYS_FAULT_INJECTION=1 -DLWS_WITH_TLS_JIT_TRUST=1 -DLWS_ROLE_MQTT=1 -DLWS_ROLE_RAW_PROXY=1 -DLWS_WITH_EVENT_LIBS=1 -DLWS_WITH_LIBUV=1 -DLWS_WITH_STRUCT_JSON=1 -DLWS_WITH_LWS_DSH=1 -DLWS_WITH_SECURE_STREAMS_PROXY_API=1 -DLWS_WITH_QUIC=1 -DLWS_WITH_HTTP3=1",
+#			"cmake":	"-DLWS_WITH_MBEDTLS=1 -DLWS_WITHOUT_EXTENSIONS=0 -DLWS_WITH_CGI=1 -DLWS_IPV6=1 -DLWS_WITH_HTTP_PROXY=1 -DLWS_WITH_RANGES=1 -DLWS_WITH_THREADPOOL=1 -DLWS_WITH_CBOR=1 -DLWS_WITH_JOSE=1 -DLWS_WITH_COSE=1 -DLWS_WITH_SYS_DHCP_CLIENT=1 -DLWS_WITH_FTS=1 -DLWS_WITH_STRUCT_SQLITE3=1 -DLWS_ROLE_DBUS=1 -DLWS_WITH_SYS_ASYNC_DNS=1 -DLWS_WITH_SYS_ASYNC_DNS_DNSSEC=1 -DLWS_WITH_WEBRTC=1 -DLWS_WITH_DHT=1  -DLWS_WITH_ASYNC_QUEUE=1 -DLWS_WITH_SYS_FAULT_INJECTION=1 -DLWS_WITH_TLS_JIT_TRUST=1 -DLWS_ROLE_MQTT=1 -DLWS_ROLE_RAW_PROXY=1 -DLWS_WITH_EVENT_LIBS=1 -DLWS_WITH_LIBUV=1 -DLWS_WITH_STRUCT_JSON=1 -DLWS_WITH_LWS_DSH=1 -DLWS_WITH_SECURE_STREAMS_PROXY_API=1 -DLWS_ROLE_QUIC=1 -DLWS_WITH_HTTP3=1",
 #			"platforms":	"none, coverity/x86_64/gcc",
 #			"cpack":	"export STAMP=`git log -1 --pretty=format:%h` && rm -f libwebsockets.tar.xz && tar cJvf libwebsockets.tar.xz cov-int && script -e -q -c \"cat /etc/coverity/secrets.sh | lws-minimal-http-client-post-form --h1 https://scan.coverity.com:443/builds?project=warmcat%2Flibwebsockets --form file=@libwebsockets.tar.xz --form version=${STAMP} --form 'description=lws qa'\" /dev/null",
 #			"branches":	"coverity"

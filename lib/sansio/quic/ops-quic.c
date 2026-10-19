@@ -207,6 +207,388 @@ lws_quic_frame_not_retransmitted(const struct lws_quic_tx_frame *f)
 }
 
 /*
+ * A server's PATH_CHALLENGE to a peer address it is probing, ie, not the
+ * connection's path.  Losing it says nothing about the connection's path, so
+ * it doesn't count as congestion there, nor towards PMTUD's black hole, and
+ * it isn't sent again by loss recovery: that would send it again each time
+ * a few packets on the connection's path are acked after it, ie, as fast as
+ * the connection goes.  The probe sends it again once a PTO instead (RFC 9000
+ * 8.2.1), see lws_quic_path_probe_sul_cb().
+ */
+static int
+lws_quic_frame_probes_another_path(const struct lws_quic_netconn *qn,
+				   const struct lws_quic_tx_frame *f)
+{
+	return f->type == LWS_QUIC_FT_PATH_CHALLENGE && f->has_dest &&
+	       !lws_quic_sa46_same_path(&f->dest_sa46, &qn->path_sa46);
+}
+
+/*
+ * DPLPMTUD (RFC 9000 14.3): each probe is a packet of its own, a PING padded
+ * out to the size being probed.  So the search goes on whether there is
+ * anything else to send or not, and the peer acks each probe, since a PING is
+ * ack-eliciting.  Losing a probe costs nothing but the probe: it isn't sent
+ * again by loss recovery, and doesn't count as congestion (RFC 9000 14.4).
+ */
+static uint32_t
+lws_quic_pmtud_ceiling(const struct lws_quic_netconn *qn)
+{
+	if (qn->peer_max_udp_payload &&
+	    qn->peer_max_udp_payload <
+			LWS_QUIC_PMTU_CEILING - LWS_QUIC_PMTU_OVERHEAD)
+		return qn->peer_max_udp_payload + LWS_QUIC_PMTU_OVERHEAD;
+
+	return LWS_QUIC_PMTU_CEILING;
+}
+
+/* start the search again from the base, eg, on a new path */
+void
+lws_quic_pmtud_reset(struct lws_quic_netconn *qn)
+{
+	qn->current_mtu			= LWS_QUIC_PMTU_BASE;
+	qn->probed_mtu			= LWS_QUIC_PMTU_FIRST_PROBE;
+	qn->pmtud_probe_pn		= LWS_QUIC_PMTUD_PROBE_NONE;
+	qn->pmtud_bh_probe_pn		= LWS_QUIC_PMTUD_PROBE_NONE;
+	qn->pmtud_bh_from_probe_pn	= LWS_QUIC_PMTUD_PROBE_NONE;
+	qn->pmtud_bh_from_late_pn	= LWS_QUIC_PMTUD_PROBE_NONE;
+	qn->pmtud_bh_from_fails		= 0;
+	qn->pmtud_late_probe_pn		= LWS_QUIC_PMTUD_PROBE_NONE;
+	qn->pmtud_probe_fails		= 0;
+	qn->consecutive_mtu_losses	= 0;
+	qn->pmtud_big_acked_pn1		= 0;
+	qn->pmtud_bh_from_mtu		= 0;
+	qn->pmtud_raise_at		= 0;
+	qn->pmtud_state			= 1; /* SEARCHING */
+}
+
+/*
+ * Not before the handshake is confirmed, ie, until both sides have 1-RTT keys
+ * and the client knows the server's 1-RTT packets get through, nor to a peer
+ * whose address a server hasn't validated
+ */
+static int
+lws_quic_pmtud_may_probe(const struct lws_quic_netconn *qn)
+{
+	return qn->handshake_confirmed && !qn->is_closing && qn->nwsi &&
+	       !(qn->is_server && !qn->address_validated);
+}
+
+static int
+lws_quic_pmtud_queue_probe(struct lws_quic_netconn *qn, uint8_t kind)
+{
+	struct lws_quic_tx_frame *f = lws_zalloc(sizeof(*f), "quic pmtud probe");
+
+	if (!f)
+		return 1;
+
+	f->type		= LWS_QUIC_FT_PING;
+	f->pmtud_probe	= kind;
+	lws_quic_dbg_1rtt_account(qn, f, "pmtud-probe");
+	/* lws_quic_packet_tx() sends it ahead of what else is waiting */
+	lws_dll2_add_tail(&f->list, &qn->pending_tx[LWS_QUIC_LEVEL_APP]);
+	lws_callback_on_writable(qn->nwsi);
+
+	return 0;
+}
+
+/*
+ * Queue the next search probe, if the search wants one now and none is on its
+ * way.  A search that settled below the ceiling tries the size it settled
+ * under again once LWS_QUIC_PMTUD_RAISE_US is up, since the path may carry it
+ * by then; one that went back to the base for a black hole that wasn't
+ * confirmed either way starts again from the base.
+ */
+void
+lws_quic_pmtud_kick(struct lws_quic_netconn *qn)
+{
+	if (!lws_quic_pmtud_may_probe(qn))
+		return;
+
+	if (qn->pmtud_raise_at && lws_wsi_now(qn->nwsi) >= qn->pmtud_raise_at) {
+		qn->pmtud_raise_at = 0;
+		if (!qn->pmtud_state)
+			lws_quic_pmtud_reset(qn);
+		else if (qn->pmtud_state == 2) {
+			qn->pmtud_probe_fails	= 0;
+			qn->pmtud_state		= 1; /* SEARCHING */
+		}
+	}
+
+	if (qn->pmtud_state != 1 || qn->pmtud_probe_queued ||
+	    qn->pmtud_probe_pn != LWS_QUIC_PMTUD_PROBE_NONE)
+		return;
+
+	if (qn->probed_mtu > lws_quic_pmtud_ceiling(qn)) {
+		qn->pmtud_state = 2; /* SEARCH_COMPLETE */
+		return;
+	}
+
+	if (!lws_quic_pmtud_queue_probe(qn, LWS_QUIC_PMTUD_PROBE_SEARCH))
+		qn->pmtud_probe_queued = 1;
+}
+
+/*
+ * A search probe of mtu was acked: the path carries it, so the search goes on
+ * from there, unless it has reached the ceiling.  If the search had settled
+ * below mtu, because the probe's ack was late, it searches on.
+ */
+static void
+lws_quic_pmtud_carries(struct lws_quic_netconn *qn, uint32_t mtu)
+{
+	uint32_t ceiling = lws_quic_pmtud_ceiling(qn);
+
+	qn->pmtud_probe_pn		= LWS_QUIC_PMTUD_PROBE_NONE;
+	qn->consecutive_mtu_losses	= 0;
+
+	if (mtu <= qn->current_mtu || !qn->pmtud_state)
+		return;
+
+	lwsl_wsi_info(qn->nwsi, "QUIC PMTUD: mtu %u -> %u", qn->current_mtu,
+		      mtu);
+	qn->current_mtu		= mtu;
+	qn->pmtud_probe_fails	= 0;
+	qn->pmtud_raise_at	= 0;
+
+	if (mtu >= ceiling) {
+		qn->pmtud_state = 2; /* SEARCH_COMPLETE */
+		return;
+	}
+
+	qn->pmtud_state = 1; /* SEARCHING */
+	if (qn->probed_mtu <= mtu) {
+		qn->probed_mtu = mtu + LWS_QUIC_PMTU_STEP;
+		if (qn->probed_mtu > ceiling)
+			qn->probed_mtu = ceiling;
+	}
+}
+
+/*
+ * A packet that wasn't a probe was lost.  If it was bigger than the base, and
+ * enough of those were lost with no bigger packet sent after them getting
+ * through, the path's MTU may have fallen: go back to the base now, and check
+ * the base still gets through, see LWS_QUIC_PMTUD_BH_LOSSES.  *last_pn is the
+ * PN of the last lost frame the caller saw, so each packet counts once.
+ */
+static void
+lws_quic_pmtud_lost_packet(struct lws_quic_netconn *qn,
+			   const struct lws_quic_tx_frame *f, uint64_t *last_pn)
+{
+	if (f->sent_in_pn == *last_pn)
+		return;
+	*last_pn = f->sent_in_pn;
+
+	if (f->packet_size + LWS_QUIC_PMTU_OVERHEAD <= LWS_QUIC_PMTU_BASE ||
+	    f->sent_in_pn < qn->pmtud_big_acked_pn1)
+		return;
+
+	if (qn->consecutive_mtu_losses < LWS_QUIC_PMTUD_BH_LOSSES)
+		qn->consecutive_mtu_losses++;
+
+	if (qn->consecutive_mtu_losses < LWS_QUIC_PMTUD_BH_LOSSES ||
+	    qn->current_mtu <= LWS_QUIC_PMTU_BASE ||
+	    !lws_quic_pmtud_may_probe(qn))
+		return;
+
+	lwsl_wsi_info(qn->nwsi, "QUIC PMTUD: %u packets bigger than %u lost, "
+		      "going back to %u", qn->consecutive_mtu_losses,
+		      LWS_QUIC_PMTU_BASE - LWS_QUIC_PMTU_OVERHEAD,
+		      LWS_QUIC_PMTU_BASE);
+
+	qn->pmtud_bh_from_mtu	= qn->current_mtu;
+	qn->pmtud_bh_from_state	= qn->pmtud_state;
+	qn->current_mtu		= LWS_QUIC_PMTU_BASE;
+	qn->pmtud_state		= 0; /* BASE */
+	/*
+	 * A search probe on its way stays the search's: if this was no black
+	 * hole, the search goes on from where it was, and that probe's loss
+	 * counts against its size, as it would have.  Forgotten, nothing would
+	 * stop the search sending another of that size while it is still out,
+	 * so a stall that looked like a black hole would cost the path one
+	 * more probe it can't carry.  A confirming probe from an earlier black
+	 * hole says nothing now.
+	 */
+	qn->pmtud_late_probe_pn	= LWS_QUIC_PMTUD_PROBE_NONE;
+	qn->pmtud_bh_from_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
+	qn->pmtud_bh_from_late_pn = LWS_QUIC_PMTUD_PROBE_NONE;
+	qn->pmtud_bh_from_fails	= 0;
+	qn->pmtud_raise_at	= lws_wsi_now(qn->nwsi) + LWS_QUIC_PMTUD_RAISE_US;
+
+	if (qn->pmtud_bh_probe_queued ||
+	    qn->pmtud_bh_probe_pn != LWS_QUIC_PMTUD_PROBE_NONE)
+		return;
+
+	if (!lws_quic_pmtud_queue_probe(qn, LWS_QUIC_PMTUD_PROBE_BASE))
+		qn->pmtud_bh_probe_queued = 1;
+}
+
+/*
+ * The base gets through, and the probe of the size from before going back to
+ * it was lost: the path's MTU fell, so the search starts again from the base
+ */
+static void
+lws_quic_pmtud_bh_confirmed(struct lws_quic_netconn *qn)
+{
+	lwsl_wsi_warn(qn->nwsi, "QUIC PMTUD: black hole: packets of %u are "
+		      "lost, the base gets through: searching again from %u",
+		      qn->pmtud_bh_from_mtu - LWS_QUIC_PMTU_OVERHEAD,
+		      LWS_QUIC_PMTU_BASE);
+	qn->pmtud_bh_from_mtu		= 0;
+	qn->pmtud_bh_from_late_pn	= LWS_QUIC_PMTUD_PROBE_NONE;
+	qn->consecutive_mtu_losses	= 0;
+	/* a search probe from before says nothing about the new search */
+	qn->pmtud_probe_pn		= LWS_QUIC_PMTUD_PROBE_NONE;
+	qn->probed_mtu			= LWS_QUIC_PMTU_FIRST_PROBE;
+	qn->pmtud_probe_fails		= 0;
+	qn->pmtud_raise_at		= 0;
+	qn->pmtud_state			= 1; /* SEARCHING */
+	lws_quic_pmtud_kick(qn);
+}
+
+/*
+ * A packet bigger than the base got through while a black hole is suspected,
+ * not confirmed yet: it wasn't a black hole, so go back to the size from
+ * before, and the search to where it was
+ */
+static void
+lws_quic_pmtud_bh_undo(struct lws_quic_netconn *qn)
+{
+	lwsl_wsi_info(qn->nwsi, "QUIC PMTUD: a packet bigger than %u got "
+		      "through after all, back to %u", LWS_QUIC_PMTU_BASE -
+		      LWS_QUIC_PMTU_OVERHEAD, qn->pmtud_bh_from_mtu);
+	qn->current_mtu		= qn->pmtud_bh_from_mtu;
+	qn->pmtud_state		= qn->pmtud_bh_from_state;
+	qn->pmtud_bh_from_mtu	= 0;
+	/* whichever packet it was, the confirming probes have nothing to say */
+	qn->pmtud_bh_from_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
+	qn->pmtud_bh_from_late_pn = LWS_QUIC_PMTUD_PROBE_NONE;
+	/* a settled search tries the size it settled under again later */
+	qn->pmtud_raise_at	= qn->pmtud_state == 2 ? lws_wsi_now(qn->nwsi) +
+						LWS_QUIC_PMTUD_RAISE_US : 0;
+	lws_quic_pmtud_kick(qn);
+}
+
+/*
+ * Packet f, bigger than the base, was acked.  If going back to the base for a
+ * black hole is still unconfirmed, f was sent before then, so it was loss,
+ * or it is the probe of the size from before: it wasn't a black hole.
+ */
+static void
+lws_quic_pmtud_big_acked(struct lws_quic_netconn *qn,
+			 const struct lws_quic_tx_frame *f)
+{
+	qn->consecutive_mtu_losses = 0;
+	if (f->sent_in_pn >= qn->pmtud_big_acked_pn1)
+		qn->pmtud_big_acked_pn1 = f->sent_in_pn + 1;
+
+	if (qn->pmtud_bh_from_mtu)
+		lws_quic_pmtud_bh_undo(qn);
+}
+
+/*
+ * The transport couldn't take the packet with probe f in it, which goes back
+ * to pending_tx to be sent in a packet of its own again
+ */
+static void
+lws_quic_pmtud_probe_unsent(struct lws_quic_netconn *qn,
+			    const struct lws_quic_tx_frame *f)
+{
+	if (f->pmtud_probe == LWS_QUIC_PMTUD_PROBE_BASE) {
+		if (f->sent_in_pn == qn->pmtud_bh_probe_pn)
+			qn->pmtud_bh_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
+		qn->pmtud_bh_probe_queued = 1;
+	} else if (f->pmtud_probe == LWS_QUIC_PMTUD_PROBE_FROM) {
+		if (f->sent_in_pn == qn->pmtud_bh_from_probe_pn)
+			qn->pmtud_bh_from_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
+		qn->pmtud_bh_from_probe_queued = 1;
+	} else if (f->pmtud_probe) {
+		if (f->sent_in_pn == qn->pmtud_probe_pn)
+			qn->pmtud_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
+		qn->pmtud_probe_queued = 1;
+	}
+}
+
+/*
+ * A probe's packet was lost.  The size of a search probe may be too big for
+ * the path, or the probe was just unlucky, so it is tried again until that
+ * size lost LWS_QUIC_PMTUD_MAX_PROBES, then the search settles on the size it
+ * has.  A base size probe being lost says the path loses small packets too,
+ * eg, it is down for a while, so the big ones lost before it say nothing
+ * about its MTU: the base is probed again, until one gets through.  The probe
+ * of the size from before going back, sent once the base got through, may
+ * only be late, so it is tried again until LWS_QUIC_PMTUD_MAX_PROBES of them
+ * are lost, which confirms the black hole.  A search probe sent before going
+ * back counts as it would have, for the search going on if it was no black
+ * hole.
+ *
+ * Returns nonzero if f is a probe, which the caller frees, without sending it
+ * again or counting it as congestion.
+ */
+static int
+lws_quic_pmtud_probe_lost(struct lws_quic_netconn *qn,
+			  const struct lws_quic_tx_frame *f)
+{
+	if (!f->pmtud_probe)
+		return 0;
+
+	if (f->pmtud_probe == LWS_QUIC_PMTUD_PROBE_FROM) {
+		if (f->sent_in_pn != qn->pmtud_bh_from_probe_pn)
+			return 1; /* it has nothing to say any more */
+		qn->pmtud_bh_from_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
+		if (!qn->pmtud_bh_from_mtu)
+			return 1;
+		/* its ack may yet come, if it was only late */
+		qn->pmtud_bh_from_late_pn = f->sent_in_pn;
+		if (++qn->pmtud_bh_from_fails >= LWS_QUIC_PMTUD_MAX_PROBES)
+			lws_quic_pmtud_bh_confirmed(qn);
+		else if (!qn->pmtud_bh_from_probe_queued &&
+			 lws_quic_pmtud_may_probe(qn) &&
+			 !lws_quic_pmtud_queue_probe(qn,
+						LWS_QUIC_PMTUD_PROBE_FROM))
+			qn->pmtud_bh_from_probe_queued = 1;
+		return 1;
+	}
+
+	if (f->pmtud_probe == LWS_QUIC_PMTUD_PROBE_BASE) {
+		if (f->sent_in_pn != qn->pmtud_bh_probe_pn)
+			return 1;
+		qn->pmtud_bh_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
+		if (qn->pmtud_bh_from_mtu && !qn->pmtud_bh_probe_queued &&
+		    lws_quic_pmtud_may_probe(qn) &&
+		    !lws_quic_pmtud_queue_probe(qn, LWS_QUIC_PMTUD_PROBE_BASE))
+			qn->pmtud_bh_probe_queued = 1;
+		return 1;
+	}
+
+	if (f->sent_in_pn != qn->pmtud_probe_pn)
+		return 1; /* one from before the search was reset */
+
+	/* its ack may yet come, if it was only late, see lws_quic_handle_ack */
+	qn->pmtud_late_probe_pn		= f->sent_in_pn;
+	qn->pmtud_late_probe_mtu	= qn->probed_mtu;
+	qn->pmtud_probe_pn		= LWS_QUIC_PMTUD_PROBE_NONE;
+	if (++qn->pmtud_probe_fails >= LWS_QUIC_PMTUD_MAX_PROBES) {
+		/*
+		 * Back at the base for a black hole, it's the search going on
+		 * from where it was, if it was no black hole, that settles
+		 */
+		lwsl_wsi_info(qn->nwsi, "QUIC PMTUD: %u lost probes of %u, "
+			      "settling on %u", qn->pmtud_probe_fails,
+			      qn->probed_mtu, qn->pmtud_state ?
+				qn->current_mtu : qn->pmtud_bh_from_mtu);
+		if (!qn->pmtud_state)
+			qn->pmtud_bh_from_state	= 2; /* SEARCH_COMPLETE */
+		else {
+			qn->pmtud_state		= 2; /* SEARCH_COMPLETE */
+			qn->pmtud_raise_at	= lws_wsi_now(qn->nwsi) +
+						LWS_QUIC_PMTUD_RAISE_US;
+		}
+	} else
+		lws_quic_pmtud_kick(qn);
+
+	return 1;
+}
+
+/*
  * The most DATAGRAM payload one packet can carry on the connection's path as
  * it is now: a short header packet with nothing else in it, fitted the way
  * lws_quic_packet_tx() fits frames
@@ -225,15 +607,44 @@ lws_quic_datagram_max(const struct lws_quic_netconn *qn)
 	return room > over ? room - over : 0;
 }
 
+/*
+ * Stop probing the address in probing_sa46.  failed says why the probe failed,
+ * or is NULL when it's only superseded by a probe of another address
+ */
 void
-lws_quic_path_probe_abandon(struct lws *nwsi)
+lws_quic_path_probe_abandon(struct lws *nwsi, const char *failed)
 {
 	struct lws_quic_netconn *qn = nwsi ? nwsi->quic.qn : NULL;
 
 	if (!qn || !qn->is_server || !qn->probing_sa46_valid)
 		return;
 
-	lwsl_wsi_notice(nwsi, "QUIC: path probe abandoned, staying on validated path");
+	if (failed) {
+		unsigned int shift = qn->probe_fails;
+#if (_LWS_ENABLED_LOGS & LLL_NOTICE)
+		char ads[64];
+
+		lws_sa46_write_numeric_address(&qn->probing_sa46, ads,
+					       sizeof(ads));
+#endif
+
+		if (shift > LWS_QUIC_PROBE_HOLDOFF_MAX_SHIFT)
+			shift = LWS_QUIC_PROBE_HOLDOFF_MAX_SHIFT;
+		if (qn->probe_fails < 255)
+			qn->probe_fails++;
+		qn->probe_holdoff_until = lws_wsi_now(nwsi) +
+				((lws_usec_t)LWS_QUIC_PROBE_HOLDOFF_US << shift);
+
+		lwsl_wsi_notice(nwsi, "QUIC: probe of peer's new address %s "
+				"failed, %s (%u in a row, sent %llu, rx %llu): "
+				"staying on validated path, not probing it "
+				"again for %llus", ads, failed, qn->probe_fails,
+				(unsigned long long)qn->probe_bytes_sent,
+				(unsigned long long)qn->probe_bytes_received,
+				(unsigned long long)(LWS_QUIC_PROBE_HOLDOFF_US
+						<< shift) / LWS_US_PER_SEC);
+	} else
+		lwsl_wsi_info(nwsi, "QUIC: path probe superseded");
 
 	lws_sul_cancel(&qn->path_probe_sul);
 	qn->probing_sa46_valid = 0;
@@ -263,17 +674,77 @@ lws_quic_path_probe_abandon(struct lws *nwsi)
 	} lws_end_foreach_dll_safe(d, d1);
 }
 
+/*
+ * Queue the server's PATH_CHALLENGE, with the data in path_challenge, to the
+ * address it is probing, unless one is already waiting to go.  It goes at the
+ * head of the queue, so the tx path gives it a packet of its own, sized to
+ * the address' anti-amplification allowance.
+ */
+static int
+lws_quic_path_probe_queue_challenge(struct lws *nwsi)
+{
+	struct lws_quic_netconn *qn = nwsi->quic.qn;
+	struct lws_quic_tx_frame *f;
+
+	lws_start_foreach_dll(struct lws_dll2 *, d,
+			      qn->pending_tx[LWS_QUIC_LEVEL_APP].head) {
+		f = lws_container_of(d, struct lws_quic_tx_frame, list);
+		if (f->type == LWS_QUIC_FT_PATH_CHALLENGE)
+			return 0;
+	} lws_end_foreach_dll(d);
+
+	f = lws_zalloc(sizeof(*f) + sizeof(qn->path_challenge),
+		       "quic path_chall");
+	if (!f)
+		return 1;
+
+	f->type		= LWS_QUIC_FT_PATH_CHALLENGE;
+	f->len		= sizeof(qn->path_challenge);
+	f->data		= (uint8_t *)&f[1];
+	memcpy(f->data, qn->path_challenge, sizeof(qn->path_challenge));
+	f->dest_sa46	= qn->probing_sa46;
+	f->has_dest	= 1;
+
+	qn->path_challenge_pending = 1;
+	lws_dll2_add_head(&f->list, &qn->pending_tx[LWS_QUIC_LEVEL_APP]);
+	lws_callback_on_writable(nwsi);
+
+	return 0;
+}
+
+/*
+ * Each PTO while the server's probe of a peer address is unanswered: send the
+ * PATH_CHALLENGE again, in case it was lost, until the probe's deadline, when
+ * it is abandoned (RFC 9000 8.2.1, 8.2.4).  It's the same challenge each
+ * time, so a PATH_RESPONSE to any of them validates the address.
+ */
 static void
 lws_quic_path_probe_sul_cb(lws_sorted_usec_list_t *sul)
 {
 	struct lws_quic_netconn *qn = lws_container_of(sul,
 					struct lws_quic_netconn, path_probe_sul);
+	lws_usec_t now, next;
 
-	if (!qn->nwsi)
+	if (!qn->nwsi || !qn->probing_sa46_valid)
 		return;
 
-	lwsl_wsi_notice(qn->nwsi, "QUIC: path validation timed out (RFC 9000 8.2.4)");
-	lws_quic_path_probe_abandon(qn->nwsi);
+	now = lws_wsi_now(qn->nwsi);
+	if (now >= qn->probe_deadline) {
+		lws_quic_path_probe_abandon(qn->nwsi, "no PATH_RESPONSE in "
+						      "time (RFC 9000 8.2.4)");
+		return;
+	}
+
+	if (lws_quic_path_probe_queue_challenge(qn->nwsi)) {
+		lws_quic_path_probe_abandon(qn->nwsi, "OOM");
+		return;
+	}
+
+	next = qn->probe_deadline - now;
+	if (next > qn->probe_pto)
+		next = qn->probe_pto;
+	lws_sul_schedule(qn->nwsi->a.context, qn->nwsi->tsi,
+			 &qn->path_probe_sul, lws_quic_path_probe_sul_cb, next);
 }
 
 /*
@@ -390,7 +861,7 @@ lws_quic_client_probe_preferred_address(struct lws *nwsi,
  * allocated for the connection, the original client DCID (it may not have
  * switched yet), or the preferred_address CID we advertised (RFC 9000 9.6).
  */
-static struct lws *
+struct lws *
 lws_quic_find_child_by_dcid(struct lws *listener,
 			    const struct lws_quic_cid *dcid)
 {
@@ -502,16 +973,17 @@ lws_quic_pto_cb(lws_sorted_usec_list_t *sul)
 	if (qn && qn->nwsi) {
 		qn->pto_count++;
 		/*
-		 * Pre-handshake_done on the client, leave the death of a silent
-		 * peer to the wsi connect timeout so the capped probe spacing in
-		 * lws_quic_pto_delay_us() can keep probing for the whole
-		 * connect window (otherwise the counter would kill it at
-		 * ~4x base x 8 first).  Server-side, keep the reap: it is the
-		 * only bound on half-open connections from clients that vanish
-		 * mid-handshake, and the capped spacing only makes it fire
-		 * sooner.
+		 * Pre-handshake_done, leave the death of a silent peer to the
+		 * handshake's own deadline, the wsi connect timeout on a client
+		 * and PENDING_TIMEOUT_AWAITING_CLIENT_HS_SEND on a server, so
+		 * the capped probe spacing in lws_quic_pto_delay_us() can keep
+		 * probing for the whole of it.  Otherwise the counter kills it
+		 * at ~4x base x 8 first: on a short path, a server waiting for
+		 * the client's Finished gave up after a couple of seconds of
+		 * corrupted packets, while the client, its handshake done,
+		 * carried on sending to a connection that no longer existed.
 		 */
-		if (qn->pto_count >= 8 && (qn->is_server || qn->handshake_done)) {
+		if (qn->pto_count >= 8 && qn->handshake_done) {
 			lwsl_wsi_notice(qn->nwsi, "QUIC connection dead: max PTO count (%d) reached\n", qn->pto_count);
 			lws_close_free_wsi(qn->nwsi, LWS_CLOSE_STATUS_NOSTATUS, "quic pto timeout");
 			return;
@@ -620,10 +1092,11 @@ lws_quic_detect_loss(struct lws *nwsi, int level, uint64_t largest_acked)
         struct lws_quic_netconn *qn = nwsi->quic.qn;
         if (!qn) return;
 
-        size_t total_bytes_lost = 0;
+        size_t total_bytes_lost = 0, bytes_off_path = 0;
         lws_usec_t now = lws_wsi_now(nwsi);
         lws_usec_t loss_time = qn->smoothed_rtt ? (qn->smoothed_rtt * 9 / 8) : 50000;
         lws_usec_t oldest_lost = 0, newest_lost = 0;
+	uint64_t last_lost_pn = LWS_QUIC_PMTUD_PROBE_NONE;
 
 	int check_levels[] = { level, level == LWS_QUIC_LEVEL_APP ? LWS_QUIC_LEVEL_EARLY : -1 };
 	for (int i = 0; i < 2; i++) {
@@ -635,10 +1108,27 @@ lws_quic_detect_loss(struct lws *nwsi, int level, uint64_t largest_acked)
 
 			if (f->sent_in_pn <= largest_acked &&
 				(f->sent_in_pn + 3 <= largest_acked || (f->sent_in_pn < largest_acked && now > f->sent_time_us + loss_time))) {
-				
+
+				if (lws_quic_pmtud_probe_lost(qn, f)) {
+					/* not congestion, see RFC 9000 14.4 */
+					bytes_off_path += f->wire_len;
+					lws_dll2_remove(&f->list);
+					lws_free(f);
+					continue;
+				}
+
+				if (lws_quic_frame_probes_another_path(qn, f)) {
+					/* the probe sends it again */
+					bytes_off_path += f->wire_len;
+					lws_dll2_remove(&f->list);
+					lws_free(f);
+					continue;
+				}
+
 				/* Mark as lost */
 				total_bytes_lost += f->wire_len;
 				lwsl_wsi_info(nwsi, "QUIC LOSS: Packet %llu lost, frame %d", (unsigned long long)f->sent_in_pn, f->type);
+				lws_quic_pmtud_lost_packet(qn, f, &last_lost_pn);
 				
 				if (!oldest_lost || f->sent_time_us < oldest_lost)
 					oldest_lost = f->sent_time_us;
@@ -685,6 +1175,10 @@ lws_quic_detect_loss(struct lws *nwsi, int level, uint64_t largest_acked)
                 }
         }
 
+        /* not congestion on our path, but no longer in flight either */
+        if (bytes_off_path && qn->cc_ops && qn->cc_ops->on_discard)
+                qn->cc_ops->on_discard(nwsi, bytes_off_path);
+
         if (total_bytes_lost)
                 lws_callback_on_writable(nwsi);
 }
@@ -706,18 +1200,47 @@ lws_quic_handle_ack(struct lws *nwsi, int level, uint64_t pn_lo,
 	if (ack_delay > 0x7fffffff)
 		ack_delay = 0x7fffffff;
 
-	/* PMTUD: Check if our active probe was acknowledged */
-	if (qn->pmtud_probe_pn != LWS_QUIC_PMTUD_PROBE_NONE &&
+	/*
+	 * PMTUD: our probe, in the application PN space, was acknowledged, so
+	 * the path carries its size: probe the next one up, if any.  So it does
+	 * if the ack came after we gave the probe up for lost.
+	 */
+	if (level == LWS_QUIC_LEVEL_APP &&
+	    qn->pmtud_probe_pn != LWS_QUIC_PMTUD_PROBE_NONE &&
 	    qn->pmtud_probe_pn >= pn_lo && qn->pmtud_probe_pn <= pn_hi) {
-		lwsl_wsi_info(nwsi, "QUIC PMTUD: Probe %llu ACKed! MTU upgraded from %d to %d",
-			(unsigned long long)qn->pmtud_probe_pn, (int)qn->current_mtu, (int)qn->probed_mtu);
-		qn->current_mtu = qn->probed_mtu;
-		qn->pmtud_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
-		qn->consecutive_mtu_losses = 0;
-		qn->probed_mtu += 100; /* Probe upward in 100-byte increments */
-		if (qn->probed_mtu > 1400) /* Cap at typical Ethernet MTU payload limit for this example */
-			qn->pmtud_state = 2; /* SEARCH_COMPLETE */
+		lwsl_wsi_info(nwsi, "QUIC PMTUD: probe %llu of %u acked",
+			      (unsigned long long)qn->pmtud_probe_pn,
+			      qn->probed_mtu);
+		lws_quic_pmtud_carries(qn, qn->probed_mtu);
 	}
+
+	if (level == LWS_QUIC_LEVEL_APP &&
+	    qn->pmtud_late_probe_pn != LWS_QUIC_PMTUD_PROBE_NONE &&
+	    qn->pmtud_late_probe_pn >= pn_lo &&
+	    qn->pmtud_late_probe_pn <= pn_hi) {
+		lwsl_wsi_info(nwsi, "QUIC PMTUD: probe %llu of %u acked after "
+			      "it was given up for lost",
+			      (unsigned long long)qn->pmtud_late_probe_pn,
+			      qn->pmtud_late_probe_mtu);
+		qn->pmtud_late_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
+		lws_quic_pmtud_carries(qn, qn->pmtud_late_probe_mtu);
+	}
+
+	/* a confirming probe given up for lost was only late: no black hole */
+	if (level == LWS_QUIC_LEVEL_APP && qn->pmtud_bh_from_mtu &&
+	    qn->pmtud_bh_from_late_pn != LWS_QUIC_PMTUD_PROBE_NONE &&
+	    qn->pmtud_bh_from_late_pn >= pn_lo &&
+	    qn->pmtud_bh_from_late_pn <= pn_hi) {
+		lwsl_wsi_info(nwsi, "QUIC PMTUD: probe %llu of %u acked after "
+			      "it was given up for lost",
+			      (unsigned long long)qn->pmtud_bh_from_late_pn,
+			      qn->pmtud_bh_from_mtu);
+		lws_quic_pmtud_bh_undo(qn);
+	}
+
+	/* the next probe, or the first since the search was reset */
+	if (level == LWS_QUIC_LEVEL_APP)
+		lws_quic_pmtud_kick(qn);
 
 	size_t bytes_acked = 0;
 	lws_usec_t rtt = 0;
@@ -741,6 +1264,10 @@ lws_quic_handle_ack(struct lws *nwsi, int level, uint64_t pn_lo,
 				 */
 				if (f->sent_in_pn == pn_hi)
 					rtt_largest = rtt;
+				/* a packet bigger than the base got through */
+				if (f->packet_size + LWS_QUIC_PMTU_OVERHEAD >
+							LWS_QUIC_PMTU_BASE)
+					lws_quic_pmtud_big_acked(qn, f);
 				/* Packet was received successfully, free the frame! */
 				lws_dll2_remove(&f->list);
 				lws_free(f);
@@ -753,6 +1280,30 @@ lws_quic_handle_ack(struct lws *nwsi, int level, uint64_t pn_lo,
 				}
 			}
 		} lws_end_foreach_dll_safe(d, d1);
+	}
+
+	/*
+	 * PMTUD black hole check: the base size probe got through, and no big
+	 * packet from before going back to the base did.  The path is up, but
+	 * that doesn't say big packets are lost, eg, after an outage of
+	 * everything: confirm it with a probe of the size from before, see
+	 * LWS_QUIC_PMTUD_BH_LOSSES.  Its ack is a big packet's, which goes back
+	 * to that size, and losing it confirms the black hole.
+	 */
+	if (level == LWS_QUIC_LEVEL_APP &&
+	    qn->pmtud_bh_probe_pn != LWS_QUIC_PMTUD_PROBE_NONE &&
+	    qn->pmtud_bh_probe_pn >= pn_lo && qn->pmtud_bh_probe_pn <= pn_hi) {
+		qn->pmtud_bh_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
+
+		if (qn->pmtud_bh_from_mtu &&
+		    !qn->pmtud_bh_from_probe_queued &&
+		    qn->pmtud_bh_from_probe_pn == LWS_QUIC_PMTUD_PROBE_NONE) {
+			lwsl_wsi_info(nwsi, "QUIC PMTUD: the base gets through, "
+				      "probing %u again", qn->pmtud_bh_from_mtu);
+			if (!lws_quic_pmtud_queue_probe(qn,
+						LWS_QUIC_PMTUD_PROBE_FROM))
+				qn->pmtud_bh_from_probe_queued = 1;
+		}
 	}
 
 	if (bytes_acked) {
@@ -860,6 +1411,7 @@ void
 lws_quic_discard_keys(struct lws *nwsi, int level)
 {
 	struct lws_quic_netconn *qn = nwsi->quic.qn;
+	size_t bytes_discarded = 0;
 	int discarded = 0;
 
 	if (!qn) return;
@@ -878,9 +1430,21 @@ lws_quic_discard_keys(struct lws *nwsi, int level)
 
 	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, qn->in_flight[level].head) {
 		struct lws_quic_tx_frame *f = lws_container_of(d, struct lws_quic_tx_frame, list);
+		bytes_discarded += f->wire_len;
 		lws_dll2_remove(&f->list);
 		lws_free(f);
 	} lws_end_foreach_dll_safe(d, d1);
+
+	/*
+	 * RFC 9002 A.11: the space's packets still in flight are no longer
+	 * in flight for congestion control either.  They are neither acked
+	 * nor lost, so cwnd stays as it is.  Left counted, they are a
+	 * permanent debt against the window: once loss shrinks cwnd near
+	 * its minimum, nothing in flight is left to arm the PTO, and what
+	 * the window has no room for is never sent.
+	 */
+	if (bytes_discarded && qn->cc_ops && qn->cc_ops->on_discard)
+		qn->cc_ops->on_discard(nwsi, bytes_discarded);
 
 	lws_quic_rx_held_destroy(&qn->rx_crypto_held[level]);
 
@@ -928,6 +1492,201 @@ lws_get_quic_network_wsi(struct lws *wsi)
 		wsi = wsi->mux.parent_wsi;
 	}
 	return NULL;
+}
+
+/*
+ * A stream timed out sending its ws close, or waiting for the peer's answer to
+ * it, or flushing what it sent before closing with nothing left to flush, or
+ * its connection timed out with streams like that, or with frames of theirs
+ * still waiting or in flight: say what the stream and its connection were
+ * doing, at notice, ie, which of the things that give a stream its turn to
+ * write, or get what it wrote to the peer, didn't happen.  Logging before
+ * such a stall can change its timing enough to hide it, so this is only
+ * printed once it happened.
+ */
+static int
+lws_quic_dump_frames(struct lws *wsi, const char *what, lws_dll2_owner_t *o,
+		     uint64_t sid, lws_usec_t now, int print)
+{
+	int n = 0;
+
+	lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(o)) {
+		struct lws_quic_tx_frame *f = lws_container_of(d,
+					struct lws_quic_tx_frame, list);
+
+		if ((f->type & 0xf8) != LWS_QUIC_FT_STREAM ||
+		    f->stream_id != sid)
+			continue;
+		if (print && n < 4)
+			lwsl_wsi_notice(wsi, "  %s: off %llu len %u fin %d, "
+					"pn %llu, sent %lldms ago", what,
+					(unsigned long long)f->offset,
+					(unsigned int)f->len, f->type & 1,
+					(unsigned long long)f->sent_in_pn,
+					f->sent_time_us ? (long long)
+					((now - f->sent_time_us) /
+						LWS_US_PER_MS) : -1ll);
+		n++;
+	} lws_end_foreach_dll(d);
+
+	return n;
+}
+
+/* stream w's frames still waiting or in flight */
+static int
+lws_quic_stream_frames(struct lws_quic_netconn *qn, struct lws *w,
+		       lws_usec_t now)
+{
+	uint64_t sid = w->quic.qs->stream_id;
+
+	return lws_quic_dump_frames(w, NULL, &qn->pending_tx[LWS_QUIC_LEVEL_APP],
+				    sid, now, 0) ||
+	       lws_quic_dump_frames(w, NULL, &qn->in_flight[LWS_QUIC_LEVEL_APP],
+				    sid, now, 0);
+}
+
+/*
+ * Is stream w closing once what it sent has gone, with nothing left to go?
+ * Then it can only be waiting on its own next turn, which never came.  One
+ * still sending, or waiting for the peer to acknowledge it, is not stuck
+ * here: a peer that went away takes as long as its flush timeout.
+ */
+static int
+lws_quic_stream_flush_stuck(struct lws_quic_netconn *qn, struct lws *w,
+			    lws_usec_t now)
+{
+	return lwsi_flushing_to_close(w) && !w->buflist_out &&
+	       !lws_quic_stream_frames(qn, w, now);
+}
+
+/* does stream w still wait on its peer for anything, see above */
+static int
+lws_quic_stream_outstanding(struct lws_quic_netconn *qn, struct lws *w,
+			    lws_usec_t now)
+{
+	return lwsi_close(w) == LCS_WAITING_TO_SEND_CLOSE ||
+	       lwsi_close(w) == LCS_AWAITING_CLOSE_ACK ||
+	       lws_quic_stream_flush_stuck(qn, w, now) ||
+	       lws_quic_stream_frames(qn, w, now);
+}
+
+#if (_LWS_ENABLED_LOGS & LLL_NOTICE)
+static const char * const close_phase_names[] = {
+	[LCS_NONE]			= "none",
+	[LCS_CLOSE_WHEN_FLUSHED]	= "close when flushed",
+	[LCS_CLOSING]			= "closing",
+	[LCS_WAITING_TO_SEND_CLOSE]	= "waiting to send close",
+	[LCS_RETURNED_CLOSE]		= "returned close",
+	[LCS_AWAITING_CLOSE_ACK]	= "awaiting close ack",
+	[LCS_FLUSHING_BEFORE_CLOSE]	= "flushing before close",
+	[LCS_SHUTDOWN]			= "shutdown",
+	[LCS_DEAD_SOCKET]		= "dead socket",
+	[LCS_USER_TOLD]			= "user told",
+};
+#endif
+
+static void
+lws_quic_dump_stream(struct lws_quic_netconn *qn, struct lws *w,
+		     lws_usec_t now)
+{
+	struct lws_quic_stream *qs = w->quic.qs;
+#if (_LWS_ENABLED_LOGS & LLL_NOTICE)
+	unsigned int cp = (unsigned int)lwsi_close(w);
+#endif
+
+	/*
+	 * Its role and state say whose turn to write it gets (a ws stream's
+	 * is not an h3 one's), lws' own held tx is what a close flushes
+	 */
+	lwsl_wsi_notice(w, "  stream %llu: role %s, state 0x%x, close phase "
+			"%s, wants write %d, tx_offset %llu, tx credit %d, "
+			"fin sent %d, fin rx %d, lws holds %u tx",
+			(unsigned long long)qs->stream_id,
+			w->role_ops ? w->role_ops->name : "none",
+			(unsigned int)lwsi_state(w),
+			cp < LWS_ARRAY_SIZE(close_phase_names) &&
+				close_phase_names[cp] ?
+					close_phase_names[cp] : "?",
+			w->mux.requested_POLLOUT,
+			(unsigned long long)qs->tx_offset, (int)w->txc.tx_cr,
+			qs->sent_fin, qs->fin_received,
+			(unsigned int)lws_buflist_total_len(&w->buflist_out));
+	lws_quic_dump_frames(w, "waiting", &qn->pending_tx[LWS_QUIC_LEVEL_APP],
+			     qs->stream_id, now, 1);
+	lws_quic_dump_frames(w, "in flight", &qn->in_flight[LWS_QUIC_LEVEL_APP],
+			     qs->stream_id, now, 1);
+}
+
+void
+lws_quic_dump_stalled(struct lws *wsi)
+{
+	struct lws *nwsi = lws_get_quic_network_wsi(wsi);
+	struct lws_quic_netconn *qn;
+	lws_usec_t now;
+	int l, any = 0;
+
+	if (!nwsi || !nwsi->quic.qn)
+		return;
+
+	qn = nwsi->quic.qn;
+	now = lws_wsi_now(nwsi);
+
+	if (wsi->quic.qs)
+		any = wsi->pending_timeout !=
+				PENDING_FLUSH_STORED_SEND_BEFORE_CLOSE ||
+		      lws_quic_stream_flush_stuck(qn, wsi, now);
+	else
+		lws_start_foreach_dll(struct lws_dll2 *, d,
+				lws_dll2_get_head(&nwsi->mux.child_list_owner)) {
+			struct lws *w = lws_container_of(d, struct lws,
+							 mux.sibling_list);
+
+			if (w->quic.qs && lws_quic_stream_outstanding(qn, w, now))
+				any = 1;
+		} lws_end_foreach_dll(d);
+
+	if (!any)
+		return;
+
+	lwsl_wsi_notice(wsi, "QUIC: timed out (%d) with a stream stuck",
+			wsi->pending_timeout);
+	lwsl_wsi_notice(nwsi, "  conn: handshake done %d, closing %d, tx "
+			"credit %d, pto_count %u, pto armed %d, wants write %d "
+			"(its listener %d), last pass held %d full %d failed %d, "
+			"mtu %u, pmtud state %u, probe queued %d/%d/%d",
+			qn->handshake_done, qn->is_closing, (int)nwsi->txc.tx_cr,
+			qn->pto_count, !lws_dll2_is_detached(&qn->pto_sul.list),
+			nwsi->mux.requested_POLLOUT, nwsi->mux.parent_wsi ?
+				nwsi->mux.parent_wsi->mux.requested_POLLOUT : -1,
+			qn->tx_held, qn->tx_full, qn->tx_failed,
+			qn->current_mtu, qn->pmtud_state,
+			qn->pmtud_probe_queued, qn->pmtud_bh_probe_queued,
+			qn->pmtud_bh_from_probe_queued);
+	for (l = 0; l < LWS_QUIC_LEVEL_COUNT; l++)
+		if (qn->pending_tx[l].count || qn->in_flight[l].count ||
+		    qn->needs_ack[l])
+			lwsl_wsi_notice(nwsi, "  level %d: %u waiting, %u in "
+					"flight, ack owed %d", l,
+					(unsigned int)qn->pending_tx[l].count,
+					(unsigned int)qn->in_flight[l].count,
+					qn->needs_ack[l]);
+	if (qn->cc_ops && qn->cc_ops->can_send)
+		lwsl_wsi_notice(nwsi, "  cc can send a packet: %d",
+				qn->cc_ops->can_send(nwsi, qn->current_mtu));
+
+	if (wsi->quic.qs) {
+		lws_quic_dump_stream(qn, wsi, now);
+		return;
+	}
+
+	lws_start_foreach_dll(struct lws_dll2 *, d,
+			lws_dll2_get_head(&nwsi->mux.child_list_owner)) {
+		struct lws *w = lws_container_of(d, struct lws,
+						 mux.sibling_list);
+
+		if (w->quic.qs && lws_quic_stream_outstanding(qn, w, now))
+			lws_quic_dump_stream(qn, w, now);
+	} lws_end_foreach_dll(d);
 }
 
 #if defined(LWS_WITH_SERVER)
@@ -1101,7 +1860,7 @@ lws_quic_replies_destroy(struct lws *lwsi)
  * The DCID and SCID of the long header packet at p (RFC 9000 17.2), or -1 if
  * the header does not fit in len or a CID is longer than QUIC allows
  */
-static int
+int
 lws_quic_long_hdr_cids(const uint8_t *p, size_t len, struct lws_quic_cid *dcid,
 		       struct lws_quic_cid *scid)
 {
@@ -1163,6 +1922,36 @@ lws_quic_client_long_hdr_foreign(struct lws *nwsi,
  * parsed.  wsi is the socket's wsi: on a server the listening one, where the
  * packet's DCID finds the connection it belongs to.
  */
+static lws_handling_result_t
+lws_quic_rx_early_pkts(struct lws *wsi, struct lws_quic_netconn *qn);
+
+/*
+ * Keep a copy of a 1-RTT packet that reached a server before its handshake
+ * completed, see struct lws_quic_early_pkt.  Returns 0 if it was kept.
+ */
+static int
+lws_quic_hold_early_pkt(struct lws_quic_netconn *qn, const uint8_t *pkt,
+			size_t len, const lws_sockaddr46 *peer, uint8_t ecn)
+{
+	struct lws_quic_early_pkt *ep;
+
+	if (lws_dll2_count(&qn->early_pkts) >= LWS_QUIC_EARLY_PKTS_MAX)
+		return 1;
+
+	ep = lws_malloc(sizeof(*ep) + len, __func__);
+	if (!ep)
+		return 1;
+
+	memset(&ep->list, 0, sizeof(ep->list));
+	ep->peer	= *peer;
+	ep->len		= len;
+	ep->ecn		= ecn;
+	memcpy(&ep[1], pkt, len);
+	lws_dll2_add_tail(&ep->list, &qn->early_pkts);
+
+	return 0;
+}
+
 static lws_handling_result_t
 rops_rx_dgram_quic(struct lws *wsi, uint8_t *buf, size_t len,
 		   const lws_sockaddr46 *peer, uint8_t ecn)
@@ -1383,10 +2172,7 @@ rops_rx_dgram_quic(struct lws *wsi, uint8_t *buf, size_t len,
 		/* RFC 9000 §13.2.1 default max_ack_delay cap for delayed ACKs */
 		nwsi->quic.qn->ack_delay_us = 25 * LWS_US_PER_MS;
 
-		nwsi->quic.qn->current_mtu = 1280;
-		nwsi->quic.qn->probed_mtu = 1380; /* first probe size */
-		nwsi->quic.qn->pmtud_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
-		nwsi->quic.qn->pmtud_state = 1; /* SEARCHING */
+		lws_quic_pmtud_reset(nwsi->quic.qn);
 
 		if (nwsi->a.context->quic_cc_ops)
 			nwsi->quic.qn->cc_ops = nwsi->a.context->quic_cc_ops;
@@ -1904,8 +2690,12 @@ tp_ok:
 		 * would be served to a peer that may yet be refused... and
 		 * the handshake keys, which the client's Finished still
 		 * needs, are discarded below on the first 1-RTT packet.  So
-		 * drop it undecrypted: it is not acknowledged, and the
-		 * client's loss recovery sends its frames again.
+		 * don't decrypt it yet.  It can simply have overtaken the
+		 * client's Finished on the way, so hold a few still
+		 * protected until the handshake completes, and process them
+		 * then (lws_quic_rx_early_pkts()).  Any more are dropped
+		 * unacknowledged, and the client's loss recovery sends their
+		 * frames again.
 		 *
 		 * 0-RTT is served before the handshake completes by design,
 		 * with nothing yet known about this client: a vhost that
@@ -1917,9 +2707,17 @@ tp_ok:
 		     (level == LWS_QUIC_LEVEL_EARLY && nwsi->a.vhost &&
 		      lws_check_opt(nwsi->a.vhost->options,
 			LWS_SERVER_OPTION_REQUIRE_VALID_OPENSSL_CLIENT_CERT)))) {
-			lwsl_wsi_info(wsi, "QUIC RX: level %d before the handshake "
-					   "completed, dropping %zu bytes",
-					   level, packet_size);
+			if (level == LWS_QUIC_LEVEL_APP &&
+			    !lws_quic_hold_early_pkt(nwsi->quic.qn, p,
+						     packet_size, peer, ecn))
+				lwsl_wsi_info(wsi, "QUIC RX: 1-RTT before the "
+						   "handshake completed, holding "
+						   "%zu bytes", packet_size);
+			else
+				lwsl_wsi_info(wsi, "QUIC RX: level %d before "
+						   "the handshake completed, "
+						   "dropping %zu bytes",
+						   level, packet_size);
 			p += packet_size;
 			n -= (int)packet_size;
 			continue;
@@ -2283,9 +3081,31 @@ tp_ok:
 #endif
 #endif
 
-				if (nwsi->quic.qn->is_server) {
+				if (nwsi->quic.qn->is_server &&
+				    nwsi->quic.qn->probe_fails &&
+				    lws_quic_sa46_same_path(&migration_sa46,
+						&nwsi->quic.qn->probing_sa46) &&
+				    lws_wsi_now(nwsi) <
+					nwsi->quic.qn->probe_holdoff_until) {
+					/*
+					 * Probing this address failed lately,
+					 * don't try again yet; what it sends
+					 * still earns its allowance for when we
+					 * do
+					 */
+					nwsi->quic.qn->probe_bytes_received +=
+							(uint64_t)orig_n;
+				} else if (nwsi->quic.qn->is_server) {
 #if (_LWS_ENABLED_LOGS & LLL_NOTICE)
-					lwsl_notice("QUIC Server: Connection Migration initiated! Peer address changed from %s:%u to %s:%u (pending validation)\n",
+					/* trying an address again is not news */
+					if (nwsi->quic.qn->probe_fails &&
+					    lws_quic_sa46_same_path(&migration_sa46,
+						    &nwsi->quic.qn->probing_sa46))
+						lwsl_info("QUIC Server: probing peer address %s:%u again\n",
+							  buf_new,
+							  (unsigned int)ntohs(port_new));
+					else
+						lwsl_notice("QUIC Server: Connection Migration initiated! Peer address changed from %s:%u to %s:%u (pending validation)\n",
 						    buf_old, (unsigned int)ntohs(port_old),
 						    buf_new, (unsigned int)ntohs(port_new));
 #endif
@@ -2307,7 +3127,7 @@ tp_ok:
 					 * (8.2.4).  A probe to a different address that
 					 * is still outstanding is superseded.
 					 */
-					lws_quic_path_probe_abandon(nwsi);
+					lws_quic_path_probe_abandon(nwsi, NULL);
 					nwsi->quic.qn->rx_has_non_probing = 0;
 					if (lws_quic_sa46_same_path(&migration_sa46,
 						    &nwsi->quic.qn->probing_sa46))
@@ -2317,44 +3137,40 @@ tp_ok:
 						nwsi->quic.qn->probing_sa46 = migration_sa46;
 						nwsi->quic.qn->probe_bytes_received = (uint64_t)orig_n;
 						nwsi->quic.qn->probe_bytes_sent = 0;
+						/* a new address has failed nothing yet */
+						nwsi->quic.qn->probe_fails = 0;
 					}
 					nwsi->quic.qn->probing_sa46_valid = 1;
 
 					{
-						struct lws_quic_tx_frame *f_pc =
-							lws_zalloc(sizeof(*f_pc) + 8,
-								   "quic path_chall");
+						struct lws_quic_netconn *qn =
+							nwsi->quic.qn;
 						lws_usec_t pto;
 
-						if (f_pc) {
-							f_pc->type = LWS_QUIC_FT_PATH_CHALLENGE;
-							f_pc->len = 8;
-							f_pc->data = (uint8_t *)&f_pc[1];
-							if (lws_get_random(wsi->a.context,
-									   f_pc->data, 8) != 8) {
-								lws_free(f_pc);
-								return LWS_HPI_RET_HANDLED;
-							}
-							memcpy(nwsi->quic.qn->path_challenge,
-							       f_pc->data, 8);
-							nwsi->quic.qn->path_challenge_pending = 1;
-							f_pc->dest_sa46 = migration_sa46;
-							f_pc->has_dest = 1;
-							lws_dll2_add_head(&f_pc->list,
-								&nwsi->quic.qn->pending_tx[LWS_QUIC_LEVEL_APP]);
+						if (lws_get_random(wsi->a.context,
+							qn->path_challenge,
+							sizeof(qn->path_challenge)) !=
+						      sizeof(qn->path_challenge) ||
+						    lws_quic_path_probe_queue_challenge(nwsi)) {
+							qn->probing_sa46_valid = 0;
+							return LWS_HPI_RET_HANDLED;
 						}
 
 						/*
 						 * RFC 9000 8.2.4: give up after three
 						 * times the larger of the current PTO
-						 * and the initial PTO
+						 * and the initial PTO, sending the
+						 * challenge again each PTO until then
 						 */
-						pto = lws_quic_pto_base_us(nwsi->quic.qn);
+						pto = lws_quic_pto_base_us(qn);
 						if (pto < LWS_QUIC_DEFAULT_PTO_US)
 							pto = LWS_QUIC_DEFAULT_PTO_US;
+						qn->probe_pto = pto;
+						qn->probe_deadline = lws_wsi_now(nwsi) +
+								     3 * pto;
 						lws_sul_schedule(nwsi->a.context, nwsi->tsi,
-							&nwsi->quic.qn->path_probe_sul,
-							lws_quic_path_probe_sul_cb, 3 * pto);
+							&qn->path_probe_sul,
+							lws_quic_path_probe_sul_cb, pto);
 					}
 
 				} else {
@@ -2381,10 +3197,7 @@ tp_ok:
 					nwsi->quic.qn->latest_rtt = 0;
 
 					/* Reset PMTUD */
-					nwsi->quic.qn->current_mtu = 1280;
-					nwsi->quic.qn->probed_mtu = 1380;
-					nwsi->quic.qn->pmtud_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
-					nwsi->quic.qn->pmtud_state = 1;
+					lws_quic_pmtud_reset(nwsi->quic.qn);
 
 					/* Set path to unvalidated */
 					nwsi->quic.qn->address_validated = 0;
@@ -2642,7 +3455,52 @@ next_packet:
 		p += packet_size;
 	}
 
+	/*
+	 * If this completed a server's handshake, the 1-RTT packets that got
+	 * here before it can be processed now
+	 */
+	if (nwsi && nwsi != wsi && nwsi->quic.qn &&
+	    nwsi->quic.qn->handshake_done &&
+	    lws_dll2_count(&nwsi->quic.qn->early_pkts))
+		return lws_quic_rx_early_pkts(wsi, nwsi->quic.qn);
+
 	return LWS_HPI_RET_HANDLED;
+}
+
+/*
+ * The server's 1-RTT packets that came before its handshake completed, once it
+ * has: each is processed as if it had just arrived alone in a datagram from
+ * where it came.  They are taken off the connection first, since processing
+ * one may close it.
+ */
+static lws_handling_result_t
+lws_quic_rx_early_pkts(struct lws *wsi, struct lws_quic_netconn *qn)
+{
+	lws_handling_result_t r = LWS_HPI_RET_HANDLED;
+	lws_dll2_owner_t owner;
+	struct lws_dll2 *d;
+
+	memset(&owner, 0, sizeof(owner));
+	while ((d = lws_dll2_get_head(&qn->early_pkts))) {
+		lws_dll2_remove(d);
+		lws_dll2_add_tail(d, &owner);
+	}
+
+	while ((d = lws_dll2_get_head(&owner))) {
+		struct lws_quic_early_pkt *ep = lws_container_of(d,
+					struct lws_quic_early_pkt, list);
+
+		lws_dll2_remove(d);
+		if (r == LWS_HPI_RET_HANDLED) {
+			lwsl_wsi_info(wsi, "QUIC RX: processing held 1-RTT "
+					   "packet, %zu bytes", ep->len);
+			r = rops_rx_dgram_quic(wsi, (uint8_t *)&ep[1], ep->len,
+					       &ep->peer, ep->ecn);
+		}
+		lws_free(ep);
+	}
+
+	return r;
 }
 
 /* a quic socket is read one datagram at a time, to rx_dgram */
@@ -2992,6 +3850,28 @@ lws_quic_packet_tx(struct lws *wsi, uint8_t *buf, size_t max,
 		}
 
 		/*
+		 * A PMTUD probe has a packet of its own, so where it is in the
+		 * queue, it would wait until everything ahead of it was sent,
+		 * and loss recovery keeps putting what was lost ahead of it.
+		 * Behind a black hole, that is never: move it to the front.
+		 */
+		if (level == LWS_QUIC_LEVEL_APP &&
+		    (qn->pmtud_probe_queued || qn->pmtud_bh_probe_queued ||
+		     qn->pmtud_bh_from_probe_queued)) {
+			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+					qn->pending_tx[level].head) {
+				struct lws_quic_tx_frame *f =
+					lws_container_of(d, struct lws_quic_tx_frame, list);
+				if (f->pmtud_probe) {
+					lws_dll2_remove(&f->list);
+					lws_dll2_add_head(&f->list,
+						&qn->pending_tx[level]);
+					break;
+				}
+			} lws_end_foreach_dll_safe(d, d1);
+		}
+
+		/*
 		 * If a path probe is pending, promote PATH_CHALLENGE to the
 		 * very front of pending_tx so it is the first APP frame sent
 		 * to the new address (QIR requires this for connectionmigration
@@ -3046,12 +3926,9 @@ lws_quic_packet_tx(struct lws *wsi, uint8_t *buf, size_t max,
 
 					if (qn->probe_bytes_sent + probe_min >
 								allowance) {
-						lwsl_wsi_notice(wsi, "QUIC TX: probe path "
-							"anti-amplification limit reached "
-							"(sent %llu, rx %llu)",
-							(unsigned long long)qn->probe_bytes_sent,
-							(unsigned long long)qn->probe_bytes_received);
-						lws_quic_path_probe_abandon(wsi);
+						lws_quic_path_probe_abandon(wsi,
+							"anti-amplification "
+							"limit reached");
 					} else {
 						probe_budget = allowance - qn->probe_bytes_sent;
 						to_probe_path = 1;
@@ -3157,6 +4034,9 @@ lws_quic_packet_tx(struct lws *wsi, uint8_t *buf, size_t max,
 		}
 
 		/* 2. Bundle frames from pending_tx until MTU is reached */
+		uint8_t * const p_frames = p;
+		int pmtud_probe = 0;
+
 		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, qn->pending_tx[level].head) {
 			struct lws_quic_tx_frame *f = lws_container_of(d, struct lws_quic_tx_frame, list);
 
@@ -3204,6 +4084,16 @@ lws_quic_packet_tx(struct lws *wsi, uint8_t *buf, size_t max,
 				}
 				packet_dest_sa46 = f->dest_sa46;
 				has_packet_dest = 1;
+			}
+
+			/*
+			 * A PMTUD probe's PING has a packet of its own, but
+			 * for an ACK, so it waits for one that has nothing
+			 * else in it yet
+			 */
+			if (f->pmtud_probe && p != p_frames) {
+				d = d1;
+				continue;
 			}
 
 			/* Check if frame fits in remaining MTU (leaving room for headers and 16-byte AEAD tag) */
@@ -3336,6 +4226,20 @@ lws_quic_packet_tx(struct lws *wsi, uint8_t *buf, size_t max,
 
 				/* Schedule PTO timer since we have data in-flight */
 				lws_sul_schedule(wsi->a.context, 0, &qn->pto_sul, lws_quic_pto_cb, pto_delay);
+
+				if (f->pmtud_probe) {
+					/* nothing else joins it */
+					if (f->pmtud_probe ==
+						LWS_QUIC_PMTUD_PROBE_BASE)
+						qn->pmtud_bh_probe_queued = 0;
+					else if (f->pmtud_probe ==
+						LWS_QUIC_PMTUD_PROBE_FROM)
+						qn->pmtud_bh_from_probe_queued = 0;
+					else
+						qn->pmtud_probe_queued = 0;
+					pmtud_probe = f->pmtud_probe;
+					break;
+				}
 			}
 
 		} lws_end_foreach_dll_safe(d, d1);
@@ -3366,24 +4270,62 @@ lws_quic_packet_tx(struct lws *wsi, uint8_t *buf, size_t max,
 		}
 
 		/*
-		 * PMTUD: Send a probe if we are searching and don't currently
-		 * have a probe in flight.  Never on a packet with its own
-		 * destination: that is a path probe to an address whose MTU
-		 * and validity we know nothing about yet.
+		 * PMTUD: the packet with a probe's PING is padded out to the
+		 * datagram size being probed, or for a black hole check, the
+		 * base, then the size from before it.  If we can't send one
+		 * that big anyway, there is nothing to find out, and the
+		 * search is over.  If a server's peer moved since the probe was
+		 * queued, the new path isn't validated, so it only gets a plain
+		 * PING, and the search goes on there with the first ack after
+		 * it is.  So does a search probe queued before a black hole
+		 * stopped the search, and a probe confirming a black hole that
+		 * was settled meanwhile.
 		 */
-		if (level == LWS_QUIC_LEVEL_APP && qn->pmtud_state == 1 &&
-		    qn->pmtud_probe_pn == LWS_QUIC_PMTUD_PROBE_NONE &&
-		    !has_packet_dest &&
-		    !(qn->is_server && !qn->address_validated)) {
-			size_t target_payload_len = qn->probed_mtu - header_len - 16;
+		if (pmtud_probe && !(qn->is_server && !qn->address_validated)) {
+			uint64_t *probe_pn = NULL;
+			uint32_t mtu_probed = 0;
 
-			if (target_payload_len > max - header_len - 16)
-				target_payload_len = max - header_len - 16;
-			if (payload_len < target_payload_len) {
-				memset(p, LWS_QUIC_FT_PADDING, target_payload_len - payload_len);
-				p += (target_payload_len - payload_len);
-				payload_len = target_payload_len;
-				qn->pmtud_probe_pn = my_pn;
+			switch (pmtud_probe) {
+			case LWS_QUIC_PMTUD_PROBE_BASE:
+				mtu_probed = LWS_QUIC_PMTU_BASE;
+				probe_pn = &qn->pmtud_bh_probe_pn;
+				break;
+			case LWS_QUIC_PMTUD_PROBE_FROM:
+				if (!qn->pmtud_bh_from_mtu)
+					break;
+				mtu_probed = qn->pmtud_bh_from_mtu;
+				probe_pn = &qn->pmtud_bh_from_probe_pn;
+				break;
+			default:
+				if (qn->pmtud_state != 1)
+					break;
+				mtu_probed = qn->probed_mtu;
+				probe_pn = &qn->pmtud_probe_pn;
+				break;
+			}
+
+			if (probe_pn) {
+				size_t target = mtu_probed -
+						LWS_QUIC_PMTU_OVERHEAD;
+
+				if (target > max) {
+					if (pmtud_probe ==
+						LWS_QUIC_PMTUD_PROBE_SEARCH)
+						qn->pmtud_state = 2; /* SEARCH_COMPLETE */
+				} else {
+					if (header_len + payload_len + 16 <
+								target) {
+						size_t pad = target -
+							header_len -
+							payload_len - 16;
+
+						memset(p, LWS_QUIC_FT_PADDING,
+						       pad);
+						p += pad;
+						payload_len += pad;
+					}
+					*probe_pn = my_pn;
+				}
 			}
 		}
 
@@ -3511,6 +4453,8 @@ lws_quic_packet_sent(struct lws *wsi, const struct lws_quic_tx_pkt *tp, int n)
 				if (f->sent_in_pn == tp->pn) {
 					struct lws_dll2 *prev = lws_dll2_get_prev(d);
 					lws_dll2_remove(d);
+					/* before its pn goes */
+					lws_quic_pmtud_probe_unsent(qn, f);
 					f->sent_in_pn = 0;
 					f->sent_time_us = 0;
 					f->wire_len = 0;
@@ -3528,6 +4472,37 @@ lws_quic_packet_sent(struct lws *wsi, const struct lws_quic_tx_pkt *tp, int n)
 			/* the caller keeps POLLOUT: the transport wakes us */
 			return 1;
 		} else {
+			struct lws_dll2 *d = qn->in_flight[tp->level].tail;
+
+			/*
+			 * A PMTUD probe can be too big for our own interface,
+			 * eg, a tunnel's, which with Don't Fragment the OS
+			 * refuses to send: it's lost, now.  Only the probe is:
+			 * an ACK that went with it is still owed, and what is
+			 * waiting behind it must still go, so ask to write
+			 * again, as a sent packet would.  Nothing else may come
+			 * along to wake us, eg, a close frame waiting behind
+			 * the probe would only go at the close timeout.
+			 */
+			if (d) {
+				struct lws_quic_tx_frame *f = lws_container_of(d,
+						struct lws_quic_tx_frame, list);
+
+				if (f->sent_in_pn == tp->pn && f->pmtud_probe) {
+					lwsl_wsi_info(wsi, "QUIC TX: PMTUD probe "
+						      "of %u not sent",
+						      (unsigned int)tp->len);
+					lws_quic_pmtud_probe_lost(qn, f);
+					lws_dll2_remove(d);
+					lws_free(f);
+
+					qn->needs_ack[LWS_QUIC_LEVEL_APP] = 1;
+					lws_callback_on_writable(wsi);
+
+					return -1;
+				}
+			}
+
 			lwsl_wsi_err(wsi, "QUIC TX: write failed");
 			return -1;
 		}
@@ -3599,7 +4574,7 @@ lws_quic_pto_sweep(struct lws *wsi)
 
 	lws_usec_t now = lws_wsi_now(wsi);
 	size_t total_bytes_lost = 0;
-	uint64_t last_lost_pn = (uint64_t)-1;
+	uint64_t last_lost_pn = LWS_QUIC_PMTUD_PROBE_NONE;
 	for (level = 0; level < LWS_QUIC_LEVEL_COUNT; level++) {
 		if (!qn->in_flight[level].count)
 			continue;
@@ -3619,24 +4594,22 @@ lws_quic_pto_sweep(struct lws *wsi)
 			if (now + 5000 >= f->sent_time_us + sweep_pto_delay) {
 				// lwsl_notice("PTO Sweep: Packet %llu (type 0x%02x) lost! Retransmitting!\n", (unsigned long long)f->sent_in_pn, f->type);
 
-				/* PMTUD Black Hole Detection */
-				if (f->sent_in_pn != last_lost_pn) {
-					last_lost_pn = f->sent_in_pn;
-					if (qn->pmtud_probe_pn != LWS_QUIC_PMTUD_PROBE_NONE &&
-					    f->sent_in_pn == qn->pmtud_probe_pn) {
-						/* Active probe was lost */
-						qn->pmtud_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
-						qn->pmtud_state = 2; /* SEARCH_COMPLETE, stop probing */
-					} else if (f->packet_size >= qn->current_mtu - 16) {
-						qn->consecutive_mtu_losses++;
-						if (qn->consecutive_mtu_losses >= 3) {
-							lwsl_wsi_warn(wsi, "QUIC PMTUD: Black Hole detected! Reverting MTU to 1280.");
-							qn->current_mtu = 1280;
-							qn->pmtud_state = 0;
-							qn->consecutive_mtu_losses = 0;
-						}
-					}
+				if (lws_quic_pmtud_probe_lost(qn, f)) {
+					total_bytes_lost += f->wire_len;
+					lws_dll2_remove(&f->list);
+					lws_free(f);
+					continue;
 				}
+
+				if (lws_quic_frame_probes_another_path(qn, f)) {
+					/* the probe sends it again */
+					total_bytes_lost += f->wire_len;
+					lws_dll2_remove(&f->list);
+					lws_free(f);
+					continue;
+				}
+
+				lws_quic_pmtud_lost_packet(qn, f, &last_lost_pn);
 
 				/* Packet lost! */
 				lws_dll2_remove(&f->list);
@@ -4247,6 +5220,20 @@ rops_write_role_protocol_quic(struct lws *wsi, unsigned char *buf, size_t len,
 		f->offset = wsi->quic.qs->tx_offset;
 		wsi->quic.qs->tx_offset += len;
 
+#if defined(LWS_WITH_SYS_FAULT_INJECTION)
+		if (!f->offset && !wsi->quic.qs->fi_replay &&
+		    lws_fi(&wsi->fic, "quic_stream_replay")) {
+			struct lws_quic_tx_frame *r = lws_malloc(sizeof(*f) + len,
+							 "quic fi replay");
+
+			if (r) {
+				memcpy(r, f, sizeof(*f) + len);
+				r->data = (uint8_t *)&r[1];
+				wsi->quic.qs->fi_replay = r;
+			}
+		}
+#endif
+
 		/* Deduct credit here so current_max calculations work correctly */
 		wsi->txc.tx_cr -= (int)len;
 		if (nwsi) {
@@ -4329,10 +5316,7 @@ rops_client_bind_quic(struct lws *wsi, const struct lws_client_connect_info *i)
 		/* RFC 9000 §13.2.1 default max_ack_delay cap for delayed ACKs */
 		wsi->quic.qn->ack_delay_us = 25 * LWS_US_PER_MS;
 
-		wsi->quic.qn->current_mtu = 1280;
-		wsi->quic.qn->probed_mtu = 1380; /* first probe size */
-		wsi->quic.qn->pmtud_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
-		wsi->quic.qn->pmtud_state = 1; /* SEARCHING */
+		lws_quic_pmtud_reset(wsi->quic.qn);
 
 		if (wsi->a.context->quic_cc_ops)
 			wsi->quic.qn->cc_ops = wsi->a.context->quic_cc_ops;
@@ -4485,6 +5469,27 @@ rops_callback_on_writable_quic(struct lws *wsi)
 
 	return 0; /* not handled, let core enable socket POLLOUT */
 }
+
+#if defined(LWS_WITH_SYS_FAULT_INJECTION)
+/* long after a loopback peer acked our end of the stream and freed it */
+#define LWS_QUIC_FI_REPLAY_DELAY_MS 100
+
+static void
+lws_quic_fi_replay_cb(lws_sorted_usec_list_t *sul)
+{
+	struct lws_quic_netconn *qn = lws_container_of(sul,
+				struct lws_quic_netconn, fi_replay_sul);
+
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+				   lws_dll2_get_head(&qn->fi_replays)) {
+		lws_dll2_remove(d);
+		lws_dll2_add_tail(d, &qn->pending_tx[LWS_QUIC_LEVEL_APP]);
+	} lws_end_foreach_dll_safe(d, d1);
+
+	lwsl_wsi_notice(qn->nwsi, "quic_stream_replay: sending again");
+	lws_callback_on_writable(qn->nwsi);
+}
+#endif
 
 void
 lws_quic_stream_cleanup(struct lws *wsi)
@@ -4756,6 +5761,25 @@ lws_quic_stream_cleanup(struct lws *wsi)
 		}
 	}
 
+#if defined(LWS_WITH_SYS_FAULT_INJECTION)
+	/*
+	 * quic_stream_replay: our first STREAM frame goes again once the peer
+	 * has had time to finish with the stream too
+	 */
+	if (wsi->quic.qs->fi_replay) {
+		if (qn && nwsi) {
+			lws_dll2_add_tail(&wsi->quic.qs->fi_replay->list,
+					  &qn->fi_replays);
+			lws_sul_schedule(nwsi->a.context, 0, &qn->fi_replay_sul,
+					 lws_quic_fi_replay_cb,
+					 LWS_QUIC_FI_REPLAY_DELAY_MS *
+							LWS_US_PER_MS);
+		} else
+			lws_free(wsi->quic.qs->fi_replay);
+		wsi->quic.qs->fi_replay = NULL;
+	}
+#endif
+
 	lws_free_set_NULL(wsi->quic.qs);
 }
 
@@ -4857,8 +5881,26 @@ lws_quic_netconn_destroy(struct lws_quic_netconn **pqn)
 		lws_quic_rx_held_destroy(&qn->rx_crypto_held[i]);
 	}
 
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+				   lws_dll2_get_head(&qn->early_pkts)) {
+		lws_dll2_remove(d);
+		lws_free(lws_container_of(d, struct lws_quic_early_pkt, list));
+	} lws_end_foreach_dll_safe(d, d1);
+
 	if (qn->cc_state)
 		lws_free_set_NULL(qn->cc_state);
+
+	lws_quic_idtr_destroy(&qn->peer_opened[0]);
+	lws_quic_idtr_destroy(&qn->peer_opened[1]);
+
+#if defined(LWS_WITH_SYS_FAULT_INJECTION)
+	lws_sul_cancel(&qn->fi_replay_sul);
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+				   lws_dll2_get_head(&qn->fi_replays)) {
+		lws_dll2_remove(d);
+		lws_free(lws_container_of(d, struct lws_quic_tx_frame, list));
+	} lws_end_foreach_dll_safe(d, d1);
+#endif
 
 	for (i = 0; i < 4; i++)
 		if (qn->crypto_rx_buf[i]) {
@@ -4902,6 +5944,9 @@ rops_close_kill_connection_quic(struct lws *wsi, enum lws_close_status reason)
 		lws_sul_cancel(&qn->pto_sul);
 		lws_sul_cancel(&qn->pacer_sul);
 		lws_sul_cancel(&qn->ack_delay_sul);
+#if defined(LWS_WITH_SYS_FAULT_INJECTION)
+		lws_sul_cancel(&qn->fi_replay_sul);
+#endif
 
 #if defined(LWS_ROLE_H3)
 		if (wsi->h3.h3n) {
@@ -5350,6 +6395,16 @@ rops_alpn_negotiated_quic(struct lws *wsi, const char *alpn)
         if (nwsi->quic.qn->next_stream_id_bidi_local == 0)
                 nwsi->quic.qn->next_stream_id_bidi_local = 4;
         lws_set_timeout(nwsi, NO_PENDING_TIMEOUT, 0);
+	/*
+	 * A server reaps the connection when it's idle from when its handshake
+	 * completed, which was while this wsi was the connection.  It's only
+	 * stream 0 now, and the connection, which has it as a stream, isn't
+	 * idle: otherwise stream 0 is closed when that runs out, however much
+	 * is still coming on it, since what refreshes it only looks at the
+	 * connection's network wsi.
+	 */
+	if (wsi->pending_timeout == PENDING_TIMEOUT_UDP_IDLE)
+		lws_set_timeout(wsi, NO_PENDING_TIMEOUT, 0);
 
 	if (listener) {
 		nwsi->mux_substream = 1;

@@ -172,7 +172,7 @@ lws_sort_dns_scope(lws_sockaddr46 *sa46)
 }
 
 static int
-lws_sort_dns_classify(lws_sockaddr46 *sa46, lws_dns_score_t *score)
+lws_sort_dns_classify(const lws_sockaddr46 *sa46, lws_dns_score_t *score)
 {
 	const struct score_policy *pol = rfc6724_policy;
 	const uint8_t *p, *po;
@@ -416,8 +416,8 @@ lws_sort_dns_dcomp(const lws_dns_sort_t *da, const lws_dns_sort_t *db)
 
 	scopea = lws_ipv6_unicast_scope(to_v6_sa(&da->dest));
 	scopeb = lws_ipv6_unicast_scope(to_v6_sa(&db->dest));
-	scope_srca = da->source ? lws_ipv6_unicast_scope(to_v6_sa(&da->source->src)) : 0;
-	scope_srcb = db->source ? lws_ipv6_unicast_scope(to_v6_sa(&db->source->src)) : 0;
+	scope_srca = da->has_source ? lws_ipv6_unicast_scope(&da->src.sa6) : 0;
+	scope_srcb = db->has_source ? lws_ipv6_unicast_scope(&db->src.sa6) : 0;
 
 	if (scopea == scope_srca && scopeb != scope_srcb)
 		return SAS_PREFER_A;
@@ -474,15 +474,13 @@ lws_sort_dns_dcomp(const lws_dns_sort_t *da, const lws_dns_sort_t *db)
 	 * Label(Source(DB)) = Label(DB), then prefer DB
 	 */
 
-	if (!da->source)
+	if (!da->has_source)
 		return SAS_PREFER_B;
-	if (!db->source)
+	if (!db->has_source)
 		return SAS_PREFER_A;
 
-	if (da->source)
-		lws_sort_dns_classify(&da->source->src, &score_srca);
-	if (db->source)
-		lws_sort_dns_classify(&db->source->src, &score_srcb);
+	lws_sort_dns_classify(&da->src, &score_srca);
+	lws_sort_dns_classify(&db->src, &score_srcb);
 
 	if (score_srca.label == da->score.label &&
 	    score_srcb.label != db->score.label)
@@ -538,8 +536,8 @@ lws_sort_dns_dcomp(const lws_dns_sort_t *da, const lws_dns_sort_t *db)
 	 * then prefer DB.
 	 */
 
-	cpla = da->source ? lws_ipv6_prefix_match_len(&da->source->src.sa6, &da->dest.sa6) : 0;
-	cplb = db->source ? lws_ipv6_prefix_match_len(&db->source->src.sa6, &db->dest.sa6) : 0;
+	cpla = lws_ipv6_prefix_match_len(&da->src.sa6, &da->dest.sa6);
+	cplb = lws_ipv6_prefix_match_len(&db->src.sa6, &db->dest.sa6);
 
 	if (cpla > cplb)
 		return SAS_PREFER_A;
@@ -601,6 +599,12 @@ lws_sort_dns(struct lws *wsi, const struct addrinfo *result)
 {
 #if defined(LWS_WITH_ROUTING)
 	struct lws_context_per_thread *pt = &wsi->a.context->pt[(int)wsi->tsi];
+	/*
+	 * Without a complete routing table, eg, while netlink is still
+	 * delivering it, we can't filter or sort by it: keep every result,
+	 * in the resolver's order
+	 */
+	int use_rt = _lws_route_table_usable(wsi->a.context);
 #endif
 	const struct addrinfo *ai = result;
 
@@ -686,7 +690,7 @@ lws_sort_dns(struct lws *wsi, const struct addrinfo *result)
 		 * we don't have a way to use it if we listed it
 		 */
 
-		if (lws_dll2_count(&pt->context->routing_table) && !wsi->io->do_bind) {
+		if (use_rt && !wsi->io->do_bind) {
 
 			estr = _lws_route_est_outgoing(pt, &ds->dest);
 			if (!estr) {
@@ -720,6 +724,9 @@ lws_sort_dns(struct lws *wsi, const struct addrinfo *result)
 		 * ipv6 source address to route it, because of ipv6-only
 		 * egress, then promote it to ipv6 and sort it
 		 */
+
+		if (!use_rt)
+			goto just_add;
 
 #if !defined(LWS_WITH_IPV4)
 		if (lws_sa46_is_ipv4_mapped(&ds->dest))
@@ -784,15 +791,25 @@ lws_sort_dns(struct lws *wsi, const struct addrinfo *result)
 
 		/* bestsrc is the best source route, or NULL if none */
 
-		if (!bestsrc && lws_dll2_count(&pt->context->routing_table)) {
+		if (!bestsrc) {
 			/* drop it, no usable source route */
 			lws_free(ds);
 			goto next;
 		}
 
 just_add:
-		ds->source = bestsrc ? bestsrc : estr;
-		if (!ds->source) {
+		/*
+		 * The list outlives this pass, and the routing table entries
+		 * don't: netlink replaces a route by freeing it and adding a
+		 * new one, eg, on any NEWROUTE for the same src and dest.  So
+		 * keep a copy of the source address the later comparisons
+		 * need, not a pointer to the route it came from.
+		 */
+		if (bestsrc || estr) {
+			ds->src = (bestsrc ? bestsrc : estr)->src;
+			ds->has_source = 1;
+		}
+		if (!ds->has_source) {
 			lws_dll2_add_tail(&ds->list, &wsi->io->dns_sorted_list);
 			goto next;
 		}

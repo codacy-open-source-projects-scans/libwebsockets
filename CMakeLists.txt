@@ -146,6 +146,7 @@ endif()
 #
 option(LWS_WITH_DISTRO_RECOMMENDED "Enable features recommended for distro packaging" OFF)
 option(LWS_FOR_GITOHASHI "Enable features recommended for use with gitohashi" OFF)
+option(LWS_FOR_SAI "Enable the features sai needs, for its server, web, builder, virt and other daemons" OFF)
 
 #
 # Compiler features
@@ -180,6 +181,7 @@ option(LWS_UNIX_SOCK "Compile with support for UNIX domain socket if OS supports
 option(LWS_WITH_PLUGINS "Support plugins for protocols and extensions (implies LWS_WITH_PLUGINS_API)" OFF)
 option(LWS_WITH_PLUGINS_BUILTIN "Build the plugin protocols directly into lws library" OFF)
 option(LWS_WITH_HTTP_PROXY "Support for active HTTP proxying" OFF)
+option(LWS_WITH_TLS_PASSTHROUGH "Pass a vhost's TLS connections, chosen by their SNI, to another server undecrypted, and accept PROXY v2 headers from trusted proxies" OFF)
 option(LWS_WITH_ZIP_FOPS "Support serving pre-zipped files" OFF)
 option(LWS_WITH_SOCKS5 "Allow use of SOCKS5 proxy on client connections" OFF)
 option(LWS_WITH_PEER_LIMITS "Track peers and restrict resources a single peer can allocate" OFF)
@@ -200,6 +202,7 @@ option(LWS_WITH_SYS_ASYNC_DNS "Nonblocking internal IPv4 + IPv6 DNS resolver" ON
 option(LWS_WITH_SYS_ASYNC_DNS_DNSSEC "Include DNSSEC parsing/validation in async-dns (requires crypto)" OFF)
 option(LWS_WITH_AUTHORITATIVE_DNS "Authoritative DNS zone signer / server" OFF)
 option(LWS_WITH_SYS_NTPCLIENT "Build in tiny ntpclient good for tls date validation and run via lws_system" OFF)
+option(LWS_WITH_SYS_INFO "System information snapshot: the interfaces and their addresses, hostname, OS, RAM, time, resolver and lws build, see READMEs/README.sysinfo.md" ON)
 option(LWS_WITH_SYS_WHOIS "Build in tiny recursive whois client run via lws_system" OFF)
 option(LWS_WITH_SYS_DHCP_CLIENT "Build in tiny DHCP client" OFF)
 option(LWS_WITH_HTTP_BASIC_AUTH "Support Basic Auth" ON)
@@ -449,6 +452,11 @@ option(LWS_WITH_LWS_DSH "Support lws_dsh_t Disordered Shared Heap" OFF)
 option(LWS_CLIENT_HTTP_PROXYING "Support external http proxies for client connections" ON)
 option(LWS_WITH_FILE_OPS "Support file operations vfs" ON)
 option(LWS_WITH_UDP "Platform supports UDP" ON)
+if (NOT LWS_WITH_NETWORK AND LWS_WITH_SYS_INFO)
+	# the snapshot is mostly about the network interfaces and resolver
+	message(STATUS "LWS_WITH_SYS_INFO requires LWS_WITH_NETWORK, disabling it")
+	set(LWS_WITH_SYS_INFO OFF)
+endif()
 if (NOT LWS_WITH_UDP AND LWS_WITH_SYS_ASYNC_DNS)
 	# the async dns resolver talks to nameservers over UDP, and its public
 	# header (lws-async-dns.h) is compiled out without LWS_WITH_UDP
@@ -941,10 +949,6 @@ if (LWS_WITH_ZLIB AND NOT LWS_WITH_BUNDLED_ZLIB)
 	list(APPEND LIB_LIST_AT_END "${ZLIB_LIBRARIES}")
 endif()
 
-if (LWS_WITH_PLUGINS_API AND UNIX AND CMAKE_DL_LIBS AND NOT (${CMAKE_SYSTEM_NAME} MATCHES "QNX"))
-	list(APPEND LIB_LIST_AT_END ${CMAKE_DL_LIBS})
-endif()
-
 
 if (LWS_WITHOUT_CLIENT OR LWS_WITHOUT_SERVER)
 	set(LWS_WITH_STUB OFF)
@@ -1232,6 +1236,27 @@ if (LWS_WITH_ASAN)
 	set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${ASAN_FLAGS}")
 endif()
 
+#
+# Apple's ld (Xcode 15 and later) warns when a library is on the link line
+# more than once.  lws's targets pass their dependencies on to what links
+# them, and apps also add LIBWEBSOCKETS_DEP_LIBS, which can repeat some of
+# them: harmless, each is used once, but a warning nobody should act on.
+# Older ld doesn't know the switch, so only use it if the linker takes it.
+#
+if (APPLE AND NOT CMAKE_VERSION VERSION_LESS 3.14)
+	set(_lws_req_lo ${CMAKE_REQUIRED_LINK_OPTIONS})
+	set(CMAKE_REQUIRED_LINK_OPTIONS "-Wl,-no_warn_duplicate_libraries")
+	CHECK_C_SOURCE_COMPILES("int main(void) { return 0; }"
+				LWS_LD_NO_WARN_DUPLICATE_LIBRARIES)
+	set(CMAKE_REQUIRED_LINK_OPTIONS ${_lws_req_lo})
+	if (LWS_LD_NO_WARN_DUPLICATE_LIBRARIES)
+		foreach(_lws_lf EXE SHARED MODULE)
+			set(CMAKE_${_lws_lf}_LINKER_FLAGS
+			    "${CMAKE_${_lws_lf}_LINKER_FLAGS} -Wl,-no_warn_duplicate_libraries")
+		endforeach()
+	endif()
+endif()
+
 if (${CMAKE_SYSTEM_NAME} MATCHES "SunOS")
 		list(APPEND LIB_LIST_AT_END -lsocket)
 		if ((CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_GNUCXX))
@@ -1261,6 +1286,14 @@ if (MSVC)
 	else()
 		add_compile_options(/experimental:preprocessor /wd5105)
 	endif()
+	# Prebuilt third-party static libs, eg, mbedtls, often name .pdb files
+	# for their debug info that weren't installed with them.  The linker
+	# then warns LNK4099 for every object it takes from them and links it
+	# without debug info, which is all it can do: the warning says nothing
+	# about lws, and comes from every link
+	foreach (lt EXE SHARED MODULE)
+		set(CMAKE_${lt}_LINKER_FLAGS "${CMAKE_${lt}_LINKER_FLAGS} /ignore:4099")
+	endforeach()
 	if (LWS_MSVC_STATIC_RUNTIME AND NOT LWS_WITH_STATIC)
 		message(FATAL_ERROR "Incompatible options: when LWS_MSVC_STATIC_RUNTIME=ON, must also set LWS_WITH_STATIC=ON")
 	endif()
@@ -1514,6 +1547,25 @@ endif()
 
 if (LWS_WITH_MCUFONT_ENCODER)
 	add_subdirectory(contrib/mcufont/encoder)
+endif()
+
+#
+# Commands ctest runs before it starts any test, that tests' CMakeLists
+# register in LWS_CTEST_PRE_TEST, eg, api-test-plugins loading the plugins
+# once.  Each is a whole command line, quoted as it needs.  ctest reads them
+# from CTestCustom.cmake where it runs, and runs no tests if one fails.
+#
+
+get_property(_lws_pre_test GLOBAL PROPERTY LWS_CTEST_PRE_TEST)
+if (_lws_pre_test)
+	set(_lws_ctc "set(CTEST_CUSTOM_PRE_TEST")
+	foreach(_c ${_lws_pre_test})
+		string(REPLACE "\\" "\\\\" _c "${_c}")
+		string(REPLACE "\"" "\\\"" _c "${_c}")
+		string(APPEND _lws_ctc "\n\t\"${_c}\"")
+	endforeach()
+	file(GENERATE OUTPUT "${PROJECT_BINARY_DIR}/CTestCustom.cmake"
+		      CONTENT "${_lws_ctc})\n")
 endif()
 
 # Generate the lws_config.h that includes all the public compilation settings.

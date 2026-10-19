@@ -59,7 +59,7 @@ acme_state_name(lws_acme_state s)
 	static const char *const n[] = {
 		"DIRECTORY", "NEW-NONCE", "NEW-ACCOUNT", "NEW-ORDER",
 		"AUTHZ", "START-CHALL", "POLLING", "POLLING-CSR",
-		"DOWNLOAD-CERT", "FINISHED",
+		"DOWNLOAD-CERT", "CHALL-REASON", "FINISHED",
 	};
 
 	return s <= ACME_STATE_FINISHED ? n[s] : "unknown";
@@ -68,6 +68,8 @@ acme_state_name(lws_acme_state s)
 
 static void
 acme_aging_next_cert(struct per_vhost_data__lws_acme_client *vhd);
+static void
+lws_acme_timer_cb(lws_sorted_usec_list_t *sul);
 static void
 acme_ipc_arm(struct per_vhost_data__lws_acme_client *vhd);
 
@@ -169,9 +171,14 @@ acme_ipc_sign_jwt(struct per_vhost_data__lws_acme_client *vhd, char *jwt, size_t
 			jwk.e[LWS_GENCRYPTO_OCT_KEYEL_K].len = (uint32_t)klen;
 			jwk.e[LWS_GENCRYPTO_OCT_KEYEL_K].buf = key;
 
+			/*
+			 * "sub" tells the root daemon it is us: it takes the
+			 * saves of keys and certs from nobody else, see the
+			 * dnssec-monitor's monitor-ipc-auth.c
+			 */
 			uint64_t now = (uint64_t)time(NULL);
 			lws_jwt_sign_compact(vhd->context, &jwk, "HS256", jwt, &jwt_len, temp, sizeof(temp),
-			    "{\"iss\":\"acme-ipc\",\"aud\":\"dnssec-monitor\",\"iat\":%llu,\"nbf\":%llu,\"exp\":%llu}",
+			    "{\"iss\":\"acme-ipc\",\"aud\":\"dnssec-monitor\",\"sub\":\"acme-client\",\"iat\":%llu,\"nbf\":%llu,\"exp\":%llu}",
 			    (unsigned long long)now, (unsigned long long)now, (unsigned long long)now + 300);
 
 			jwk.e[LWS_GENCRYPTO_OCT_KEYEL_K].buf = NULL;
@@ -246,6 +253,45 @@ lws_acme_core_trigger_resign(struct per_vhost_data__lws_acme_client *vhd)
 	acme_ipc_save_payload(vhd, "trigger_resign", "none", "none", "", 0);
 }
 
+/* ask the root daemon for the account key it stored for the active cert */
+
+static int
+acme_ipc_get_auth_key(struct per_vhost_data__lws_acme_client *vhd)
+{
+	const char *fp = vhd->active_cert->pvop[LWS_TLS_SET_AUTH_PATH],
+		   *domain = vhd->active_cert->pvop[LWS_TLS_SET_ROOT_DOMAIN] ?
+			vhd->active_cert->pvop[LWS_TLS_SET_ROOT_DOMAIN] :
+			vhd->active_cert->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME],
+		   *fn;
+	char req[3072], jwt[2048], esc_domain[512], esc_fn[512];
+	int n;
+
+	if (!vhd->ipc || !fp || !domain)
+		return 1;
+
+	fn = strrchr(fp, '/');
+	fn = fn ? fn + 1 : fp;
+
+	acme_ipc_sign_jwt(vhd, jwt, sizeof(jwt));
+
+	/* config-derived, so escaped before it enters the IPC JSON */
+	lws_json_purify(esc_domain, domain, (int)sizeof(esc_domain), NULL);
+	lws_json_purify(esc_fn, fn, (int)sizeof(esc_fn), NULL);
+
+	n = lws_snprintf(req, sizeof(req), "{\"req\":\"get_auth_key\","
+			 "\"jwt\":\"%s\",\"domain\":\"%s\","
+			 "\"subdomain\":\"%s\"}\n", jwt, esc_domain, esc_fn);
+	if ((size_t)n >= sizeof(req) - 1 ||
+	    lws_async_ipc_queue_payload(vhd->ipc, req, (size_t)n))
+		return 1;
+
+	/* answered by exactly one line, see acme_ipc_line() */
+	vhd->ipc_key_pending = 1;
+	acme_ipc_arm(vhd);
+
+	return 0;
+}
+
 #else
 static int
 acme_ipc_save_payload(struct per_vhost_data__lws_acme_client *vhd, const char *req, const char *domain, const char *filename, const char *payload, size_t payload_len)
@@ -256,6 +302,12 @@ acme_ipc_save_payload(struct per_vhost_data__lws_acme_client *vhd, const char *r
 static void
 lws_acme_core_trigger_resign(struct per_vhost_data__lws_acme_client *vhd)
 {
+}
+
+static int
+acme_ipc_get_auth_key(struct per_vhost_data__lws_acme_client *vhd)
+{
+	return 1;
 }
 #endif
 
@@ -663,37 +715,25 @@ lws_acme_finished(struct per_vhost_data__lws_acme_client *vhd)
 	 */
 
 	vhd->ac = NULL;
-	vhd->last_acme_failure = 0;
 #if defined(LWS_WITH_ESP32)
 	lws_esp32.acme = 0; /* enable scanning */
 #endif
 }
 
-/* seconds to wait after the n'th consecutive failed acquisition:
- * 1h, 2h, 4h, 8h, 16h, capped at 24h... still comfortably inside the
- * renewal margin of a 6-day cert renewed at 25% life */
-static lws_usec_t
-acme_backoff_us(int fails)
-{
-	lws_usec_t u = 3600ll * LWS_USEC_PER_SEC << (fails > 5 ? 5 : fails);
-
-	return u > 24 * 3600ll * LWS_USEC_PER_SEC ?
-			24 * 3600ll * LWS_USEC_PER_SEC : u;
-}
+/*
+ * The acquisition is over, one way or the other: look at the certs again
+ * soon, rather than at the next hourly evaluation, since the one that ended
+ * stopped the last evaluation before it reached the certs after it
+ */
 
 static void
-acme_note_failure(struct per_vhost_data__lws_acme_client *vhd)
+acme_evaluate_again(struct per_vhost_data__lws_acme_client *vhd)
 {
-	vhd->acme_fail_count++;
-	vhd->acme_retry_not_before = lws_now_usecs() +
-				     acme_backoff_us(vhd->acme_fail_count);
-	lwsl_vhost_warn(vhd->vhost, "acme: failed acquisition #%d, next "
-			"attempt in %llds", vhd->acme_fail_count,
-			(long long)(acme_backoff_us(vhd->acme_fail_count) /
-				    LWS_USEC_PER_SEC));
+	lws_sul_schedule(vhd->context, 0, &vhd->sul_aging, lws_acme_timer_cb,
+			 5 * LWS_US_PER_SEC);
 }
 
-/* end the acquisition in progress as a failure, and back off */
+/* end the acquisition in progress as a failure, and back off that cert */
 
 static void
 acme_fail_acquisition(struct per_vhost_data__lws_acme_client *vhd,
@@ -704,8 +744,24 @@ acme_fail_acquisition(struct per_vhost_data__lws_acme_client *vhd,
 
 	lws_acme_report_status(vhd->vhost, LWS_CUS_FAILED, reason);
 	lws_acme_finished(vhd);
-	vhd->last_acme_failure = lws_now_usecs();
-	acme_note_failure(vhd);
+
+	if (vhd->active_cert) {
+		acme_renew_failed(vhd->active_cert, lws_now_usecs());
+
+		lwsl_vhost_warn(vhd->vhost, "acme: %s: failed acquisition #%d "
+				"(%s), next attempt in %llds",
+				vhd->active_cert->pvop[
+					LWS_TLS_REQ_ELEMENT_COMMON_NAME] ?
+				vhd->active_cert->pvop[
+					LWS_TLS_REQ_ELEMENT_COMMON_NAME] :
+					"unknown",
+				vhd->active_cert->fail_count,
+				reason ? reason : "unknown",
+				(long long)((vhd->active_cert->retry_not_before -
+					     lws_now_usecs()) / LWS_USEC_PER_SEC));
+	}
+
+	acme_evaluate_again(vhd);
 }
 
 /*
@@ -750,7 +806,8 @@ acme_ipc_arm(struct per_vhost_data__lws_acme_client *vhd)
 	if (vhd->ipc_failing)
 		return; /* the failure handling is already scheduled */
 
-	if (vhd->ipc_pending_saves || vhd->aging_current_cert)
+	if (vhd->ipc_pending_saves || vhd->ipc_key_pending ||
+	    vhd->aging_current_cert)
 		lws_sul_schedule(vhd->context, 0, &vhd->sul_ipc,
 				 acme_ipc_fail_cb, ACME_IPC_REPLY_TIMEOUT_US);
 	else
@@ -774,7 +831,8 @@ acme_ipc_fail(struct per_vhost_data__lws_acme_client *vhd)
 /*
  * Drop the connection and everything outstanding on it.  An aging validity
  * check that was waiting counts as failed, and aging moves on to the next
- * cert, on a new connection
+ * cert, on a new connection.  The caller deals with an acquisition that was
+ * waiting for its account key.
  */
 
 static void
@@ -783,7 +841,9 @@ acme_ipc_abandon(struct per_vhost_data__lws_acme_client *vhd)
 	lws_sul_cancel(&vhd->sul_ipc);
 	vhd->ipc_failing = 0;
 	vhd->ipc_pending_saves = 0;
+	vhd->ipc_key_pending = 0;
 	vhd->ipc_rx.len = 0;
+	lws_explicit_bzero(vhd->ipc_rx.buf, sizeof(vhd->ipc_rx.buf));
 
 	lws_async_ipc_destroy(&vhd->ipc);
 	if (acme_ipc_open(vhd))
@@ -801,16 +861,20 @@ acme_ipc_fail_cb(lws_sorted_usec_list_t *sul)
 {
 	struct per_vhost_data__lws_acme_client *vhd = lws_container_of(sul,
 			struct per_vhost_data__lws_acme_client, sul_ipc);
-	int had_saves = vhd->ipc_pending_saves;
+	int had_saves = vhd->ipc_pending_saves, had_key = vhd->ipc_key_pending;
 
 	lwsl_vhost_warn(vhd->vhost, "acme: IPC with the root daemon failed or "
-			"stalled with %d save(s)%s outstanding", had_saves,
+			"stalled with %d save(s)%s%s outstanding", had_saves,
+			had_key ? ", the account key" : "",
 			vhd->aging_current_cert ? " and a validity check" : "");
 
 	acme_ipc_abandon(vhd);
 
-	/* what this acquisition asked the daemon to store may not be stored */
-	if (had_saves && vhd->ac)
+	/*
+	 * what this acquisition asked the daemon to store may not be stored,
+	 * or it can't go on without the account key it was waiting for
+	 */
+	if ((had_saves || had_key) && vhd->ac)
 		acme_fail_acquisition(vhd, "IPC with the root daemon failed");
 }
 
@@ -841,40 +905,50 @@ lws_acme_watchdog_cb(lws_sorted_usec_list_t *sul)
 	 * Answers still owed to this attempt must not be counted against
 	 * anything later, so they go with it
 	 */
-	if (vhd->ipc_pending_saves)
+	if (vhd->ipc_pending_saves || vhd->ipc_key_pending)
 		acme_ipc_abandon(vhd);
 
 	acme_fail_acquisition(vhd, "ACME transaction watchdog timeout");
 }
 
 
+/*
+ * The account key, and so our account at the CA, last from one acquisition
+ * to the next.  Where the root daemon stores it, only it can read it, so if
+ * we can't load it ourselves, we ask the daemon for it, and only make a new
+ * key, and so a new account, when it has none either.  Given the same key,
+ * the CA's newAccount answers with the account we already have.
+ */
+
+/* is the key in vhd->jwk one we can sign with?  If not, it is dropped */
+
 static int
-lws_acme_load_create_auth_keys(struct per_vhost_data__lws_acme_client *vhd,
-		int bits)
+acme_auth_key_usable(struct per_vhost_data__lws_acme_client *vhd,
+		     const char *from)
 {
-	int n;
-
-	if (!lws_jwk_load(&vhd->jwk, vhd->active_cert->pvop[LWS_TLS_SET_AUTH_PATH],
-				NULL, NULL)) {
-		if (acme_jws_alg(&vhd->jwk))
-			return 0;
-
-		/* we make P-256 keys, but an older or imported one may differ */
-		lwsl_vhost_err(vhd->vhost, "acme: account key %s is not RSA, "
-			       "P-256 or P-384, unable to sign with it",
-			       vhd->active_cert->pvop[LWS_TLS_SET_AUTH_PATH]);
-		lws_jwk_destroy(&vhd->jwk);
-		vhd->last_acme_failure = lws_now_usecs();
-
+	if (acme_jws_alg(&vhd->jwk))
 		return 1;
-	}
+
+	/* we make P-256 keys, but an older or imported one may differ */
+	lwsl_vhost_err(vhd->vhost, "acme: account key %s is not RSA, "
+		       "P-256 or P-384, unable to sign with it", from);
+	lws_jwk_destroy(&vhd->jwk);
+
+	return 0;
+}
+
+/* make a new account key in vhd->jwk, and store it */
+
+static int
+acme_auth_key_create(struct per_vhost_data__lws_acme_client *vhd)
+{
+	struct lws_genec_ctx ecdsa;
+	int n;
 
 	vhd->jwk.kty = LWS_GENCRYPTO_KTY_EC;
 
 	lwsl_notice("Generating ACME P-256 keypair... "
 			"will take a little while\n");
-
-	struct lws_genec_ctx ecdsa;
 
 	memset(&ecdsa, 0, sizeof(ecdsa));
 
@@ -927,12 +1001,96 @@ lws_acme_load_create_auth_keys(struct per_vhost_data__lws_acme_client *vhd,
 
 		if (r) {
 			lwsl_vhost_warn(vhd->vhost, "unable to save %s via footprint IPC", fp);
-			vhd->last_acme_failure = lws_now_usecs();
 			return 1;
 		}
 	}
 
 	return 0;
+}
+
+/* we have the account key: start talking to the CA */
+
+static void
+acme_acquisition_connect(struct per_vhost_data__lws_acme_client *vhd)
+{
+	char buf[128];
+
+	lws_acme_report_status(vhd->vhost, LWS_CUS_CREATE_KEYS,
+			"Auth keys ready");
+
+	/*
+	 * So if we don't have it, the first job is get the directory.
+	 *
+	 * If we already have the directory, jump straight into trying
+	 * to register our key.
+	 *
+	 * We always try to register the key... if it's not the first
+	 * time, the CA answers with the account it already has for it
+	 */
+	if (!vhd->ac->urls[0][0]) {
+		vhd->ac->state = ACME_STATE_DIRECTORY;
+		lws_snprintf(buf, sizeof(buf) - 1, "%s",
+				vhd->active_cert->pvop[LWS_TLS_SET_DIR_URL]);
+	} else {
+		vhd->ac->state = ACME_STATE_NEW_ACCOUNT;
+		lws_snprintf(buf, sizeof(buf) - 1, "%s",
+				vhd->ac->urls[JAD_NEW_ACCOUNT_URL]);
+	}
+
+	if (lws_acme_client_connect(vhd->context, vhd->vhost,
+				&vhd->ac->cwsi, &vhd->ac->i, buf, "GET"))
+		return;
+
+	/* it can fail before it returns, and then it is already over */
+	if (vhd->ac)
+		acme_fail_acquisition(vhd, "unable to connect to the CA");
+}
+
+/*
+ * The root daemon's answer to get_auth_key: the stored key as base64url of
+ * its JWK, or that there is none.  The line holds the private key, so the
+ * caller scrubs it after.
+ */
+
+static void
+acme_ipc_auth_key(struct per_vhost_data__lws_acme_client *vhd,
+		  const char *line, size_t len, int ok)
+{
+	const char *cn = vhd->active_cert->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME];
+
+	if (!ok) {
+		if (lws_json_simple_strcmp(line, len, "\"none\":", "true")) {
+			/* not that it has none, so we must not replace it */
+			lwsl_vhost_warn(vhd->vhost, "acme: %s: root daemon could "
+					"not give us the account key: %.*s", cn,
+					(int)len, line);
+			acme_fail_acquisition(vhd, "account key unavailable");
+			return;
+		}
+
+		lwsl_vhost_notice(vhd->vhost, "acme: %s: no account key stored, "
+				  "making one (and so a new account)", cn);
+		if (acme_auth_key_create(vhd)) {
+			acme_fail_acquisition(vhd, "unable to make an account key");
+			return;
+		}
+		acme_acquisition_connect(vhd);
+		return;
+	}
+
+	if (acme_ipc_auth_key_import(line, len, &vhd->jwk)) {
+		acme_fail_acquisition(vhd, "root daemon's account key malformed");
+		return;
+	}
+
+	if (!acme_auth_key_usable(vhd, "from the root daemon")) {
+		acme_fail_acquisition(vhd, "no usable account key");
+		return;
+	}
+
+	lwsl_vhost_notice(vhd->vhost, "acme: %s: using the stored account key",
+			  cn);
+	acme_acquisition_connect(vhd);
 }
 
 static int
@@ -955,7 +1113,7 @@ static int
 lws_acme_start_acquisition(struct per_vhost_data__lws_acme_client *vhd,
 		struct lws_vhost *v)
 {
-	char buf[128];
+	const char *auth_path;
 
 	/* ...and we were given enough info to do the update? */
 
@@ -964,12 +1122,6 @@ lws_acme_start_acquisition(struct per_vhost_data__lws_acme_client *vhd,
 
 	if (vhd->ac) {
 		lwsl_vhost_notice(vhd->vhost, "acme: acquisition already in progress, ignoring trigger");
-		return 0;
-	}
-
-	if (vhd->last_acme_failure &&
-	    lws_now_usecs() - vhd->last_acme_failure < 60 * LWS_US_PER_SEC) {
-		lwsl_vhost_notice(vhd->vhost, "acme: recent failure, cooling down");
 		return 0;
 	}
 
@@ -993,32 +1145,6 @@ lws_acme_start_acquisition(struct per_vhost_data__lws_acme_client *vhd,
 	lws_sul_schedule(vhd->context, 0, &vhd->sul_watchdog,
 			 lws_acme_watchdog_cb, 600 * LWS_US_PER_SEC);
 
-	/*
-	 * So if we don't have it, the first job is get the directory.
-	 *
-	 * If we already have the directory, jump straight into trying
-	 * to register our key.
-	 *
-	 * We always try to register the keys... if it's not the first
-	 * time, we will get a JSON body in the (legal, nonfatal)
-	 * response like this
-	 *
-	 * {
-	 *   "type": "urn:acme:error:malformed",
-	 *   "detail": "Registration key is already in use",
-	 *   "status": 409
-	 * }
-	 */
-	if (!vhd->ac->urls[0][0]) {
-		vhd->ac->state = ACME_STATE_DIRECTORY;
-		lws_snprintf(buf, sizeof(buf) - 1, "%s",
-				vhd->active_cert->pvop[LWS_TLS_SET_DIR_URL]);
-	} else {
-		vhd->ac->state = ACME_STATE_NEW_ACCOUNT;
-		lws_snprintf(buf, sizeof(buf) - 1, "%s",
-				vhd->ac->urls[JAD_NEW_ACCOUNT_URL]);
-	}
-
 	vhd->ac->real_vh_port = lws_get_vhost_port(vhd->vhost);
 	vhd->ac->real_vh_name = lws_get_vhost_name(vhd->vhost);
 	vhd->ac->real_vh_iface = lws_get_vhost_iface(vhd->vhost);
@@ -1026,21 +1152,30 @@ lws_acme_start_acquisition(struct per_vhost_data__lws_acme_client *vhd,
 	lws_acme_report_status(vhd->vhost, LWS_CUS_STARTING, NULL);
 
 	lws_acme_report_status(vhd->vhost, LWS_CUS_CREATE_KEYS,
-			"Generating auth keys, please wait");
-	if (lws_acme_load_create_auth_keys(vhd, 2048))
-		goto bail;
-	lws_acme_report_status(vhd->vhost, LWS_CUS_CREATE_KEYS,
-			"Auth keys created");
+			"Getting the account key");
 
-	if (lws_acme_client_connect(vhd->context, vhd->vhost,
-				&vhd->ac->cwsi, &vhd->ac->i, buf, "GET"))
+	auth_path = vhd->active_cert->pvop[LWS_TLS_SET_AUTH_PATH];
+	if (!lws_jwk_load(&vhd->jwk, auth_path, NULL, NULL)) {
+		if (!acme_auth_key_usable(vhd, auth_path)) {
+			acme_fail_acquisition(vhd, "no usable account key");
+			return 1;
+		}
+		acme_acquisition_connect(vhd);
+		return 0;
+	}
+
+	/* it goes on in acme_ipc_auth_key() when the daemon answers */
+	if (!acme_ipc_get_auth_key(vhd))
 		return 0;
 
-bail:
-	acme_connection_free(vhd->ac);
-	vhd->ac = NULL;
+	/* there's no daemon to ask: it's ours to make */
+	if (acme_auth_key_create(vhd)) {
+		acme_fail_acquisition(vhd, "unable to make an account key");
+		return 1;
+	}
+	acme_acquisition_connect(vhd);
 
-	return 1;
+	return 0;
 }
 
 struct acme_scan_ctx {
@@ -1377,6 +1512,73 @@ acme_smd_cb(void *opaque, lws_smd_class_t _class, lws_usec_t timestamp,
 }
 #endif
 
+/*
+ * The CA issued the cert: note how long it is good for, so the log says what
+ * we got, and so does the line saying it was stored
+ */
+
+static void
+acme_cert_note_validity(struct per_vhost_data__lws_acme_client *vhd,
+			struct acme_connection *ac, size_t leaf_len)
+{
+	union lws_tls_cert_info_results ir;
+	struct lws_x509_cert *x = NULL;
+	uint8_t *pem;
+
+	ac->not_after = 0;
+
+	pem = malloc(leaf_len + 1);
+	if (!pem)
+		return;
+	memcpy(pem, ac->crx.pem, leaf_len);
+	pem[leaf_len] = '\0';
+
+	/* mbedtls needs the terminating NUL counted in the PEM's length */
+	if (!lws_x509_create(&x)) {
+		if (!lws_x509_parse_from_pem(x, pem, leaf_len + 1) &&
+		    !lws_x509_info(x, LWS_TLS_CERT_INFO_VALIDITY_TO, &ir, 0))
+			ac->not_after = ir.time;
+		lws_x509_destroy(&x);
+	}
+	free(pem);
+
+	if (ac->not_after)
+		lwsl_vhost_notice(vhd->vhost, "acme: %s: the CA issued a cert "
+				  "valid for %lld days, storing it",
+				  vhd->active_cert->pvop[
+					LWS_TLS_REQ_ELEMENT_COMMON_NAME],
+				  (long long)((ac->not_after -
+					(time_t)lws_now_secs()) / 86400));
+	else
+		lwsl_vhost_warn(vhd->vhost, "acme: %s: unable to read the "
+				"dates of the cert the CA issued, storing it "
+				"anyway", vhd->active_cert->pvop[
+					LWS_TLS_REQ_ELEMENT_COMMON_NAME]);
+}
+
+/* the new cert is fetched and stored: the acquisition is over */
+
+static void
+acme_acquisition_succeeded(struct per_vhost_data__lws_acme_client *vhd)
+{
+	if (vhd->active_cert)
+		lwsl_vhost_notice(vhd->vhost, "acme: %s: renewed, the new cert "
+				  "is stored, valid for %lld more days",
+				  vhd->active_cert->pvop[
+					LWS_TLS_REQ_ELEMENT_COMMON_NAME],
+				  (long long)(vhd->ac && vhd->ac->not_after ?
+					(vhd->ac->not_after -
+					 (time_t)lws_now_secs()) / 86400 : 0));
+
+	lws_acme_finished(vhd);
+	lws_acme_report_status(vhd->vhost, LWS_CUS_SUCCESS, NULL);
+	/* cert fetched AND stored: clear its acquisition failure backoff */
+	if (vhd->active_cert)
+		acme_renew_succeeded(vhd->active_cert);
+
+	acme_evaluate_again(vhd);
+}
+
 /* the cert was fetched, and every save we asked the daemon for is answered */
 
 static void
@@ -1387,11 +1589,7 @@ acme_ipc_saves_done(struct per_vhost_data__lws_acme_client *vhd)
 		return;
 	}
 
-	lws_acme_finished(vhd);
-	lws_acme_report_status(vhd->vhost, LWS_CUS_SUCCESS, NULL);
-	/* cert fetched AND stored: clear the acquisition failure backoff */
-	vhd->acme_fail_count = 0;
-	vhd->acme_retry_not_before = 0;
+	acme_acquisition_succeeded(vhd);
 }
 
 /* the answer to the aging validity check for vhd->aging_current_cert */
@@ -1402,30 +1600,30 @@ acme_ipc_validity(struct per_vhost_data__lws_acme_client *vhd,
 {
 	struct lws_acme_cert_config *cfg = lws_container_of(
 			vhd->aging_current_cert, struct lws_acme_cert_config, list);
-	lws_usec_t now;
+	lws_usec_t now = lws_now_usecs();
 
-	if (!cfg->force_reissue && r->ok &&
-	    !(r->total_days && r->days_left <= (r->total_days / 4))) {
+	switch (acme_renew_verdict(cfg, r, now)) {
+	case ACME_RENEW_NOT_DUE:
 		lwsl_vhost_notice(vhd->vhost, "acme: cert %s: %d days left, total %d (skip renewal)", cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME], r->days_left, r->total_days);
 		vhd->aging_current_cert = lws_dll2_get_next(vhd->aging_current_cert);
 		acme_aging_next_cert(vhd);
 		return;
-	}
 
-	now = lws_now_usecs();
-	if (now < vhd->acme_retry_not_before) {
-		/* a recent acquisition for this failed:
-		 * don't hammer the CA with repeated
-		 * orders for the same cert (LE allows
-		 * 5 duplicates / 7 days) */
+	case ACME_RENEW_BACKOFF:
+		/* a recent acquisition for this failed: don't hammer the CA
+		 * with repeated orders for the same cert, but the certs after
+		 * it are still looked at */
 		lwsl_vhost_notice(vhd->vhost, "acme_aging: %s still needs a cert "
-			"but backing off, next attempt in %llds",
-			cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME],
-			(long long)((vhd->acme_retry_not_before - now) /
+			"(%d days left) but backing off, next attempt in %llds",
+			cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME], r->days_left,
+			(long long)((cfg->retry_not_before - now) /
 				    LWS_USEC_PER_SEC));
 		vhd->aging_current_cert = lws_dll2_get_next(vhd->aging_current_cert);
 		acme_aging_next_cert(vhd);
 		return;
+
+	case ACME_RENEW_DUE:
+		break;
 	}
 
 	if (cfg->force_reissue)
@@ -1488,8 +1686,22 @@ acme_ipc_line(void *opaque, const char *line, size_t len)
 		acme_ipc_arm(vhd);
 		break;
 
+	case ACME_IPC_LINE_AUTH_KEY:
+		if (!vhd->ipc_key_pending)
+			break; /* not ours */
+		vhd->ipc_key_pending = 0;
+		acme_ipc_arm(vhd);
+
+		if (vhd->ac)
+			acme_ipc_auth_key(vhd, line, len, r.ok);
+
+		/* the line was the private key: don't leave it lying around */
+		lws_explicit_bzero(vhd->ipc_rx.buf, sizeof(vhd->ipc_rx.buf));
+		break;
+
 	case ACME_IPC_LINE_REFUSED:
-		if (!vhd->ipc_pending_saves && !vhd->aging_current_cert)
+		if (!vhd->ipc_pending_saves && !vhd->ipc_key_pending &&
+		    !vhd->aging_current_cert)
 			break;
 
 		/* it was one of ours, but which?  Everything outstanding fails */
@@ -1763,6 +1975,7 @@ callback_acme_client(struct lws *wsi, enum lws_callback_reasons reason,
 			break;
 
 		case ACME_STATE_START_CHALL:
+		case ACME_STATE_CHALL_REASON:
 			lejp_construct(&ac->jctx, acme_cb_chac, ac, acme_jchac_tok,
 					LWS_ARRAY_SIZE(acme_jchac_tok));
 			break;
@@ -1894,6 +2107,11 @@ pkt_add_hdrs:
 			lws_strncpy(ac->active_url, ac->order_url, sizeof(ac->active_url));
 			goto pkt_add_hdrs;
 
+		case ACME_STATE_CHALL_REASON:
+			/* POST-as-GET of the challenge */
+			lws_strncpy(ac->active_url, ac->challenge_uri, sizeof(ac->active_url));
+			goto pkt_add_hdrs;
+
 		case ACME_STATE_POLLING_CSR:
 			if (ac->goes_around) {
 				lws_strncpy(ac->active_url, ac->order_url, sizeof(ac->active_url));
@@ -1953,6 +2171,7 @@ pkt_add_hdrs:
 		case ACME_STATE_POLLING_CSR:
 		case ACME_STATE_POLLING:
 		case ACME_STATE_START_CHALL:
+		case ACME_STATE_CHALL_REASON:
 		case ACME_STATE_AUTHZ:
 		case ACME_STATE_NEW_ORDER:
 		case ACME_STATE_DIRECTORY:
@@ -2232,12 +2451,24 @@ poll_again:
 				goto poll_again;
 
 			if (!strcmp(ac->status, "invalid")) {
-				lwsl_vhost_warn(vhd->vhost, "Challenge failed");
-				lws_snprintf(buf, sizeof(buf),
-						"Challenge Invalid: %s",
-						ac->detail);
-				failreason = buf;
-				goto failed;
+				/*
+				 * The order only says that it failed: the
+				 * CA's reason is in the challenge's error, so
+				 * ask for the challenge before we give up
+				 */
+				ac->state = ACME_STATE_CHALL_REASON;
+				ac->detail[0] = '\0';
+				lws_strncpy(buf, ac->challenge_uri, sizeof(buf));
+				cwsi = lws_acme_client_connect(vhd->context,
+						vhd->vhost, &ac->cwsi, &ac->i,
+						buf, "POST");
+				if (!cwsi) {
+					lwsl_vhost_warn(vhd->vhost, "Challenge "
+							"failed, reason unknown");
+					failreason = (char *)"Challenge Invalid";
+					goto failed;
+				}
+				return -1; /* close the completed client connection */
 			}
 
 			lwsl_vhost_notice(vhd->vhost, "ACME challenge passed");
@@ -2273,6 +2504,18 @@ poll_again:
 				goto failed;
 			}
 			return -1; /* close the completed client connection */
+
+		case ACME_STATE_CHALL_REASON:
+			lwsl_vhost_warn(vhd->vhost, "Challenge for %s failed: %s",
+					vhd->active_cert ? vhd->active_cert->pvop[
+					    LWS_TLS_REQ_ELEMENT_COMMON_NAME] :
+					    "unknown",
+					ac->detail[0] ? ac->detail :
+							"the CA gave no reason");
+			lws_snprintf(buf, sizeof(buf), "Challenge Invalid: %s",
+				     ac->detail);
+			failreason = buf;
+			goto failed;
 
 		case ACME_STATE_POLLING_CSR:
 			if (ac->resp < 200 || ac->resp > 202) {
@@ -2337,6 +2580,7 @@ poll_again:
 				lwsl_vhost_err(vhd->vhost, "Unable to find ACME cert!");
 				goto failed;
 			}
+			acme_cert_note_validity(vhd, ac, leaf_len);
 
 			{
 				char cert_ts[256], key_ts[256], full_ts[256];
@@ -2476,26 +2720,30 @@ poll_again:
 #endif
 			}
 
-			/* notify lws there was a cert update */
+			/*
+			 * Notify lws there was a cert update.  The copies we
+			 * hand over are what the vhosts load, so they get the
+			 * chain, not the leaf alone.
+			 */
 
 			if (lws_tls_cert_updated(vhd->context,
 					vhd->active_cert->pvop[LWS_TLS_SET_CERT_PATH],
 					vhd->active_cert->pvop[LWS_TLS_SET_KEY_PATH],
-						ac->crx.pem, leaf_len,
+						ac->crx.pem, ac->crx.len,
 						ac->alloc_privkey_pem,
-						ac->len_privkey_pem)) {
-				lwsl_vhost_warn(vhd->vhost, "problem setting certs");
-			}
+						ac->len_privkey_pem))
+				lwsl_vhost_err(vhd->vhost, "acme: %s: a vhost "
+					"serving it could not load the new "
+					"cert, see above",
+					vhd->active_cert->pvop[
+					LWS_TLS_REQ_ELEMENT_COMMON_NAME]);
 
 			if (vhd->ipc_pending_saves > 0) {
 				lwsl_vhost_notice(vhd->vhost, "Waiting for %d IPC saves to complete...", vhd->ipc_pending_saves);
 				/* the last answer finishes it, acme_ipc_line() */
 				ac->saves_awaited = 1;
-			} else {
-				lws_acme_finished(vhd);
-				lws_acme_report_status(vhd->vhost,
-						LWS_CUS_SUCCESS, NULL);
-			}
+			} else
+				acme_acquisition_succeeded(vhd);
 
 			return -1;
 
@@ -2681,12 +2929,6 @@ acme_aging_next_cert(struct per_vhost_data__lws_acme_client *vhd)
 				vhd->aging_current_cert = lws_dll2_get_next(vhd->aging_current_cert);
 				continue;
 			}
-		}
-
-		if (vhd->last_acme_failure && lws_now_usecs() - vhd->last_acme_failure < 60 * LWS_US_PER_SEC) {
-			lwsl_vhost_notice(vhd->vhost, "acme_aging: skipping %s: last_acme_failure cooldown\n", cfg->pvop[LWS_TLS_REQ_ELEMENT_COMMON_NAME]);
-			vhd->aging_current_cert = lws_dll2_get_next(vhd->aging_current_cert);
-			continue;
 		}
 
 		/* Asynchronous IPC validity check */

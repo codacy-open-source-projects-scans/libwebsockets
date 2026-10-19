@@ -497,23 +497,17 @@ lws_quic_stream_is_h3(const struct lws *wsi_child)
 }
 
 /*
- * Deliver in-order stream data to h3.  Nonzero from lws_h3_rx_stream_data()
- * means either the h3 layer closed the stream (or whole connection) itself,
- * or the http-level callback refused the data and wants the stream closed,
- * the same as the raw-protocol case above: it must be honoured via
+ * h3 returned nonzero for what we handed it on a stream.  That means either
+ * the h3 layer closed the stream (or whole connection) itself, or the
+ * http-level callback refused the data and wants the stream closed, the same
+ * as the raw-protocol case above: it must be honoured via
  * close_after_rx, not just dropped, or an SS returning DISCONNECT_ME from
  * its rx on an h3 stream never sees DISCONNECTED.
  */
 static int
-lws_quic_rx_deliver_h3(struct lws *nwsi, struct lws *wsi_child,
-		       struct lws_quic_stream *qs, const uint8_t *buf,
-		       size_t len)
+lws_quic_rx_h3_wants_close(struct lws *nwsi, struct lws *wsi_child,
+			   struct lws_quic_stream *qs, uint64_t sid)
 {
-	uint64_t sid = qs ? qs->stream_id : 0;
-
-	if (!lws_h3_rx_stream_data(wsi_child, buf, len))
-		return 0;
-
 	if (!qs || lws_quic_stream_find(nwsi, sid) != wsi_child)
 		/* already gone */
 		return 1;
@@ -532,6 +526,40 @@ lws_quic_rx_deliver_h3(struct lws *nwsi, struct lws *wsi_child,
 
 	return 1;
 }
+
+/*
+ * Deliver in-order stream data to h3
+ */
+static int
+lws_quic_rx_deliver_h3(struct lws *nwsi, struct lws *wsi_child,
+		       struct lws_quic_stream *qs, const uint8_t *buf,
+		       size_t len)
+{
+	uint64_t sid = qs ? qs->stream_id : 0;
+
+	if (!lws_h3_rx_stream_data(wsi_child, buf, len))
+		return 0;
+
+	return lws_quic_rx_h3_wants_close(nwsi, wsi_child, qs, sid);
+}
+
+#if defined(LWS_WITH_SERVER)
+/*
+ * The peer's FIN came after all it sent on a server request stream, and that
+ * has all been through h3 now: it may be what ends the request body
+ */
+static int
+lws_quic_rx_fin_h3_server(struct lws *nwsi, struct lws *wsi_child,
+			  struct lws_quic_stream *qs)
+{
+	uint64_t sid = qs->stream_id;
+
+	if (!lws_h3_rx_fin_server(wsi_child))
+		return 0;
+
+	return lws_quic_rx_h3_wants_close(nwsi, wsi_child, qs, sid);
+}
+#endif
 #endif
 
 /*
@@ -657,6 +685,11 @@ lws_quic_rx_reassemble(struct lws *nwsi, struct lws *wsi_child, struct lws_quic_
 #if defined(LWS_WITH_CLIENT)
 							wsi_child->client_mux_substream = 0;
 #endif
+#if defined(LWS_WITH_SERVER)
+							if (lws_quic_rx_fin_h3_server(nwsi,
+									wsi_child, qs))
+								wsi_child = NULL;
+#endif
                                                 }
                                         } else {
                                                 if (wsi_child->h3.type_set && (wsi_child->h3.stream_type == 0x00 || wsi_child->h3.stream_type == 0x02 || wsi_child->h3.stream_type == 0x03)) {
@@ -747,6 +780,11 @@ lws_quic_rx_reassemble(struct lws *nwsi, struct lws *wsi_child, struct lws_quic_
 #if defined(LWS_WITH_CLIENT)
 								wsi_child->client_mux_substream = 0;
 #endif
+#if defined(LWS_WITH_SERVER)
+								if (lws_quic_rx_fin_h3_server(nwsi,
+										wsi_child, qs))
+									wsi_child = NULL;
+#endif
 							}
 						}
 					}
@@ -821,6 +859,99 @@ lws_quic_stream_find(struct lws *nwsi, uint64_t stream_id)
 	return NULL;
 }
 
+/*
+ * The ranges only split where there is a stream index below the highest one
+ * opened that hasn't been, and the stream limit leaves at most its window of
+ * those, so a peer can't make this big.  The cap is a backstop.
+ */
+#define LWS_QUIC_IDTR_MAX_RANGES 4096
+
+/* the first range starting above idx, or count if none does */
+
+static uint32_t
+lws_quic_idtr_after(const struct lws_quic_idtr *t, uint64_t idx)
+{
+	uint32_t lo = 0, hi = t->count;
+
+	while (lo < hi) {
+		uint32_t m = lo + ((hi - lo) / 2);
+
+		if (t->r[m].lo > idx)
+			hi = m;
+		else
+			lo = m + 1;
+	}
+
+	return lo;
+}
+
+int
+lws_quic_idtr_is_opened(const struct lws_quic_idtr *t, uint64_t idx)
+{
+	uint32_t n = lws_quic_idtr_after(t, idx);
+
+	return n && idx < t->r[n - 1].hi;
+}
+
+/* 0, or -1 if it couldn't be recorded */
+
+int
+lws_quic_idtr_open(struct lws_quic_idtr *t, uint64_t idx)
+{
+	uint32_t n = lws_quic_idtr_after(t, idx);
+	int join_prev = n && t->r[n - 1].hi == idx,
+	    join_next = n < t->count && t->r[n].lo == idx + 1;
+
+	if (n && idx < t->r[n - 1].hi)
+		return 0; /* already */
+
+	if (join_prev && join_next) {
+		/* idx was the gap between them: they become one */
+		t->r[n - 1].hi = t->r[n].hi;
+		memmove(&t->r[n], &t->r[n + 1],
+			(t->count - n - 1) * sizeof(t->r[0]));
+		t->count--;
+		return 0;
+	}
+	if (join_prev) {
+		t->r[n - 1].hi = idx + 1;
+		return 0;
+	}
+	if (join_next) {
+		t->r[n].lo = idx;
+		return 0;
+	}
+
+	if (t->count == t->alloc) {
+		uint32_t na = t->alloc ? t->alloc * 2 : 8;
+		void *nr;
+
+		if (t->alloc >= LWS_QUIC_IDTR_MAX_RANGES)
+			return -1;
+		if (na > LWS_QUIC_IDTR_MAX_RANGES)
+			na = LWS_QUIC_IDTR_MAX_RANGES;
+		nr = lws_realloc(t->r, na * sizeof(t->r[0]), "quic idtr");
+		if (!nr)
+			return -1;
+		t->r = nr;
+		t->alloc = na;
+	}
+
+	memmove(&t->r[n + 1], &t->r[n], (t->count - n) * sizeof(t->r[0]));
+	t->r[n].lo = idx;
+	t->r[n].hi = idx + 1;
+	t->count++;
+
+	return 0;
+}
+
+void
+lws_quic_idtr_destroy(struct lws_quic_idtr *t)
+{
+	lws_free_set_NULL(t->r);
+	t->count = 0;
+	t->alloc = 0;
+}
 
 /*
  * Parses QUIC frames from a decrypted payload and routes them.
@@ -1156,6 +1287,19 @@ lws_quic_parse_frames(struct lws *nwsi, int level, uint8_t *payload, size_t payl
 			lwsl_wsi_info(nwsi, "QUIC RX: Parsed RESET_STREAM! stream_id %llu, err %llu, final_size %llu",
 				(unsigned long long)stream_id, (unsigned long long)app_err_code, (unsigned long long)final_size);
 			
+			/*
+			 * A peer's stream reset before any of it reached us is
+			 * as finished as one we closed: what it sent before
+			 * the reset may still arrive, and must not open it
+			 */
+			if (is_peer_initiated && !wsi_child &&
+			    lws_quic_idtr_open(&qn->peer_opened[
+					is_unidirectional ? 1 : 0], stream_id >> 2)) {
+				lws_quic_enter_closing_state(nwsi,
+					LWS_QUIC_ERR_INTERNAL_ERROR, type, 0);
+				return -1;
+			}
+
 			if (wsi_child && wsi_child->quic.qs) {
 				if (wsi_child->quic.qs->fin_received && wsi_child->quic.qs->rx_final_size != final_size) {
 					lws_quic_enter_closing_state(nwsi, LWS_QUIC_ERR_FINAL_SIZE_ERROR, type, 0);
@@ -1453,6 +1597,7 @@ lws_quic_parse_frames(struct lws *nwsi, int level, uint8_t *payload, size_t payl
 							lws_sul_cancel(&nwsi->quic.qn->path_probe_sul);
 							nwsi->quic.qn->probe_bytes_received = 0;
 							nwsi->quic.qn->probe_bytes_sent = 0;
+							nwsi->quic.qn->probe_fails = 0;
 						}
 						nwsi->quic.qn->probing_sa46_valid = 0;
 						nwsi->quic.qn->prefaddr_active = 0;
@@ -1485,9 +1630,7 @@ lws_quic_parse_frames(struct lws *nwsi, int level, uint8_t *payload, size_t payl
 						nwsi->quic.qn->smoothed_rtt = 0;
 						nwsi->quic.qn->rttvar = 0;
 						nwsi->quic.qn->latest_rtt = 0;
-						nwsi->quic.qn->current_mtu = 1280;
-						nwsi->quic.qn->probed_mtu = 1380;
-						nwsi->quic.qn->pmtud_state = 1;
+						lws_quic_pmtud_reset(nwsi->quic.qn);
 					}
 				} else {
 					lwsl_wsi_notice(nwsi, "QUIC RX: Spurious or mismatched PATH_RESPONSE, ignoring");
@@ -1504,6 +1647,13 @@ lws_quic_parse_frames(struct lws *nwsi, int level, uint8_t *payload, size_t payl
 				return -1;
 			} else {
 				lws_quic_discard_keys(nwsi, LWS_QUIC_LEVEL_HANDSHAKE);
+
+				if (nwsi->quic.qn &&
+				    !nwsi->quic.qn->handshake_confirmed) {
+					nwsi->quic.qn->handshake_confirmed = 1;
+					/* see what the path takes, beyond 1200 */
+					lws_quic_pmtud_kick(nwsi->quic.qn);
+				}
 
 				/*
 				 * Now that the server confirmed handshake completion,
@@ -1660,7 +1810,24 @@ lws_quic_parse_frames(struct lws *nwsi, int level, uint8_t *payload, size_t payl
 					}
 				}
 
+				/*
+				 * A stream of the peer's we have, however it
+				 * came to be (the connection's first one is
+				 * made with it), is opened now
+				 */
+				if (wsi_child && is_peer_initiated &&
+				    lws_quic_idtr_open(&qn->peer_opened[
+						is_unidirectional ? 1 : 0],
+						stream_id >> 2)) {
+					lws_quic_enter_closing_state(nwsi,
+						LWS_QUIC_ERR_INTERNAL_ERROR, type, 0);
+					return -1;
+				}
+
 				if (!wsi_child) {
+					struct lws_quic_idtr *t = &qn->peer_opened[
+							is_unidirectional ? 1 : 0];
+
 					/* Enforce MAX_STREAMS limit before creating a new stream */
 					uint64_t limit = is_unidirectional ? qn->max_streams_unidi_local : qn->max_streams_bidi_local;
 					if ((stream_id >> 2) >= limit) {
@@ -1668,6 +1835,47 @@ lws_quic_parse_frames(struct lws *nwsi, int level, uint8_t *payload, size_t payl
 						lws_quic_enter_closing_state(nwsi, LWS_QUIC_ERR_STREAM_LIMIT_ERROR, type, 0);
 						return -1;
 					}
+
+					/*
+					 * One of the peer's we opened, and have
+					 * closed since: this is late, eg, a
+					 * retransmission of what we already
+					 * had.  A new stream for it would act
+					 * on its request again.
+					 */
+					if (lws_quic_idtr_is_opened(t, stream_id >> 2)) {
+						lwsl_wsi_info(nwsi, "QUIC RX: STREAM for "
+							      "closed stream %llu",
+							      (unsigned long long)stream_id);
+						pos += len;
+						ack_eliciting = 1;
+						continue;
+					}
+
+					if (lws_quic_idtr_open(t, stream_id >> 2)) {
+						lws_quic_enter_closing_state(nwsi,
+							LWS_QUIC_ERR_INTERNAL_ERROR, type, 0);
+						return -1;
+					}
+
+#if defined(LWS_ROLE_H3)
+					/*
+					 * An h3 server may not open a request
+					 * stream on its client, only one of a
+					 * WebTransport session's streams
+					 */
+					if (nwsi->h3.h3n && !is_unidirectional &&
+					    !lws_h3_peer_bidi_allowed(nwsi)) {
+						lwsl_wsi_notice(nwsi, "QUIC RX: h3 "
+							"server opened bidi "
+							"stream %llu",
+							(unsigned long long)stream_id);
+						lws_quic_enter_closing_state(nwsi,
+							LWS_H3_STREAM_CREATION_ERROR,
+							0, 1);
+						return -1;
+					}
+#endif
 
 					/* Peer initiated a new stream. We must create a child WSI! */
 					wsi_child = lws_create_new_server_wsi(nwsi->a.vhost, nwsi->tsi, LWSLCG_WSI_MUX, "quic stream");
@@ -2036,6 +2244,9 @@ lws_quic_parse_transport_parameters(struct lws *wsi, const uint8_t *buf, size_t 
 					lwsl_wsi_err(wsi, "QUIC TP error: max_udp_payload_size %llu < 1200", (unsigned long long)val);
 					return -1;
 				}
+				/* it bounds the PMTUD search's ceiling */
+				qn->peer_max_udp_payload = val > 65527 ? 65527 :
+							   (uint32_t)val;
 			} else return -1;
 			break;
 		case 0x04: /* initial_max_data */

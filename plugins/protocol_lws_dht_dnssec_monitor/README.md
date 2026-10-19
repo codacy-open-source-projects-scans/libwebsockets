@@ -15,6 +15,15 @@ This monitor is designed specifically to work in tandem with the [lws-acme-clien
 ### Web UI
 The plugin includes a set of HTML/JS/CSS assets for a modern, Web-based management UI that interfaces securely with the backend JSON WS proxy using stateless `lws_jwt_auth` API verification.
 
+The proxy forwards the UI's requests to the root process over its UDS, each
+with a short-lived JWT signed with the secret the two share.  The ACME client
+and the whois lookups in the lwsws process sign theirs with the same secret,
+and each token's `sub` says which of them made it (`ui`, `acme-client` or
+`whois`).  The root process takes the saves of keys, certs and dns-01
+challenges, resign requests and requests for the ACME account key
+(`get_auth_key`) only from the ACME client, and `update_whois` only from the
+whois lookups, so a browser cannot have the proxy make them.
+
 These UI assets do not contain any inline scripts or styles, ensuring they are strictly Content-Security-Policy (CSP) compliant. The `assets/` directory must be manually mounted by the administrator in the `lwsws` JSON configuration if Web UI management is desired. To prevent unauthenticated users from even loading the UI files, configure the mount to use the `lws-login` interceptor protocol, requiring the `domain-admin` service grant (which aligns identically with the WebSocket backend verification).
 
 #### Force cert reissue
@@ -28,7 +37,7 @@ certificate's toplevel domain is set.  The ACME client runs in the lwsws
 process rather than the root process, so the proxy answers this request itself,
 checking the row's FQDN lies inside its domain and sending
 `{"acme":"force-reissue","domain":"...","common-name":"..."}` on SMD class
-`LWSSMDCL_CERTS`.  The usual backoff after failed acquisitions still applies,
+`LWSSMDCL_CERTS`.  The certificate's backoff after failed acquisitions still applies,
 and Let's Encrypt allows only 5 identical certificates per week.
 
 #### Registrar DS record

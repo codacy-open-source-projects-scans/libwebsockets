@@ -26,13 +26,15 @@
 
 /*
  * The hangup alone, without the POLLERR that LWS_POLLHUP also carries on
- * unix.  The small platforms number poll events lws' own way, so it is all
- * of LWS_POLLHUP there.
+ * unix, and that error alone.  The small platforms number poll events lws'
+ * own way, so both are all of LWS_POLLHUP there: any hangup is an error.
  */
 #if defined(POLLHUP) && !defined(LWS_PLAT_FREERTOS)
 #define LWS_POLL_HANGUP		(POLLHUP)
+#define LWS_POLL_ERROR		(POLLERR)
 #else
 #define LWS_POLL_HANGUP		(LWS_POLLHUP)
+#define LWS_POLL_ERROR		(LWS_POLLHUP)
 #endif
 
 #if defined(_DEBUG)
@@ -68,8 +70,18 @@ lws_handle_POLLOUT_event(struct lws *wsi, struct lws_pollfd *pollfd)
 	lws_handling_result_t hr;
 	int n;
 
-	if (lwsi_skt_unusable(wsi))
+	if (lwsi_skt_unusable(wsi)) {
+		/*
+		 * Nothing will be written on it any more, and the poll is
+		 * level-triggered: POLLOUT left armed is reported on every
+		 * pass, a busy spin until the wsi is closed, or for good if
+		 * whoever found the socket unusable never closes it
+		 */
+		if (pollfd && lws_change_pollfd(wsi, LWS_POLLOUT, 0))
+			return 1;
+
 		return 0;
+	}
 
 #if defined(LWS_WITH_CLIENT)
 	/* Intercept POLLOUT for parallel sockets if we are racing H3 */
@@ -313,8 +325,8 @@ bail_die:
  * consuming it.  Each of those phases ends with our tx (the response, the
  * handshake, the flush, the CLOSE), not with anything the peer sends.
  *
- * A server close staged in SHUTDOWN has sent its FIN and waits only for the
- * peer's: its protocol is gone, so nothing parked on it can ever be consumed
+ * A close staged in SHUTDOWN (a server's, or an h2 client connection's after
+ * its GOAWAY) has sent its FIN and waits only for the peer's: its protocol is gone, so nothing parked on it can ever be consumed
  * either (the staging drops it, see __lws_close_free_wsi()).
  */
 int
@@ -554,6 +566,13 @@ lws_buflist_aware_read(struct lws_context_per_thread *pt, struct lws *wsi,
 
 	ebuf->token = ep;
 	ebuf->len = n = lws_ssl_capable_read(wsi, ep, (size_t)e);
+	if (n == LWS_SSL_CAPABLE_ERROR) {
+		int en = LWS_ERRNO;
+
+		/* the transport may have said more precisely already */
+		lws_wsi_close_cause_set(wsi, en ? "rx failed, errno" :
+						  "rx failed", en);
+	}
 
 	lwsl_wsi_debug(wsi, "%s: ssl_capable_read %d", hint, ebuf->len);
 
@@ -707,6 +726,8 @@ lws_rx_pump(struct lws_context_per_thread *pt, struct lws *wsi,
 			return LWS_HPI_RET_HANDLED;
 		}
 #endif
+		lws_wsi_close_cause_set(wsi, "peer closed", 0);
+
 		return rx_pump_peer_closed(wsi, nothing);
 
 	case LWS_SSL_CAPABLE_ERROR:
@@ -720,8 +741,11 @@ lws_rx_pump(struct lws_context_per_thread *pt, struct lws *wsi,
 		 * forever.  A read that yields nothing on a hung-up socket
 		 * is the peer closed, however it was spelled.
 		 */
-		if (pollfd && (pollfd->revents & LWS_POLLHUP))
+		if (pollfd && (pollfd->revents & LWS_POLLHUP)) {
+			lws_wsi_close_cause_set(wsi, "peer hung up", 0);
+
 			return rx_pump_peer_closed(wsi, nothing);
+		}
 
 		if (ebuf.len == LWS_SSL_CAPABLE_ERROR) {
 			/*
@@ -849,8 +873,9 @@ lws_rx_pump_dgram(struct lws_context_per_thread *pt, struct lws *wsi,
 	lws_handling_result_t hr;
 	lws_sockaddr46 sa46;
 	socklen_t slen = sizeof(sa46);
-	uint8_t ecn = 0;
+	uint8_t ecn = 0, *b;
 	int n, sb;
+	size_t l;
 
 	*nothing = 0;
 
@@ -947,8 +972,23 @@ lws_rx_pump_dgram(struct lws_context_per_thread *pt, struct lws *wsi,
 #endif
 
 	sb = lws_servbuf_claim(pt, pt->serv_buf, (size_t)n, "rx dgram pump");
+	b = pt->serv_buf;
+	l = (size_t)n;
+#if defined(LWS_WITH_TLS_PASSTHROUGH) && defined(LWS_ROLE_QUIC)
+	/*
+	 * A trusted relay's PROXY v2 header comes off first, then a
+	 * datagram for a passed through vhost goes on to its server
+	 * (lib/io/passthrough.c)
+	 */
+	if (wsi->io->listener && wsi->role_ops == &role_ops_quic &&
+	    (lws_relayed_dgram_rx(wsi, &b, &l, &sa46) ||
+	     lws_quic_passthrough_rx(wsi, b, l, &sa46, ecn))) {
+		lws_servbuf_release(pt, sb);
+		return LWS_HPI_RET_HANDLED;
+	}
+#endif
 	hr = lws_rops_func_fidx(wsi->role_ops, LWS_ROPS_rx_dgram).
-			rx_dgram(wsi, pt->serv_buf, (size_t)n, &sa46, ecn);
+			rx_dgram(wsi, b, l, &sa46, ecn);
 	lws_servbuf_release(pt, sb);
 
 	return hr;
@@ -1468,6 +1508,9 @@ _lws_service_fd_tsi(struct lws_context *context, struct lws_pollfd *pollfd,
 	 * only have finished sending, with what it sent before it (eg, why it
 	 * refused what we are sending) still unread, because reading was held
 	 * behind the partial.  That is read before the wsi goes, below.
+	 * Windows' WSAPoll reports a FIN as POLLHUP too, which is all of
+	 * LWS_POLLHUP there, so it is never a bare hangup; but a hangup with
+	 * no POLLERR is no reset either, and is read the same way.
 	 *
 	 * A wsi asking for neither POLLIN nor POLLOUT (waiting for a header
 	 * table, or rx flow-controlled with nothing to send) is only told of
@@ -1500,7 +1543,9 @@ _lws_service_fd_tsi(struct lws_context *context, struct lws_pollfd *pollfd,
 
 		if (!(pollfd->revents & pollfd->events & LWS_POLLIN)) {
 
-			if (bare_hangup && wsi->buflist_out) {
+			if (wsi->buflist_out &&
+			    (bare_hangup ||
+			     !(pollfd->revents & LWS_POLL_ERROR))) {
 				/*
 				 * The partial send reading was held behind can
 				 * never go now: drop it, and tell the role its
@@ -1610,7 +1655,7 @@ _lws_service_fd_tsi(struct lws_context *context, struct lws_pollfd *pollfd,
 
 #if defined(LWS_WITH_TLS)
 	/*
-	 * A tls server close staged in SHUTDOWN first sees our close_notify
+	 * A tls close staged in SHUTDOWN first sees our close_notify
 	 * away; then it is only waiting for his FIN, as a plaintext one is.
 	 */
 	if (lwsi_close(wsi) == LCS_SHUTDOWN && lws_is_ssl(wsi) &&
@@ -1636,7 +1681,7 @@ _lws_service_fd_tsi(struct lws_context *context, struct lws_pollfd *pollfd,
 #endif
 
 	/*
-	 * A server close staged in SHUTDOWN has sent its FIN (after its tls
+	 * A close staged in SHUTDOWN has sent its FIN (after its tls
 	 * close_notify, if any) and only waits for his; nothing he sends now
 	 * is for anyone (the protocol has been dropped), so it is read and
 	 * discarded rather than parsed by the role or the tls session, and his
@@ -1706,6 +1751,16 @@ _lws_service_fd_tsi(struct lws_context *context, struct lws_pollfd *pollfd,
 
 		goto handled;
 	}
+
+#if defined(LWS_WITH_TLS_PASSTHROUGH)
+	/* so is the look at a server connection's first bytes before it */
+	if (wsi->io->pre_accept) {
+		if (lws_pre_accept_service(wsi))
+			goto close_and_handled_l;
+
+		goto handled;
+	}
+#endif
 
 	/* a server's tls accept in progress is IO's alone */
 	if (!lwsi_role_client(wsi) && lwsi_state(wsi) == LRS_SSL_ACK_PENDING) {

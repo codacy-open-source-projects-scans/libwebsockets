@@ -261,6 +261,14 @@ lws_get_peer_simple(struct lws *wsi, char *name, size_t namelen)
 		return name;
 	}
 #endif
+#if defined(LWS_WITH_TLS_PASSTHROUGH)
+	if (wsi->io->proxied) {
+		/* the client a trusted proxy named in its PROXY v2 header */
+		lws_sa46_write_numeric_address(&wsi->io->sa46_proxied, name,
+					       namelen);
+		return name;
+	}
+#endif
 	return lws_get_peer_simple_fd(wsi->io->desc.sockfd, name, namelen);
 }
 #endif
@@ -284,6 +292,13 @@ lws_get_peer_addresses(struct lws *wsi, lws_sockfd_type fd, char *name,
 		rip[0] = '\0';
 	if (name)
 		name[0] = '\0';
+
+#if defined(LWS_WITH_TLS_PASSTHROUGH)
+	if (wsi->io->proxied && fd == wsi->io->desc.sockfd)
+		/* the client a trusted proxy named in its PROXY v2 header */
+		return lws_get_addresses(wsi->a.vhost, &wsi->io->sa46_proxied,
+					 name, name_len, rip, rip_len);
+#endif
 
 #ifdef LWS_WITH_IPV6
 	if (LWS_IPV6_ENABLED(wsi->a.vhost)) {
@@ -869,6 +884,13 @@ lws_io_send_dgram(struct lws *wsi, const uint8_t *buf, size_t len,
 	}
 #endif
 
+#if defined(LWS_WITH_TLS_PASSTHROUGH) && defined(LWS_ROLE_QUIC)
+	/* a client a trusted relay forwards is answered through the relay */
+	if (dest && !lwsi_role_client(nwsi) &&
+	    lws_relayed_dgram_tx(nwsi, fd, buf, len, dest, &n))
+		return n;
+#endif
+
 #if defined(WIN32) || defined(_WIN32)
 	if (dest)
 		n = sendto(fd, (const char *)buf, (int)len, 0,
@@ -887,6 +909,26 @@ lws_io_send_dgram(struct lws *wsi, const uint8_t *buf, size_t len,
 
 	/* latch it before the logging can clobber it */
 	e = LWS_ERRNO;
+
+	/*
+	 * Too big to send at all, eg, a path MTU probe bigger than our own
+	 * interface's MTU, on a socket with Don't Fragment.  It's not a fault,
+	 * and it never goes, so the sender hears it failed.
+	 */
+	if (
+#if defined(WIN32)
+	    e == WSAEMSGSIZE
+#elif defined(EMSGSIZE)
+	    e == EMSGSIZE
+#else
+	    0
+#endif
+	    ) {
+		lwsl_wsi_info(wsi, "dgram of %u bytes too big to send",
+			      (unsigned int)len);
+
+		return LWS_SSL_CAPABLE_ERROR;
+	}
 
 #if (_LWS_ENABLED_LOGS & LLL_WARN)
 	{

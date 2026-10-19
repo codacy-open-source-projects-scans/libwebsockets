@@ -229,9 +229,16 @@ lws_adns_direct_callback(struct lws *wsi, enum lws_callback_reasons reason,
 			break;
 		wsi->io->udp->sa46 = ad->server;
 		if (lws_write(wsi, ad->pkt + LWS_PRE, ad->pkt_len, 0) !=
-							(int)ad->pkt_len)
-			lwsl_cx_info(ad->cx, "%s: send failed, retrying",
-				     __func__);
+							(int)ad->pkt_len) {
+			/*
+			 * The failed send left the socket unusable (eg, it
+			 * took the icmp error for an earlier try the server
+			 * refused): nothing more can go out on it to retry
+			 */
+			lwsl_cx_info(ad->cx, "%s: send about %s failed",
+				     __func__, ad->name);
+			direct_complete(ad, LADNS_RET_FAILED, 0, 0);
+		}
 		break;
 
 	case LWS_CALLBACK_RAW_RX:
@@ -335,6 +342,19 @@ lws_async_dns_query_direct(struct lws_context *cx,
 	ad->cb		= cb;
 	ad->opaque	= opaque;
 	ad->server	= *server;
+#if defined(LWS_WITH_IPV6) && !defined(LWS_WITH_IPV4)
+	/*
+	 * An IPv6-only build only has AF_INET6 sockets: an IPv4 server can
+	 * only be asked as its v4-mapped address
+	 */
+	if (server->sa4.sin_family == AF_INET) {
+		/* sin_addr would otherwise be left in sin6_flowinfo */
+		memset(&ad->server, 0, sizeof(ad->server));
+		lws_sa46_4to6(&ad->server,
+			      (const uint8_t *)&server->sa4.sin_addr,
+			      ntohs(server->sa4.sin_port));
+	}
+#endif
 	ad->qtype	= (uint16_t)qtype;
 	if (!direct_port(&ad->server))
 		sa46_sockport(&ad->server, htons(53));

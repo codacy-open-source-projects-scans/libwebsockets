@@ -305,9 +305,6 @@ typedef enum {
 	LMQPROP_SHARED_SUBSCRIPTION_AVAIL			= 0x2a
 } lws_mqtt_property;
 
-int
-lws_read_mqtt(struct lws *wsi, unsigned char *buf, lws_filepos_t len);
-
 /* returns 0 if bd1 and bd2 are "the same", that includes empty, else nonzero */
 LWS_VISIBLE LWS_EXTERN int
 lws_mqtt_bindata_cmp(const lws_mqtt_str_t *bd1, const lws_mqtt_str_t *bd2);
@@ -362,9 +359,25 @@ lws_mqtt_str_free(lws_mqtt_str_t **s);
  *
  * Final should be set when you're calling with the last part of the payload.
  *
+ * While a PUBLISH is going out in parts, nothing else can be sent on the
+ * connection, including the acks lws owes the broker for what it receives.
+ * lws holds a limited number of those, and when they fill up it stops reading
+ * the connection until it can write them, ie, until this PUBLISH is finished.
+ * So finishing a PUBLISH sent in parts must not wait for anything received on
+ * the same connection, or it may wait forever.
+ *
  * A QoS0 PUBLISH has no PUBACK, lws acknowledges it locally with
  * LWS_CALLBACK_MQTT_ACK once the last part is sent.  Like a real PUBACK for
  * QoS1, that comes afterwards from the event loop, never from inside this call.
+ *
+ * A stream has at most one operation awaiting the broker's ack: a QoS1 or QoS2
+ * PUBLISH until its LWS_CALLBACK_MQTT_ACK (for QoS2, that comes at the PUBREC;
+ * lws completes the exchange itself), or a SUBSCRIBE or UNSUBSCRIBE until its
+ * SUBSCRIBED or UNSUBSCRIBED.  Starting a QoS1 or QoS2 PUBLISH while one is
+ * awaiting its ack fails.  After LWS_CALLBACK_MQTT_RESEND, the PUBLISH may be
+ * sent again with \p pub .dup set, which goes with the packet id it went with
+ * before, or the stream may go on to something else instead.  Use more streams
+ * on the connection for more operations at once.
  */
 LWS_VISIBLE LWS_EXTERN int
 lws_mqtt_client_send_publish(struct lws *wsi, lws_mqtt_publish_param_t *pub,
@@ -381,6 +394,9 @@ lws_mqtt_client_send_publish(struct lws *wsi, lws_mqtt_publish_param_t *pub,
  * subscribed to be the shared network connection, just trigger the
  * LWS_CALLBACK_MQTT_SUBSCRIBED callback as if a SUBACK had come: like a real
  * SUBACK, it comes afterwards from the event loop, not from inside this call.
+ *
+ * It fails if the stream already has an operation awaiting the broker's ack,
+ * see lws_mqtt_client_send_publish().
  *
  * \p sub doesn't need to exist after the return from this function.
  */
@@ -399,6 +415,9 @@ lws_mqtt_client_send_subcribe(struct lws *wsi, lws_mqtt_subscribe_param_t *sub);
  * network connection, just trigger the LWS_CALLBACK_MQTT_UNSUBSCRIBED
  * callback as if a UNSUBACK had come: like a real UNSUBACK, it comes
  * afterwards from the event loop, not from inside this call.
+ *
+ * It fails if the stream already has an operation awaiting the broker's ack,
+ * see lws_mqtt_client_send_publish().
  *
  * \p unsub doesn't need to exist after the return from this function.
  */

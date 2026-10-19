@@ -93,6 +93,25 @@ if (LWS_FOR_GITOHASHI)
 	set(LWS_WITH_HL_LANG_DIFF 1)
 endif()
 
+#
+# Everything sai-server, sai-web, sai-builder, sai-virt, sai-power and the
+# other sai daemons need from lws, see sai's README.md
+#
+if (LWS_FOR_SAI)
+	set(LWS_UNIX_SOCK 1)		# sai-server <-> sai-web, sai-jig
+	set(LWS_WITH_SECURE_STREAMS 1)	# links to sai-server
+	set(LWS_WITH_STRUCT_JSON 1)	# everything sai says on the wire
+	set(LWS_WITH_STRUCT_SQLITE3 1)	# sai-server, sai-web, sai-power dbs
+	set(LWS_WITH_GENCRYPTO 1)	# sai-server, sai-web
+	set(LWS_WITH_JOSE 1)		# sai-server, sai-web
+	set(LWS_WITH_SPAWN 1)		# builds, power and push scripts
+	set(LWS_WITH_STUB 1)		# sai-builder's deletion stub
+	set(LWS_WITH_WOL 1)		# sai-power
+	set(LWS_WITH_EMAIL 1)		# sai-server's mail notifications
+	set(LWS_WITH_SYS_INFO 1)	# the system each daemon's logs came from
+	set(LWS_WITH_SYS_NTPCLIENT 1)	# sai-builder waits for the right time
+endif()
+
 if(LWS_WITH_DISTRO_RECOMMENDED)
 	set(LWS_WITH_HTTP2 1)				# selfcontained
 	set(LWS_WITH_LWSWS 1)				# libuv
@@ -115,6 +134,7 @@ if(LWS_WITH_DISTRO_RECOMMENDED)
 	set(LWS_WITH_THREADPOOL 1)			# pthreads
 	set(LWS_UNIX_SOCK 1)				# selfcontained
 	set(LWS_WITH_HTTP_PROXY 1)			# selfcontained
+	set(LWS_WITH_TLS_PASSTHROUGH 1)			# selfcontained
 	set(LWS_WITH_DISKCACHE 1)			# selfcontained
 	set(LWS_WITH_LWSAC 1)				# selfcontained
 	set(LWS_WITH_LEJP_CONF 1)			# selfcontained
@@ -238,6 +258,7 @@ if (NOT LWS_WITH_NETWORK)
 	set(LWS_WITH_SOCKS5 0)
 	set(LWS_UNIX_SOCK 0)
 	set(LWS_WITH_HTTP_PROXY 0)
+	set(LWS_WITH_TLS_PASSTHROUGH 0)
 	set(LWS_WITH_PLUGINS 0)
 	set(LWS_WITH_LWSWS 0)
 	set(LWS_WITH_CGI 0)
@@ -402,6 +423,12 @@ if (LWS_WITHOUT_SERVER)
 set(LWS_WITH_LWSWS OFF)
 endif()
 
+# the access log is of server transactions, lwsws may have asked for it above
+if (LWS_WITH_ACCESS_LOG AND LWS_WITHOUT_SERVER)
+	message("LWS_WITH_ACCESS_LOG needs a server, disabling it")
+	set(LWS_WITH_ACCESS_LOG 0)
+endif()
+
 if (LWS_WITH_LEJP_CONF)
 	set(LWS_WITH_DIR 1)
 endif()
@@ -441,6 +468,12 @@ endif()
 if (LWS_WITH_HTTP_PROXY AND (LWS_WITHOUT_CLIENT OR LWS_WITHOUT_SERVER))
 	message("You have to enable both client and server for http proxy")
 	set(LWS_WITH_HTTP_PROXY 0)
+endif()
+
+if (LWS_WITH_TLS_PASSTHROUGH AND (LWS_WITHOUT_CLIENT OR LWS_WITHOUT_SERVER OR
+				  NOT LWS_WITH_SSL OR NOT LWS_ROLE_RAW))
+	message("LWS_WITH_TLS_PASSTHROUGH needs client, server, tls and the raw role")
+	set(LWS_WITH_TLS_PASSTHROUGH 0)
 endif()
 
 if (NOT LWS_WITHOUT_EXTENSIONS OR LWS_WITH_ZIP_FOPS)

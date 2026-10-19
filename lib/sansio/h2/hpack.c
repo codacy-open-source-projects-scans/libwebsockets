@@ -260,7 +260,15 @@ static int lws_frag_start(struct lws *wsi, int hdr_token_idx)
 		return 1;
 	}
 
-	if (ah->nfrag >= LWS_ARRAY_SIZE(ah->frag_index)) {
+	/*
+	 * ah->nfrag names the last slot used, the same as for the ah's other
+	 * writers, lws_parse(), lws_hdr_simple_create() and lws_hdr_alias(),
+	 * so the field claims the next one.  An h2 client's response decodes
+	 * into the ah still holding the request's _WSI_TOKEN_CLIENT_* tokens,
+	 * and starting the field at ah->nfrag took the last of those over.
+	 * Check before moving nfrag on: never leave it naming no slot.
+	 */
+	if (ah->nfrag + 1 >= (int)LWS_ARRAY_SIZE(ah->frags)) {
 		lwsl_info("%s: frag index %d too big\n", __func__, ah->nfrag);
 		return LWS_H2_FRAG_NO_ROOM;
 	}
@@ -274,8 +282,7 @@ static int lws_frag_start(struct lws *wsi, int hdr_token_idx)
 	    ah->frag_index[hdr_token_idx])
 		return lws_hpack_pseudo_duplicated(wsi, hdr_token_idx);
 
-	if (ah->nfrag == 0)
-		ah->nfrag = 1;
+	ah->nfrag++;
 
 	ah->frags[ah->nfrag].offset = ah->pos;
 	ah->frags[ah->nfrag].len = 0;
@@ -338,10 +345,12 @@ static int lws_frag_end(struct lws *wsi)
 	if (lws_frag_append(wsi, 0))
 		return LWS_H2_FRAG_NO_ROOM;
 
-	/* don't account for the terminating NUL in the logical length */
+	/*
+	 * don't account for the terminating NUL in the logical length.  The
+	 * fragment stays ah->nfrag, the last slot used, until the next one is
+	 * started
+	 */
 	wsi->stream.ah->frags[wsi->stream.ah->nfrag].len--;
-
-	wsi->stream.ah->nfrag++;
 
 	return 0;
 }
@@ -394,9 +403,8 @@ lws_hpack_path_end(struct lws *wsi)
 	/*
 	 * :path ended in "/..": back up one dir level if possible, the same
 	 * as the h1 parser does at the end of the request URI.  This has to
-	 * act on the still-open fragment, before lws_frag_end() terminates it
-	 * and moves ah->nfrag on to the next slot (which is one past the end
-	 * of ah->frags[] when all the slots are in use).  There is no query
+	 * act on the still-open fragment, before lws_frag_end() terminates it.
+	 * There is no query
 	 * then: a ? moves the state on from URIPS_SEEN_SLASH_DOT_DOT, so the
 	 * open fragment is the path's.
 	 */
@@ -1302,6 +1310,16 @@ lws_hpack_handle_pseudo_rules(struct lws *nwsi, struct lws *wsi, int m)
 	if (m == LWS_HPACK_IGNORE_ENTRY || m == -1)
 		return 0;
 
+#if defined(LWS_WITH_CLIENT)
+	/* RFC 9113 8.3.2: a response has only :status of the pseudo-headers */
+	if (wsi->client_mux_substream && lws_hpack_tok_is_request_pseudo(m)) {
+		if (lws_h2_goaway(nwsi, H2_ERR_PROTOCOL_ERROR,
+				  "Request pseudoheader in response"))
+			lwsl_info("%s: GOAWAY not queued\n", __func__);
+		return 1;
+	}
+#endif
+
 	if (wsi->seen_nonpseudoheader &&
 	    (lws_header_implies_psuedoheader_map[m >> 3] & (1 << (m & 7)))) {
 
@@ -1872,6 +1890,22 @@ int lws_hpack_interpret(struct lws *wsi, unsigned char c)
 				 * ends up "unknown" at fin below, which routes
 				 * the field to the ignored-entry handling
 				 */
+				/*
+				 * A regular name only matches on the ':' we
+				 * feed lws_parse() once the name has ended,
+				 * but a pseudo-header's matches on its last
+				 * byte.  A name going on past one, eg
+				 * ":methodx", is no pseudo-header lws knows,
+				 * and its bytes must not become the value of
+				 * the one it starts with
+				 */
+				if (!h2n->unknown_header &&
+				    !lws_h2_hpack_no_store(wsi) &&
+				    ah->parser_state < WSI_TOKEN_COUNT)
+					return lws_h2_goaway(nwsi,
+						H2_ERR_PROTOCOL_ERROR,
+						"Unknown pseudoheader");
+
 				if (!h2n->unknown_header &&
 				    !lws_h2_hpack_no_store(wsi)) {
 					m = lws_parse(wsi, &c1, &plen);

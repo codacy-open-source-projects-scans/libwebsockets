@@ -4,31 +4,69 @@
 # SOCKS5 proxy in one process, so the client proxy connect states can be
 # exercised without external infrastructure.
 #
-#   proxy-fixture.py --port P [--auth-port Q] [ignored args...]
+#   proxy-fixture.py --port P [--auth-port Q] [--log FILE] [ignored args...]
 #
 # Port P accepts both "CONNECT host:port HTTP/1.1" and SOCKS5 with the
 # no-authentication method.  Port Q, if given, is SOCKS5 selecting the
 # username/password method and only accepting user "user", password "pass".
 # Anything after the handshake is relayed byte for byte in both directions.
 # Extra args (ctest-background.sh appends -d1039) are ignored.
+#
+# Every connection is logged as it goes, to stderr and, with --log, to FILE:
+# who connected, what it asked for, how long the onward connect took or why
+# it failed, and how the relay ended, with the bytes each way.  The tests
+# using the fixture take the same FILE as --proxy-log and print it when they
+# fail, since ctest only shows a fixture's own output when the fixture fails.
+# The timestamps are in the lws log format, so the two can be read together.
 
-import socket, sys, threading, select
+import socket, sys, threading, select, time, os, traceback
 
-def relay(a, b):
+log_lock = threading.Lock()
+log_file = None
+conn_seq = 0
+
+def stamp():
+    t = time.time()
+    return "%s:%04d" % (time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(t)),
+                        int((t % 1) * 10000))
+
+def log(msg):
+    line = "[%s] P: %s\n" % (stamp(), msg)
+    with log_lock:
+        sys.stderr.write(line)
+        sys.stderr.flush()
+        if log_file:
+            log_file.write(line)
+            log_file.flush()
+
+def ms_since(t0):
+    return int((time.monotonic() - t0) * 1000)
+
+def pump(a, b, count):
+    # copy each way until one side closes or it all goes quiet, and say which
     socks = [a, b]
+    while True:
+        r, _, _ = select.select(socks, [], [], 30)
+        if not r:
+            return "idle 30s"
+        for s in r:
+            d = s.recv(65536)
+            if not d:
+                return "client closed" if s is a else "upstream closed"
+            count[s] += len(d)
+            (b if s is a else a).sendall(d)
+
+def relay(cid, a, b, t0):
+    socks = [a, b]
+    count = {a: 0, b: 0}
+    why = "?"
     try:
-        while True:
-            r, _, _ = select.select(socks, [], [], 30)
-            if not r:
-                break
-            for s in r:
-                d = s.recv(65536)
-                if not d:
-                    return
-                (b if s is a else a).sendall(d)
-    except OSError:
-        pass
+        why = pump(a, b, count)
+    except OSError as e:
+        why = "error: %s" % e
     finally:
+        log("c%d: relay ended, %s, client->upstream %d, upstream->client "
+            "%d, after %dms" % (cid, why, count[a], count[b], ms_since(t0)))
         for s in socks:
             try:
                 s.close()
@@ -67,7 +105,48 @@ def socks5_greeting(c, require_auth):
     if require_auth:
         socks5_userpass(c)
 
-def socks5(c, require_auth):
+# localhost is always loopback (RFC 6761 6.3), as lws treats it too: the
+# system resolver isn't asked, since where /etc/hosts doesn't list it, it
+# goes to dns, which may take longer than the tests wait, or never answer
+LOOPBACK = [(socket.AF_INET6, "::1"), (socket.AF_INET, "127.0.0.1")]
+
+def resolve(cid, host, port):
+    if host.lower() == "localhost" or host.lower().endswith(".localhost"):
+        return [(af, socket.SOCK_STREAM, 0, "", (a, port))
+                for af, a in LOOPBACK if af != socket.AF_INET6 or
+                socket.has_ipv6]
+    tr = time.monotonic()
+    try:
+        ai = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as e:
+        log("c%d: resolving %s failed after %dms: %s" %
+            (cid, host, ms_since(tr), e))
+        raise
+    log("c%d: resolving %s took %dms" % (cid, host, ms_since(tr)))
+    return ai
+
+def upstream(cid, host, port):
+    log("c%d: connecting on to %s:%d" % (cid, host, port))
+    tu = time.monotonic()
+    err = OSError("no addresses for %s" % host)
+    for af, st, proto, _, sa in resolve(cid, host, port):
+        up = socket.socket(af, st, proto)
+        up.settimeout(10)
+        try:
+            up.connect(sa)
+        except OSError as e:
+            up.close()
+            err = e
+            continue
+        up.settimeout(None)
+        log("c%d: onward connect to %s:%d (%s) took %dms" %
+            (cid, host, port, sa[0], ms_since(tu)))
+        return up
+    log("c%d: onward connect to %s:%d failed after %dms: %s" %
+        (cid, host, port, ms_since(tu), err))
+    raise err
+
+def socks5(cid, c, require_auth, t0):
     socks5_greeting(c, require_auth)
     ver, cmd, _, atyp = recv_exact(c, 4)
     if ver != 5 or cmd != 1:
@@ -82,11 +161,13 @@ def socks5(c, require_auth):
     else:
         raise OSError("bad atyp")
     port = int.from_bytes(recv_exact(c, 2), "big")
-    up = socket.create_connection((host, port), timeout=10)
+    log("c%d: socks5%s CONNECT %s:%d, %dms after accept" %
+        (cid, " (auth)" if require_auth else "", host, port, ms_since(t0)))
+    up = upstream(cid, host, port)
     c.sendall(b"\x05\x00\x00\x01" + b"\x00" * 6)
     return up
 
-def http_connect(c, first):
+def http_connect(cid, c, first, t0):
     buf = first
     while b"\r\n\r\n" not in buf:
         d = c.recv(4096)
@@ -98,42 +179,62 @@ def http_connect(c, first):
     if len(parts) < 2 or parts[0] != "CONNECT":
         c.sendall(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
         raise OSError("not a CONNECT: " + line)
+    log("c%d: http %s, %dms after accept" % (cid, line, ms_since(t0)))
     host, _, port = parts[1].rpartition(":")
     host = host.strip("[]")
-    up = socket.create_connection((host, int(port)), timeout=10)
+    up = upstream(cid, host, int(port))
     c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
     return up
 
-def serve(c, require_auth):
+def serve(cid, c, require_auth, t0):
     up = None
     try:
         c.settimeout(10)
         first = c.recv(1, socket.MSG_PEEK)
+        if not first:
+            raise OSError("client closed before sending anything")
         if first == b"\x05":
-            up = socks5(c, require_auth)
+            up = socks5(cid, c, require_auth, t0)
         elif require_auth:
             raise OSError("auth port only speaks socks5")
         else:
-            up = http_connect(c, c.recv(4096))
+            up = http_connect(cid, c, c.recv(4096), t0)
         c.settimeout(None)
-        relay(c, up)
-    except OSError as e:
-        sys.stderr.write("fixture: %s\n" % e)
+        log("c%d: tunnel up, %dms after accept" % (cid, ms_since(t0)))
+        relay(cid, c, up, t0)
+    except Exception as e:
+        # anything else would end the thread with its traceback only in our
+        # stderr, which the tests don't show, and the connection just hangs
+        if isinstance(e, OSError):
+            log("c%d: failed after %dms: %s" % (cid, ms_since(t0), e))
+        else:
+            log("c%d: failed after %dms: %s" % (cid, ms_since(t0),
+                traceback.format_exc().rstrip().replace("\n", " | ")))
         c.close()
         if up:
             up.close()
 
 def listen(port, require_auth):
+    global conn_seq
     l = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     l.bind(("127.0.0.1", port))
     l.listen(16)
+    log("pid %d listening on 127.0.0.1:%d%s" %
+        (os.getpid(), port, " (socks5 auth)" if require_auth else ""))
     while True:
-        c, _ = l.accept()
-        threading.Thread(target=serve, args=(c, require_auth),
+        c, peer = l.accept()
+        t0 = time.monotonic()
+        with log_lock:
+            conn_seq += 1
+            cid = conn_seq
+        log("c%d: accepted from %s:%d on port %d" %
+            (cid, peer[0], peer[1], port))
+        threading.Thread(target=serve, args=(cid, c, require_auth, t0),
                          daemon=True).start()
 
 def main():
+    global log_file
     port = auth_port = None
     a = sys.argv[1:]
     while a:
@@ -141,6 +242,9 @@ def main():
             port = int(a[1]); a = a[2:]
         elif a[0] == "--auth-port":
             auth_port = int(a[1]); a = a[2:]
+        elif a[0] == "--log":
+            log_file = open(a[1], "w")
+            a = a[2:]
         else:
             a = a[1:]
     if port is None:

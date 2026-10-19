@@ -23,6 +23,75 @@ SOCKS5, compression, ...).  When adding a Sai dimension, verify it locally
 with `-DLWS_WITH_MINIMAL_EXAMPLES=1` **and** ctest: examples have broken
 the link on a new dimension that built fine without them.
 
+## Reading Sai results and fleet logs
+
+lws is built by the Sai at **https://libwebsockets.org/sai/**.  The Sai at
+warmcat.com is a different instance that only builds sai and gitohashi:
+nothing about an lws build is there, including its fleet logs.
+
+What the web UI shows, events, tasks, their logs and problems, is public.
+`https://libwebsockets.org/sai/rss.json?project=libwebsockets&branch=main-dev`
+lists the latest events as JSON.
+
+Start looking into a red or flaky event from its problems: sai reads every
+try's log for compiler, linker and cmake diagnostics and failed tests,
+including tests that failed and passed when ctest ran them again, and groups
+them across the event's builds.  The web UI shows them in the problems pane;
+sai's `scripts/sai-problems.py` gets the same from the command line, with no
+account (see sai's `READMEs/README-problems.md`):
+
+```
+$ sai-problems.py libwebsockets.org problems latest:libwebsockets:main-dev
+$ sai-problems.py libwebsockets.org excerpts <event uuid> 1,2,3
+$ sai-problems.py libwebsockets.org log <task uuid> > task.log
+```
+
+`problems` gives each group's builds, failure rate and history in earlier
+events, and for each occurrence its `uid`, task uuid, try and log line.  An
+excerpt is only the start of the stanza (24 lines or 2KiB), so a fixture's
+log is usually cut off: get the whole task log for the rest, and to see
+what else was running at the time.  Several flakes in one task that failed
+together, at the same moment, are usually one cause.
+
+`log` ends after 5s with nothing arriving, but while the event is still
+building, other tasks' updates keep the connection busy and it never ends.
+Run it under `timeout 100 python3 -u ...`: the whole log of a finished task
+arrives well inside that.
+
+The fleet logs are what the Sai daemons themselves logged on every host
+(sai-server, sai-builder, sai-virt, sai-power), tagged with the build they
+were about.  They show what happened around a build that its task log
+can't, eg, a VM being started or reaped, a git fetch failing, or a builder
+restarting.  They're at `https://libwebsockets.org/sai/logs/`, and need an
+account holding the fleet log grant: ask the person you're working with
+for one.  The query is documented in sai's `READMEs/README-logs.md`.  A
+build's 8-hex hash is the first 4 and last 4 hex of its 64-hex task uuid,
+which is also its job dir name: a log path like
+`/home/sai/jobs/A177EBC2/src/...` is build `a177ebc2`.  (Builders older
+than sai's "builder: name the job dir from the whole task uuid" named the
+dir from the wrong 4 at the end, so their job dir names find nothing; use
+the task uuid.)
+
+sai's `scripts/sai-logs.py` makes the queries from the command line,
+logging in with the account's credentials file and keeping its session
+cookie, so you don't log in again on every query:
+
+```
+$ sai-logs.py --creds <file> libwebsockets.org 'hash=a177ebc2'
+$ sai-logs.py libwebsockets.org 'hash=a177ebc2&lvl=warn&src=sai-virt'
+$ sai-logs.py libwebsockets.org 'grep=reap&from=2026-10-14T08:00:00Z&to=2026-10-14T09:00:00Z'
+```
+
+`hash` gives the build's window with a minute either side, by default;
+without it you get the last 10 minutes.  Lines are kept for 14 days.
+
+Each line keeps the timestamp its source's clock gave it.  A VM that
+logged before its clock was corrected has those lines filed at the wrong
+time, eg, a fedora VM's first lines came an hour early, so a time window
+can miss a VM's lines entirely.  If a source you expect is missing, ask
+for its host (`src=sai-vm-fedora44-*`) over a wider window and look at
+where its lines landed.
+
 ## Windows
 
  - **Wrap every POSIX io length** (`read`, `write`, `send`, `recv`,
@@ -33,6 +102,13 @@ the link on a new dimension that built fine without them.
    crash, not a hang (historically a Debug CRT modal dialog; now routed to
    stderr).  The Sai log of a timed-out test is cut at an arbitrary point,
    so its tail says nothing about where it stopped.
+ - **A FIN is POLLHUP, not POLLIN.**  WSAPoll reports the peer's FIN as
+   POLLHUP, which is all of `LWS_POLLHUP` on Windows, so `service.c`
+   takes it as a full hangup, not a "bare" one; only a POLLERR alongside
+   says it was a reset.  Linux reports a FIN as POLLIN, so code that waits
+   for the zero-length read before closing behaves differently there,
+   most visibly on a wsi whose reading was held behind a partial send.
+   [debug-recipes.md](debug-recipes.md) has a way to reproduce it on Linux.
  - Exit code 3 is `abort()` (a Debug CRT assert).  Exit code 252 is
    `lws_spawn_piped_kill_child_process()` killing a child: expected at
    teardown.
@@ -75,6 +151,15 @@ the link on a new dimension that built fine without them.
    Linux: "af 30" in a log is a mac.
  - Darwin kqueue fds refuse O_NONBLOCK; adopting them needs
    `LWS_ADOPT_FLAG_NO_NONBLOCK`.
+ - **The first dlopen() of a newly built dylib can take seconds.**  On the
+   Sai M1, each protocol plugin took 1 - 6s to load the first time while the
+   process used almost no CPU, and well under 1ms once another process had
+   loaded it.  Every context on a plugins build loads every plugin on
+   `LD_LIBRARY_PATH`, so fixture servers started together by `ctest -j8`
+   ran past `ctest-background.sh`'s wait for their port ("Timed out waiting
+   for port", the fixture's log ending in `lws_plugins_init` "trying ...").
+   `api-test-plugins` registers a ctest pre-test that loads them all once
+   before any test starts (`LWS_CTEST_PRE_TEST` in the top `CMakeLists.txt`).
  - Linux loopback buffering hides bugs where a close with unread rx loses
    tx (the kernel aborts the connection and drops unsent data).  macOS
    shows them.  Clamp the receiver's `SO_RCVBUF` in tests to see them on

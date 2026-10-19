@@ -158,10 +158,10 @@ lws_state_notify_protocol_init(struct lws_state_manager *mgr,
 #if defined(LWS_WITH_ROUTING)
 	/*
 	 * If we're going to use netlink routing data for DNS, we have to
-	 * wait to collect it asynchronously from the platform first.  Netlink
-	 * role init starts a ctx sul for 350ms (reset to 100ms each time some
-	 * new netlink data comes) that sets nl_initial_done and tries to move
-	 * us to OPERATIONAL
+	 * wait to collect it asynchronously from the platform first.  The
+	 * end of netlink's dump of the existing routes sets nl_initial_done
+	 * and tries to move us to OPERATIONAL (netlink role init also starts
+	 * a ctx sul to do it anyway, if the end of the dump never comes)
 	 */
 
 	if (target == LWS_SYSTATE_IFACE_COLDPLUG &&
@@ -312,6 +312,16 @@ lws_system_smd_cb(void *opaque, lws_smd_class_t _class, lws_usec_t timestamp,
 	if (_class != LWSSMDCL_NETWORK)
 		return 0;
 
+#if defined(LWS_WITH_SECURE_STREAMS)
+	/*
+	 * A route appearing, or an address being acquired, may be what
+	 * streams waiting to retry a failed connection were missing
+	 */
+	if (!lws_json_simple_strcmp(buf, len, "\"rt\":", "add") ||
+	    !lws_json_simple_strcmp(buf, len, "\"type\":", "ipacq"))
+		lws_ss_network_improved(cx);
+#endif
+
 	/* something external requested CPD check */
 
 	if (!lws_json_simple_strcmp(buf, len, "\"trigger\":", "cpdcheck"))
@@ -339,7 +349,7 @@ lws_system_smd_cb(void *opaque, lws_smd_class_t _class, lws_usec_t timestamp,
 	/*
 	 * Captive portal detect showing internet workable triggers NTP Client
 	 */
-	if (!lws_json_simple_strcmp(buf, len, "\"type\":", "cps") &&
+	if (!lws_json_simple_strcmp(buf, len, "\"type\":", "cpd") &&
 	    !lws_json_simple_strcmp(buf, len, "\"result\":", "OK") &&
 	    lws_now_secs() < 1594017754) /* 06:42 Mon Jul 6 2020 UTC */
 		lws_ntpc_trigger(cx);
@@ -821,6 +831,22 @@ lws_create_context(const struct lws_context_creation_info *info)
 
 		if (!lws_check_opt(ev_options, map[n].flag))
 			continue;
+
+#if defined(LWS_WITH_LIBUV_INTERNAL)
+		if (!n) {
+			/*
+			 * libuv is built into the lib (eg, for lwsws), so its
+			 * evlib is already here: loading the plugin too would
+			 * put a second copy of the same code and globals in
+			 * the process, beside the one the lib's uv apis use
+			 */
+			extern const lws_plugin_evlib_t evlib_uv;
+
+			plev = &evlib_uv;
+			fatal_exit_defer = !!info->foreign_loops;
+			break;
+		}
+#endif
 
 		if (!lws_plugins_init(&evlib_plugin_list,
 				     dp, "lws_evlib_plugin",
@@ -3069,6 +3095,9 @@ next_l:
 
 #if defined(LWS_WITH_SYS_ASYNC_DNS)
 		lws_async_dns_deinit(&context->async_dns);
+#endif
+#if defined(LWS_WITH_TLS_PASSTHROUGH) && defined(LWS_ROLE_QUIC)
+		lws_quic_passthrough_context_destroy(context);
 #endif
 #if defined(LWS_WITH_SYS_DHCP_CLIENT)
 		lws_dhcpc_remove(context, NULL);

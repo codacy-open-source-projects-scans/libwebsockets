@@ -85,6 +85,9 @@ if (LWS_WITH_NETWORK)
 			endif()
 		endif()
 	endif()
+	if (LWS_WITH_SYS_INFO)
+		list(APPEND SOURCES plat/unix/unix-sysinfo.c)
+	endif()
 	if (LWS_WITH_SDEVENT AND LWS_HAVE_SYSTEMD_H)
 		list(APPEND SOURCES
 			plat/unix/unix-systemd.c
@@ -99,6 +102,7 @@ endif()
 
 if (LWS_WITH_SPAWN)
 	list(APPEND SOURCES plat/unix/unix-spawn.c)
+	list(APPEND SOURCES plat/unix/unix-spawn-tree.c)
 endif()
 
 if (HAIKU)
@@ -126,6 +130,10 @@ if (${CMAKE_SYSTEM_NAME} MATCHES "QNX")
 	list(APPEND LIB_LIST_AT_END socket)
 endif()
 
+# dlopen() and friends, for plugins and dynamically-loaded TLS / event libs.
+# This is the one place it goes on the link: CMake knows where it's needed
+# (eg, "dl" on Linux) and where it's part of libc (eg, "" on macOS, whose
+# linker warns about a library given more than once)
 list(APPEND LIB_LIST_AT_END ${CMAKE_DL_LIBS})
 
 #

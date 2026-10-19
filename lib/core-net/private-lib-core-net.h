@@ -353,6 +353,16 @@ typedef struct lws_async_dns {
 	uint8_t			in_parse; /* inside lws_adns_parse_udp() */
 
 	/*
+	 * The platform resolver's search list, the domains a name with fewer
+	 * than ndots dots is tried under, as NUL-terminated domains one after
+	 * another; reloaded with the nameservers
+	 */
+#define LWS_ADNS_SEARCH_BUF	256
+	char			search[LWS_ADNS_SEARCH_BUF];
+	uint8_t			search_count;
+	uint8_t			ndots;
+
+	/*
 	 * Platform DNS server change detection + publication on SMD.
 	 *
 	 * The watcher side (in async-dns.c) acquires the platform's current
@@ -860,6 +870,17 @@ struct lws_vhost {
 	unsigned char default_protocol_index;
 	unsigned char raw_protocol_index;
 
+#if defined(LWS_WITH_TLS_PASSTHROUGH)
+	char			*passthrough_host; /* where its tls goes, or NULL */
+	uint16_t		passthrough_port;
+	uint8_t			passthrough_proxy_v2;
+	lws_dll2_owner_t	proxy_v2_trusted; /* lws_proxy_v2_trust_t */
+#if defined(LWS_ROLE_QUIC)
+	lws_sockaddr46		passthrough_sa46; /* numeric, for quic */
+	struct lws		*passthrough_qwsi; /* our udp socket to it */
+#endif
+#endif
+
 #if defined(LWS_WITH_DHT)
 	lws_dll2_owner_t	dht_owner;
 #endif
@@ -894,6 +915,8 @@ lws_stub_destroy_all_on_vhost(struct lws_vhost *vh);
 
 void
 lws_wsi_mux_insert(struct lws *wsi, struct lws *parent_wsi, uint64_t sid);
+int
+lws_wsi_mux_has_busy_child(struct lws *parent_wsi);
 int
 lws_wsi_mux_mark_parents_needing_writeable(struct lws *wsi);
 struct lws *
@@ -1037,6 +1060,22 @@ struct lws_io_adjunct {
 	/* the connection's addresses, family and route */
 	lws_sockaddr46			sa46_local;
 	lws_sockaddr46			sa46_peer;
+#if defined(LWS_WITH_TLS_PASSTHROUGH)
+	/*
+	 * A server connection's first bytes, looked at before its tls or role
+	 * sees them (lib/io/passthrough.c): a PROXY v2 header from a trusted
+	 * proxy, then the ClientHello's SNI to see if it is passed through
+	 */
+	lws_sorted_usec_list_t		sul_pre_accept;
+	lws_sockaddr46			sa46_proxied; /* the client a trusted
+						       * proxy named */
+	uint8_t				*pa_peek;
+	unsigned int			pre_accept:1;
+	unsigned int			pa_tls:1;	/* tls accept after */
+	unsigned int			pa_proxy_v2:1;	/* header expected */
+	unsigned int			pa_sni:1;	/* passthrough possible */
+	unsigned int			proxied:1;	/* sa46_proxied is set */
+#endif
 #if defined(LWS_WITH_ROUTING)
 	lws_route_uidx_t		peer_route_uidx;
 #endif
@@ -1256,6 +1295,11 @@ struct lws {
 	 * since the size may have come from LWS_CALLBACK_GET_PSS_SIZE and not
 	 * from protocol->per_session_data_size */
 	void				*opaque_parent_data;
+	/*
+	 * The first thing known to have ended the connection, a static
+	 * string, with close_cause_arg: see lws_wsi_close_cause()
+	 */
+	const char			*close_cause;
 
 	struct lws_buflist		*buflist; /* input-side buflist */
 	struct lws_buflist		*buflist_out; /* output-side buflist */
@@ -1281,8 +1325,10 @@ struct lws {
 	int				flags;
 #endif
 	unsigned int			cache_secs;
+	int				close_cause_arg; /* errno, timeout... */
 
 
+	unsigned int			close_decided:1; /* LWS_TO_KILL_ASYNC set */
 	unsigned int			mux_substream:1;
 	unsigned int			mux_stream_immortal:1;
 	unsigned int			h23_stream_carries_ws:1; /* immortal set as well */
@@ -1366,7 +1412,7 @@ struct lws {
 	char redirects;
 #if defined(LWS_WITH_CLIENT)
 #endif
-	uint8_t rxflow_bitmap;
+	uint16_t rxflow_bitmap; /* LWS_RXFLOW_REASON_ bits b11..b0 */
 #if defined(LWS_WITH_CGI) || defined(LWS_WITH_CLIENT)
 	char reason_bf; /* internal writeable callback reason bitfield */
 #endif
@@ -1417,6 +1463,7 @@ struct lws_spawn_piped {
 	pid_t				child_pid;
 
 	siginfo_t			si;
+	lws_sorted_usec_list_t		sul_mem; /* samples tree memory */
 #endif
 	int				reap_retry_budget;
 
@@ -1433,6 +1480,18 @@ struct lws_spawn_piped {
 	uint8_t				destroying:1;
 };
 
+#if !defined(WIN32)
+/* how often the memory of a spawn's process tree is added up while it runs */
+#define LWS_SPAWN_TREE_SAMPLE_US	(200 * LWS_US_PER_MS)
+
+int
+lws_spawn_tree_rss(struct lws_spawn_piped *lsp, uint64_t *rss);
+int
+lws_spawn_cgroup_cpu(struct lws_spawn_piped *lsp, uint64_t *us_user,
+		     uint64_t *us_sys);
+void
+lws_spawn_tree_sample_cb(lws_sorted_usec_list_t *sul);
+#endif
 
 #endif
 
@@ -1521,6 +1580,10 @@ lws_handling_result_t
 _lws_close_free_wsi(struct lws *wsi, enum lws_close_status, const char *caller);
 lws_handling_result_t
 __lws_close_free_wsi(struct lws *wsi, enum lws_close_status, const char *caller);
+void
+lws_wsi_close_cause_set(struct lws *wsi, const char *cause, int arg);
+int
+lws_close_cause_render(char *buf, size_t len, const char *cause, int arg);
 
 void
 __lws_free_wsi(struct lws *wsi);
@@ -1790,6 +1853,38 @@ lws_wsi_state_fmt(const struct lws_role_ops *ops, lws_wsi_state_t s,
 int
 lws_http_to_fallback(struct lws *wsi, unsigned char *buf, size_t len);
 
+#if defined(LWS_WITH_TLS_PASSTHROUGH)
+/* lib/io/passthrough.c: see the comment at its top */
+extern const struct lws_protocols lws_passthrough_protocol;
+
+int
+lws_passthrough_vhost_init(struct lws_vhost *vh,
+			   const struct lws_context_creation_info *info);
+void
+lws_passthrough_vhost_destroy(struct lws_vhost *vh);
+int
+lws_pre_accept_wanted(struct lws *wsi, int tls);
+int
+lws_pre_accept_service(struct lws *wsi);
+void
+lws_pre_accept_destroy(struct lws *wsi);
+#if defined(LWS_ROLE_QUIC)
+extern const struct lws_protocols lws_quic_passthrough_protocol;
+
+int
+lws_quic_passthrough_rx(struct lws *listener, uint8_t *buf, size_t len,
+			const lws_sockaddr46 *peer, uint8_t ecn);
+int
+lws_relayed_dgram_rx(struct lws *listener, uint8_t **buf, size_t *len,
+		     lws_sockaddr46 *peer);
+int
+lws_relayed_dgram_tx(struct lws *nwsi, lws_sockfd_type fd, const uint8_t *buf,
+		     size_t len, const lws_sockaddr46 *dest, int *sent);
+void
+lws_quic_passthrough_context_destroy(struct lws_context *cx);
+#endif
+#endif
+
 
 int LWS_WARN_UNUSED_RESULT
 user_callback_handle_rxflow(lws_callback_function, struct lws *wsi,
@@ -1868,6 +1963,9 @@ lws_ensure_user_space(struct lws *wsi);
 #if defined(LWS_WITH_SERVER)
 struct lws_vhost *
  lws_select_vhost(struct lws_context *context, int port, const char *servername);
+struct lws_vhost *
+ lws_select_vhost_by_name(struct lws_context *context, int port,
+			  const char *servername);
 int LWS_WARN_UNUSED_RESULT
  lws_parse_ws(struct lws *wsi, unsigned char **buf, size_t len);
 void
@@ -1987,7 +2085,20 @@ __lws_ss_timeout_check(struct lws_context_per_thread *pt, lws_usec_t usnow);
 
 LWS_VISIBLE struct lws * LWS_WARN_UNUSED_RESULT
 lws_client_reset(struct lws **wsi, int ssl, const char *address, int port,
-		 const char *path, const char *host, char weak);
+		 const char *path, const char *host, const char *method,
+		 char weak);
+
+/* where a redirect's Location takes a client request */
+typedef struct lws_client_redir {
+	const char	*address;	/* to connect to */
+	const char	*host;		/* for the Host: header */
+	const char	*path;		/* starts with '/', with any query */
+	int		port;
+	char		ssl;
+} lws_client_redir_t;
+
+lws_client_redir_t * LWS_WARN_UNUSED_RESULT
+lws_client_redirect_resolve(struct lws *wsi, const char *loc);
 
 
 char * LWS_WARN_UNUSED_RESULT
@@ -2239,10 +2350,6 @@ lws_wsi_keepalive_timeout_eff(struct lws *wsi);
 
 #if defined(LWS_WITH_SYS_SMD)
 #endif
-
-
-void
-lws_ntpc_trigger(struct lws_context *ctx);
 
 
 #define lws_netdevs_from_ndi(ni) \
